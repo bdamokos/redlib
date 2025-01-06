@@ -205,13 +205,20 @@ pub async fn add_quarantine_exception(req: Request<Body>) -> Result<Response<Bod
 	let subreddit = req.param("sub").ok_or("Invalid URL")?;
 	let redir = param(&format!("?{}", req.uri().query().unwrap_or_default()), "redir").ok_or("Invalid URL")?;
 	let mut response = redirect(&redir);
-	response.insert_cookie(
-		Cookie::build((&format!("allow_quaran_{}", subreddit.to_lowercase()), "true"))
-			.path("/")
-			.http_only(true)
-			.expires(cookie::Expiration::Session)
-			.into(),
-	);
+
+	let mut cookie = Cookie::build((&format!("allow_quaran_{}", subreddit.to_lowercase()), "true"))
+		.path("/")
+		.http_only(true)
+		.expires(cookie::Expiration::Session);
+
+	// Add domain from request host header
+	if let Some(host) = req.headers().get("host") {
+		if let Ok(host_str) = host.to_str() {
+			cookie = cookie.domain(host_str.to_owned());
+		}
+	}
+
+	response.insert_cookie(cookie.into());
 	Ok(response)
 }
 

@@ -85,13 +85,21 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	for &name in &PREFS {
 		match form.get(name) {
-			Some(value) => response.insert_cookie(
-				Cookie::build((name.to_owned(), value.clone()))
+			Some(value) => {
+				let mut cookie = Cookie::build((name.to_owned(), value.clone()))
 					.path("/")
 					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			),
+					.expires(OffsetDateTime::now_utc() + Duration::weeks(52));
+				
+				// Add domain from request host header
+				if let Some(host) = req.headers().get("host") {
+					if let Ok(host_str) = host.to_str() {
+						cookie = cookie.domain(host_str.to_owned());
+					}
+				}
+				
+				response.insert_cookie(cookie.into());
+			}
 			None => response.remove_cookie(name.to_string()),
 		};
 	}
@@ -124,13 +132,21 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 
 	for name in [PREFS.to_vec(), vec!["subscriptions", "filters"]].concat() {
 		match form.get(name) {
-			Some(value) => response.insert_cookie(
-				Cookie::build((name.to_owned(), value.clone()))
+			Some(value) => {
+				let mut cookie = Cookie::build((name.to_owned(), value.clone()))
 					.path("/")
 					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			),
+					.expires(OffsetDateTime::now_utc() + Duration::weeks(52));
+				
+				// Add domain from request host header
+				if let Some(host) = req.headers().get("host") {
+					if let Ok(host_str) = host.to_str() {
+						cookie = cookie.domain(host_str.to_owned());
+					}
+				}
+				
+				response.insert_cookie(cookie.into());
+			}
 			None => {
 				if remove_cookies {
 					response.remove_cookie(name.to_string());
