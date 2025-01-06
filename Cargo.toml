@@ -14,7 +14,7 @@ default-run = "redlib"
 [dependencies]
 rinja = { version = "0.3.4", default-features = false }
 cached = { version = "0.54.0", features = ["async"] }
-clap = { version = "4.4.11", default-features = false, features = [
+clap = { version = "4.5.23", default-features = false, features = [
     "std",
     "env",
     "derive",
