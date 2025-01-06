@@ -1,14 +1,16 @@
+#![allow(clippy::cmp_owned)]
+
 // CRATES
 use crate::utils::{self, catch_random, error, filter_posts, format_num, format_url, get_filters, param, redirect, setting, template, val, Post, Preferences};
 use crate::{
 	client::json,
+	server::RequestExt,
 	subreddit::{can_access_quarantine, quarantine},
-	RequestExt,
 };
-use askama::Template;
 use hyper::{Body, Request, Response};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rinja::Template;
 
 // STRUCTS
 struct SearchParams {
@@ -60,7 +62,8 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		""
 	};
-	let path = format!("{}.json?{}{}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default(), nsfw_results);
+	let uri_path = req.uri().path().replace("+", "%2B");
+	let path = format!("{}.json?{}{}&raw_json=1", uri_path, req.uri().query().unwrap_or_default(), nsfw_results);
 	let mut query = param(&path, "q").unwrap_or_default();
 	query = REDDIT_URL_MATCH.replace(&query, "").to_string();
 
@@ -68,8 +71,12 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 		return Ok(redirect("/"));
 	}
 
-	if query.starts_with("r/") {
+	if query.starts_with("r/") || query.starts_with("user/") {
 		return Ok(redirect(&format!("/{query}")));
+	}
+
+	if query.starts_with("u/") {
+		return Ok(redirect(&format!("/user{}", &query[1..])));
 	}
 
 	let sub = req.param("sub").unwrap_or_default();

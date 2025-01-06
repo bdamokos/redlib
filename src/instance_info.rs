@@ -3,10 +3,10 @@ use crate::{
 	server::RequestExt,
 	utils::{ErrorTemplate, Preferences},
 };
-use askama::Template;
 use build_html::{Container, Html, HtmlContainer, Table};
 use hyper::{http::Error, Body, Request, Response};
 use once_cell::sync::Lazy;
+use rinja::Template;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -85,7 +85,7 @@ fn info_html(req: &Request<Body>) -> Result<Response<Body>, Error> {
 pub struct InstanceInfo {
 	package_name: String,
 	crate_version: String,
-	git_commit: String,
+	pub git_commit: String,
 	deploy_date: String,
 	compile_mode: String,
 	deploy_unix_ts: i64,
@@ -126,6 +126,8 @@ impl InstanceInfo {
 				["Compile mode", &self.compile_mode],
 				["SFW only", &convert(&self.config.sfw_only)],
 				["Pushshift frontend", &convert(&self.config.pushshift)],
+				["RSS enabled", &convert(&self.config.enable_rss)],
+				["Full URL", &convert(&self.config.full_url)],
 				//TODO: fallback to crate::config::DEFAULT_PUSHSHIFT_FRONTEND
 			])
 			.with_header_row(["Settings"]),
@@ -166,6 +168,8 @@ impl InstanceInfo {
                 Compile mode: {}\n
 				SFW only: {:?}\n
 				Pushshift frontend: {:?}\n
+				RSS enabled: {:?}\n
+				Full URL: {:?}\n
                 Config:\n
                     Banner: {:?}\n
                     Hide awards: {:?}\n
@@ -191,6 +195,8 @@ impl InstanceInfo {
 					self.deploy_unix_ts,
 					self.compile_mode,
 					self.config.sfw_only,
+					self.config.enable_rss,
+					self.config.full_url,
 					self.config.pushshift,
 					self.config.banner,
 					self.config.default_hide_awards,

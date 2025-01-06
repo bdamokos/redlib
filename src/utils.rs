@@ -1,20 +1,25 @@
 #![allow(dead_code)]
-use crate::config::get_setting;
+#![allow(clippy::cmp_owned)]
+
+use crate::config::{self, get_setting};
 //
 // CRATES
 //
 use crate::{client::json, server::RequestExt};
-use askama::Template;
 use cookie::Cookie;
 use hyper::{Body, Request, Response};
 use log::error;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rinja::Template;
 use rust_embed::RustEmbed;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
+use serde_json_path::{JsonPath, JsonPathExt};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::str::FromStr;
+use std::string::ToString;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use url::Url;
 
@@ -44,6 +49,7 @@ pub enum ResourceType {
 }
 
 // Post flair with content, background color and foreground color
+#[derive(Serialize)]
 pub struct Flair {
 	pub flair_parts: Vec<FlairPart>,
 	pub text: String,
@@ -52,7 +58,7 @@ pub struct Flair {
 }
 
 // Part of flair, either emoji or text
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct FlairPart {
 	pub flair_part_type: String,
 	pub value: String,
@@ -94,12 +100,14 @@ impl FlairPart {
 	}
 }
 
+#[derive(Serialize)]
 pub struct Author {
 	pub name: String,
 	pub flair: Flair,
 	pub distinguished: String,
 }
 
+#[derive(Serialize)]
 pub struct Poll {
 	pub poll_options: Vec<PollOption>,
 	pub voting_end_timestamp: (String, String),
@@ -127,6 +135,7 @@ impl Poll {
 	}
 }
 
+#[derive(Serialize)]
 pub struct PollOption {
 	pub id: u64,
 	pub text: String,
@@ -156,13 +165,14 @@ impl PollOption {
 }
 
 // Post flags with nsfw and stickied
+#[derive(Serialize)]
 pub struct Flags {
 	pub spoiler: bool,
 	pub nsfw: bool,
 	pub stickied: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Media {
 	pub url: String,
 	pub hls_url: String,
@@ -268,6 +278,7 @@ impl Media {
 	}
 }
 
+#[derive(Serialize)]
 pub struct GalleryMedia {
 	pub url: String,
 	pub width: i64,
@@ -308,6 +319,7 @@ impl GalleryMedia {
 }
 
 // Post containing content, metadata and media
+#[derive(Serialize)]
 pub struct Post {
 	pub id: String,
 	pub title: String,
@@ -333,6 +345,7 @@ pub struct Post {
 	pub gallery: Vec<GalleryMedia>,
 	pub awards: Awards,
 	pub nsfw: bool,
+	pub out_url: Option<String>,
 	pub ws_url: String,
 }
 
@@ -442,6 +455,7 @@ impl Post {
 				awards,
 				nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 				ws_url: val(post, "websocket_url"),
+				out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 			});
 		}
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
@@ -473,7 +487,7 @@ pub struct Comment {
 	pub prefs: Preferences,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize)]
 pub struct Award {
 	pub name: String,
 	pub icon_url: String,
@@ -487,6 +501,7 @@ impl std::fmt::Display for Award {
 	}
 }
 
+#[derive(Serialize)]
 pub struct Awards(pub Vec<Award>);
 
 impl std::ops::Deref for Awards {
@@ -499,7 +514,7 @@ impl std::ops::Deref for Awards {
 
 impl std::fmt::Display for Awards {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		self.iter().fold(Ok(()), |result, award| result.and_then(|()| writeln!(f, "{award}")))
+		self.iter().try_fold((), |_, award| writeln!(f, "{award}"))
 	}
 }
 
@@ -593,8 +608,9 @@ pub struct Params {
 	pub before: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 pub struct Preferences {
+	#[serde(skip)]
 	pub available_themes: Vec<String>,
 	pub theme: String,
 	pub front_page: String,
@@ -604,6 +620,7 @@ pub struct Preferences {
 	pub show_nsfw: String,
 	pub blur_nsfw: String,
 	pub hide_hls_notification: String,
+	pub video_quality: String,
 	pub hide_sidebar_and_summary: String,
 	pub use_dash: String,
 	pub use_hls: String,
@@ -612,10 +629,19 @@ pub struct Preferences {
 	pub disable_visit_reddit_confirmation: String,
 	pub comment_sort: String,
 	pub post_sort: String,
+	#[serde(serialize_with = "serialize_vec_with_plus")]
 	pub subscriptions: Vec<String>,
+	#[serde(serialize_with = "serialize_vec_with_plus")]
 	pub filters: Vec<String>,
 	pub hide_awards: String,
 	pub hide_score: String,
+}
+
+fn serialize_vec_with_plus<S>(vec: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: Serializer,
+{
+	serializer.serialize_str(&vec.join("+"))
 }
 
 #[derive(RustEmbed)]
@@ -646,6 +672,7 @@ impl Preferences {
 			use_dash: setting(req, "use_dash"),
 			use_hls: setting(req, "use_hls"),
 			hide_hls_notification: setting(req, "hide_hls_notification"),
+			video_quality: setting(req, "video_quality"),
 			autoplay_videos: setting(req, "autoplay_videos"),
 			fixed_navbar: setting_or_default(req, "fixed_navbar", "on".to_string()),
 			disable_visit_reddit_confirmation: setting(req, "disable_visit_reddit_confirmation"),
@@ -656,6 +683,10 @@ impl Preferences {
 			hide_awards: setting(req, "hide_awards"),
 			hide_score: setting(req, "hide_score"),
 		}
+	}
+
+	pub fn to_urlencoded(&self) -> Result<String, String> {
+		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
 	}
 }
 
@@ -780,6 +811,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		awards,
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
+		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 	}
 }
 
@@ -930,12 +962,19 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		// Rewrite Reddit links to Redlib
 		REDDIT_REGEX.replace_all(input_text, r#"href="/"#)
 			.to_string();
-	text1 = REDDIT_EMOJI_REGEX
-		.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
-		.to_string()
-		// Remove (html-encoded) "\" from URLs.
-		.replace("%5C", "")
-		.replace("\\_", "_");
+
+	loop {
+		if REDDIT_EMOJI_REGEX.find(&text1).is_none() {
+			break;
+		} else {
+			text1 = REDDIT_EMOJI_REGEX
+				.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
+				.to_string()
+		}
+	}
+
+	// Remove (html-encoded) "\" from URLs.
+	text1 = text1.replace("%5C", "").replace("\\_", "_");
 
 	// Rewrite external media previews to Redlib
 	loop {
@@ -989,6 +1028,83 @@ pub fn rewrite_urls(input_text: &str) -> String {
 				.to_string()
 		}
 	}
+}
+
+// These links all follow a pattern of "https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/SUBREDDIT_ID/RANDOM_FILENAME.png"
+static REDDIT_EMOTE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/(.*)"#).unwrap());
+
+// These all follow a pattern of '"emote|SUBREDDIT_IT|NUMBER"', we want the number
+static REDDIT_EMOTE_ID_NUMBER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#""emote\|.*\|(.*)""#).unwrap());
+
+pub fn rewrite_emotes(media_metadata: &Value, comment: String) -> String {
+	/* Create the paths we'll use to look for our data inside the json.
+	Because we don't know the name of any given emote we use a wildcard to parse them. */
+	let link_path = JsonPath::parse("$[*].s.u").expect("valid JSON Path");
+	let id_path = JsonPath::parse("$[*].id").expect("valid JSON Path");
+	let size_path = JsonPath::parse("$[*].s.y").expect("valid JSON Path");
+
+	// Extract all of the results from those json paths
+	let link_nodes = media_metadata.json_path(&link_path);
+	let id_nodes = media_metadata.json_path(&id_path);
+
+	// Initialize our vectors
+	let mut id_vec = Vec::new();
+	let mut link_vec = Vec::new();
+
+	// Add the relevant data to each of our vectors so we can access it by number later
+	for current_id in id_nodes {
+		id_vec.push(current_id)
+	}
+	for current_link in link_nodes {
+		link_vec.push(current_link)
+	}
+
+	/* Set index to the length of link_vec.
+	This is one larger than we'll actually be looking at, but we correct that later */
+	let mut index = link_vec.len();
+
+	// Comment needs to be in scope for when we call rewrite_urls()
+	let mut comment = comment;
+
+	/* Loop until index hits zero.
+	This also prevents us from trying to do anything on an empty vector */
+	while index != 0 {
+		/* Subtract 1 from index to get the real index we should be looking at.
+		Then continue on each subsequent loop to continue until we hit the last entry in the vector.
+		This is how we get this to deal with multiple emotes in a single message and properly replace each ID with it's link */
+		index -= 1;
+
+		// Convert our current index in id_vec into a string so we can search through it with regex
+		let current_id = id_vec[index].to_string();
+
+		/* The ID number can be multiple lengths, so we capture it with regex.
+		We also want to only attempt anything when we get matches to avoid panicking */
+		if let Some(id_capture) = REDDIT_EMOTE_ID_NUMBER_REGEX.captures(&current_id) {
+			// Format the ID to include the colons it has in the comment text
+			let id = format!(":{}:", &id_capture[1]);
+
+			// Convert current link to string to search through it with the regex
+			let link = link_vec[index].to_string();
+
+			// Make sure we only do operations when we get matches, otherwise we panic when trying to access the first match
+			if let Some(link_capture) = REDDIT_EMOTE_LINK_REGEX.captures(&link) {
+				/* Reddit sends a size for the image based on whether it's alone or accompanied by text.
+				It's a good idea and makes everything look nicer, so we'll do the same. */
+				let size = media_metadata.json_path(&size_path).first().unwrap().to_string();
+
+				// Replace the ID we found earlier in the comment with the respective image and it's link from the regex capture
+				let to_replace_with = format!(
+					"<img loading=\"lazy\" src=\"/emote/{} width=\"{size}\" height=\"{size}\" style=\"vertical-align:text-bottom\">",
+					&link_capture[1]
+				);
+
+				// Inside the comment replace the ID we found with the string that will embed the image
+				comment = comment.replace(&id, &to_replace_with).to_string();
+			}
+		}
+	}
+	// Call rewrite_urls() to transform any other Reddit links
+	rewrite_urls(&comment)
 }
 
 // Format vote count to a string that will be displayed.
@@ -1097,6 +1213,28 @@ pub fn sfw_only() -> bool {
 	}
 }
 
+/// Returns true if the config/env variable REDLIB_ENABLE_RSS is set to "on".
+/// If this variable is set as such, the instance will enable RSS feeds.
+/// Otherwise, the instance will not provide RSS feeds.
+pub fn enable_rss() -> bool {
+	match get_setting("REDLIB_ENABLE_RSS") {
+		Some(val) => val == "on",
+		None => false,
+	}
+}
+
+/// Returns true if the config/env variable `REDLIB_ROBOTS_DISABLE_INDEXING` carries the
+/// value `on`.
+///
+/// If this variable is set as such, the instance will block all robots in robots.txt and
+/// insert the noindex, nofollow meta tag on every page.
+pub fn disable_indexing() -> bool {
+	match get_setting("REDLIB_ROBOTS_DISABLE_INDEXING") {
+		Some(val) => val == "on",
+		None => false,
+	}
+}
+
 // Determines if a request shoud redirect to a nsfw landing gate.
 pub fn should_be_nsfw_gated(req: &Request<Body>, req_url: &str) -> bool {
 	let sfw_instance = sfw_only();
@@ -1152,9 +1290,23 @@ pub fn url_path_basename(path: &str) -> String {
 	}
 }
 
+// Returns the URL of a post, as needed by RSS feeds
+pub fn get_post_url(post: &Post) -> String {
+	if let Some(out_url) = &post.out_url {
+		// Handle cross post
+		if out_url.starts_with("/r/") {
+			format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), out_url)
+		} else {
+			out_url.to_string()
+		}
+	} else {
+		format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), post.permalink)
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::{format_num, format_url, rewrite_urls};
+	use super::{format_num, format_url, rewrite_urls, Preferences};
 
 	#[test]
 	fn format_num_works() {
@@ -1221,6 +1373,35 @@ mod tests {
 		assert_eq!(format_url("nsfw"), "");
 		assert_eq!(format_url("spoiler"), "");
 	}
+	#[test]
+	fn serialize_prefs() {
+		let prefs = Preferences {
+			available_themes: vec![],
+			theme: "laserwave".to_owned(),
+			front_page: "default".to_owned(),
+			layout: "compact".to_owned(),
+			wide: "on".to_owned(),
+			blur_spoiler: "on".to_owned(),
+			show_nsfw: "off".to_owned(),
+			blur_nsfw: "on".to_owned(),
+			hide_hls_notification: "off".to_owned(),
+			video_quality: "best".to_owned(),
+			hide_sidebar_and_summary: "off".to_owned(),
+			use_hls: "on".to_owned(),
+			autoplay_videos: "on".to_owned(),
+			fixed_navbar: "on".to_owned(),
+			disable_visit_reddit_confirmation: "on".to_owned(),
+			comment_sort: "confidence".to_owned(),
+			post_sort: "top".to_owned(),
+			subscriptions: vec!["memes".to_owned(), "mildlyinteresting".to_owned()],
+			filters: vec![],
+			hide_awards: "off".to_owned(),
+			hide_score: "off".to_owned(),
+		};
+		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
+
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off")
+	}
 }
 
 #[test]
@@ -1275,4 +1456,12 @@ fn test_url_path_basename() {
 	assert_eq!(url_path_basename("https://doma.in/first/last"), "last");
 	// empty path
 	assert_eq!(url_path_basename("/"), "");
+}
+
+#[test]
+fn test_rewriting_emotes() {
+	let json_input = serde_json::from_str(r#"{"emote|t5_31hpy|2028":{"e":"Image","id":"emote|t5_31hpy|2028","m":"image/png","s":{"u":"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/t5_31hpy/PW6WsOaLcd.png","x":60,"y":60},"status":"valid","t":"sticker"}}"#).expect("Valid JSON");
+	let comment_input = r#"<div class="comment_body "><div class="md"><p>:2028:</p></div></div>"#;
+	let output = r#"<div class="comment_body "><div class="md"><p><img loading="lazy" src="/emote/t5_31hpy/PW6WsOaLcd.png" width="60" height="60" style="vertical-align:text-bottom"></p></div></div>"#;
+	assert_eq!(rewrite_emotes(&json_input, comment_input.to_string()), output);
 }

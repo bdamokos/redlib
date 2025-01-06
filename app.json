@@ -59,8 +59,8 @@
     "REDLIB_BANNER": {
       "required": false
     },
-    "REDLIB_ROBOTS_DISABLE_INDEXING":  {
-        "required": false
+    "REDLIB_ROBOTS_DISABLE_INDEXING": {
+      "required": false
     },
     "REDLIB_DEFAULT_SUBSCRIPTIONS": {
       "required": false
@@ -72,6 +72,12 @@
       "required": false
     },
     "REDLIB_PUSHSHIFT_FRONTEND": {
+      "required": false
+    },
+    "REDLIB_ENABLE_RSS": {
+      "required": false
+    },
+    "REDLIB_FULL_URL": {
       "required": false
     }
   }

@@ -1,11 +1,15 @@
+#![allow(clippy::cmp_owned)]
+
+use crate::{config, utils};
 // CRATES
 use crate::utils::{
 	catch_random, error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, redirect, rewrite_urls, setting, template, val, Post, Preferences, Subreddit,
 };
-use crate::{client::json, server::ResponseExt, RequestExt};
-use askama::Template;
+use crate::{client::json, server::RequestExt, server::ResponseExt};
 use cookie::Cookie;
 use hyper::{Body, Request, Response};
+use log::{debug, trace};
+use rinja::Template;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -59,6 +63,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
 	let root = req.uri().path() == "/";
 	let query = req.uri().query().unwrap_or_default().to_string();
+	trace!("query: {}", query);
 	let subscribed = setting(&req, "subscriptions");
 	let front_page = setting(&req, "front_page");
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
@@ -120,6 +125,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let path = format!("/r/{}/{sort}.json?{}{params}", sub_name.replace('+', "%2B"), req.uri().query().unwrap_or_default());
+	debug!("Path: {}", path);
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let filters = get_filters(&req);
@@ -459,8 +465,71 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 	})
 }
 
+pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
+	if config::get_setting("REDLIB_ENABLE_RSS").is_none() {
+		return Ok(error(req, "RSS is disabled on this instance.").await.unwrap_or_default());
+	}
+
+	use hyper::header::CONTENT_TYPE;
+	use rss::{ChannelBuilder, Item};
+
+	// Get subreddit
+	let sub = req.param("sub").unwrap_or_default();
+	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
+	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
+
+	// Get path
+	let path = format!("/r/{sub}/{sort}.json?{}", req.uri().query().unwrap_or_default());
+
+	// Get subreddit data
+	let subreddit = subreddit(&sub, false).await?;
+
+	// Get posts
+	let (posts, _) = Post::fetch(&path, false).await?;
+
+	// Build the RSS feed
+	let channel = ChannelBuilder::default()
+		.title(&subreddit.title)
+		.description(&subreddit.description)
+		.items(
+			posts
+				.into_iter()
+				.map(|post| Item {
+					title: Some(post.title.to_string()),
+					link: Some(utils::get_post_url(&post)),
+					author: Some(post.author.name),
+					content: Some(rewrite_urls(&post.body)),
+					description: Some(format!(
+						"<a href='{}{}'>Comments</a>",
+						config::get_setting("REDLIB_FULL_URL").unwrap_or_default(),
+						post.permalink
+					)),
+					..Default::default()
+				})
+				.collect::<Vec<_>>(),
+		)
+		.build();
+
+	// Serialize the feed to RSS
+	let body = channel.to_string().into_bytes();
+
+	// Create the HTTP response
+	let mut res = Response::new(Body::from(body));
+	res.headers_mut().insert(CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/rss+xml"));
+
+	Ok(res)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fetching_subreddit() {
 	let subreddit = subreddit("rust", false).await;
 	assert!(subreddit.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_gated_and_quarantined() {
+	let quarantined = subreddit("edgy", true).await;
+	assert!(quarantined.is_ok());
+	let gated = subreddit("drugs", true).await;
+	assert!(gated.is_ok());
 }

@@ -1,12 +1,14 @@
+#![allow(clippy::cmp_owned)]
+
 use std::collections::HashMap;
 
 // CRATES
 use crate::server::ResponseExt;
 use crate::utils::{redirect, template, Preferences};
-use askama::Template;
 use cookie::Cookie;
 use futures_lite::StreamExt;
 use hyper::{Body, Request, Response};
+use rinja::Template;
 use time::{Duration, OffsetDateTime};
 
 // STRUCTS
@@ -38,6 +40,7 @@ const PREFS: [&str; 18] = [
 	"hide_awards",
 	"hide_score",
 	"disable_visit_reddit_confirmation",
+	"video_quality",
 ];
 
 // FUNCTIONS
