@@ -227,9 +227,11 @@ enum StringType {
 }
 #[derive(Template)]
 #[template(path = "message.html")]
-struct MessageTemplate {
+pub struct MessageTemplate {
 	title: String,
 	body: String,
 	prefs: Preferences,
 	url: String,
 }
+
+crate::impl_template_str_eq!(MessageTemplate);

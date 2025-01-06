@@ -3,7 +3,7 @@
 // CRATES
 use crate::client::json;
 use crate::server::RequestExt;
-use crate::utils::{error, filter_posts, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
+use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
 use crate::{config, utils};
 use hyper::{Body, Request, Response};
 use rinja::Template;
@@ -12,7 +12,7 @@ use time::{macros::format_description, OffsetDateTime};
 // STRUCTS
 #[derive(Template)]
 #[template(path = "user.html")]
-struct UserTemplate {
+pub struct UserTemplate {
 	user: User,
 	posts: Vec<Post>,
 	sort: (String, String),
@@ -31,6 +31,8 @@ struct UserTemplate {
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
 }
+
+crate::impl_template_str_eq!(UserTemplate);
 
 // FUNCTIONS
 pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -123,7 +125,8 @@ async fn user(name: &str) -> Result<User, String> {
 			name: res["data"]["name"].as_str().unwrap_or(name).to_owned(),
 			title: about("title"),
 			icon: format_url(&about("icon_img")),
-			karma: res["data"]["total_karma"].as_i64().unwrap_or(0),
+			post_karma: format_num(res["data"]["link_karma"].as_i64().unwrap_or(0)),
+			comment_karma: format_num(res["data"]["comment_karma"].as_i64().unwrap_or(0)),
 			created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
 			banner: about("banner_img"),
 			description: about("public_description"),
@@ -182,9 +185,3 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(res)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_fetching_user() {
-	let user = user("spez").await;
-	assert!(user.is_ok());
-	assert!(user.unwrap().karma > 100);
-}

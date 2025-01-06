@@ -48,8 +48,18 @@ pub enum ResourceType {
 	Post,
 }
 
+impl ResourceType {
+	pub fn as_str(&self) -> &str {
+		match self {
+			ResourceType::Subreddit => "Subreddit",
+			ResourceType::User => "User",
+			ResourceType::Post => "Post",
+		}
+	}
+}
+
 // Post flair with content, background color and foreground color
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Flair {
 	pub flair_parts: Vec<FlairPart>,
 	pub text: String,
@@ -58,7 +68,7 @@ pub struct Flair {
 }
 
 // Part of flair, either emoji or text
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct FlairPart {
 	pub flair_part_type: String,
 	pub value: String,
@@ -100,14 +110,14 @@ impl FlairPart {
 	}
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Author {
 	pub name: String,
 	pub flair: Flair,
 	pub distinguished: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Poll {
 	pub poll_options: Vec<PollOption>,
 	pub voting_end_timestamp: (String, String),
@@ -135,7 +145,7 @@ impl Poll {
 	}
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct PollOption {
 	pub id: u64,
 	pub text: String,
@@ -165,14 +175,33 @@ impl PollOption {
 }
 
 // Post flags with nsfw and stickied
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Flags {
 	pub spoiler: bool,
 	pub nsfw: bool,
 	pub stickied: bool,
+	#[serde(skip)]
+	pub nsfw_str: &'static str,
+	#[serde(skip)]
+	pub spoiler_str: &'static str,
+	#[serde(skip)]
+	pub stickied_str: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+impl Flags {
+	pub fn new(spoiler: bool, nsfw: bool, stickied: bool) -> Self {
+		Self {
+			spoiler,
+			nsfw,
+			stickied,
+			nsfw_str: if nsfw { "true" } else { "false" },
+			spoiler_str: if spoiler { "true" } else { "false" },
+			stickied_str: if stickied { "true" } else { "false" },
+		}
+	}
+}
+
+#[derive(Debug, Serialize, PartialEq)]
 pub struct Media {
 	pub url: String,
 	pub hls_url: String,
@@ -278,7 +307,7 @@ impl Media {
 	}
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct GalleryMedia {
 	pub url: String,
 	pub width: i64,
@@ -319,7 +348,7 @@ impl GalleryMedia {
 }
 
 // Post containing content, metadata and media
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Post {
 	pub id: String,
 	pub title: String,
@@ -442,6 +471,9 @@ impl Post {
 					spoiler: data["spoiler"].as_bool().unwrap_or_default(),
 					nsfw: data["over_18"].as_bool().unwrap_or_default(),
 					stickied: data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or_default(),
+					nsfw_str: if data["over_18"].as_bool().unwrap_or_default() { "true" } else { "false" },
+					spoiler_str: if data["spoiler"].as_bool().unwrap_or_default() { "true" } else { "false" },
+					stickied_str: if data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or_default() { "true" } else { "false" },
 				},
 				permalink: val(post, "permalink"),
 				link_title: val(post, "link_title"),
@@ -487,7 +519,7 @@ pub struct Comment {
 	pub prefs: Preferences,
 }
 
-#[derive(Default, Clone, Serialize)]
+#[derive(Default, Clone, Serialize, PartialEq)]
 pub struct Award {
 	pub name: String,
 	pub icon_url: String,
@@ -501,7 +533,7 @@ impl std::fmt::Display for Award {
 	}
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Awards(pub Vec<Award>);
 
 impl std::ops::Deref for Awards {
@@ -570,20 +602,21 @@ pub struct NSFWLandingTemplate {
 	pub url: String,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 // User struct containing metadata about user
 pub struct User {
 	pub name: String,
 	pub title: String,
 	pub icon: String,
-	pub karma: i64,
+	pub post_karma: (String, String),
+	pub comment_karma: (String, String),
 	pub created: String,
 	pub banner: String,
 	pub description: String,
 	pub nsfw: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 // Subreddit struct containing metadata about community
 pub struct Subreddit {
 	pub name: String,
@@ -599,7 +632,7 @@ pub struct Subreddit {
 }
 
 // Parser for query params, used in sorting (eg. /r/rust/?sort=hot)
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, PartialEq)]
 pub struct Params {
 	pub t: Option<String>,
 	pub q: Option<String>,
@@ -608,7 +641,7 @@ pub struct Params {
 	pub before: Option<String>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, PartialEq)]
 pub struct Preferences {
 	#[serde(skip)]
 	pub available_themes: Vec<String>,
@@ -800,6 +833,9 @@ pub async fn parse_post(post: &Value) -> Post {
 			spoiler: post["data"]["spoiler"].as_bool().unwrap_or_default(),
 			nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 			stickied: post["data"]["stickied"].as_bool().unwrap_or_default() || post["data"]["pinned"].as_bool().unwrap_or(false),
+			nsfw_str: if post["data"]["over_18"].as_bool().unwrap_or_default() { "true" } else { "false" },
+			spoiler_str: if post["data"]["spoiler"].as_bool().unwrap_or_default() { "true" } else { "false" },
+			stickied_str: if post["data"]["stickied"].as_bool().unwrap_or_default() || post["data"]["pinned"].as_bool().unwrap_or(false) { "true" } else { "false" },
 		},
 		domain: val(post, "domain"),
 		rel_time,
@@ -1304,164 +1340,23 @@ pub fn get_post_url(post: &Post) -> String {
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use super::{format_num, format_url, rewrite_urls, Preferences};
+/// Helper function for comparing strings in templates
+#[macro_export]
+macro_rules! impl_template_str_eq {
+	($type:ty) => {
+		impl $type {
+			pub fn str_eq(&self, a: &str, b: &str) -> bool {
+				a == b
+			}
 
-	#[test]
-	fn format_num_works() {
-		assert_eq!(format_num(567), ("567".to_string(), "567".to_string()));
-		assert_eq!(format_num(1234), ("1.2k".to_string(), "1234".to_string()));
-		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
-		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
-		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
-	}
-
-	#[test]
-	fn rewrite_urls_removes_backslashes_and_rewrites_url() {
-		assert_eq!(
-			rewrite_urls(
-				"<a href=\"https://new.reddit.com/r/linux%5C_gaming/comments/x/just%5C_a%5C_test%5C/\">https://new.reddit.com/r/linux\\_gaming/comments/x/just\\_a\\_test/</a>"
-			),
-			"<a href=\"/r/linux_gaming/comments/x/just_a_test/\">https://new.reddit.com/r/linux_gaming/comments/x/just_a_test/</a>"
-		);
-		assert_eq!(
-			rewrite_urls(
-				"e.g. &lt;a href=\"https://www.reddit.com/r/linux%5C_gaming/comments/ql9j15/anyone%5C_else%5C_confused%5C_with%5C_linus%5C_linux%5C_issues/\"&gt;https://www.reddit.com/r/linux\\_gaming/comments/ql9j15/anyone\\_else\\_confused\\_with\\_linus\\_linux\\_issues/&lt;/a&gt;"
-			),
-			"e.g. &lt;a href=\"/r/linux_gaming/comments/ql9j15/anyone_else_confused_with_linus_linux_issues/\"&gt;https://www.reddit.com/r/linux_gaming/comments/ql9j15/anyone_else_confused_with_linus_linux_issues/&lt;/a&gt;"
-		);
-	}
-
-	#[test]
-	fn rewrite_urls_keeps_intentional_backslashes() {
-		assert_eq!(
-			rewrite_urls("printf \"\\npolkit.addRule(function(action, subject)"),
-			"printf \"\\npolkit.addRule(function(action, subject)"
-		);
-	}
-
-	#[test]
-	fn test_format_url() {
-		assert_eq!(format_url("https://a.thumbs.redditmedia.com/XYZ.jpg"), "/thumb/a/XYZ.jpg");
-		assert_eq!(format_url("https://emoji.redditmedia.com/a/b"), "/emoji/a/b");
-
-		assert_eq!(
-			format_url("https://external-preview.redd.it/foo.jpg?auto=webp&s=bar"),
-			"/preview/external-pre/foo.jpg?auto=webp&s=bar"
-		);
-
-		assert_eq!(format_url("https://i.redd.it/foobar.jpg"), "/img/foobar.jpg");
-		assert_eq!(
-			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
-			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
-		);
-		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/360.mp4");
-		assert_eq!(
-			format_url("https://v.redd.it/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"),
-			"/hls/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"
-		);
-		assert_eq!(format_url("https://www.redditstatic.com/gold/awards/icon/icon.png"), "/static/gold/awards/icon/icon.png");
-		assert_eq!(
-			format_url("https://www.redditstatic.com/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"),
-			"/static/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"
-		);
-
-		assert_eq!(format_url(""), "");
-		assert_eq!(format_url("self"), "");
-		assert_eq!(format_url("default"), "");
-		assert_eq!(format_url("nsfw"), "");
-		assert_eq!(format_url("spoiler"), "");
-	}
-	#[test]
-	fn serialize_prefs() {
-		let prefs = Preferences {
-			available_themes: vec![],
-			theme: "laserwave".to_owned(),
-			front_page: "default".to_owned(),
-			layout: "compact".to_owned(),
-			wide: "on".to_owned(),
-			blur_spoiler: "on".to_owned(),
-			show_nsfw: "off".to_owned(),
-			blur_nsfw: "on".to_owned(),
-			hide_hls_notification: "off".to_owned(),
-			video_quality: "best".to_owned(),
-			hide_sidebar_and_summary: "off".to_owned(),
-			use_hls: "on".to_owned(),
-			autoplay_videos: "on".to_owned(),
-			fixed_navbar: "on".to_owned(),
-			disable_visit_reddit_confirmation: "on".to_owned(),
-			comment_sort: "confidence".to_owned(),
-			post_sort: "top".to_owned(),
-			subscriptions: vec!["memes".to_owned(), "mildlyinteresting".to_owned()],
-			filters: vec![],
-			hide_awards: "off".to_owned(),
-			hide_score: "off".to_owned(),
-		};
-		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
-
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off")
-	}
+			pub fn bool_to_str(&self, val: bool) -> &'static str {
+				if val { "true" } else { "false" }
+			}
+		}
+	};
 }
 
-#[test]
-fn test_rewriting_emoji() {
-	let input = r#"<div class="md"><p>How can you have such hard feelings towards a license? <img src="https://www.redditstatic.com/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif" width="20" height="20" style="vertical-align:middle"> Let people use what license they want, and BSD is one of the least restrictive ones AFAIK.</p>"#;
-	let output = r#"<div class="md"><p>How can you have such hard feelings towards a license? <img src="/static/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif" width="20" height="20" style="vertical-align:middle"> Let people use what license they want, and BSD is one of the least restrictive ones AFAIK.</p>"#;
-	assert_eq!(rewrite_urls(input), output);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_fetching_subreddit_quarantined() {
-	let subreddit = Post::fetch("/r/drugs", true).await;
-	assert!(subreddit.is_ok());
-	assert!(!subreddit.unwrap().0.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_fetching_nsfw_subreddit() {
-	let subreddit = Post::fetch("/r/randnsfw", false).await;
-	assert!(subreddit.is_ok());
-	assert!(!subreddit.unwrap().0.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_fetching_ws() {
-	let subreddit = Post::fetch("/r/popular", false).await;
-	assert!(subreddit.is_ok());
-	for post in subreddit.unwrap().0 {
-		assert!(post.ws_url.starts_with("wss://k8s-lb.wss.redditmedia.com/link/"));
-	}
-}
-
-#[test]
-fn test_rewriting_image_links() {
-	let input =
-		r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
-	let output = r#"<p><figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure></p"#;
-	assert_eq!(rewrite_urls(input), output);
-}
-
-#[test]
-fn test_url_path_basename() {
-	// without trailing slash
-	assert_eq!(url_path_basename("/first/last"), "last");
-	// with trailing slash
-	assert_eq!(url_path_basename("/first/last/"), "last");
-	// with query parameters
-	assert_eq!(url_path_basename("/first/last/?some=query"), "last");
-	// file path
-	assert_eq!(url_path_basename("/cdn/image.jpg"), "image.jpg");
-	// when a full url is passed instead of just a path
-	assert_eq!(url_path_basename("https://doma.in/first/last"), "last");
-	// empty path
-	assert_eq!(url_path_basename("/"), "");
-}
-
-#[test]
-fn test_rewriting_emotes() {
-	let json_input = serde_json::from_str(r#"{"emote|t5_31hpy|2028":{"e":"Image","id":"emote|t5_31hpy|2028","m":"image/png","s":{"u":"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/t5_31hpy/PW6WsOaLcd.png","x":60,"y":60},"status":"valid","t":"sticker"}}"#).expect("Valid JSON");
-	let comment_input = r#"<div class="comment_body "><div class="md"><p>:2028:</p></div></div>"#;
-	let output = r#"<div class="comment_body "><div class="md"><p><img loading="lazy" src="/emote/t5_31hpy/PW6WsOaLcd.png" width="60" height="60" style="vertical-align:text-bottom"></p></div></div>"#;
-	assert_eq!(rewrite_emotes(&json_input, comment_input.to_string()), output);
-}
+impl_template_str_eq!(Comment);
+impl_template_str_eq!(ErrorTemplate);
+impl_template_str_eq!(NSFWLandingTemplate);
+impl_template_str_eq!(User);

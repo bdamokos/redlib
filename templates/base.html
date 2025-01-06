@@ -1,7 +1,7 @@
 {% import "utils.html" as utils %}
 
 <!DOCTYPE html>
-<html lang="en" class="{% if prefs.fixed_navbar == "on" %}fixed_navbar{% endif %}">
+<html lang="en" class="{% if str_eq(prefs.fixed_navbar, "on") %}fixed_navbar{% endif %}">
 	<head>
 		{% block head %}
 		<title>{% block title %}Redlib{% endblock %}</title>
@@ -33,27 +33,27 @@
 		{% endblock %}
 		</head>
 	<body class="
-		{% if prefs.layout != "" %}{{ prefs.layout }}{% endif %}
-		{% if prefs.wide == "on" %} wide{% endif %}
-		{% if prefs.theme != "system" %} {{ prefs.theme }}{% endif %}
-		{% if prefs.fixed_navbar == "on" %} fixed_navbar{% endif %}">
+		{% if !str_eq(prefs.layout, "") %}{{ prefs.layout }}{% endif %}
+		{% if str_eq(prefs.wide, "on") %} wide{% endif %}
+		{% if !str_eq(prefs.theme, "system") %} {{ prefs.theme }}{% endif %}
+		{% if str_eq(prefs.fixed_navbar, "on") %} fixed_navbar{% endif %}">
 		<!-- NAVIGATION BAR -->
 		<nav class="
-			{% if prefs.fixed_navbar == "on" %} fixed_navbar{% endif %}">
+			{% if str_eq(prefs.fixed_navbar, "on") %} fixed_navbar{% endif %}">
 			<div id="logo">
 				<a id="redlib" href="/"><span id="red">red</span><span id="lib">lib.</span></a>
 				{% block subscriptions %}{% endblock %}
 			</div>
 			{% block search %}{% endblock %}
 			<div id="links">
-				<a id="reddit_link" {% if prefs.disable_visit_reddit_confirmation != "on" %}href="#popup"{% else %}href="https://www.reddit.com{{ url }}" rel="nofollow"{% endif %}>
+				<a id="reddit_link" {% if !str_eq(prefs.disable_visit_reddit_confirmation, "on") %}href="#popup"{% else %}href="https://www.reddit.com{{ url }}" rel="nofollow"{% endif %}>
 					<span>reddit</span>
 					<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M22 2L12 22"/>
 						<path d="M2 6.70587C3.33333 8.07884 3.33333 11.5971 3.33333 11.5971M3.33333 19.647V11.5971M3.33333 11.5971C3.33333 11.5971 5.125 7.47817 8 7.47817C10.875 7.47817 12 8.85114 12 8.85114"/>
 					</svg>
 				</a>
-				{% if prefs.disable_visit_reddit_confirmation != "on" %}
+				{% if !str_eq(prefs.disable_visit_reddit_confirmation, "on") %}
 					{% call utils::visit_reddit_confirmation(url) %}
 				{% endif %}
 				<a id="settings_link" href="/settings">

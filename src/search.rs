@@ -13,6 +13,7 @@ use regex::Regex;
 use rinja::Template;
 
 // STRUCTS
+#[derive(PartialEq)]
 struct SearchParams {
 	q: String,
 	sort: String,
@@ -24,6 +25,7 @@ struct SearchParams {
 }
 
 // STRUCTS
+#[derive(PartialEq)]
 struct Subreddit {
 	name: String,
 	url: String,
@@ -34,7 +36,7 @@ struct Subreddit {
 
 #[derive(Template)]
 #[template(path = "search.html")]
-struct SearchTemplate {
+pub struct SearchTemplate {
 	posts: Vec<Post>,
 	subreddits: Vec<Subreddit>,
 	sub: String,
@@ -50,6 +52,8 @@ struct SearchTemplate {
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
 }
+
+crate::impl_template_str_eq!(SearchTemplate);
 
 // Regex matched against search queries to determine if they are reddit urls.
 static REDDIT_URL_MATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^https?://([^\./]+\.)*reddit.com/").unwrap());

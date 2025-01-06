@@ -18,7 +18,7 @@ use time::{Duration, OffsetDateTime};
 // STRUCTS
 #[derive(Template)]
 #[template(path = "subreddit.html")]
-struct SubredditTemplate {
+pub struct SubredditTemplate {
 	sub: Subreddit,
 	posts: Vec<Post>,
 	sort: (String, String),
@@ -36,9 +36,11 @@ struct SubredditTemplate {
 	no_posts: bool,
 }
 
+crate::impl_template_str_eq!(SubredditTemplate);
+
 #[derive(Template)]
 #[template(path = "wiki.html")]
-struct WikiTemplate {
+pub struct WikiTemplate {
 	sub: String,
 	wiki: String,
 	page: String,
@@ -46,15 +48,19 @@ struct WikiTemplate {
 	url: String,
 }
 
+crate::impl_template_str_eq!(WikiTemplate);
+
 #[derive(Template)]
 #[template(path = "wall.html")]
-struct WallTemplate {
+pub struct WallTemplate {
 	title: String,
 	sub: String,
 	msg: String,
 	prefs: Preferences,
 	url: String,
 }
+
+crate::impl_template_str_eq!(WallTemplate);
 
 static GEO_FILTER_MATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
 

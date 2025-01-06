@@ -14,14 +14,16 @@ use time::{Duration, OffsetDateTime};
 // STRUCTS
 #[derive(Template)]
 #[template(path = "settings.html")]
-struct SettingsTemplate {
-	prefs: Preferences,
-	url: String,
+pub struct SettingsTemplate {
+	pub prefs: Preferences,
+	pub url: String,
 }
+
+crate::impl_template_str_eq!(SettingsTemplate);
 
 // CONSTANTS
 
-const PREFS: [&str; 18] = [
+const PREFS: [&str; 19] = [
 	"theme",
 	"front_page",
 	"layout",

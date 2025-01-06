@@ -3,7 +3,9 @@
 use crate::client::json;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
-use crate::utils::{error, filter_posts, get_filters, nsfw_landing, parse_post, template, Post, Preferences};
+use crate::utils::{
+	error, filter_posts, get_filters, nsfw_landing, parse_post, template, Post, Preferences,
+};
 
 use hyper::{Body, Request, Response};
 use rinja::Template;
@@ -13,6 +15,7 @@ use std::collections::HashSet;
 use std::vec::Vec;
 
 /// `DuplicatesParams` contains the parameters in the URL.
+#[derive(PartialEq)]
 struct DuplicatesParams {
 	before: String,
 	after: String,
@@ -23,7 +26,7 @@ struct DuplicatesParams {
 /// posts.
 #[derive(Template)]
 #[template(path = "duplicates.html")]
-struct DuplicatesTemplate {
+pub struct DuplicatesTemplate {
 	/// params contains the relevant request parameters.
 	params: DuplicatesParams,
 
@@ -49,6 +52,8 @@ struct DuplicatesTemplate {
 	/// edge case but can still happen.
 	all_posts_filtered: bool,
 }
+
+crate::impl_template_str_eq!(DuplicatesTemplate);
 
 /// Make the GET request to Reddit. It assumes `req` is the appropriate Reddit
 /// REST endpoint for enumerating post duplicates.

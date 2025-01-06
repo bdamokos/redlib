@@ -18,16 +18,19 @@ use std::collections::{HashMap, HashSet};
 // STRUCTS
 #[derive(Template)]
 #[template(path = "post.html")]
-struct PostTemplate {
+pub struct PostTemplate {
 	comments: Vec<Comment>,
 	post: Post,
 	sort: String,
 	prefs: Preferences,
 	single_thread: bool,
+	single_thread_str: &'static str,
 	url: String,
 	url_without_query: String,
 	comment_query: String,
 }
+
+crate::impl_template_str_eq!(PostTemplate);
 
 static COMMENT_SEARCH_CAPTURE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\?q=(.*)&type=comment").unwrap());
 
@@ -96,6 +99,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				sort,
 				prefs: Preferences::new(&req),
 				single_thread,
+				single_thread_str: if single_thread { "true" } else { "false" },
 				url: req_url,
 				comment_query: query,
 			}))
