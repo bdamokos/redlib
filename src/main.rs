@@ -236,6 +236,9 @@ async fn main() {
 		.at("/dash.all.min.js")
 		.get(|_| resource(include_str!("../static/dash.all.min.js"), "text/javascript", false).boxed());
 	app
+		.at("/dash.all.min.js.map")
+		.get(|_| resource(include_str!("../static/dash.all.min.js.map"), "application/json", false).boxed());
+	app
 		.at("/dash-player.js")
 		.get(|_| resource(include_str!("../static/dash-player.js"), "text/javascript", false).boxed());
 	app
