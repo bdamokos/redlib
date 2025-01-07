@@ -18,20 +18,21 @@
 ## Table of Contents
 
 1. [Redlib](#redlib)
-2. [Instances](#instances)
-3. [About](#about)
+2. [This fork](#this-fork)
+3. [Instances](#instances)
+4. [About](#about)
    - [Built with](#built-with)
    - [How is it different from other Reddit front ends?](#how-is-it-different-from-other-reddit-front-ends)
      - [Teddit](#teddit)
      - [Libreddit](#libreddit)
-4. [Comparison](#comparison)
+5. [Comparison](#comparison)
    - [Speed](#speed)
    - [Privacy](#privacy)
      - [Reddit](#reddit)
      - [Redlib](#redlib-1)
        - [Server](#server)
        - [Official instance (redlib.matthew.science)](#official-instance-redlibmatthewscience)
-5. [Deployment](#deployment)
+6. [Deployment](#deployment)
    - [Docker](#docker)
      - [Docker Compose](#docker-compose)
      - [Docker CLI](#docker-cli)
@@ -48,6 +49,10 @@
    - [Default user settings](#default-user-settings)
 
 ---
+
+# This fork
+
+See [CHANGELOG.md](CHANGELOG.md) for details on what has changed compared to the main redlib repository.
 
 # Instances
 
