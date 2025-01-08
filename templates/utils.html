@@ -366,39 +366,12 @@
 {% macro render_video_html(post, view_type) -%}
 <br/>
 	{% if post.post_type == "video" || post.post_type == "gif" %}
-	{% set use_dash = str_eq(prefs.use_dash, "on") && !post.media.dash_url.is_empty() %}
-	{% set use_hls = !use_dash && str_eq(prefs.use_hls, "on") && !post.media.hls_url.is_empty() %}
+	{% if !post.media.embed_code.is_empty() %}
 	<div class="post_media_content">
-		<video
-			id="vid_{{ post.id }}"
-			class="post_media_video short{% if use_dash %} video-dash{% endif %}{% if post_should_be_blurred %} post_nsfw_blur{% endif %}{% if str_eq(prefs.autoplay_videos, "on") %} autoplay{% endif -%}"
-			poster="{{ post.media.poster }}"
-			preload="none"
-			controls
-			{% if post.media.width > 0 && post.media.height > 0 -%}
-			width="{{ post.media.width }}"
-			height="{{ post.media.height }}"
-			{% endif -%}
-			{% if use_dash -%}
-			{# dont show controls to hide switch from native player to video.js #}
-			data-dash="{{ post.media.dash_url }}"
-			data-hls="{{ post.media.hls_url }}"
-			{% endif -%}
-		>
-			{% if use_hls -%}
-			<source src="{{ post.media.hls_url }}" type="application/vnd.apple.mpegurl" />
-			{% endif -%}
-			<source src="{{ post.media.url }}" type="video/mp4" />
-		</video>
+		<div class="post_media_embed" {% if post.media.width > 0 && post.media.height > 0 -%}style="width: {{ post.media.width }}px; height: {{ post.media.height }}px;"{% endif -%}>
+			{{ post.media.embed_code|safe }}
+		</div>
 	</div>
-
-	{% if !use_dash && !use_hls && !str_eq(prefs.hide_hls_notification, "on") %}
-	{% if  view_type == "list" %}
-	{% set post_id = post.id.clone() %}
-	{% call render_video_audio_notification(format!("{}%23{}", &self.url[1..].replace("&", "%26").replace("+", "%2B"), post_id)) %}
-	{% else if view_type == "post" %}
-	{% call render_video_audio_notification(post.permalink[1..]) %}
-	{% endif %}
 	{% endif %}
 	{% endif %}
 {%- endmacro %}

@@ -1106,15 +1106,17 @@ a.search_subreddit:hover {
     border-radius: 5px;
 }
 
-.post_media_content,
-.post .__NoScript_PlaceHolder__,
-.gallery {
+.post_media_content {
     max-width: calc(100% - 40px);
     grid-area: post_media;
     margin: 15px auto 5px auto;
     width: auto;
     height: auto;
     overflow: hidden;
+}
+
+.post_media_content + .post_media_content {
+    margin-top: 30px;  /* Add extra space between consecutive media content divs */
 }
 
 .post_media_video {
@@ -2131,4 +2133,20 @@ th {
 .quality-selector option:hover {
     background-color: var(--accent);
     color: var(--text);
+}
+
+.post_media_embed {
+    position: relative;
+    width: 100%;
+    max-width: 100%;
+    margin: 0 auto;
+}
+
+.post_media_embed iframe {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
 }

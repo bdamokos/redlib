@@ -210,6 +210,7 @@ pub struct Media {
 	pub height: i64,
 	pub poster: String,
 	pub download_name: String,
+	pub embed_code: String,
 }
 
 impl Media {
@@ -220,6 +221,12 @@ impl Media {
 		let data_preview = &data["preview"]["reddit_video_preview"];
 		let secure_media = &data["secure_media"]["reddit_video"];
 		let crosspost_parent_media = &data["crosspost_parent_list"][0]["secure_media"]["reddit_video"];
+
+		// Get embed code if available
+		let embed_code = data["secure_media_embed"]["content"]
+			.as_str()
+			.unwrap_or_default()
+			.to_string();
 
 		// If post is a video, return the video
 		let (post_type, url_val, hls_url_val, dash_url_val) = if data_preview["fallback_url"].is_string() {
@@ -295,12 +302,11 @@ impl Media {
 				url: format_url(url_val.as_str().unwrap_or_default()),
 				hls_url,
 				dash_url,
-				// Note: in the data["is_reddit_media_domain"] path above
-				// width and height will be 0.
 				width: source["width"].as_i64().unwrap_or_default(),
 				height: source["height"].as_i64().unwrap_or_default(),
 				poster: format_url(source["url"].as_str().unwrap_or_default()),
 				download_name,
+				embed_code,
 			},
 			gallery,
 		)
@@ -450,6 +456,7 @@ impl Post {
 					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
 					poster: String::new(),
 					download_name: String::new(),
+					embed_code: String::new(),
 				},
 				media,
 				domain: val(post, "domain"),
@@ -814,6 +821,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
 			poster: String::new(),
 			download_name: String::new(),
+			embed_code: String::new(),
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(
