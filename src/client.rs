@@ -399,27 +399,36 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 				None
 			};
 
-			// asynchronously aggregate the chunks of the body
-			match hyper::body::aggregate(response).await {
-				Ok(body) => {
-					let has_remaining = body.has_remaining();
-
-					if !has_remaining {
-						// Rate limited, so spawn a force_refresh_token()
-						tokio::spawn(force_refresh_token());
-						return match reset {
-							Some(val) => Err(format!(
-								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
-								 Rate limit will reset in: {val}"
-							)),
-							None => Err("Reddit rate limit exceeded".to_string()),
-						};
+			// Get the response body
+			match hyper::body::to_bytes(response.into_body()).await {
+				Ok(bytes) => {
+					let text = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
+					
+					// Save response to debug log if debug logging is enabled
+					if std::env::var("REDLIB_DEBUG_LOGGING").unwrap_or_default() == "true" {
+						use std::fs::{create_dir_all, OpenOptions};
+						use std::io::Write;
+						use chrono::Utc;
+						
+						if let Ok(_) = create_dir_all("logs/reddit_api") {
+							let timestamp = Utc::now().format("%Y%m%d_%H%M%S%.3f");
+							let filename = format!("logs/reddit_api/response_{}.json", timestamp);
+							if let Ok(mut file) = OpenOptions::new()
+								.write(true)
+								.create(true)
+								.append(false)
+								.open(&filename) 
+							{
+								let _ = writeln!(file, "// Path: {}", path);
+								let _ = writeln!(file, "{}", text);
+							}
+						}
 					}
 
-					// Parse the response from Reddit as JSON
-					match serde_json::from_reader(body.reader()) {
-						Ok(value) => {
-							let json: Value = value;
+					// Parse the response as JSON
+					match serde_json::from_str(&text) {
+						Ok(json) => {
+							let json: Value = json;
 
 							// If user is suspended
 							if let Some(data) = json.get("data") {

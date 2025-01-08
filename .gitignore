@@ -9,3 +9,4 @@ redlib.toml
 .direnv/
 result
 docker-compose.yml
+logs/reddit_api/
