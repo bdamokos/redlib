@@ -3,7 +3,7 @@ version: "3.8"
 
 services:
   redlib:
-    build: .
+    image: 192.168.50.25:5010/redlib:latest
     restart: always
     container_name: "redlib"
     ports:
