@@ -450,6 +450,9 @@ impl Post {
 					},
 					distinguished: val(post, "distinguished"),
 				},
+				permalink: val(post, "permalink"),
+				link_title: val(post, "link_title"),
+				poll: Poll::parse(&data["poll_data"]),
 				score: if data["hide_score"].as_bool().unwrap_or_default() {
 					("\u{2022}".to_string(), "Hidden".to_string())
 				} else {
@@ -457,6 +460,28 @@ impl Post {
 				},
 				upvote_ratio: ratio as i64,
 				post_type,
+				flair: Flair {
+					flair_parts: FlairPart::parse(
+						data["link_flair_type"].as_str().unwrap_or_default(),
+						data["link_flair_richtext"].as_array(),
+						data["link_flair_text"].as_str(),
+					),
+					text: val(post, "link_flair_text"),
+					background_color: val(post, "link_flair_background_color"),
+					foreground_color: if val(post, "link_flair_text_color") == "dark" {
+						"black".to_string()
+					} else {
+						"white".to_string()
+					},
+				},
+				flags: Flags {
+					spoiler: data["spoiler"].as_bool().unwrap_or_default(),
+					nsfw: data["over_18"].as_bool().unwrap_or_default(),
+					stickied: data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or(false),
+					nsfw_str: if data["over_18"].as_bool().unwrap_or_default() { "true" } else { "false" },
+					spoiler_str: if data["spoiler"].as_bool().unwrap_or_default() { "true" } else { "false" },
+					stickied_str: if data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or(false) { "true" } else { "false" },
+				},
 				thumbnail: Media {
 					url: format_url(val(post, "thumbnail").as_str()),
 					hls_url: String::new(),
@@ -848,7 +873,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
 		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
-	});
+	}
 }
 
 //
