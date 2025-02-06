@@ -7,6 +7,7 @@ use crate::config::{self, get_setting};
 //
 use crate::{client::json, server::RequestExt};
 use cookie::Cookie;
+use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 use log::error;
 use once_cell::sync::Lazy;
@@ -266,13 +267,21 @@ impl Media {
 			// If this post contains a gallery of images
 			gallery = GalleryMedia::parse(&data["gallery_data"]["items"], &data["media_metadata"]);
 
-			("gallery", &data["url"], None, None)
+			("gallery", &data["url"], None)
+		} else if data["crosspost_parent_list"][0]["is_gallery"].as_bool().unwrap_or_default() {
+			// If this post contains a gallery of images
+			gallery = GalleryMedia::parse(
+				&data["crosspost_parent_list"][0]["gallery_data"]["items"],
+				&data["crosspost_parent_list"][0]["media_metadata"],
+			);
+
+			("gallery", &data["url"], None)
 		} else if data["is_reddit_media_domain"].as_bool().unwrap_or_default() && data["domain"] == "i.redd.it" {
 			// If this post contains a reddit media (image) URL.
-			("image", &data["url"], None, None)
+			("image", &data["url"], None)
 		} else {
 			// If type can't be determined, return url
-			("link", &data["url"], None, None)
+			("link", &data["url"], None)
 		};
 
 		let source = &data["preview"]["images"][0]["source"];
@@ -411,7 +420,7 @@ impl Post {
 			let awards = Awards::parse(&data["all_awardings"]);
 
 			// selftext_html is set for text posts when browsing.
-			let mut body = rewrite_urls(&val(post, "selftext_html"));
+			let mut body = rewrite_urls(&decode_html(&val(post, "selftext_html")).unwrap());
 			if body.is_empty() {
 				body = rewrite_urls(&val(post, "body_html"));
 			}
@@ -453,31 +462,6 @@ impl Post {
 				},
 				media,
 				domain: val(post, "domain"),
-				flair: Flair {
-					flair_parts: FlairPart::parse(
-						data["link_flair_type"].as_str().unwrap_or_default(),
-						data["link_flair_richtext"].as_array(),
-						data["link_flair_text"].as_str(),
-					),
-					text: val(post, "link_flair_text"),
-					background_color: val(post, "link_flair_background_color"),
-					foreground_color: if val(post, "link_flair_text_color") == "dark" {
-						"black".to_string()
-					} else {
-						"white".to_string()
-					},
-				},
-				flags: Flags {
-					spoiler: data["spoiler"].as_bool().unwrap_or_default(),
-					nsfw: data["over_18"].as_bool().unwrap_or_default(),
-					stickied: data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or_default(),
-					nsfw_str: if data["over_18"].as_bool().unwrap_or_default() { "true" } else { "false" },
-					spoiler_str: if data["spoiler"].as_bool().unwrap_or_default() { "true" } else { "false" },
-					stickied_str: if data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or_default() { "true" } else { "false" },
-				},
-				permalink: val(post, "permalink"),
-				link_title: val(post, "link_title"),
-				poll: Poll::parse(&data["poll_data"]),
 				rel_time,
 				created,
 				created_ts,
@@ -670,7 +654,7 @@ pub struct Preferences {
 	pub hide_score: String,
 }
 
-fn serialize_vec_with_plus<S>(vec: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_vec_with_plus<S>(vec: &[String], serializer: S) -> Result<S::Ok, S::Error>
 where
 	S: Serializer,
 {
@@ -776,7 +760,15 @@ pub async fn parse_post(post: &Value) -> Post {
 			get_setting("REDLIB_PUSHSHIFT_FRONTEND").unwrap_or_else(|| String::from(crate::config::DEFAULT_PUSHSHIFT_FRONTEND)),
 		)
 	} else {
-		rewrite_urls(&val(post, "selftext_html"))
+		let selftext = val(post, "selftext");
+		if selftext.contains("```") {
+			let mut html_output = String::new();
+			let parser = pulldown_cmark::Parser::new(&selftext);
+			pulldown_cmark::html::push_html(&mut html_output, parser);
+			rewrite_urls(&html_output)
+		} else {
+			rewrite_urls(&val(post, "selftext_html"))
+		}
 	};
 
 	// Build a post using data parsed from Reddit post API
@@ -848,7 +840,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
 		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
-	}
+	});
 }
 
 //
@@ -871,18 +863,72 @@ pub fn param(path: &str, value: &str) -> Option<String> {
 // Retrieve the value of a setting by name
 pub fn setting(req: &Request<Body>, name: &str) -> String {
 	// Parse a cookie value from request
-	req
-		.cookie(name)
-		.unwrap_or_else(|| {
-			// If there is no cookie for this setting, try receiving a default from the config
-			if let Some(default) = get_setting(&format!("REDLIB_DEFAULT_{}", name.to_uppercase())) {
-				Cookie::new(name, default)
-			} else {
-				Cookie::from(name)
-			}
-		})
-		.value()
-		.to_string()
+
+	// If this was called with "subscriptions" and the "subscriptions" cookie has a value
+	if name == "subscriptions" && req.cookie("subscriptions").is_some() {
+		// Create subscriptions string
+		let mut subscriptions = String::new();
+
+		// Default subscriptions cookie
+		if req.cookie("subscriptions").is_some() {
+			subscriptions.push_str(req.cookie("subscriptions").unwrap().value());
+		}
+
+		// Start with first numbered subscription cookie
+		let mut subscriptions_number = 1;
+
+		// While whatever subscriptionsNUMBER cookie we're looking at has a value
+		while req.cookie(&format!("subscriptions{}", subscriptions_number)).is_some() {
+			// Push whatever subscriptionsNUMBER cookie we're looking at into the subscriptions string
+			subscriptions.push_str(req.cookie(&format!("subscriptions{}", subscriptions_number)).unwrap().value());
+
+			// Increment subscription cookie number
+			subscriptions_number += 1;
+		}
+
+		// Return the subscriptions cookies as one large string
+		subscriptions
+	}
+	// If this was called with "filters" and the "filters" cookie has a value
+	else if name == "filters" && req.cookie("filters").is_some() {
+		// Create filters string
+		let mut filters = String::new();
+
+		// Default filters cookie
+		if req.cookie("filters").is_some() {
+			filters.push_str(req.cookie("filters").unwrap().value());
+		}
+
+		// Start with first numbered filters cookie
+		let mut filters_number = 1;
+
+		// While whatever filtersNUMBER cookie we're looking at has a value
+		while req.cookie(&format!("filters{}", filters_number)).is_some() {
+			// Push whatever filtersNUMBER cookie we're looking at into the filters string
+			filters.push_str(req.cookie(&format!("filters{}", filters_number)).unwrap().value());
+
+			// Increment filters cookie number
+			filters_number += 1;
+		}
+
+		// Return the filters cookies as one large string
+		filters
+	}
+	// The above two still come to this if there was no existing value
+	else {
+		req
+			.cookie(name)
+			.unwrap_or_else(|| {
+				// If there is no cookie for this setting, try receiving a default from the config
+				if let Some(default) = get_setting(&format!("REDLIB_DEFAULT_{}", name.to_uppercase())) {
+					Cookie::new(name, default)
+				} else {
+					Cookie::from(name)
+				}
+			})
+			.value()
+			.to_string()
+	}
 }
 
 // Retrieve the value of a setting by name or the default value
@@ -898,11 +944,12 @@ pub fn setting_or_default(req: &Request<Body>, name: &str, default: String) -> S
 // Detect and redirect in the event of a random subreddit
 pub async fn catch_random(sub: &str, additional: &str) -> Result<Response<Body>, String> {
 	if sub == "random" || sub == "randnsfw" {
-		let new_sub = json(format!("/r/{sub}/about.json?raw_json=1"), false).await?["data"]["display_name"]
-			.as_str()
-			.unwrap_or_default()
-			.to_string();
-		Ok(redirect(&format!("/r/{new_sub}{additional}")))
+		Ok(redirect(&format!(
+			"/r/{}{additional}",
+			json(format!("/r/{sub}/about.json?raw_json=1"), false).await?["data"]["display_name"]
+				.as_str()
+				.unwrap_or_default()
+		)))
 	} else {
 		Err("No redirect needed".to_string())
 	}
@@ -985,9 +1032,20 @@ pub fn format_url(url: &str) -> String {
 	}
 }
 
+static REGEX_BULLET: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^- (.*)$").unwrap());
+static REGEX_BULLET_CONSECUTIVE_LINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"</ul>\n<ul>").unwrap());
+
+pub fn render_bullet_lists(input_text: &str) -> String {
+	// ref: https://stackoverflow.com/a/4902622
+	// First enclose each bullet with <ul> <li> tags
+	let text1 = REGEX_BULLET.replace_all(input_text, "<ul><li>$1</li></ul>").to_string();
+	// Then remove any consecutive </ul> <ul> tags
+	REGEX_BULLET_CONSECUTIVE_LINES.replace_all(&text1, "").to_string()
+}
+
 // These are links we want to replace in-body
 static REDDIT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|new\.|)(reddit\.com|redd\.it)/"#).unwrap());
-static REDDIT_PREVIEW_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://(external-preview|preview|i)\.redd\.it(.*)[^?]").unwrap());
+static REDDIT_PREVIEW_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://(external-preview|preview|i)\.redd\.it(.*)").unwrap());
 static REDDIT_EMOJI_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
 static REDLIB_PREVIEW_LINK_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r">(.*?)</a>").unwrap());
@@ -996,8 +1054,7 @@ static REDLIB_PREVIEW_TEXT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r">(.*?)
 pub fn rewrite_urls(input_text: &str) -> String {
 	let mut text1 =
 		// Rewrite Reddit links to Redlib
-		REDDIT_REGEX.replace_all(input_text, r#"href="/"#)
-			.to_string();
+		REDDIT_REGEX.replace_all(input_text, r#"href="/"#).to_string();
 
 	loop {
 		if REDDIT_EMOJI_REGEX.find(&text1).is_none() {
@@ -1019,49 +1076,44 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		} else {
 			let formatted_url = format_url(REDDIT_PREVIEW_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default());
 
-			let image_url = REDLIB_PREVIEW_LINK_REGEX.find(&formatted_url).map_or("", |m| m.as_str()).to_string();
-			let mut image_caption = REDLIB_PREVIEW_TEXT_REGEX.find(&formatted_url).map_or("", |m| m.as_str()).to_string();
+			let image_url = REDLIB_PREVIEW_LINK_REGEX.find(&formatted_url).map_or("", |m| m.as_str());
+			let mut image_caption = REDLIB_PREVIEW_TEXT_REGEX.find(&formatted_url).map_or("", |m| m.as_str());
 
 			/* As long as image_caption isn't empty remove first and last four characters of image_text to leave us with just the text in the caption without any HTML.
 			This makes it possible to enclose it in a <figcaption> later on without having stray HTML breaking it */
 			if !image_caption.is_empty() {
-				image_caption = image_caption[1..image_caption.len() - 4].to_string();
+				image_caption = &image_caption[1..image_caption.len() - 4];
 			}
 
 			// image_url contains > at the end of it, and right above this we remove image_text's front >, leaving us with just a single > between them
-			let image_to_replace = format!("<a href=\"{image_url}{image_caption}</a>");
-
-			// _image_replacement needs to be in scope for the replacement at the bottom of the loop
-			let mut _image_replacement = String::new();
+			let image_to_replace = format!("<p><a href=\"{image_url}{image_caption}</a></p>");
 
 			/* We don't want to show a caption that's just the image's link, so we check if we find a Reddit preview link within the image's caption.
 			If we don't find one we must have actual text, so we include a <figcaption> block that contains it.
 			Otherwise we don't include the <figcaption> block as we don't need it. */
-			if REDDIT_PREVIEW_REGEX.find(&image_caption).is_none() {
+			let _image_replacement = if REDDIT_PREVIEW_REGEX.find(image_caption).is_none() {
 				// Without this " would show as \" instead. "\&quot;" is how the quotes are formatted within image_text beforehand
-				image_caption = image_caption.replace("\\&quot;", "\"");
-
-				_image_replacement = format!("<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a><figcaption>{image_caption}</figcaption></figure>");
+				format!(
+					"<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a><figcaption>{}</figcaption></figure>",
+					image_caption.replace("\\&quot;", "\"")
+				)
 			} else {
-				_image_replacement = format!("<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a></figure>");
-			}
+				format!("<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a></figure>")
+			};
 
 			/* In order to know if we're dealing with a normal or external preview we need to take a look at the first capture group of REDDIT_PREVIEW_REGEX
 			if it's preview we're dealing with something that needs /preview/pre, external-preview is /preview/external-pre, and i is /img */
-			let reddit_preview_regex_capture = REDDIT_PREVIEW_REGEX.captures(&text1).unwrap().get(1).map_or("", |m| m.as_str()).to_string();
-			let mut _preview_type = String::new();
-			if reddit_preview_regex_capture == "preview" {
-				_preview_type = "/preview/pre".to_string();
-			} else if reddit_preview_regex_capture == "external-preview" {
-				_preview_type = "/preview/external-pre".to_string();
-			} else {
-				_preview_type = "/img".to_string();
-			}
+			let reddit_preview_regex_capture = REDDIT_PREVIEW_REGEX.captures(&text1).unwrap().get(1).map_or("", |m| m.as_str());
+
+			let _preview_type = match reddit_preview_regex_capture {
+				"preview" => "/preview/pre",
+				"external-preview" => "/preview/external-pre",
+				_ => "/img",
+			};
 
 			text1 = REDDIT_PREVIEW_REGEX
 				.replace(&text1, format!("{_preview_type}$2"))
 				.replace(&image_to_replace, &_image_replacement)
-				.to_string()
 		}
 	}
 }
@@ -1135,10 +1187,14 @@ pub fn rewrite_emotes(media_metadata: &Value, comment: String) -> String {
 				);
 
 				// Inside the comment replace the ID we found with the string that will embed the image
-				comment = comment.replace(&id, &to_replace_with).to_string();
+				comment = comment.replace(&id, &to_replace_with);
 			}
 		}
 	}
+
+	// render bullet (unordered) lists
+	comment = render_bullet_lists(&comment);
+
 	// Call rewrite_urls() to transform any other Reddit links
 	rewrite_urls(&comment)
 }
@@ -1322,7 +1378,7 @@ pub fn url_path_basename(path: &str) -> String {
 		let mut url = url_result.unwrap();
 		url.path_segments_mut().unwrap().pop_if_empty();
 
-		url.path_segments().unwrap().last().unwrap().to_string()
+		url.path_segments().unwrap().next_back().unwrap().to_string()
 	}
 }
 
@@ -1360,3 +1416,195 @@ impl_template_str_eq!(Comment);
 impl_template_str_eq!(ErrorTemplate);
 impl_template_str_eq!(NSFWLandingTemplate);
 impl_template_str_eq!(User);
+
+#[cfg(test)]
+mod tests {
+	use super::{format_num, format_url, rewrite_urls, Preferences};
+
+	#[test]
+	fn format_num_works() {
+		assert_eq!(format_num(567), ("567".to_string(), "567".to_string()));
+		assert_eq!(format_num(1234), ("1.2k".to_string(), "1234".to_string()));
+		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
+		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
+		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
+	}
+
+	#[test]
+	fn rewrite_urls_removes_backslashes_and_rewrites_url() {
+		assert_eq!(
+			rewrite_urls(
+				"<a href=\"https://new.reddit.com/r/linux%5C_gaming/comments/x/just%5C_a%5C_test%5C/\">https://new.reddit.com/r/linux\\_gaming/comments/x/just\\_a\\_test/</a>"
+			),
+			"<a href=\"/r/linux_gaming/comments/x/just_a_test/\">https://new.reddit.com/r/linux_gaming/comments/x/just_a_test/</a>"
+		);
+		assert_eq!(
+			rewrite_urls(
+				"e.g. &lt;a href=\"https://www.reddit.com/r/linux%5C_gaming/comments/ql9j15/anyone%5C_else%5C_confused%5C_with%5C_linus%5C_linux%5C_issues/\"&gt;https://www.reddit.com/r/linux\\_gaming/comments/ql9j15/anyone\\_else\\_confused\\_with\\_linus\\_linux\\_issues/&lt;/a&gt;"
+			),
+			"e.g. &lt;a href=\"/r/linux_gaming/comments/ql9j15/anyone_else_confused_with_linus_linux_issues/\"&gt;https://www.reddit.com/r/linux_gaming/comments/ql9j15/anyone_else_confused_with_linus_linux_issues/&lt;/a&gt;"
+		);
+	}
+
+	#[test]
+	fn rewrite_urls_keeps_intentional_backslashes() {
+		assert_eq!(
+			rewrite_urls("printf \"\\npolkit.addRule(function(action, subject)"),
+			"printf \"\\npolkit.addRule(function(action, subject)"
+		);
+	}
+
+	#[test]
+	fn test_format_url() {
+		assert_eq!(format_url("https://a.thumbs.redditmedia.com/XYZ.jpg"), "/thumb/a/XYZ.jpg");
+		assert_eq!(format_url("https://emoji.redditmedia.com/a/b"), "/emoji/a/b");
+
+		assert_eq!(
+			format_url("https://external-preview.redd.it/foo.jpg?auto=webp&s=bar"),
+			"/preview/external-pre/foo.jpg?auto=webp&s=bar"
+		);
+
+		assert_eq!(format_url("https://i.redd.it/foobar.jpg"), "/img/foobar.jpg");
+		assert_eq!(
+			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
+			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
+		);
+		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/360.mp4");
+		assert_eq!(
+			format_url("https://v.redd.it/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"),
+			"/hls/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"
+		);
+		assert_eq!(format_url("https://www.redditstatic.com/gold/awards/icon/icon.png"), "/static/gold/awards/icon/icon.png");
+		assert_eq!(
+			format_url("https://www.redditstatic.com/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"),
+			"/static/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"
+		);
+
+		assert_eq!(format_url(""), "");
+		assert_eq!(format_url("self"), "");
+		assert_eq!(format_url("default"), "");
+		assert_eq!(format_url("nsfw"), "");
+		assert_eq!(format_url("spoiler"), "");
+	}
+
+	#[test]
+	fn serialize_prefs() {
+		let prefs = Preferences {
+			available_themes: vec![],
+			theme: "laserwave".to_owned(),
+			front_page: "default".to_owned(),
+			layout: "compact".to_owned(),
+			wide: "on".to_owned(),
+			blur_spoiler: "on".to_owned(),
+			show_nsfw: "off".to_owned(),
+			blur_nsfw: "on".to_owned(),
+			hide_hls_notification: "off".to_owned(),
+			video_quality: "best".to_owned(),
+			hide_sidebar_and_summary: "off".to_owned(),
+			use_dash: "on".to_owned(),
+			use_hls: "on".to_owned(),
+			autoplay_videos: "on".to_owned(),
+			fixed_navbar: "on".to_owned(),
+			disable_visit_reddit_confirmation: "on".to_owned(),
+			comment_sort: "confidence".to_owned(),
+			post_sort: "top".to_owned(),
+			subscriptions: vec!["memes".to_owned(), "mildlyinteresting".to_owned()],
+			filters: vec![],
+			hide_awards: "off".to_owned(),
+			hide_score: "off".to_owned(),
+		};
+		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
+
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off")
+	}
+}
+
+#[test]
+fn test_rewriting_emoji() {
+	let input = r#"<div class="md"><p>How can you have such hard feelings towards a license? <img src="https://www.redditstatic.com/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif" width="20" height="20" style="vertical-align:middle"> Let people use what license they want, and BSD is one of the least restrictive ones AFAIK.</p>"#;
+	let output = r#"<div class="md"><p>How can you have such hard feelings towards a license? <img src="/static/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif" width="20" height="20" style="vertical-align:middle"> Let people use what license they want, and BSD is one of the least restrictive ones AFAIK.</p>"#;
+	assert_eq!(rewrite_urls(input), output);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fetching_subreddit_quarantined() {
+	let subreddit = Post::fetch("/r/drugs", true).await;
+	assert!(subreddit.is_ok());
+	assert!(!subreddit.unwrap().0.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fetching_nsfw_subreddit() {
+	// Gonwild is a place for closed, Euclidean Geometric shapes to exchange their nth terms for karma; showing off their edges in a comfortable environment without pressure.
+	// Find a good sub that is tagged NSFW but that actually isn't in case my future employers are watching (they probably are)
+	// switched from randnsfw as it is no longer functional.
+	let subreddit = Post::fetch("/r/gonwild", false).await;
+	assert!(subreddit.is_ok());
+	assert!(!subreddit.unwrap().0.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fetching_ws() {
+	let subreddit = Post::fetch("/r/popular", false).await;
+	assert!(subreddit.is_ok());
+	for post in subreddit.unwrap().0 {
+		assert!(post.ws_url.starts_with("wss://k8s-lb.wss.redditmedia.com/link/"));
+	}
+}
+
+#[test]
+fn test_rewriting_image_links() {
+	let input =
+			r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
+	let output = r#"<figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure>"#;
+	assert_eq!(rewrite_urls(input), output);
+}
+
+#[test]
+fn test_url_path_basename() {
+	// without trailing slash
+	assert_eq!(url_path_basename("/first/last"), "last");
+	// with trailing slash
+	assert_eq!(url_path_basename("/first/last/"), "last");
+	// with query parameters
+	assert_eq!(url_path_basename("/first/last/?some=query"), "last");
+	// file path
+	assert_eq!(url_path_basename("/cdn/image.jpg"), "image.jpg");
+	// when a full url is passed instead of just a path
+	assert_eq!(url_path_basename("https://doma.in/first/last"), "last");
+	// empty path
+	assert_eq!(url_path_basename("/"), "");
+}
+
+#[test]
+fn test_rewriting_emotes() {
+	let json_input = serde_json::from_str(r#"{"emote|t5_31hpy|2028":{"e":"Image","id":"emote|t5_31hpy|2028","m":"image/png","s":{"u":"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/t5_31hpy/PW6WsOaLcd.png","x":60,"y":60},"status":"valid","t":"sticker"}}"#).expect("Valid JSON");
+	let comment_input = r#"<div class="comment_body "><div class="md"><p>:2028:</p></div></div>"#;
+	let output = r#"<div class="comment_body "><div class="md"><p><img loading="lazy" src="/emote/t5_31hpy/PW6WsOaLcd.png" width="60" height="60" style="vertical-align:text-bottom"></p></div></div>"#;
+	assert_eq!(rewrite_emotes(&json_input, comment_input.to_string()), output);
+}
+
+#[test]
+fn test_rewriting_bullet_list() {
+	let input = r#"<div class="md"><p>Hi, I&#39;ve bought this very same monitor and found no calibration whatsoever. I have an ICC profile that has been set up since I&#39;ve installed its driver from the LG website and it works ok. I also used <a href="http://www.lagom.nl/lcd-test/">http://www.lagom.nl/lcd-test/</a> to calibrate it. After some good tinkering I&#39;ve found the following settings + the color profile from the driver gets me past all the tests perfectly:
+- Brightness 50 (still have to settle on this one, it&#39;s personal preference, it controls the backlight, not the colors)
+- Contrast 70 (which for me was the default one)
+- Picture mode Custom
+- Super resolution + Off (it looks horrible anyway)
+- Sharpness 50 (default one I think)
+- Black level High (low messes up gray colors)
+- DFC Off 
+- Response Time Middle (personal preference, <a href="https://www.blurbusters.com/">https://www.blurbusters.com/</a> show horrible overdrive with it on high)
+- Freesync doesn&#39;t matter
+- Black stabilizer 50
+- Gamma setting on 0 
+- Color Temp Medium
+How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or the panel is pretty good, 0 bleed for me, just the usual IPS glow. How about the pixels? I see the pixels even at one meter away, especially on Microsoft Edge&#39;s icon for example, the blue background is just blocky, don&#39;t know why.</p>
+</div>"#;
+	let output = r#"<div class="md"><p>Hi, I&#39;ve bought this very same monitor and found no calibration whatsoever. I have an ICC profile that has been set up since I&#39;ve installed its driver from the LG website and it works ok. I also used <a href="http://www.lagom.nl/lcd-test/">http://www.lagom.nl/lcd-test/</a> to calibrate it. After some good tinkering I&#39;ve found the following settings + the color profile from the driver gets me past all the tests perfectly:
+<ul><li>Brightness 50 (still have to settle on this one, it&#39;s personal preference, it controls the backlight, not the colors)</li><li>Contrast 70 (which for me was the default one)</li><li>Picture mode Custom</li><li>Super resolution + Off (it looks horrible anyway)</li><li>Sharpness 50 (default one I think)</li><li>Black level High (low messes up gray colors)</li><li>DFC Off </li><li>Response Time Middle (personal preference, <a href="https://www.blurbusters.com/">https://www.blurbusters.com/</a> show horrible overdrive with it on high)</li><li>Freesync doesn&#39;t matter</li><li>Black stabilizer 50</li><li>Gamma setting on 0 </li><li>Color Temp Medium</li></ul>
+How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or the panel is pretty good, 0 bleed for me, just the usual IPS glow. How about the pixels? I see the pixels even at one meter away, especially on Microsoft Edge&#39;s icon for example, the blue background is just blocky, don&#39;t know why.</p>
+</div>"#;
+
+	assert_eq!(render_bullet_lists(input), output);
+}
