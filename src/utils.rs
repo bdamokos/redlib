@@ -274,7 +274,7 @@ impl Media {
 			// If this post contains a gallery of images
 			gallery = GalleryMedia::parse(&data["gallery_data"]["items"], &data["media_metadata"]);
 
-			("gallery", &data["url"], None)
+			("gallery", &data["url"], None, None)
 		} else if data["crosspost_parent_list"][0]["is_gallery"].as_bool().unwrap_or_default() {
 			// If this post contains a gallery of images
 			gallery = GalleryMedia::parse(
@@ -282,13 +282,13 @@ impl Media {
 				&data["crosspost_parent_list"][0]["media_metadata"],
 			);
 
-			("gallery", &data["url"], None)
+			("gallery", &data["url"], None, None)
 		} else if data["is_reddit_media_domain"].as_bool().unwrap_or_default() && data["domain"] == "i.redd.it" {
 			// If this post contains a reddit media (image) URL.
-			("image", &data["url"], None)
+			("image", &data["url"], None, None)
 		} else {
 			// If type can't be determined, return url
-			("link", &data["url"], None)
+			("link", &data["url"], None, None)
 		};
 
 		let source = &data["preview"]["images"][0]["source"];
