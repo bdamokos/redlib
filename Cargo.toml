@@ -20,7 +20,7 @@ clap = { version = "4.5.23", default-features = false, features = [
     "derive",
 ] }
 regex = "1.10.2"
-serde = { version = "1.0.193", features = ["derive"] }
+serde = { version = "1.0.218", features = ["derive"] }
 cookie = "0.18.0"
 futures-lite = "2.2.0"
 hyper = { version = "0.14.31", features = ["full"] }
