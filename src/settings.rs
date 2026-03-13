@@ -5,12 +5,14 @@ use std::collections::HashMap;
 // CRATES
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{redirect, template, Preferences};
+use crate::utils::{deflate_decompress, redirect, template, Preferences};
+use askama::Template;
 use cookie::Cookie;
 use futures_lite::StreamExt;
 use hyper::{Body, Request, Response};
-use rinja::Template;
 use time::{Duration, OffsetDateTime};
+use tokio::time::timeout;
+use url::form_urlencoded;
 
 // STRUCTS
 #[derive(Template)]
@@ -24,7 +26,7 @@ crate::impl_template_str_eq!(SettingsTemplate);
 
 // CONSTANTS
 
-const PREFS: [&str; 19] = [
+const PREFS: [&str; 20] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -44,11 +46,12 @@ const PREFS: [&str; 19] = [
 	"hide_score",
 	"disable_visit_reddit_confirmation",
 	"video_quality",
+	"remove_default_feeds",
 ];
 
 // FUNCTIONS
 
-// Retrieve cookies from request "Cookie" header
+/// Retrieve cookies from request "Cookie" header
 pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = req.uri().to_string();
 	Ok(template(&SettingsTemplate {
@@ -57,7 +60,7 @@ pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	}))
 }
 
-// Set cookies using response "Set-Cookie" header
+/// Set cookies using response "Set-Cookie" header
 pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Split the body into parts
 	let (parts, mut body) = req.into_parts();
@@ -117,7 +120,14 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	let form = url::form_urlencoded::parse(query).collect::<HashMap<_, _>>();
 
 	let path = match form.get("redirect") {
-		Some(value) => format!("/{}", value.replace("%26", "&").replace("%23", "#")),
+		Some(value) => {
+			let value = value.replace("%26", "&").replace("%23", "#");
+			if value.starts_with('/') {
+				value
+			} else {
+				format!("/{value}")
+			}
+		}
 		None => "/".to_string(),
 	};
 
@@ -152,8 +162,8 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 		.unwrap_or_else(String::new); // Return an empty string if None
 
 	// If there are subscriptions to restore set them and delete any old subscriptions cookies, otherwise delete them all
-	if subscriptions.is_some() {
-		let sub_list: Vec<String> = subscriptions.expect("Subscriptions").split('+').map(str::to_string).collect();
+	if let Some(subscriptions) = subscriptions {
+		let sub_list: Vec<String> = subscriptions.split('+').map(str::to_string).collect();
 
 		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
 		let mut subscriptions_number_to_delete_from = 0;
@@ -163,7 +173,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 			let subscriptions_cookie = if subscriptions_number == 0 {
 				"subscriptions".to_string()
 			} else {
-				format!("subscriptions{}", subscriptions_number)
+				format!("subscriptions{subscriptions_number}")
 			};
 
 			response.insert_cookie(
@@ -203,8 +213,8 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	}
 
 	// If there are filters to restore set them and delete any old filters cookies, otherwise delete them all
-	if filters.is_some() {
-		let filters_list: Vec<String> = filters.expect("Filters").split('+').map(str::to_string).collect();
+	if let Some(filters) = filters {
+		let filters_list: Vec<String> = filters.split('+').map(str::to_string).collect();
 
 		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
 		let mut filters_number_to_delete_from = 0;
@@ -214,7 +224,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 			let filters_cookie = if filters_number == 0 {
 				"filters".to_string()
 			} else {
-				format!("filters{}", filters_number)
+				format!("filters{filters_number}")
 			};
 
 			response.insert_cookie(
@@ -256,11 +266,43 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	response
 }
 
-// Set cookies using response "Set-Cookie" header
+/// Set cookies using response "Set-Cookie" header
 pub async fn restore(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(set_cookies_method(req, true))
 }
 
 pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(set_cookies_method(req, false))
+}
+
+pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
+	let body = hyper::body::to_bytes(req.into_body())
+		.await
+		.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
+
+	if body.len() > 1024 * 1024 {
+		return Err("Request body too large".to_string());
+	}
+
+	let encoded_prefs = form_urlencoded::parse(&body)
+		.find(|(key, _)| key == "encoded_prefs")
+		.map(|(_, value)| value)
+		.ok_or_else(|| "encoded_prefs parameter not found in request body".to_string())?;
+
+	let bytes = base2048::decode(&encoded_prefs).ok_or_else(|| "Failed to decode base2048 encoded preferences".to_string())?;
+
+	let out = timeout(std::time::Duration::from_secs(1), async { deflate_decompress(bytes) })
+		.await
+		.map_err(|e| format!("Failed to decompress bytes: {e}"))??;
+
+	let mut prefs: Preferences = timeout(std::time::Duration::from_secs(1), async { bincode::deserialize(&out) })
+		.await
+		.map_err(|e| format!("Failed to deserialize preferences: {e}"))?
+		.map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;
+
+	prefs.available_themes = vec![];
+
+	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
+
+	Ok(redirect(&url))
 }

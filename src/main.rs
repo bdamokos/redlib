@@ -5,12 +5,12 @@
 use cached::proc_macro::cached;
 use clap::{Arg, ArgAction, Command};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use futures_lite::FutureExt;
 use hyper::Uri;
 use hyper::{header::HeaderValue, Body, Request, Response};
 use log::{info, warn};
-use once_cell::sync::Lazy;
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
@@ -60,6 +60,17 @@ async fn font() -> Result<Response<Body>, String> {
 			.header("content-type", "font/woff2")
 			.header("Cache-Control", "public, max-age=1209600, s-maxage=86400")
 			.body(include_bytes!("../static/Inter.var.woff2").as_ref().into())
+			.unwrap_or_default(),
+	)
+}
+
+async fn opensearch() -> Result<Response<Body>, String> {
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "application/opensearchdescription+xml")
+			.header("Cache-Control", "public, max-age=1209600, s-maxage=86400")
+			.body(include_bytes!("../static/opensearch.xml").as_ref().into())
 			.unwrap_or_default(),
 	)
 }
@@ -153,12 +164,12 @@ async fn main() {
 			info!("[✅] Rate limit check passed");
 		}
 		Err(e) => {
-			let mut message = format!("Rate limit check failed: {}", e);
+			let mut message = format!("Rate limit check failed: {e}");
 			message += "\nThis may cause issues with the rate limit.";
 			message += "\nPlease report this error with the above information.";
 			message += "\nhttps://github.com/redlib-org/redlib/issues/new?assignees=sigaloid&labels=bug&title=%F0%9F%90%9B+Bug+Report%3A+Rate+limit+mismatch";
 			warn!("{}", message);
-			eprintln!("{}", message);
+			eprintln!("{message}");
 		}
 	}
 
@@ -170,9 +181,9 @@ async fn main() {
 	let ipv6_only = std::env::var("IPV6_ONLY").is_ok() || matches.get_flag("ipv6-only");
 
 	let listener = if ipv4_only {
-		format!("0.0.0.0:{}", port)
+		format!("0.0.0.0:{port}")
 	} else if ipv6_only {
-		format!("[::]:{}", port)
+		format!("[::]:{port}")
 	} else {
 		[address, ":", port].concat()
 	};
@@ -189,11 +200,11 @@ async fn main() {
 	// at first request
 
 	info!("Evaluating config.");
-	Lazy::force(&config::CONFIG);
+	LazyLock::force(&config::CONFIG);
 	info!("Evaluating instance info.");
-	Lazy::force(&instance_info::INSTANCE_INFO);
+	LazyLock::force(&instance_info::INSTANCE_INFO);
 	info!("Creating OAUTH client.");
-	Lazy::force(&OAUTH_CLIENT);
+	LazyLock::force(&OAUTH_CLIENT);
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -234,6 +245,7 @@ async fn main() {
 	app.at("/Inter.var.woff2").get(|_| font().boxed());
 	app.at("/touch-icon-iphone.png").get(|_| iphone_logo().boxed());
 	app.at("/apple-touch-icon.png").get(|_| iphone_logo().boxed());
+	app.at("/opensearch.xml").get(|_| opensearch().boxed());
 	app
 		.at("/playHLSVideo.js")
 		.get(|_| resource(include_str!("../static/playHLSVideo.js"), "text/javascript", false).boxed());
@@ -255,6 +267,7 @@ async fn main() {
 	app
 		.at("/check_update.js")
 		.get(|_| resource(include_str!("../static/check_update.js"), "text/javascript", false).boxed());
+	app.at("/copy.js").get(|_| resource(include_str!("../static/copy.js"), "text/javascript", false).boxed());
 
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());
@@ -294,6 +307,7 @@ async fn main() {
 	// Configure settings
 	app.at("/settings").get(|r| settings::get(r).boxed()).post(|r| settings::set(r).boxed());
 	app.at("/settings/restore").get(|r| settings::restore(r).boxed());
+	app.at("/settings/encoded-restore").post(|r| settings::encoded_restore(r).boxed());
 	app.at("/settings/update").get(|r| settings::update(r).boxed());
 
 	// RSS Subscriptions

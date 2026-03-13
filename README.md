@@ -6,7 +6,7 @@
 
 ---
 
-**10-second pitch:** Redlib is a private front-end like [Invidious](https://github.com/iv-org/invidious) but for Reddit. Browse the coldest takes of [r/unpopularopinion](https://redlib.matthew.science/r/unpopularopinion) without being [tracked](#reddit).
+**10-second pitch:** Redlib is a private front-end like [Invidious](https://github.com/iv-org/invidious) but for Reddit. Browse the coldest takes of [r/unpopularopinion](https://farside.link/redlib/r/unpopularopinion) without being [tracked](#reddit).
 
 - 🚀 Fast: written in Rust for blazing-fast speeds and memory safety
 - ☁️ Light: no JavaScript, no ads, no tracking, no bloat
@@ -44,7 +44,7 @@
    - [Building from source](#building-from-source)
    - [Replit/Heroku/Glitch](#replit-heroku-glitch)
    - [launchd (macOS)](#launchd-macos)
-6. [Configuration](#configuration)
+7. [Configuration](#configuration)
    - [Instance settings](#instance-settings)
    - [Default user settings](#default-user-settings)
 
@@ -80,7 +80,7 @@ Redlib currently implements most of Reddit's (signed-out) functionalities but st
 
 - [Rust](https://www.rust-lang.org/) - Programming language
 - [Hyper](https://github.com/hyperium/hyper) - HTTP server and client
-- [Rinja](https://github.com/rinja-rs/rinja) - Templating engine
+- [Askama](https://github.com/askama-rs/askama) - Templating engine
 - [Rustls](https://github.com/rustls/rustls) - TLS library
 
 ## How is it different from other Reddit front ends?
@@ -164,17 +164,7 @@ For transparency, I hope to describe all the ways Redlib handles user privacy.
 
 - **Logging:** In production (when running the binary, hosting with docker, or using the official instances), Redlib logs nothing. When debugging (running from source without `--release`), Redlib logs post IDs fetched to aid with troubleshooting.
 
-- **Cookies:** Redlib uses optional cookies to store any configured settings in [the settings menu](https://redlib.matthew.science/settings). These are not cross-site cookies and the cookies hold no personal data.
-
-#### Official instance (redlib.matthew.science)
-
-The official instance is hosted at https://redlib.matthew.science.
-
-- **Server:** The official instance runs a production binary, and thus logs nothing.
-
-- **DNS:** The domain for the official instance uses Cloudflare as the DNS resolver. However, this site is not proxied through Cloudflare, and thus Cloudflare doesn't have access to user traffic.
-
-- **Hosting:** The official instance is hosted on [Replit](https://replit.com/), which monitors usage to prevent abuse. I can understand if this invalidates certain users' threat models, and therefore, self-hosting, using unofficial instances, and browsing through Tor are welcomed.
+- **Cookies:** Redlib uses optional cookies to store any configured settings in the settings menu. These are not cross-site cookies and the cookies hold no personal data.
 
 ---
 
@@ -445,7 +435,7 @@ Assign a default value for each user-modifiable setting by passing environment v
 | `WIDE`                              | `["on", "off"]`                                                                                                                    | `off`         |
 | `POST_SORT`                         | `["hot", "new", "top", "rising", "controversial"]`                                                                                 | `hot`         |
 | `COMMENT_SORT`                      | `["confidence", "top", "new", "controversial", "old"]`                                                                             | `confidence`  |
-| `BLUR_SPOILER`                         | `["on", "off"]`                                                                                                                    | `off`         |
+| `BLUR_SPOILER`                      | `["on", "off"]`                                                                                                                    | `off`         |
 | `SHOW_NSFW`                         | `["on", "off"]`                                                                                                                    | `off`         |
 | `BLUR_NSFW`                         | `["on", "off"]`                                                                                                                    | `off`         |
 | `USE_DASH`                           | `["on", "off"]`                                                                                                                    | `off`         |
@@ -458,3 +448,4 @@ Assign a default value for each user-modifiable setting by passing environment v
 | `HIDE_SCORE`                        | `["on", "off"]`                                                                                                                    | `off`         |
 | `HIDE_SIDEBAR_AND_SUMMARY`          | `["on", "off"]`                                                                                                                    | `off`         |
 | `FIXED_NAVBAR`                      | `["on", "off"]`                                                                                                                    | `on`          |
+| `REMOVE_DEFAULT_FEEDS`              | `["on", "off"]`                                                                                                                    | `off`         |

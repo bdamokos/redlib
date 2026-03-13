@@ -3,17 +3,18 @@
 use crate::{config, utils};
 // CRATES
 use crate::utils::{
-	catch_random, error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, redirect, rewrite_urls, setting, template, val, Post, Preferences, Subreddit,
+	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, val, Post, Preferences,
+	Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
+use askama::Template;
 use cookie::Cookie;
+use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
-use log::{debug, trace};
-use rinja::Template;
 
 use chrono::DateTime;
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 use time::{Duration, OffsetDateTime};
 
 // STRUCTS
@@ -63,7 +64,7 @@ pub struct WallTemplate {
 
 crate::impl_template_str_eq!(WallTemplate);
 
-static GEO_FILTER_MATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
+static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
 
 // SERVICES
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -72,6 +73,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let query = req.uri().query().unwrap_or_default().to_string();
 	let subscribed = setting(&req, "subscriptions");
 	let front_page = setting(&req, "front_page");
+	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 
@@ -84,6 +86,21 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		front_page.clone()
 	});
+
+	if (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
+		if subscribed.is_empty() {
+			return info(req, "Subscribe to some subreddits! (Default feeds disabled in settings)").await;
+		} else {
+			// If there are subscribed subs, but we get here, then the problem is that front_page pref is set to something besides default.
+			// Tell user to go to settings and change front page to default.
+			return info(
+				req,
+				"You have subscribed to some subreddits, but your front page is not set to default. Visit settings and change front page to default.",
+			)
+			.await;
+		}
+	}
+
 	let quarantined = can_access_quarantine(&req, &sub_name) || root;
 
 	// Handle random subreddits
@@ -131,7 +148,6 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let path = format!("/r/{}/{sort}.json?{}{params}", sub_name.replace('+', "%2B"), req.uri().query().unwrap_or_default());
-	debug!("Path: {}", path);
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let filters = get_filters(&req);
@@ -356,9 +372,9 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		let mut subscriptions_number = 1;
 
 		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{}", subscriptions_number)).is_some() {
+		while req.cookie(&format!("subscriptions{subscriptions_number}")).is_some() {
 			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{}", subscriptions_number));
+			response.remove_cookie(format!("subscriptions{subscriptions_number}"));
 
 			// Increment subscriptions cookie number
 			subscriptions_number += 1;
@@ -372,7 +388,7 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 			let subscriptions_cookie = if subscriptions_number == 0 {
 				"subscriptions".to_string()
 			} else {
-				format!("subscriptions{}", subscriptions_number)
+				format!("subscriptions{subscriptions_number}")
 			};
 
 			response.insert_cookie(
@@ -387,9 +403,9 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		}
 
 		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{}", subscriptions_number_to_delete_from)).is_some() {
+		while req.cookie(&format!("subscriptions{subscriptions_number_to_delete_from}")).is_some() {
 			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{}", subscriptions_number_to_delete_from));
+			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
 
 			// Increment subscriptions cookie number
 			subscriptions_number_to_delete_from += 1;
@@ -405,9 +421,9 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		let mut filters_number = 1;
 
 		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{}", filters_number)).is_some() {
+		while req.cookie(&format!("filters{filters_number}")).is_some() {
 			// Remove that filters cookie
-			response.remove_cookie(format!("filters{}", filters_number));
+			response.remove_cookie(format!("filters{filters_number}"));
 
 			// Increment filters cookie number
 			filters_number += 1;
@@ -420,7 +436,7 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 			let filters_cookie = if filters_number == 0 {
 				"filters".to_string()
 			} else {
-				format!("filters{}", filters_number)
+				format!("filters{filters_number}")
 			};
 
 			response.insert_cookie(
@@ -435,9 +451,9 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		}
 
 		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{}", filters_number_to_delete_from)).is_some() {
+		while req.cookie(&format!("filters{filters_number_to_delete_from}")).is_some() {
 			// Remove that filters cookie
-			response.remove_cookie(format!("filters{}", filters_number_to_delete_from));
+			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
 
 			// Increment filters cookie number
 			filters_number_to_delete_from += 1;
@@ -612,7 +628,7 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 					title: Some(post.title.to_string()),
 					link: Some(format_url(&utils::get_post_url(&post))),
 					author: Some(post.author.name),
-					content: Some(rewrite_urls(&post.body)),
+					content: Some(rewrite_urls(&decode_html(&post.body).unwrap())),
 					pub_date: Some(DateTime::from_timestamp(post.created_ts as i64, 0).unwrap_or_default().to_rfc2822()),
 					description: Some(format!(
 						"<a href='{}{}'>Comments</a>",

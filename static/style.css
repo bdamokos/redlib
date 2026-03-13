@@ -558,14 +558,22 @@ aside {
 .subscribe,
 .unsubscribe,
 .filter,
-.unfilter {
+.unfilter,
+.copy,
+.import {
     padding: 10px 20px;
     border-radius: 5px;
     cursor: pointer;
 }
 
+.copy,
+.import {
+    margin: 5px;
+}
 .subscribe,
-.filter {
+.filter,
+.copy,
+.import {
     color: var(--foreground);
     background-color: var(--accent);
 }
@@ -1850,6 +1858,14 @@ th {
 table {
     border-width: 3px;
     border-spacing: 0;
+}
+
+th {
+    white-space: nowrap;
+}
+
+td {
+    word-wrap: break-word;
 }
 
 td,

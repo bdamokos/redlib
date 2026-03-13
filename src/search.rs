@@ -7,10 +7,10 @@ use crate::{
 	server::RequestExt,
 	subreddit::{can_access_quarantine, quarantine},
 };
+use askama::Template;
 use hyper::{Body, Request, Response};
-use once_cell::sync::Lazy;
 use regex::Regex;
-use rinja::Template;
+use std::sync::LazyLock;
 
 // STRUCTS
 #[derive(PartialEq)]
@@ -55,8 +55,8 @@ pub struct SearchTemplate {
 
 crate::impl_template_str_eq!(SearchTemplate);
 
-// Regex matched against search queries to determine if they are reddit urls.
-static REDDIT_URL_MATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"^https?://([^\./]+\.)*reddit.com/").unwrap());
+/// Regex matched against search queries to determine if they are reddit urls.
+static REDDIT_URL_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^https?://([^\./]+\.)*reddit.com/").unwrap());
 
 // SERVICES
 pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -79,7 +79,11 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 		return Ok(redirect(&format!("/{query}")));
 	}
 
-	if query.starts_with("u/") {
+	if query.starts_with("R/") {
+		return Ok(redirect(&format!("/r{}", &query[1..])));
+	}
+
+	if query.starts_with("u/") || query.starts_with("U/") {
 		return Ok(redirect(&format!("/user{}", &query[1..])));
 	}
 
