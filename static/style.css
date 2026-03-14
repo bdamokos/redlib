@@ -1052,6 +1052,39 @@ a.search_subreddit:hover {
     text-decoration: underline;
 }
 
+.post_duplicates {
+    grid-area: post_notification;
+    margin: 4px 15px 0 12px;
+    font-size: 12px;
+    line-height: 1.45;
+    opacity: 0.8;
+}
+
+.post_duplicates_label {
+    margin: 0 0 6px;
+    font-weight: 600;
+    color: var(--accent);
+}
+
+.post_duplicates_list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.post_duplicates_list li + li {
+    margin-top: 4px;
+}
+
+.post_duplicates_list a {
+    font-weight: 600;
+}
+
+.post_duplicates_list span {
+    opacity: 0.7;
+    margin-left: 6px;
+}
+
 .post_flair {
     background: var(--accent);
     color: var(--background);

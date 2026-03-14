@@ -280,9 +280,30 @@
     &#x2022;
     {% endif %}
     <span class="label"> Upvotes</span></div>
-	<div class="post_body post_preview">
-		{{ post.body|safe }}
+	{% if post.collapsed_duplicates.len() > 0 %}
+	<div class="post_duplicates">
+		<p class="post_duplicates_label">
+			Also posted to {{ post.collapsed_duplicates.len() }} other {% if post.collapsed_duplicates.len() == 1 %}subreddit{% else %}subreddits{% endif %}
+		</p>
+		<ul class="post_duplicates_list">
+			{% for duplicate in post.collapsed_duplicates %}
+			<li>
+				<a href="{{ duplicate.permalink }}">{{ duplicate.title }}</a>
+				<span>{{ duplicate.display_community }} &bull; {{ duplicate.rel_time }}</span>
+			</li>
+			{% endfor %}
+		</ul>
 	</div>
+	{% endif %}
+	{% if !post.preview_body.is_empty() || !post.body.is_empty() %}
+	<div class="post_body post_preview">
+		{% if !post.preview_body.is_empty() %}
+		{{ post.preview_body|safe }}
+		{% else %}
+		{{ post.body|safe }}
+		{% endif %}
+	</div>
+	{% endif %}
 
 	{% call poll(post) %}
 

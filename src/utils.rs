@@ -390,6 +390,17 @@ pub struct Post {
 	pub nsfw: bool,
 	pub out_url: Option<String>,
 	pub ws_url: String,
+	pub preview_body: String,
+	pub collapsed_duplicates: Vec<CollapsedDuplicate>,
+}
+
+#[derive(Serialize, PartialEq)]
+pub struct CollapsedDuplicate {
+	pub title: String,
+	pub permalink: String,
+	pub community: String,
+	pub display_community: String,
+	pub rel_time: String,
 }
 
 impl Post {
@@ -507,6 +518,8 @@ impl Post {
 				nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 				ws_url: val(post, "websocket_url"),
 				out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
+				preview_body: String::new(),
+				collapsed_duplicates: Vec::new(),
 			});
 		}
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
@@ -947,6 +960,8 @@ pub async fn parse_post(post: &Value) -> Post {
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
 		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
+		preview_body: String::new(),
+		collapsed_duplicates: Vec::new(),
 	}
 }
 
