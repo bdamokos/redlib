@@ -271,6 +271,9 @@ async fn main() {
 	app
 		.at("/space_scroll.js")
 		.get(|_| resource(include_str!("../static/space_scroll.js"), "text/javascript", false).boxed());
+	app
+		.at("/submitted_duplicates.js")
+		.get(|_| resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).boxed());
 
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());

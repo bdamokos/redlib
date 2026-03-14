@@ -199,7 +199,11 @@
 
 {% macro post_in_list(post) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
-<div id="{{ post.id }}" class="post{% if post.flags.stickied %} stickied{% endif %}">
+<div
+	id="{{ post.id }}"
+	class="post{% if post.flags.stickied %} stickied{% endif %}"
+	data-post-type="{{ post.post_type }}"
+	data-created-ts="{{ post.created_ts }}">
 	<p class="post_header">
 		{% let community -%}
 		{% if post.community.starts_with("u_") -%}

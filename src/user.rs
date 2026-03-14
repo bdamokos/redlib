@@ -70,7 +70,7 @@ fn duplicate_submission_key(post: &Post) -> Option<String> {
 			"gallery:{}",
 			post.gallery.iter().map(|image| normalize_duplicate_url(&image.url)).collect::<Vec<_>>().join("|")
 		)),
-		"image" if !post.media.url.is_empty() => Some(format!("image:{}", normalize_duplicate_url(&post.media.url))),
+		"image" | "gif" if !post.media.url.is_empty() => Some(format!("{}:{}", post.post_type, normalize_duplicate_url(&post.media.url))),
 		_ => None,
 	}
 }
@@ -90,7 +90,7 @@ fn normalize_duplicate_url(url: &str) -> String {
 	};
 
 	parsed.set_fragment(None);
-	if matches!(parsed.domain(), Some("i.redd.it" | "preview.redd.it" | "external-preview.redd.it")) {
+	if matches!(parsed.domain(), Some("i.redd.it" | "preview.redd.it" | "external-preview.redd.it" | "v.redd.it")) {
 		parsed.set_query(None);
 	}
 
@@ -279,6 +279,20 @@ mod tests {
 	}
 
 	#[test]
+	fn collapses_matching_gif_posts() {
+		let posts = vec![
+			test_post("one", "GIF one", "sub_one", "", "gif", "https://v.redd.it/example/DASH_720.mp4?source=fallback", &[]),
+			test_post("two", "GIF two", "sub_two", "", "gif", "https://v.redd.it/example/DASH_720.mp4?foo=bar", &[]),
+		];
+
+		let collapsed = collapse_duplicate_submissions(posts);
+
+		assert_eq!(collapsed.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "GIF two");
+	}
+
+	#[test]
 	fn renders_collapsed_duplicates_in_user_template() {
 		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
 		post.preview_body = "<div class=\"md\"><p>Preview text from a duplicate post.</p></div>".to_string();
@@ -319,6 +333,7 @@ mod tests {
 		.render()
 		.unwrap();
 
+		assert!(html.contains("submitted_duplicates.js"));
 		assert!(html.contains("Also posted to 2 other subreddits"));
 		assert!(html.contains("Other title one"));
 		assert!(html.contains("Other title two"));
