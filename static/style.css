@@ -991,6 +991,7 @@ a.search_subreddit:hover {
         "post_score post_poll   post_thumbnail" auto
         "post_score post_notification post_thumbnail" auto
         "post_score post_footer post_thumbnail" auto
+        "post_score post_duplicates post_thumbnail" auto
         / minmax(40px, auto) minmax(0, 1fr) fit-content(min(20%, 152px));
 }
 
@@ -1053,8 +1054,8 @@ a.search_subreddit:hover {
 }
 
 .post_duplicates {
-    grid-area: post_notification;
-    margin: 4px 15px 0 12px;
+    grid-area: post_duplicates;
+    margin: 0 15px 14px 12px;
     font-size: 12px;
     line-height: 1.45;
     opacity: 0.8;
@@ -1081,8 +1082,9 @@ a.search_subreddit:hover {
 }
 
 .post_duplicates_list span {
+    display: block;
     opacity: 0.7;
-    margin-left: 6px;
+    margin-top: 2px;
 }
 
 .post_flair {
@@ -2120,6 +2122,7 @@ th {
             "post_poll   post_poll   post_thumbnail" auto
             "post_notification post_notification post_thumbnail" auto
             "post_score  post_footer post_thumbnail" auto
+            "post_score  post_duplicates post_thumbnail" auto
             / auto 1fr fit-content(min(20%, 152px));
     }
 

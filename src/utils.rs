@@ -401,6 +401,7 @@ pub struct CollapsedDuplicate {
 	pub community: String,
 	pub display_community: String,
 	pub rel_time: String,
+	pub comments: (String, String),
 }
 
 impl Post {

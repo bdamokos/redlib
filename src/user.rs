@@ -9,9 +9,12 @@ use askama::Template;
 use chrono::DateTime;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use time::{macros::format_description, OffsetDateTime};
 use url::Url;
+
+const TARGET_POST_COUNT: usize = 25;
+const MAX_DUPLICATE_FILL_REQUESTS: usize = 4;
 
 // STRUCTS
 #[derive(Template)]
@@ -142,6 +145,7 @@ fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {
 		community: post.community.clone(),
 		display_community: display_community(&post.community),
 		rel_time: post.rel_time,
+		comments: post.comments,
 	}
 }
 
@@ -151,6 +155,60 @@ fn display_community(community: &str) -> String {
 	} else {
 		format!("r/{community}")
 	}
+}
+
+fn path_with_after(path: &str, after: &str) -> Result<String, String> {
+	let mut url = Url::parse(&format!("https://redlib.local{path}")).map_err(|err| err.to_string())?;
+	let mut query_pairs: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(key, _)| key != "after")
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect();
+
+	if !after.is_empty() {
+		query_pairs.push(("after".to_string(), after.to_string()));
+	}
+
+	url.set_query(None);
+	{
+		let mut serializer = url.query_pairs_mut();
+		for (key, value) in query_pairs {
+			serializer.append_pair(&key, &value);
+		}
+	}
+
+	Ok(url[url::Position::BeforePath..].to_string())
+}
+
+async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
+	let should_refill_duplicates = listing == "submitted" || listing == "overview";
+	let mut request_path = path.to_string();
+	let mut all_posts = Vec::new();
+	let mut fetched_raw_posts = false;
+	let mut requests = 0;
+
+	let after = loop {
+		let (mut posts, next_after) = Post::fetch(&request_path, false).await?;
+		fetched_raw_posts |= !posts.is_empty();
+
+		filter_posts(&mut posts, filters);
+		all_posts.extend(posts);
+
+		if should_refill_duplicates {
+			all_posts = collapse_duplicate_submissions(all_posts);
+		}
+
+		let should_continue = should_refill_duplicates && all_posts.len() < TARGET_POST_COUNT && !next_after.is_empty() && requests < MAX_DUPLICATE_FILL_REQUESTS;
+		if !should_continue {
+			break next_after;
+		}
+
+		request_path = path_with_after(path, &next_after)?;
+		requests += 1;
+	};
+
+	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
+	Ok((all_posts, after, all_posts_filtered))
 }
 
 #[cfg(test)]
@@ -356,6 +414,7 @@ mod tests {
 				community: "other_one".to_string(),
 				display_community: "r/other_one".to_string(),
 				rel_time: "2h ago".to_string(),
+				comments: ("12".to_string(), "12".to_string()),
 			},
 			CollapsedDuplicate {
 				title: "Other title two".to_string(),
@@ -363,6 +422,7 @@ mod tests {
 				community: "other_two".to_string(),
 				display_community: "r/other_two".to_string(),
 				rel_time: "3h ago".to_string(),
+				comments: ("1".to_string(), "1".to_string()),
 			},
 		];
 
@@ -390,6 +450,8 @@ mod tests {
 		assert!(html.contains("Also posted to 2 other subreddits"));
 		assert!(html.contains("Other title one"));
 		assert!(html.contains("Other title two"));
+		assert!(html.contains("12 comments"));
+		assert!(html.contains("1 comment"));
 		assert!(html.contains("Preview text from a duplicate post."));
 
 		println!("{html}");
@@ -467,12 +529,8 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		}))
 	} else {
 		// Request user posts/comments from Reddit
-		match Post::fetch(&path, false).await {
-			Ok((mut posts, after)) => {
-				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
-				if listing == "submitted" || listing == "overview" {
-					posts = collapse_duplicate_submissions(posts);
-				}
+		match fetch_user_listing_posts(&path, &listing, &filters).await {
+			Ok((posts, after, all_posts_filtered)) => {
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				Ok(template(&UserTemplate {

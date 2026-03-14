@@ -1,6 +1,9 @@
 const SIMILAR_DUPLICATE_WINDOW_MS = 72 * 60 * 60 * 1000;
 const HASH_SIZE = 12;
 const VISUAL_KEY_SIZE = 32;
+const TARGET_POST_COUNT = 25;
+const MAX_AUTO_LOAD_PAGES = 8;
+const entryCache = new WeakMap();
 
 function getPostKind(post) {
     const kind = post.dataset.postType || post.querySelector(".post_thumbnail span")?.textContent?.trim();
@@ -182,9 +185,7 @@ function ensureDuplicateBlock(primary) {
     list.className = "post_duplicates_list";
     block.append(list);
 
-    const preview = primary.querySelector(".post_body.post_preview");
-    const footer = primary.querySelector(".post_footer");
-    primary.insertBefore(block, preview || footer || null);
+    primary.append(block);
 
     return block;
 }
@@ -202,6 +203,7 @@ function appendDuplicate(primary, duplicate) {
     const titleLink = duplicate.querySelector(".post_title a:last-of-type");
     const communityLink = duplicate.querySelector(".post_subreddit");
     const created = duplicate.querySelector(".created");
+    const comments = duplicate.querySelector(".post_comments");
 
     if (!titleLink || !communityLink || !created) {
         return;
@@ -214,7 +216,9 @@ function appendDuplicate(primary, duplicate) {
     item.append(link);
 
     const meta = document.createElement("span");
-    meta.textContent = `${communityLink.textContent || ""} • ${created.textContent || ""}`;
+    meta.textContent = [communityLink.textContent || "", created.textContent || "", comments?.textContent?.trim() || ""]
+        .filter(Boolean)
+        .join(" • ");
     item.append(meta);
 
     list.append(item);
@@ -265,13 +269,48 @@ function clusterByTime(posts, windowMs) {
     return clusters;
 }
 
+async function buildEntry(post, domIndex) {
+    const cached = entryCache.get(post);
+    if (cached) {
+        return {
+            ...cached,
+            post,
+            domIndex,
+        };
+    }
+
+    const kind = getPostKind(post);
+    if (!kind) {
+        return null;
+    }
+
+    const exactKey = getExactMediaKey(post, kind);
+    const thumbnailUrl = getThumbnailUrl(post, kind);
+    const fingerprint = thumbnailUrl ? await fingerprintThumbnail(thumbnailUrl) : null;
+    const entry = {
+        createdAt: getCreatedAt(post),
+        exactKey:
+            exactKey ||
+            ((kind === "image" || kind === "gif") && fingerprint?.visualKey ? `${kind}:visual:${fingerprint.visualKey}` : null),
+        similarKey: fingerprint?.hash ? `${kind}:hash:${fingerprint.hash}` : null,
+    };
+
+    entryCache.set(post, entry);
+    return {
+        ...entry,
+        post,
+        domIndex,
+    };
+}
+
 function collapseGroup(group) {
     const ordered = [...group].sort((left, right) => left.domIndex - right.domIndex).filter((entry) => document.body.contains(entry.post));
     if (ordered.length < 2) {
-        return;
+        return 0;
     }
 
     const primary = ordered[0].post;
+    let collapsedCount = 0;
     for (const entry of ordered.slice(1)) {
         if (entry.post === primary) {
             continue;
@@ -279,37 +318,21 @@ function collapseGroup(group) {
 
         appendDuplicate(primary, entry.post);
         removeDuplicatePost(entry.post);
+        collapsedCount += 1;
     }
+
+    return collapsedCount;
 }
 
 async function collapseSubmittedDuplicates() {
     const posts = [...document.querySelectorAll("#posts > .post")];
     if (posts.length === 0) {
-        return;
+        return 0;
     }
 
     const entries = (
         await Promise.all(
-            posts.map(async (post, domIndex) => {
-                const kind = getPostKind(post);
-                if (!kind) {
-                    return null;
-                }
-
-                const exactKey = getExactMediaKey(post, kind);
-                const thumbnailUrl = getThumbnailUrl(post, kind);
-                const fingerprint = thumbnailUrl ? await fingerprintThumbnail(thumbnailUrl) : null;
-
-                return {
-                    post,
-                    domIndex,
-                    createdAt: getCreatedAt(post),
-                    exactKey:
-                        exactKey ||
-                        ((kind === "image" || kind === "gif") && fingerprint?.visualKey ? `${kind}:visual:${fingerprint.visualKey}` : null),
-                    similarKey: fingerprint?.hash ? `${kind}:hash:${fingerprint.hash}` : null,
-                };
-            }),
+            posts.map((post, domIndex) => buildEntry(post, domIndex)),
         )
     ).filter(Boolean);
 
@@ -330,9 +353,11 @@ async function collapseSubmittedDuplicates() {
         }
     }
 
+    let collapsedCount = 0;
+
     for (const group of exactGroups.values()) {
         if (group.length > 1) {
-            collapseGroup(group);
+            collapsedCount += collapseGroup(group);
         }
     }
 
@@ -343,10 +368,103 @@ async function collapseSubmittedDuplicates() {
 
         for (const cluster of clusterByTime(group, SIMILAR_DUPLICATE_WINDOW_MS)) {
             if (cluster.length > 1) {
-                collapseGroup(cluster);
+                collapsedCount += collapseGroup(cluster);
             }
         }
     }
+
+    return collapsedCount;
 }
 
-collapseSubmittedDuplicates();
+function updateNextLink(fetchedDocument) {
+    const footer = document.querySelector("#column_one > footer");
+    if (!footer) {
+        return;
+    }
+
+    const currentNextLink = footer.querySelector("a[accesskey='N']");
+    const nextLink = fetchedDocument.querySelector("footer a[accesskey='N']");
+    if (!nextLink) {
+        currentNextLink?.remove();
+        return;
+    }
+
+    if (currentNextLink) {
+        currentNextLink.href = nextLink.getAttribute("href") || "";
+        return;
+    }
+
+    const link = document.createElement("a");
+    link.href = nextLink.getAttribute("href") || "";
+    link.accessKey = "N";
+    link.textContent = "NEXT";
+    footer.append(" ", link);
+}
+
+function appendFetchedPosts(fetchedDocument) {
+    const currentPosts = document.querySelector("#posts");
+    const nextPosts = fetchedDocument.querySelectorAll("#posts > .post");
+    if (!currentPosts || nextPosts.length === 0) {
+        return 0;
+    }
+
+    nextPosts.forEach((post) => currentPosts.append(post));
+    return nextPosts.length;
+}
+
+async function fetchNextPage(nextLink) {
+    const response = await fetch(nextLink.href, { credentials: "same-origin" });
+    if (!response.ok) {
+        throw new Error(`Failed to fetch ${nextLink.href}: ${response.status}`);
+    }
+
+    const html = await response.text();
+    return new DOMParser().parseFromString(html, "text/html");
+}
+
+async function refillCollapsedPosts(targetPostCount) {
+    let pagesLoaded = 0;
+    let previousHref = "";
+
+    while (document.querySelectorAll("#posts > .post").length < targetPostCount && pagesLoaded < MAX_AUTO_LOAD_PAGES) {
+        const nextLink = document.querySelector("#column_one > footer a[accesskey='N']");
+        if (!nextLink || nextLink.href === previousHref) {
+            break;
+        }
+
+        previousHref = nextLink.href;
+
+        let fetchedDocument;
+        try {
+            fetchedDocument = await fetchNextPage(nextLink);
+        } catch (error) {
+            console.error("Failed to refill duplicate posts", error);
+            break;
+        }
+
+        if (appendFetchedPosts(fetchedDocument) === 0) {
+            updateNextLink(fetchedDocument);
+            break;
+        }
+
+        updateNextLink(fetchedDocument);
+        await collapseSubmittedDuplicates();
+        globalThis.initializeHlsVideos?.(document.querySelector("#posts"));
+        pagesLoaded += 1;
+    }
+}
+
+async function initializeSubmittedDuplicates() {
+    const initialPostCount = document.querySelectorAll("#posts > .post").length;
+    if (initialPostCount === 0) {
+        return;
+    }
+
+    const targetPostCount = Math.max(TARGET_POST_COUNT, initialPostCount);
+    const collapsedCount = await collapseSubmittedDuplicates();
+    if (collapsedCount > 0 || initialPostCount < targetPostCount) {
+        await refillCollapsedPosts(targetPostCount);
+    }
+}
+
+initializeSubmittedDuplicates();
