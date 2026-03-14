@@ -1256,6 +1256,9 @@ static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
 static HTML_HREF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="([^"]+)""#).unwrap());
 static PLAIN_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
+static BARE_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r#"(?i)\b(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>"']*)?"#).unwrap()
+});
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
@@ -1344,6 +1347,12 @@ fn extract_external_links(sources: &[&str]) -> Vec<ExternalLink> {
 				by_host.entry(link.host.clone()).or_insert(link);
 			}
 		}
+
+		for matched in BARE_DOMAIN_REGEX.find_iter(source) {
+			if let Some(link) = build_external_link(matched.as_str()) {
+				by_host.entry(link.host.clone()).or_insert(link);
+			}
+		}
 	}
 
 	let mut links = by_host.into_values().collect::<Vec<_>>();
@@ -1352,16 +1361,21 @@ fn extract_external_links(sources: &[&str]) -> Vec<ExternalLink> {
 }
 
 fn build_external_link(raw: &str) -> Option<ExternalLink> {
-	let decoded = raw.trim().replace("&amp;", "&");
+	let decoded = raw
+		.trim()
+		.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'))
+		.replace("&amp;", "&");
 	if decoded.is_empty() || decoded.starts_with('/') {
 		return None;
 	}
 
-	let parsed = Url::parse(&decoded).ok()?;
-	match parsed.scheme() {
-		"http" | "https" => {}
-		_ => return None,
-	}
+	let parsed = match Url::parse(&decoded) {
+		Ok(parsed) => match parsed.scheme() {
+			"http" | "https" => parsed,
+			_ => return None,
+		},
+		Err(_) => Url::parse(&format!("https://{decoded}")).ok()?,
+	};
 
 	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
 	if host.is_empty()
@@ -1747,6 +1761,20 @@ mod tests {
 		assert_eq!(profile.external_links[0].icon_path, "/site_icon/fansly.com");
 		assert_eq!(profile.external_links[1].host, "paa.ge");
 		assert_eq!(profile.external_links[1].icon_path, "/site_icon/paa.ge");
+	}
+
+	#[test]
+	fn extracts_bare_domain_links_from_blurb() {
+		let profile = user_profile_details(&json!({
+			"public_description": "Supporters get more at realankri.com 😏",
+			"public_description_html": null,
+			"description": "",
+			"description_html": null
+		}));
+
+		assert_eq!(profile.external_links.len(), 1);
+		assert_eq!(profile.external_links[0].host, "realankri.com");
+		assert_eq!(profile.external_links[0].url, "https://realankri.com/");
 	}
 
 	#[test]
