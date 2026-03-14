@@ -9,8 +9,30 @@ function getPostTop(post) {
     return Math.round(window.scrollY + post.getBoundingClientRect().top);
 }
 
-function getFeedPosts() {
-    return Array.from(document.querySelectorAll(".post:not(.highlighted)"));
+function isHighlightedTarget(target) {
+    if (!(target instanceof Element)) {
+        return false;
+    }
+
+    if (target.classList.contains("highlighted")) {
+        return true;
+    }
+
+    if (!target.classList.contains("comment")) {
+        return false;
+    }
+
+    return target.querySelector(":scope > .comment_right > .comment_body.highlighted, :scope > .comment_right > .comment_body_filtered.highlighted") !== null;
+}
+
+function isVisibleTarget(target) {
+    return target.getClientRects().length > 0;
+}
+
+function getScrollTargets() {
+    return Array.from(document.querySelectorAll(".post, .comment")).filter(
+        (target) => !isHighlightedTarget(target) && isVisibleTarget(target),
+    );
 }
 
 function isInteractiveElement(element) {
@@ -46,15 +68,15 @@ document.addEventListener("keydown", (event) => {
         return;
     }
 
-    const posts = getFeedPosts();
-    if (posts.length === 0) {
+    const targets = getScrollTargets();
+    if (targets.length === 0) {
         return;
     }
 
     const scrollPaddingTop = getScrollPaddingTop();
     const currentTop = window.scrollY + scrollPaddingTop;
     const direction = event.shiftKey ? -1 : 1;
-    const targetPost = findScrollTarget(posts, currentTop, direction);
+    const targetPost = findScrollTarget(targets, currentTop, direction);
 
     if (targetPost === null) {
         return;

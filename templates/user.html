@@ -51,7 +51,7 @@ body %}
             {% call utils::post_in_list(post) %} {% endif %} {% endfor %} {% if prefs.use_hls == "on" %}
             <script src="/hls.min.js"></script>
             <script src="/playHLSVideo.js"></script>
-            {% endif %} {% if str_eq(listing, "submitted") %}
+            {% endif %} {% if str_eq(listing, "submitted") || str_eq(listing, "overview") %}
             <script src="/submitted_duplicates.js" defer></script>
             {% endif %}
         </div>

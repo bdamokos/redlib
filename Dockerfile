@@ -1,38 +1,38 @@
-FROM rust:latest as builder
+ARG RUST_BUILDER_VERSION=slim-bookworm
+ARG DEBIAN_RUNTIME_VERSION=bookworm-slim
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+FROM rust:${RUST_BUILDER_VERSION} AS builder
 
-# Create a new empty shell project
-WORKDIR /usr/src/redlib
-COPY . .
+WORKDIR /redlib
 
-# Build the application
-RUN cargo build --release
+# Prime the dependency cache before copying the full source tree.
+COPY Cargo.lock Cargo.toml ./
+RUN mkdir src && echo "fn main() { panic!(\"why am i running?\") }" > src/main.rs
+RUN cargo build --release --locked --bin redlib
+RUN rm ./src/main.rs && rmdir ./src
 
-# Runtime stage
-FROM debian:bookworm-slim
+# Copy the application and build the release binary.
+COPY . ./
+RUN cargo build --release --locked --bin redlib
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+FROM debian:${DEBIAN_RUNTIME_VERSION} AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the binary from builder
-COPY --from=builder /usr/src/redlib/target/release/redlib /usr/local/bin/
+COPY --from=builder /redlib/target/release/redlib /usr/local/bin/redlib
+COPY --from=builder /redlib/templates /templates
+COPY --from=builder /redlib/static /static
 
-# Copy the templates directory
-COPY --from=builder /usr/src/redlib/templates /templates
-COPY --from=builder /usr/src/redlib/static /static
-
-RUN useradd -r -s /bin/false redlib
+RUN useradd \
+    --no-create-home \
+    --password "!" \
+    --comment "user for running redlib" \
+    redlib
 USER redlib
 
-# Set environment variables
 ENV REDLIB_DEFAULT_THEME=system
 ENV REDLIB_DEFAULT_FRONT_PAGE=default
 ENV REDLIB_DEFAULT_LAYOUT=card
@@ -45,8 +45,10 @@ ENV REDLIB_DEFAULT_HIDE_HLS_NOTIFICATION=off
 ENV REDLIB_DEFAULT_AUTOPLAY_VIDEOS=off
 ENV REDLIB_BANNER_TEXT=Redlib
 
-# Tell Docker to expose port 8080
 EXPOSE 8080
 
-CMD ["redlib"]
+HEALTHCHECK --interval=1m --timeout=3s CMD wget --spider -q http://localhost:8080/settings || exit 1
 
+LABEL org.opencontainers.image.authors="sigaloid"
+
+CMD ["redlib"]

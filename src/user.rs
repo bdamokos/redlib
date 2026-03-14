@@ -394,6 +394,31 @@ mod tests {
 
 		println!("{html}");
 	}
+
+	#[test]
+	fn renders_duplicate_script_in_overview_listing() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("submitted_duplicates.js"));
+	}
 }
 
 // FUNCTIONS
@@ -445,7 +470,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		match Post::fetch(&path, false).await {
 			Ok((mut posts, after)) => {
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
-				if listing == "submitted" {
+				if listing == "submitted" || listing == "overview" {
 					posts = collapse_duplicate_submissions(posts);
 				}
 				let no_posts = posts.is_empty();
