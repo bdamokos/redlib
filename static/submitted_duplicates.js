@@ -1,5 +1,6 @@
-const DUPLICATE_WINDOW_MS = 24 * 60 * 60 * 1000;
+const SIMILAR_DUPLICATE_WINDOW_MS = 72 * 60 * 60 * 1000;
 const HASH_SIZE = 12;
+const VISUAL_KEY_SIZE = 32;
 
 function getPostKind(post) {
     const kind = post.dataset.postType || post.querySelector(".post_thumbnail span")?.textContent?.trim();
@@ -11,8 +12,49 @@ function getPostKind(post) {
         return "image";
     }
 
-    if (post.querySelector(".post_media_video")) {
+    if (post.querySelector(".post_media_video") || post.querySelector("iframe")) {
         return "gif";
+    }
+
+    return null;
+}
+
+function normalizeMediaUrl(url) {
+    if (!url) {
+        return null;
+    }
+
+    try {
+        const parsed = new URL(url, window.location.origin);
+        parsed.hash = "";
+        parsed.search = "";
+        parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+        return parsed.toString();
+    } catch {
+        return url.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+    }
+}
+
+function getExactMediaKey(post, kind) {
+    const iframeSrc = post.querySelector(".post_media_embed iframe, iframe")?.getAttribute("src");
+    if (iframeSrc) {
+        const normalized = normalizeMediaUrl(iframeSrc);
+        return normalized ? `${kind}:embed:${normalized}` : null;
+    }
+
+    if (kind === "gif") {
+        const videoSrc =
+            post.querySelector(".post_media_video source")?.getAttribute("src") ||
+            post.querySelector(".post_media_video video source")?.getAttribute("src") ||
+            post.querySelector(".post_media_video video")?.getAttribute("src") ||
+            post.querySelector(".post_media_video")?.getAttribute("src");
+
+        if (videoSrc) {
+            const normalized = normalizeMediaUrl(videoSrc);
+            if (normalized) {
+                return `${kind}:video:${normalized}`;
+            }
+        }
     }
 
     return null;
@@ -74,15 +116,45 @@ function averageHash(image) {
     return luminance.map((value) => (value >= average ? "1" : "0")).join("");
 }
 
+async function exactVisualKey(image) {
+    if (!globalThis.crypto?.subtle) {
+        return null;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = VISUAL_KEY_SIZE;
+    canvas.height = VISUAL_KEY_SIZE;
+
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) {
+        return null;
+    }
+
+    context.drawImage(image, 0, 0, VISUAL_KEY_SIZE, VISUAL_KEY_SIZE);
+    const { data } = context.getImageData(0, 0, VISUAL_KEY_SIZE, VISUAL_KEY_SIZE);
+    const grayscale = new Uint8Array(VISUAL_KEY_SIZE * VISUAL_KEY_SIZE);
+
+    for (let index = 0, pixel = 0; index < data.length; index += 4, pixel += 1) {
+        grayscale[pixel] = Math.round((data[index] * 299 + data[index + 1] * 587 + data[index + 2] * 114) / 1000);
+    }
+
+    const digest = await crypto.subtle.digest("SHA-256", grayscale);
+    const hex = [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+    return `${image.naturalWidth}x${image.naturalHeight}:${hex}`;
+}
+
 function fingerprintThumbnail(url) {
     return new Promise((resolve) => {
         const image = new Image();
         image.decoding = "async";
         image.referrerPolicy = "no-referrer";
 
-        image.addEventListener("load", () => {
+        image.addEventListener("load", async () => {
             try {
-                resolve(averageHash(image));
+                resolve({
+                    hash: averageHash(image),
+                    visualKey: await exactVisualKey(image),
+                });
             } catch {
                 resolve(null);
             }
@@ -165,7 +237,7 @@ function removeDuplicatePost(post) {
     post.remove();
 }
 
-function clusterByTime(posts) {
+function clusterByTime(posts, windowMs) {
     const sorted = [...posts].sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0));
     const clusters = [];
     let current = [];
@@ -176,7 +248,7 @@ function clusterByTime(posts) {
             previous &&
             previous.createdAt != null &&
             post.createdAt != null &&
-            post.createdAt - previous.createdAt > DUPLICATE_WINDOW_MS;
+            post.createdAt - previous.createdAt > windowMs;
 
         if (shouldSplit) {
             clusters.push(current);
@@ -193,6 +265,23 @@ function clusterByTime(posts) {
     return clusters;
 }
 
+function collapseGroup(group) {
+    const ordered = [...group].sort((left, right) => left.domIndex - right.domIndex).filter((entry) => document.body.contains(entry.post));
+    if (ordered.length < 2) {
+        return;
+    }
+
+    const primary = ordered[0].post;
+    for (const entry of ordered.slice(1)) {
+        if (entry.post === primary) {
+            continue;
+        }
+
+        appendDuplicate(primary, entry.post);
+        removeDuplicatePost(entry.post);
+    }
+}
+
 async function collapseSubmittedDuplicates() {
     const posts = [...document.querySelectorAll("#posts > .post")];
     if (posts.length === 0) {
@@ -203,65 +292,61 @@ async function collapseSubmittedDuplicates() {
         await Promise.all(
             posts.map(async (post, domIndex) => {
                 const kind = getPostKind(post);
-                const thumbnailUrl = kind ? getThumbnailUrl(post, kind) : null;
-                if (!kind || !thumbnailUrl) {
+                if (!kind) {
                     return null;
                 }
 
-                const hash = await fingerprintThumbnail(thumbnailUrl);
-                if (!hash) {
-                    return null;
-                }
+                const exactKey = getExactMediaKey(post, kind);
+                const thumbnailUrl = getThumbnailUrl(post, kind);
+                const fingerprint = thumbnailUrl ? await fingerprintThumbnail(thumbnailUrl) : null;
 
                 return {
                     post,
                     domIndex,
-                    kind,
-                    hash,
                     createdAt: getCreatedAt(post),
+                    exactKey:
+                        exactKey ||
+                        ((kind === "image" || kind === "gif") && fingerprint?.visualKey ? `${kind}:visual:${fingerprint.visualKey}` : null),
+                    similarKey: fingerprint?.hash ? `${kind}:hash:${fingerprint.hash}` : null,
                 };
             }),
         )
     ).filter(Boolean);
 
-    const groups = new Map();
+    const exactGroups = new Map();
+    const similarGroups = new Map();
 
     for (const entry of entries) {
-        const key = `${entry.kind}:${entry.hash}`;
-        const group = groups.get(key) || [];
-        group.push(entry);
-        groups.set(key, group);
+        if (entry.exactKey) {
+            const group = exactGroups.get(entry.exactKey) || [];
+            group.push(entry);
+            exactGroups.set(entry.exactKey, group);
+        }
+
+        if (entry.similarKey) {
+            const group = similarGroups.get(entry.similarKey) || [];
+            group.push(entry);
+            similarGroups.set(entry.similarKey, group);
+        }
     }
 
-    for (const group of groups.values()) {
+    for (const group of exactGroups.values()) {
+        if (group.length > 1) {
+            collapseGroup(group);
+        }
+    }
+
+    for (const group of similarGroups.values()) {
         if (group.length < 2) {
             continue;
         }
 
-        for (const cluster of clusterByTime(group)) {
-            if (cluster.length < 2) {
-                continue;
-            }
-
-            const ordered = [...cluster].sort((left, right) => left.domIndex - right.domIndex);
-            const primary = ordered[0].post;
-
-            for (const entry of ordered.slice(1)) {
-                if (!document.body.contains(entry.post) || entry.post === primary) {
-                    continue;
-                }
-
-                appendDuplicate(primary, entry.post);
-                removeDuplicatePost(entry.post);
+        for (const cluster of clusterByTime(group, SIMILAR_DUPLICATE_WINDOW_MS)) {
+            if (cluster.length > 1) {
+                collapseGroup(cluster);
             }
         }
     }
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-    if (!window.location.pathname.includes("/submitted")) {
-        return;
-    }
-
-    void collapseSubmittedDuplicates();
-});
+collapseSubmittedDuplicates();

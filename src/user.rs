@@ -70,9 +70,42 @@ fn duplicate_submission_key(post: &Post) -> Option<String> {
 			"gallery:{}",
 			post.gallery.iter().map(|image| normalize_duplicate_url(&image.url)).collect::<Vec<_>>().join("|")
 		)),
-		"image" | "gif" if !post.media.url.is_empty() => Some(format!("{}:{}", post.post_type, normalize_duplicate_url(&post.media.url))),
+		"image" if !post.media.url.is_empty() => Some(format!("image:{}", normalize_duplicate_url(&post.media.url))),
+		"gif" => duplicate_gif_key(post),
 		_ => None,
 	}
+}
+
+fn duplicate_gif_key(post: &Post) -> Option<String> {
+	if let Some(embed_src) = extract_embed_src(&post.media.embed_code) {
+		return Some(format!("gif:{}", normalize_duplicate_url(&embed_src)));
+	}
+
+	if !post.media.url.is_empty() {
+		return Some(format!("gif:{}", normalize_duplicate_url(&post.media.url)));
+	}
+
+	None
+}
+
+fn extract_embed_src(embed_code: &str) -> Option<String> {
+	for delimiter in ['"', '\''] {
+		let needle = format!("src={delimiter}");
+		let Some(start) = embed_code.find(&needle) else {
+			continue;
+		};
+
+		let remainder = &embed_code[start + needle.len()..];
+		let Some((src, _)) = remainder.split_once(delimiter) else {
+			continue;
+		};
+
+		if !src.trim().is_empty() {
+			return Some(src.trim().to_string());
+		}
+	}
+
+	None
 }
 
 fn normalize_duplicate_url(url: &str) -> String {
@@ -212,6 +245,12 @@ mod tests {
 		}
 	}
 
+	fn test_embed_gif_post(id: &str, title: &str, community: &str, embed_src: &str) -> Post {
+		let mut post = test_post(id, title, community, "", "gif", "", &[]);
+		post.media.embed_code = format!("<iframe src=\"{embed_src}\" frameborder=\"0\"></iframe>");
+		post
+	}
+
 	#[test]
 	fn collapses_matching_image_posts() {
 		let posts = vec![
@@ -290,6 +329,20 @@ mod tests {
 		assert_eq!(collapsed.len(), 1);
 		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
 		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "GIF two");
+	}
+
+	#[test]
+	fn collapses_matching_embedded_gif_posts() {
+		let posts = vec![
+			test_embed_gif_post("one", "Embed one", "sub_one", "https://www.redgifs.com/ifr/mediumpurplesoggyconure/"),
+			test_embed_gif_post("two", "Embed two", "sub_two", "https://www.redgifs.com/ifr/mediumpurplesoggyconure"),
+		];
+
+		let collapsed = collapse_duplicate_submissions(posts);
+
+		assert_eq!(collapsed.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "Embed two");
 	}
 
 	#[test]
