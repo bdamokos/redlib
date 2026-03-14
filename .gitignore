@@ -1,6 +1,7 @@
 /target
 .env
 redlib.toml
+.DS_Store
 
 # Idea Files
 .idea/
