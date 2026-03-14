@@ -562,29 +562,29 @@ async fn user(name: &str) -> Result<User, String> {
 	let path: String = format!("/user/{name}/about.json?raw_json=1");
 
 	// Send a request to the url
-	json(path, false).await.map(|res| {
-		// Grab creation date as unix timestamp
-		let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
-		let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-		let profile = utils::user_profile_details(&res["data"]["subreddit"]);
+	let res = json(path, false).await?;
 
-		// Closure used to parse JSON from Reddit APIs
-		let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
+	// Grab creation date as unix timestamp
+	let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
+	let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+	let profile = utils::user_profile_details_with_social_links(name, &res["data"]["subreddit"]).await;
 
-		// Parse the JSON output into a User struct
-		User {
-			name: res["data"]["name"].as_str().unwrap_or(name).to_owned(),
-			title: about("title"),
-			icon: format_url(&about("icon_img")),
-			post_karma: format_num(res["data"]["link_karma"].as_i64().unwrap_or(0)),
-			comment_karma: format_num(res["data"]["comment_karma"].as_i64().unwrap_or(0)),
-			created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
-			banner: about("banner_img"),
-			description: profile.blurb,
-			bio_html: profile.bio_html,
-			external_links: profile.external_links,
-			nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
-		}
+	// Closure used to parse JSON from Reddit APIs
+	let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
+
+	// Parse the JSON output into a User struct
+	Ok(User {
+		name: res["data"]["name"].as_str().unwrap_or(name).to_owned(),
+		title: about("title"),
+		icon: format_url(&about("icon_img")),
+		post_karma: format_num(res["data"]["link_karma"].as_i64().unwrap_or(0)),
+		comment_karma: format_num(res["data"]["comment_karma"].as_i64().unwrap_or(0)),
+		created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
+		banner: about("banner_img"),
+		description: profile.blurb,
+		bio_html: profile.bio_html,
+		external_links: profile.external_links,
+		nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
 	})
 }
 

@@ -5,10 +5,14 @@ use crate::config::{self, get_setting};
 //
 // CRATES
 //
-use crate::{client::json, server::RequestExt};
+use crate::{
+	client::{json, CLIENT, OAUTH_CLIENT},
+	server::RequestExt,
+};
 use askama::Template;
 use cached::proc_macro::cached;
 use cookie::Cookie;
+use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 use libflate::deflate::{Decoder, Encoder};
 use log::error;
@@ -136,6 +140,18 @@ pub struct UserProfileDetails {
 	pub blurb: String,
 	pub bio_html: String,
 	pub external_links: Vec<ExternalLink>,
+}
+
+#[derive(Deserialize)]
+struct RedditSocialLinkContext {
+	social_link: RedditSocialLink,
+}
+
+#[derive(Deserialize)]
+struct RedditSocialLink {
+	url: String,
+	name: Option<String>,
+	position: Option<usize>,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -690,11 +706,21 @@ pub fn user_profile_details(subreddit: &Value) -> UserProfileDetails {
 	}
 }
 
+pub async fn user_profile_details_with_social_links(name: &str, subreddit: &Value) -> UserProfileDetails {
+	let mut profile = user_profile_details(subreddit);
+
+	if let Ok(html) = fetch_user_profile_page_html(name).await {
+		append_external_links(&mut profile.external_links, extract_profile_social_links(&html));
+	}
+
+	profile
+}
+
 #[cached(size = 512, time = 3600, result = true)]
 pub async fn fetch_user_profile_details(name: String) -> Result<UserProfileDetails, String> {
 	let path = format!("/user/{name}/about.json?raw_json=1");
 	let response = json(path, false).await?;
-	Ok(user_profile_details(&response["data"]["subreddit"]))
+	Ok(user_profile_details_with_social_links(&name, &response["data"]["subreddit"]).await)
 }
 
 pub async fn author_external_links(name: &str) -> Vec<ExternalLink> {
@@ -705,7 +731,7 @@ pub async fn author_external_links(name: &str) -> Vec<ExternalLink> {
 
 	fetch_user_profile_details(author.to_string())
 		.await
-		.map(|profile| profile.external_links)
+		.map(|profile| dedupe_external_links_by_host(profile.external_links))
 		.unwrap_or_default()
 }
 
@@ -1256,9 +1282,8 @@ static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
 static HTML_HREF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="([^"]+)""#).unwrap());
 static PLAIN_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
-static BARE_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-	Regex::new(r#"(?i)\b(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>"']*)?"#).unwrap()
-});
+static BARE_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\b(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>"']*)?"#).unwrap());
+static PROFILE_SOCIAL_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"data-faceplate-tracking-context="([^"]*social_link[^"]*)""#).unwrap());
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
@@ -1329,7 +1354,7 @@ pub fn rewrite_urls(input_text: &str) -> String {
 }
 
 fn extract_external_links(sources: &[&str]) -> Vec<ExternalLink> {
-	let mut by_host = HashMap::new();
+	let mut by_key = HashMap::new();
 
 	for source in sources {
 		if source.is_empty() {
@@ -1338,29 +1363,33 @@ fn extract_external_links(sources: &[&str]) -> Vec<ExternalLink> {
 
 		for capture in HTML_HREF_REGEX.captures_iter(source) {
 			if let Some(link) = build_external_link(capture.get(1).map_or("", |m| m.as_str())) {
-				by_host.entry(link.host.clone()).or_insert(link);
+				by_key.entry(external_link_key(&link)).or_insert(link);
 			}
 		}
 
 		for matched in PLAIN_URL_REGEX.find_iter(source) {
 			if let Some(link) = build_external_link(matched.as_str()) {
-				by_host.entry(link.host.clone()).or_insert(link);
+				by_key.entry(external_link_key(&link)).or_insert(link);
 			}
 		}
 
 		for matched in BARE_DOMAIN_REGEX.find_iter(source) {
 			if let Some(link) = build_external_link(matched.as_str()) {
-				by_host.entry(link.host.clone()).or_insert(link);
+				by_key.entry(external_link_key(&link)).or_insert(link);
 			}
 		}
 	}
 
-	let mut links = by_host.into_values().collect::<Vec<_>>();
+	let mut links = by_key.into_values().collect::<Vec<_>>();
 	links.sort_by(|a, b| a.label.cmp(&b.label));
 	links
 }
 
 fn build_external_link(raw: &str) -> Option<ExternalLink> {
+	build_external_link_with_label(raw, None)
+}
+
+fn build_external_link_with_label(raw: &str, label_override: Option<&str>) -> Option<ExternalLink> {
 	let decoded = raw
 		.trim()
 		.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'))
@@ -1386,7 +1415,11 @@ fn build_external_link(raw: &str) -> Option<ExternalLink> {
 		return None;
 	}
 
-	let label = host.trim_start_matches("www.").to_string();
+	let label = label_override
+		.map(str::trim)
+		.filter(|label| !label.is_empty())
+		.unwrap_or_else(|| host.trim_start_matches("www."))
+		.to_string();
 
 	Some(ExternalLink {
 		label,
@@ -1394,6 +1427,78 @@ fn build_external_link(raw: &str) -> Option<ExternalLink> {
 		host: host.clone(),
 		icon_path: format!("/site_icon/{host}"),
 	})
+}
+
+fn append_external_links(target: &mut Vec<ExternalLink>, links: Vec<ExternalLink>) {
+	let mut seen: HashSet<String> = target.iter().map(external_link_key).collect();
+
+	for link in links {
+		if seen.insert(external_link_key(&link)) {
+			target.push(link);
+		}
+	}
+}
+
+fn dedupe_external_links_by_host(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
+	let mut seen = HashSet::new();
+	let mut deduped = Vec::new();
+
+	for link in links {
+		if seen.insert(link.host.clone()) {
+			deduped.push(link);
+		}
+	}
+
+	deduped
+}
+
+fn external_link_key(link: &ExternalLink) -> String {
+	format!("{}|{}", link.url.to_lowercase(), link.label.to_lowercase())
+}
+
+async fn fetch_user_profile_page_html(name: &str) -> Result<String, String> {
+	let url = format!("https://www.reddit.com/user/{name}/");
+	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
+	let request = Request::builder()
+		.method("GET")
+		.uri(&url)
+		.header("Host", "www.reddit.com")
+		.header("Accept-Encoding", "identity")
+		.header("User-Agent", user_agent)
+		.body(Body::empty())
+		.map_err(|err| err.to_string())?;
+	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+
+	if !response.status().is_success() {
+		return Err(format!("profile html request failed with status {}", response.status()));
+	}
+
+	let body = hyper::body::to_bytes(response.into_body()).await.map_err(|err| err.to_string())?;
+	String::from_utf8(body.to_vec()).map_err(|err| err.to_string())
+}
+
+fn extract_profile_social_links(source: &str) -> Vec<ExternalLink> {
+	let mut ordered_links = Vec::new();
+	let mut seen = HashSet::new();
+
+	for capture in PROFILE_SOCIAL_LINK_REGEX.captures_iter(source) {
+		let Some(raw_context) = capture.get(1).map(|m| m.as_str()) else {
+			continue;
+		};
+		let decoded = decode_html(raw_context).unwrap_or_else(|_| raw_context.to_string());
+		let Ok(context) = serde_json::from_str::<RedditSocialLinkContext>(&decoded) else {
+			continue;
+		};
+		let Some(link) = build_external_link_with_label(&context.social_link.url, context.social_link.name.as_deref()) else {
+			continue;
+		};
+		if seen.insert(external_link_key(&link)) {
+			ordered_links.push((context.social_link.position.unwrap_or(usize::MAX), link));
+		}
+	}
+
+	ordered_links.sort_by_key(|(position, _)| *position);
+	ordered_links.into_iter().map(|(_, link)| link).collect()
 }
 
 // These links all follow a pattern of "https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/SUBREDDIT_ID/RANDOM_FILENAME.png"
@@ -1710,7 +1815,7 @@ impl_template_str_eq!(User);
 
 #[cfg(test)]
 mod tests {
-	use super::{format_num, format_url, rewrite_urls, user_profile_details, Preferences};
+	use super::{dedupe_external_links_by_host, extract_profile_social_links, format_num, format_url, rewrite_urls, user_profile_details, ExternalLink, Preferences};
 	use serde_json::json;
 
 	#[test]
@@ -1775,6 +1880,52 @@ mod tests {
 		assert_eq!(profile.external_links.len(), 1);
 		assert_eq!(profile.external_links[0].host, "realankri.com");
 		assert_eq!(profile.external_links[0].url, "https://realankri.com/");
+	}
+
+	#[test]
+	fn extracts_structured_social_links_from_profile_html() {
+		let profile_html = r#"
+			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;CUSTOM&quot;,&quot;url&quot;:&quot;https://onlyfans.com/lady-katarina&quot;,&quot;name&quot;:&quot;DM ME HERE&quot;,&quot;position&quot;:0}}">
+			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;ONLYFANS&quot;,&quot;url&quot;:&quot;https://onlyfans.com/lady-katarina&quot;,&quot;name&quot;:&quot;lady-katarina&quot;,&quot;position&quot;:1}}">
+			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;CUSTOM&quot;,&quot;url&quot;:&quot;https://fansly.com/LadyKatarina&quot;,&quot;name&quot;:&quot;Fansly - DM ME&quot;,&quot;position&quot;:2}}">
+			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;TWITTER&quot;,&quot;url&quot;:&quot;https://twitter.com/Lady_Kaatarina&quot;,&quot;name&quot;:&quot;Lady_Kaatarina&quot;,&quot;position&quot;:3}}">
+		"#;
+
+		let links = extract_profile_social_links(profile_html);
+
+		assert_eq!(links.len(), 4);
+		assert_eq!(links[0].label, "DM ME HERE");
+		assert_eq!(links[1].label, "lady-katarina");
+		assert_eq!(links[2].host, "fansly.com");
+		assert_eq!(links[3].host, "twitter.com");
+	}
+
+	#[test]
+	fn deduplicates_author_links_by_host() {
+		let deduped = dedupe_external_links_by_host(vec![
+			ExternalLink {
+				label: "DM ME HERE".to_string(),
+				url: "https://onlyfans.com/lady-katarina".to_string(),
+				host: "onlyfans.com".to_string(),
+				icon_path: "/site_icon/onlyfans.com".to_string(),
+			},
+			ExternalLink {
+				label: "lady-katarina".to_string(),
+				url: "https://onlyfans.com/lady-katarina".to_string(),
+				host: "onlyfans.com".to_string(),
+				icon_path: "/site_icon/onlyfans.com".to_string(),
+			},
+			ExternalLink {
+				label: "Fansly - DM ME".to_string(),
+				url: "https://fansly.com/LadyKatarina".to_string(),
+				host: "fansly.com".to_string(),
+				icon_path: "/site_icon/fansly.com".to_string(),
+			},
+		]);
+
+		assert_eq!(deduped.len(), 2);
+		assert_eq!(deduped[0].host, "onlyfans.com");
+		assert_eq!(deduped[1].host, "fansly.com");
 	}
 
 	#[test]
