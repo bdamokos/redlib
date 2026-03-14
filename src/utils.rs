@@ -7,6 +7,7 @@ use crate::config::{self, get_setting};
 //
 use crate::{client::json, server::RequestExt};
 use askama::Template;
+use cached::proc_macro::cached;
 use cookie::Cookie;
 use hyper::{Body, Request, Response};
 use libflate::deflate::{Decoder, Encoder};
@@ -24,6 +25,7 @@ use std::str::FromStr;
 use std::string::ToString;
 use std::sync::LazyLock;
 use time::{macros::format_description, Duration, OffsetDateTime};
+use tokio::task::JoinSet;
 use url::Url;
 
 /// Write a message to stderr on debug mode. This function is a no-op on
@@ -62,7 +64,7 @@ impl ResourceType {
 }
 
 /// Post flair with content, background color and foreground color
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct Flair {
 	pub flair_parts: Vec<FlairPart>,
 	pub text: String,
@@ -113,11 +115,27 @@ impl FlairPart {
 	}
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct Author {
 	pub name: String,
 	pub flair: Flair,
 	pub distinguished: String,
+	pub external_links: Vec<ExternalLink>,
+}
+
+#[derive(Default, Clone, Serialize, PartialEq, Eq)]
+pub struct ExternalLink {
+	pub label: String,
+	pub url: String,
+	pub host: String,
+	pub icon_path: String,
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct UserProfileDetails {
+	pub blurb: String,
+	pub bio_html: String,
+	pub external_links: Vec<ExternalLink>,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -460,6 +478,7 @@ impl Post {
 						foreground_color: val(post, "author_flair_text_color"),
 					},
 					distinguished: val(post, "distinguished"),
+					external_links: Vec::new(),
 				},
 				permalink: val(post, "permalink"),
 				link_title: val(post, "link_title"),
@@ -654,7 +673,69 @@ pub struct User {
 	pub created: String,
 	pub banner: String,
 	pub description: String,
+	pub bio_html: String,
+	pub external_links: Vec<ExternalLink>,
 	pub nsfw: bool,
+}
+
+pub fn user_profile_details(subreddit: &Value) -> UserProfileDetails {
+	let blurb = subreddit["public_description"].as_str().unwrap_or_default().trim().to_string();
+	let bio_html = rewrite_urls(subreddit["description_html"].as_str().unwrap_or_default()).trim().to_string();
+	let description = subreddit["description"].as_str().unwrap_or_default();
+
+	UserProfileDetails {
+		blurb: blurb.clone(),
+		bio_html: bio_html.clone(),
+		external_links: extract_external_links(&[&blurb, &bio_html, description, subreddit["public_description_html"].as_str().unwrap_or_default()]),
+	}
+}
+
+#[cached(size = 512, time = 3600, result = true)]
+pub async fn fetch_user_profile_details(name: String) -> Result<UserProfileDetails, String> {
+	let path = format!("/user/{name}/about.json?raw_json=1");
+	let response = json(path, false).await?;
+	Ok(user_profile_details(&response["data"]["subreddit"]))
+}
+
+pub async fn author_external_links(name: &str) -> Vec<ExternalLink> {
+	let author = name.trim();
+	if author.is_empty() || author == "[deleted]" {
+		return Vec::new();
+	}
+
+	fetch_user_profile_details(author.to_string())
+		.await
+		.map(|profile| profile.external_links)
+		.unwrap_or_default()
+}
+
+pub async fn hydrate_post_author_links(posts: &mut [Post]) {
+	let mut pending = JoinSet::new();
+	let mut seen = HashSet::new();
+
+	for post in posts.iter() {
+		let author = post.author.name.trim();
+		if author.is_empty() || author == "[deleted]" || !seen.insert(author.to_string()) {
+			continue;
+		}
+
+		let author_name = author.to_string();
+		pending.spawn(async move {
+			let links = author_external_links(&author_name).await;
+			(author_name, links)
+		});
+	}
+
+	let mut links_by_author = HashMap::new();
+	while let Some(result) = pending.join_next().await {
+		if let Ok((author, links)) = result {
+			links_by_author.insert(author, links);
+		}
+	}
+
+	for post in posts.iter_mut() {
+		post.author.external_links = links_by_author.get(&post.author.name).cloned().unwrap_or_default();
+	}
 }
 
 #[derive(Default, PartialEq)]
@@ -906,6 +987,7 @@ pub async fn parse_post(post: &Value) -> Post {
 				foreground_color: val(post, "author_flair_text_color"),
 			},
 			distinguished: val(post, "distinguished"),
+			external_links: author_external_links(&val(post, "author")).await,
 		},
 		permalink,
 		link_title: val(post, "link_title"),
@@ -1172,6 +1254,8 @@ static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"htt
 static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
 static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
+static HTML_HREF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="([^"]+)""#).unwrap());
+static PLAIN_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
@@ -1239,6 +1323,63 @@ pub fn rewrite_urls(input_text: &str) -> String {
 				.replace(&image_to_replace, &_image_replacement)
 		}
 	}
+}
+
+fn extract_external_links(sources: &[&str]) -> Vec<ExternalLink> {
+	let mut by_host = HashMap::new();
+
+	for source in sources {
+		if source.is_empty() {
+			continue;
+		}
+
+		for capture in HTML_HREF_REGEX.captures_iter(source) {
+			if let Some(link) = build_external_link(capture.get(1).map_or("", |m| m.as_str())) {
+				by_host.entry(link.host.clone()).or_insert(link);
+			}
+		}
+
+		for matched in PLAIN_URL_REGEX.find_iter(source) {
+			if let Some(link) = build_external_link(matched.as_str()) {
+				by_host.entry(link.host.clone()).or_insert(link);
+			}
+		}
+	}
+
+	let mut links = by_host.into_values().collect::<Vec<_>>();
+	links.sort_by(|a, b| a.label.cmp(&b.label));
+	links
+}
+
+fn build_external_link(raw: &str) -> Option<ExternalLink> {
+	let decoded = raw.trim().replace("&amp;", "&");
+	if decoded.is_empty() || decoded.starts_with('/') {
+		return None;
+	}
+
+	let parsed = Url::parse(&decoded).ok()?;
+	match parsed.scheme() {
+		"http" | "https" => {}
+		_ => return None,
+	}
+
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host.is_empty()
+		|| matches!(
+			host.as_str(),
+			"reddit.com" | "www.reddit.com" | "old.reddit.com" | "new.reddit.com" | "np.reddit.com" | "redd.it"
+		) {
+		return None;
+	}
+
+	let label = host.trim_start_matches("www.").to_string();
+
+	Some(ExternalLink {
+		label,
+		url: parsed.into(),
+		host: host.clone(),
+		icon_path: format!("/site_icon/{host}"),
+	})
 }
 
 // These links all follow a pattern of "https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/SUBREDDIT_ID/RANDOM_FILENAME.png"
@@ -1555,7 +1696,8 @@ impl_template_str_eq!(User);
 
 #[cfg(test)]
 mod tests {
-	use super::{format_num, format_url, rewrite_urls, Preferences};
+	use super::{format_num, format_url, rewrite_urls, user_profile_details, Preferences};
+	use serde_json::json;
 
 	#[test]
 	fn format_num_works() {
@@ -1588,6 +1730,23 @@ mod tests {
 			rewrite_urls("printf \"\\npolkit.addRule(function(action, subject)"),
 			"printf \"\\npolkit.addRule(function(action, subject)"
 		);
+	}
+
+	#[test]
+	fn extracts_external_links_from_user_profile_details() {
+		let profile = user_profile_details(&json!({
+			"public_description": "Find me elsewhere https://paa.ge/example",
+			"public_description_html": "<div class=\"md\"><p>Also on https://reddit.com/u/example</p></div>",
+			"description": "https://fansly.com/example",
+			"description_html": "<div class=\"md\"><p><a href=\"https://fansly.com/example\">Fansly</a> <a href=\"https://www.reddit.com/u/example\">Reddit</a></p></div>"
+		}));
+
+		assert_eq!(profile.blurb, "Find me elsewhere https://paa.ge/example");
+		assert_eq!(profile.external_links.len(), 2);
+		assert_eq!(profile.external_links[0].host, "fansly.com");
+		assert_eq!(profile.external_links[0].icon_path, "/site_icon/fansly.com");
+		assert_eq!(profile.external_links[1].host, "paa.ge");
+		assert_eq!(profile.external_links[1].icon_path, "/site_icon/paa.ge");
 	}
 
 	#[test]

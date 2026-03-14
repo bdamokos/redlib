@@ -94,6 +94,29 @@ body %}
                     <div title="{{ user.post_karma.1 }}">{{ user.post_karma.0 }}</div>
                     <div title="{{ user.comment_karma.1 }}">{{ user.comment_karma.0 }}</div>
                 </div>
+                {% if !user.description.is_empty() || !user.bio_html.is_empty() || user.external_links.len() > 0 %}
+                <div id="user_profile">
+                    {% if !user.description.is_empty() %}
+                    <p id="user_blurb">{{ user.description }}</p>
+                    {% endif %}
+                    {% if !user.bio_html.is_empty() %}
+                    <div id="user_bio">{{ user.bio_html|safe }}</div>
+                    {% endif %}
+                    {% if user.external_links.len() > 0 %}
+                    <div id="user_external_links">
+                        <span class="user_section_label">Links</span>
+                        <div class="user_external_link_list">
+                            {% for link in user.external_links.clone() %}
+                            <a class="user_external_link" href="{{ link.url }}" rel="nofollow noopener noreferrer" title="{{ link.label }}">
+                                <img loading="lazy" src="{{ link.icon_path }}" alt="{{ link.label }}" width="16" height="16" />
+                                <span>{{ link.label }}</span>
+                            </a>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+                {% endif %}
                 <div id="user_actions">
                     {% let name = ["u_", user.name.as_str()].join("") %}
                     <div id="user_subscription">

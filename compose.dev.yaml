@@ -1,13 +1,15 @@
-# docker-compose -f docker-compose.dev.yml up -d
-version: "3.8"
+# docker compose -f compose.dev.yaml up -d --build
 
 services:
   redlib:
-    image: 192.168.50.25:5010/redlib:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: redlib:local
     restart: always
     container_name: "redlib"
     ports:
-      - 8081:8080 # Specify `127.0.0.1:8080:8080` instead if using a reverse proxy
+      - 127.0.0.1:18081:8080
     user: nobody
     read_only: true
     security_opt:
@@ -15,6 +17,7 @@ services:
       # - seccomp=seccomp-redlib.json
     cap_drop:
       - ALL
+    env_file: .env
     networks:
       - redlib
     healthcheck:

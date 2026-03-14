@@ -222,6 +222,7 @@ fn build_comment(
 			foreground_color: val(comment, "author_flair_text_color"),
 		},
 		distinguished: val(comment, "distinguished"),
+		external_links: Vec::new(),
 	};
 	let is_filtered = filters.contains(&["u_", author.name.as_str()].concat());
 

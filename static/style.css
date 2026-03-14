@@ -544,6 +544,89 @@ aside {
     color: var(--accent);
 }
 
+#user_profile {
+    width: 100%;
+    margin-top: 18px;
+    text-align: left;
+}
+
+#user_profile > * + * {
+    margin-top: 14px;
+}
+
+#user_blurb,
+#user_bio {
+    margin: 0;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+#user_bio > *:first-child {
+    margin-top: 0;
+}
+
+#user_bio > *:last-child {
+    margin-bottom: 0;
+}
+
+#user_external_links {
+    text-align: left;
+}
+
+.user_section_label {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.user_external_link_list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.user_external_link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: var(--panel-border);
+    border-radius: 999px;
+    background: var(--foreground);
+    text-decoration: none;
+}
+
+.user_external_link span {
+    overflow-wrap: anywhere;
+}
+
+.external_site_icons {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 6px;
+    vertical-align: text-bottom;
+}
+
+.external_site_link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+}
+
+.external_site_link img,
+.user_external_link img {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+}
+
 /* Subscriptions */
 
 #sub_subscription,
@@ -1027,6 +1110,11 @@ a.search_subreddit:hover {
 
 .post_subreddit {
     font-weight: bold;
+}
+
+.post_author {
+    display: inline-flex;
+    align-items: center;
 }
 
 .post_title {

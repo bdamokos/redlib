@@ -14,7 +14,7 @@ use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
-use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
+use redlib::{config, duplicates, headers, instance_info, post, search, settings, site_icon, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -241,6 +241,7 @@ async fn main() {
 		.boxed()
 	});
 	app.at("/favicon.ico").get(|_| favicon().boxed());
+	app.at("/site_icon/:host").get(|r| site_icon::icon(r).boxed());
 	app.at("/logo.png").get(|_| pwa_logo().boxed());
 	app.at("/Inter.var.woff2").get(|_| font().boxed());
 	app.at("/touch-icon-iphone.png").get(|_| iphone_logo().boxed());

@@ -207,6 +207,7 @@ async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<S
 		requests += 1;
 	};
 
+	utils::hydrate_post_author_links(&mut all_posts).await;
 	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
 	Ok((all_posts, after, all_posts_filtered))
 }
@@ -233,6 +234,7 @@ mod tests {
 					foreground_color: String::new(),
 				},
 				distinguished: String::new(),
+				external_links: Vec::new(),
 			},
 			permalink: format!("/r/{community}/comments/{id}/"),
 			link_title: String::new(),
@@ -564,6 +566,7 @@ async fn user(name: &str) -> Result<User, String> {
 		// Grab creation date as unix timestamp
 		let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
 		let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+		let profile = utils::user_profile_details(&res["data"]["subreddit"]);
 
 		// Closure used to parse JSON from Reddit APIs
 		let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
@@ -577,7 +580,9 @@ async fn user(name: &str) -> Result<User, String> {
 			comment_karma: format_num(res["data"]["comment_karma"].as_i64().unwrap_or(0)),
 			created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
 			banner: about("banner_img"),
-			description: about("public_description"),
+			description: profile.blurb,
+			bio_html: profile.bio_html,
+			external_links: profile.external_links,
 			nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
 		}
 	})

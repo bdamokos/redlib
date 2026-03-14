@@ -37,6 +37,18 @@
 	{% for flair_part in flair_parts.clone() %}{% if flair_part.flair_part_type == "emoji" %}<span class="emoji" style="background-image:url('{{ flair_part.value }}');"></span>{% else if flair_part.flair_part_type == "text" && !flair_part.value.is_empty() %}<span>{{ flair_part.value }}</span>{% endif %}{% endfor %}
 {%- endmacro %}
 
+{% macro external_site_icons(links) -%}
+	{% if links.len() > 0 %}
+	<span class="external_site_icons">
+		{% for link in links.clone() %}
+			<a class="external_site_link" href="{{ link.url }}" rel="nofollow noopener noreferrer" title="{{ link.label }}">
+				<img loading="lazy" src="{{ link.icon_path }}" alt="{{ link.label }}" width="16" height="16">
+			</a>
+		{% endfor %}
+	</span>
+	{% endif %}
+{%- endmacro %}
+
 {% macro sub_list(current) -%}
 	<details class="feeds">
 		<summary>Feeds</summary>
@@ -65,6 +77,7 @@
 		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/user/{{ post.author.name }}">u/{{ post.author.name }}</a>
+		{% call external_site_icons(post.author.external_links) %}
 		{% if post.author.flair.flair_parts.len() > 0 %}
 			<small class="author_flair">{% call render_flair(post.author.flair.flair_parts) %}</small>
 		{% endif %}
@@ -214,6 +227,7 @@
 		<a class="post_subreddit" href="/{{ community }}">{{ community }}</a>
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
+		{% call external_site_icons(post.author.external_links) %}
 		<span class="dot">&bull;</span>
 		<span class="created" title="{{ post.created }}">{{ post.rel_time }}</span>
 		{% if !post.awards.is_empty() && prefs.hide_awards != "on" %}
