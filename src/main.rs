@@ -273,6 +273,9 @@ async fn main() {
 		.at("/space_scroll.js")
 		.get(|_| resource(include_str!("../static/space_scroll.js"), "text/javascript", false).boxed());
 	app
+		.at("/author_links.js")
+		.get(|_| resource(include_str!("../static/author_links.js"), "text/javascript", false).boxed());
+	app
 		.at("/submitted_duplicates.js")
 		.get(|_| resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).boxed());
 
@@ -304,6 +307,7 @@ async fn main() {
 	app.at("/u/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
 
 	app.at("/user/[deleted]").get(|req| error(req, "User has deleted their account").boxed());
+	app.at("/author_links").get(|r| user::author_links(r).boxed());
 	app.at("/user/:name.rss").get(|r| user::rss(r).boxed());
 	app.at("/user/:name").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/:listing").get(|r| user::profile(r).boxed());

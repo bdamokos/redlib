@@ -177,7 +177,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
 					posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
 				}
-				utils::hydrate_post_author_links(&mut posts).await;
+				utils::hydrate_post_author_links_from_cache(&mut posts);
 				Ok(template(&SubredditTemplate {
 					sub,
 					posts,

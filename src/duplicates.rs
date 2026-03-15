@@ -3,7 +3,7 @@
 use crate::client::json;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
-use crate::utils::{error, filter_posts, get_filters, nsfw_landing, parse_post, template, Post, Preferences};
+use crate::utils::{self, error, filter_posts, get_filters, nsfw_landing, parse_post, template, Post, Preferences};
 
 use askama::Template;
 use hyper::{Body, Request, Response};
@@ -68,7 +68,8 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	match json(path, quarantined).await {
 		// Process response JSON.
 		Ok(response) => {
-			let post = parse_post(&response[0]["data"]["children"][0]).await;
+			let mut post = parse_post(&response[0]["data"]["children"][0]).await;
+			post.author.external_links = utils::cached_author_external_links(&post.author.name);
 
 			let req_url = req.uri().to_string();
 			// Return landing page if this post if this Reddit deems this post
@@ -230,10 +231,12 @@ async fn parse_duplicates(json: &Value, filters: &HashSet<String>) -> (Vec<Post>
 
 	// Process each post and place them in the Vec<Post>.
 	for val in post_duplicates {
-		let post: Post = parse_post(val).await;
+		let mut post: Post = parse_post(val).await;
+		post.author.external_links = utils::cached_author_external_links(&post.author.name);
 		duplicates.push(post);
 	}
 
 	let (num_posts_filtered, all_posts_filtered) = filter_posts(&mut duplicates, filters);
+	utils::hydrate_post_author_links_from_cache(&mut duplicates);
 	(duplicates, num_posts_filtered, all_posts_filtered)
 }

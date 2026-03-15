@@ -27,9 +27,9 @@ use std::env;
 use std::io::{Read, Write};
 use std::str::FromStr;
 use std::string::ToString;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 use time::{macros::format_description, Duration, OffsetDateTime};
-use tokio::task::JoinSet;
 use url::Url;
 
 /// Write a message to stderr on debug mode. This function is a no-op on
@@ -152,6 +152,12 @@ struct RedditSocialLink {
 	url: String,
 	name: Option<String>,
 	position: Option<usize>,
+}
+
+#[derive(Clone)]
+struct CachedAuthorLinks {
+	links: Vec<ExternalLink>,
+	cached_at: Instant,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -694,6 +700,11 @@ pub struct User {
 	pub nsfw: bool,
 }
 
+const AUTHOR_LINKS_CACHE_SIZE: usize = 512;
+const AUTHOR_LINKS_CACHE_TTL: StdDuration = StdDuration::from_secs(3600);
+
+static AUTHOR_LINKS_CACHE: LazyLock<Mutex<HashMap<String, CachedAuthorLinks>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub fn user_profile_details(subreddit: &Value) -> UserProfileDetails {
 	let blurb = subreddit["public_description"].as_str().unwrap_or_default().trim().to_string();
 	let bio_html = rewrite_urls(subreddit["description_html"].as_str().unwrap_or_default()).trim().to_string();
@@ -713,6 +724,7 @@ pub async fn user_profile_details_with_social_links(name: &str, subreddit: &Valu
 		append_external_links(&mut profile.external_links, extract_profile_social_links(&html));
 	}
 
+	store_author_links(name, dedupe_external_links_by_host(profile.external_links.clone()));
 	profile
 }
 
@@ -729,38 +741,26 @@ pub async fn author_external_links(name: &str) -> Vec<ExternalLink> {
 		return Vec::new();
 	}
 
-	fetch_user_profile_details(author.to_string())
+	if let Some(links) = cached_author_links(author) {
+		return links;
+	}
+
+	let links = fetch_user_profile_details(author.to_string())
 		.await
 		.map(|profile| dedupe_external_links_by_host(profile.external_links))
-		.unwrap_or_default()
+		.unwrap_or_default();
+
+	store_author_links(author, links.clone());
+	links
 }
 
-pub async fn hydrate_post_author_links(posts: &mut [Post]) {
-	let mut pending = JoinSet::new();
-	let mut seen = HashSet::new();
+pub fn cached_author_external_links(name: &str) -> Vec<ExternalLink> {
+	cached_author_links(name).unwrap_or_default()
+}
 
-	for post in posts.iter() {
-		let author = post.author.name.trim();
-		if author.is_empty() || author == "[deleted]" || !seen.insert(author.to_string()) {
-			continue;
-		}
-
-		let author_name = author.to_string();
-		pending.spawn(async move {
-			let links = author_external_links(&author_name).await;
-			(author_name, links)
-		});
-	}
-
-	let mut links_by_author = HashMap::new();
-	while let Some(result) = pending.join_next().await {
-		if let Ok((author, links)) = result {
-			links_by_author.insert(author, links);
-		}
-	}
-
+pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
 	for post in posts.iter_mut() {
-		post.author.external_links = links_by_author.get(&post.author.name).cloned().unwrap_or_default();
+		post.author.external_links = cached_author_external_links(&post.author.name);
 	}
 }
 
@@ -1454,6 +1454,42 @@ fn dedupe_external_links_by_host(links: Vec<ExternalLink>) -> Vec<ExternalLink> 
 
 fn external_link_key(link: &ExternalLink) -> String {
 	format!("{}|{}", link.url.to_lowercase(), link.label.to_lowercase())
+}
+
+fn cached_author_links(name: &str) -> Option<Vec<ExternalLink>> {
+	let author = name.trim();
+	if author.is_empty() || author == "[deleted]" {
+		return None;
+	}
+
+	let mut cache = AUTHOR_LINKS_CACHE.lock().ok()?;
+	prune_author_links_cache(&mut cache);
+	cache.get(author).map(|entry| entry.links.clone())
+}
+
+fn store_author_links(name: &str, links: Vec<ExternalLink>) {
+	let author = name.trim();
+	if author.is_empty() || author == "[deleted]" {
+		return;
+	}
+
+	let Ok(mut cache) = AUTHOR_LINKS_CACHE.lock() else {
+		return;
+	};
+	prune_author_links_cache(&mut cache);
+	cache.insert(author.to_string(), CachedAuthorLinks { links, cached_at: Instant::now() });
+
+	while cache.len() > AUTHOR_LINKS_CACHE_SIZE {
+		let Some(oldest_key) = cache.iter().min_by_key(|(_, entry)| entry.cached_at).map(|(key, _)| key.clone()) else {
+			break;
+		};
+		cache.remove(&oldest_key);
+	}
+}
+
+fn prune_author_links_cache(cache: &mut HashMap<String, CachedAuthorLinks>) {
+	let now = Instant::now();
+	cache.retain(|_, entry| now.duration_since(entry.cached_at) <= AUTHOR_LINKS_CACHE_TTL);
 }
 
 async fn fetch_user_profile_page_html(name: &str) -> Result<String, String> {

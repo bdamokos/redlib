@@ -11,6 +11,7 @@ use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 use std::collections::{HashMap, HashSet};
 use time::{macros::format_description, OffsetDateTime};
+use tokio::task::JoinSet;
 use url::Url;
 
 const TARGET_POST_COUNT: usize = 25;
@@ -207,7 +208,7 @@ async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<S
 		requests += 1;
 	};
 
-	utils::hydrate_post_author_links(&mut all_posts).await;
+	utils::hydrate_post_author_links_from_cache(&mut all_posts);
 	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
 	Ok((all_posts, after, all_posts_filtered))
 }
@@ -637,4 +638,46 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	res.headers_mut().insert(CONTENT_TYPE, hyper::header::HeaderValue::from_static("application/rss+xml"));
 
 	Ok(res)
+}
+
+pub async fn author_links(req: Request<Body>) -> Result<Response<Body>, String> {
+	let names = param(&format!("?{}", req.uri().query().unwrap_or_default()), "names").unwrap_or_default();
+	let authors = names
+		.split(',')
+		.map(str::trim)
+		.filter(|name| !name.is_empty() && *name != "[deleted]")
+		.take(64)
+		.collect::<Vec<_>>();
+
+	let mut pending = JoinSet::new();
+	let mut seen = HashSet::new();
+
+	for author in authors {
+		if !seen.insert(author.to_string()) {
+			continue;
+		}
+
+		let author_name = author.to_string();
+		pending.spawn(async move {
+			let links = utils::author_external_links(&author_name).await;
+			(author_name, links)
+		});
+	}
+
+	let mut links_by_author = HashMap::new();
+	while let Some(result) = pending.join_next().await {
+		if let Ok((author, links)) = result {
+			links_by_author.insert(author, links);
+		}
+	}
+
+	let body = serde_json::to_string(&links_by_author).map_err(|err| err.to_string())?;
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "application/json")
+			.header("Cache-Control", "no-store")
+			.body(body.into())
+			.unwrap_or_default(),
+	)
 }

@@ -138,7 +138,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-				utils::hydrate_post_author_links(&mut posts).await;
+				utils::hydrate_post_author_links_from_cache(&mut posts);
 				Ok(template(&SearchTemplate {
 					posts,
 					subreddits,
