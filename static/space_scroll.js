@@ -45,7 +45,28 @@ function isInteractiveElement(element) {
     ) !== null;
 }
 
-function findScrollTarget(posts, currentTop, direction) {
+function isTargetFullyVisible(target, viewportTop, viewportBottom) {
+    const rect = target.getBoundingClientRect();
+
+    return rect.top >= viewportTop && rect.bottom <= viewportBottom;
+}
+
+function findViewportSkipTarget(targets) {
+    const viewportTop = getScrollPaddingTop();
+    const viewportBottom = window.innerHeight;
+
+    return targets.find((target) => {
+        const rect = target.getBoundingClientRect();
+
+        if (rect.bottom <= viewportTop + 1) {
+            return false;
+        }
+
+        return !isTargetFullyVisible(target, viewportTop, viewportBottom);
+    }) || null;
+}
+
+function findAdjacentScrollTarget(posts, currentTop, direction) {
     if (direction > 0) {
         return posts.find((post) => getPostTop(post) > currentTop + 1) || null;
     }
@@ -59,8 +80,23 @@ function findScrollTarget(posts, currentTop, direction) {
     return null;
 }
 
+function getNavigationDirection(event) {
+    if (event.key === " " || event.code === "Space") {
+        return event.shiftKey ? -1 : 1;
+    }
+
+    if (event.key.toLowerCase() === "j") {
+        return 1;
+    }
+
+    return 0;
+}
+
 document.addEventListener("keydown", (event) => {
-    if (event.defaultPrevented || (event.key !== " " && event.code !== "Space") || event.altKey || event.ctrlKey || event.metaKey) {
+    const isSpaceKey = event.key === " " || event.code === "Space";
+    const isSingleStepForwardKey = event.key.toLowerCase() === "j";
+
+    if (event.defaultPrevented || (!isSpaceKey && !isSingleStepForwardKey) || event.altKey || event.ctrlKey || event.metaKey) {
         return;
     }
 
@@ -74,9 +110,9 @@ document.addEventListener("keydown", (event) => {
     }
 
     const scrollPaddingTop = getScrollPaddingTop();
-    const currentTop = window.scrollY + scrollPaddingTop;
-    const direction = event.shiftKey ? -1 : 1;
-    const targetPost = findScrollTarget(targets, currentTop, direction);
+    const targetPost = isSpaceKey && !event.shiftKey
+        ? findViewportSkipTarget(targets)
+        : findAdjacentScrollTarget(targets, window.scrollY + scrollPaddingTop, getNavigationDirection(event));
 
     if (targetPost === null) {
         return;
