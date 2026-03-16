@@ -7,6 +7,7 @@ use crate::config::{self, get_setting};
 //
 use crate::{
 	client::{json, CLIENT, OAUTH_CLIENT},
+	redgifs,
 	server::RequestExt,
 };
 use askama::Template;
@@ -264,12 +265,17 @@ impl Media {
 		let data_preview = &data["preview"]["reddit_video_preview"];
 		let secure_media = &data["secure_media"]["reddit_video"];
 		let crosspost_parent_media = &data["crosspost_parent_list"][0]["secure_media"]["reddit_video"];
+		let raw_embed_code = data["secure_media_embed"]["content"].as_str().unwrap_or_default().to_string();
+		let redgifs_url = redgifs::watch_path_from_url(data["url"].as_str().unwrap_or_default())
+			.or_else(|| redgifs::watch_path_from_embed_code(&raw_embed_code))
+			.map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
 
-		// Get embed code if available
-		let embed_code = data["secure_media_embed"]["content"].as_str().unwrap_or_default().to_string();
+		let embed_code = if redgifs_url.is_some() { String::new() } else { raw_embed_code };
 
-		// If post is a video, return the video
-		let (post_type, url_val, hls_url_val, dash_url_val) = if data_preview["fallback_url"].is_string() {
+		// RedGifs previews often point at muted Reddit transcodes; use the direct RedGifs MP4 instead.
+		let (post_type, url_val, hls_url_val, dash_url_val) = if let Some(redgifs_url) = redgifs_url.as_ref() {
+			("video", redgifs_url, None, None)
+		} else if data_preview["fallback_url"].is_string() {
 			(
 				if data_preview["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
 				&data_preview["fallback_url"],
@@ -1257,6 +1263,8 @@ pub fn format_url(url: &str) -> String {
 				"external-preview.redd.it" => capture(&REGEX_URL_EXTERNAL_PREVIEW, "/preview/external-pre/", 1),
 				"styles.redditmedia.com" => capture(&REGEX_URL_STYLES, "/style/", 1),
 				"www.redditstatic.com" => capture(&REGEX_URL_STATIC_MEDIA, "/static/", 1),
+				"www.redgifs.com" | "redgifs.com" => redgifs::watch_path_from_url(url).map_or_else(|| url.to_string(), |path| format!("/redgifs/{path}")),
+				d if d.starts_with("v") && d.ends_with(".redgifs.com") => redgifs::watch_path_from_url(url).map_or_else(|| url.to_string(), |path| format!("/redgifs/{path}")),
 				_ => url.to_string(),
 			}
 		})
@@ -1989,6 +1997,9 @@ mod tests {
 			format_url("https://www.redditstatic.com/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"),
 			"/static/marketplace-assets/v1/core/emotes/snoomoji_emotes/free_emotes_pack/shrug.gif"
 		);
+		assert_eq!(format_url("https://www.redgifs.com/watch/zanyjudiciousrook"), "/redgifs/zanyjudiciousrook");
+		assert_eq!(format_url("https://www.redgifs.com/ifr/zanyjudiciousrook"), "/redgifs/zanyjudiciousrook");
+		assert_eq!(format_url("https://v3.redgifs.com/watch/zanyjudiciousrook?foo=bar"), "/redgifs/zanyjudiciousrook");
 
 		assert_eq!(format_url(""), "");
 		assert_eq!(format_url("self"), "");

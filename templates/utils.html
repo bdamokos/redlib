@@ -421,7 +421,7 @@
 			id="vid_{{ post.id }}"
 			class="post_media_video short{% if use_dash %} video-dash{% endif %}{% if str_eq(prefs.autoplay_videos, "on") %} autoplay{% endif -%}"
 			poster="{{ post.media.poster }}"
-			preload="none"
+			preload="metadata"
 			playsinline
 			controls
 			{% if post.post_type == "gif" -%}

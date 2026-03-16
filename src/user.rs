@@ -2,6 +2,7 @@
 
 // CRATES
 use crate::client::json;
+use crate::redgifs;
 use crate::server::RequestExt;
 use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
 use crate::{config, utils};
@@ -12,10 +13,12 @@ use hyper::{Body, Request, Response};
 use std::collections::{HashMap, HashSet};
 use time::{macros::format_description, OffsetDateTime};
 use tokio::task::JoinSet;
+use url::form_urlencoded;
 use url::Url;
 
 const TARGET_POST_COUNT: usize = 25;
 const MAX_DUPLICATE_FILL_REQUESTS: usize = 4;
+const USER_SORT_OPTIONS: [&str; 4] = ["hot", "new", "top", "controversial"];
 
 // STRUCTS
 #[derive(Template)]
@@ -76,6 +79,7 @@ fn duplicate_submission_key(post: &Post) -> Option<String> {
 		)),
 		"image" if !post.media.url.is_empty() => Some(format!("image:{}", normalize_duplicate_url(&post.media.url))),
 		"gif" => duplicate_gif_key(post),
+		"video" if redgifs::is_redgifs_domain(&post.domain) => duplicate_gif_key(post),
 		_ => None,
 	}
 }
@@ -179,6 +183,31 @@ fn path_with_after(path: &str, after: &str) -> Result<String, String> {
 	}
 
 	Ok(url[url::Position::BeforePath..].to_string())
+}
+
+fn default_user_sort(req: &Request<Body>) -> String {
+	let default_sort = setting(req, "post_sort");
+	if USER_SORT_OPTIONS.contains(&default_sort.as_str()) {
+		default_sort
+	} else {
+		"hot".to_string()
+	}
+}
+
+fn user_listing_path(username: &str, listing: &str, query: &str, default_sort: &str) -> String {
+	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+
+	if !query_pairs.iter().any(|(key, _)| key == "sort") {
+		query_pairs.push(("sort".to_string(), default_sort.to_string()));
+	}
+
+	query_pairs.push(("raw_json".to_string(), "1".to_string()));
+
+	let query = form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+		.finish();
+
+	format!("/user/{username}/{listing}.json?{query}")
 }
 
 async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
@@ -407,6 +436,21 @@ mod tests {
 	}
 
 	#[test]
+	fn collapses_matching_redgifs_video_posts() {
+		let mut first = test_post("one", "Video one", "sub_one", "", "video", "/redgifs/zanyjudiciousrook", &[]);
+		first.domain = "www.redgifs.com".to_string();
+
+		let mut second = test_post("two", "Video two", "sub_two", "", "video", "/redgifs/zanyjudiciousrook/", &[]);
+		second.domain = "redgifs.com".to_string();
+
+		let collapsed = collapse_duplicate_submissions(vec![first, second]);
+
+		assert_eq!(collapsed.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "Video two");
+	}
+
+	#[test]
 	fn renders_collapsed_duplicates_in_user_template() {
 		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
 		post.preview_body = "<div class=\"md\"><p>Preview text from a duplicate post.</p></div>".to_string();
@@ -484,24 +528,37 @@ mod tests {
 
 		assert!(html.contains("submitted_duplicates.js"));
 	}
+
+	#[test]
+	fn user_listing_path_uses_default_sort_when_missing() {
+		assert_eq!(
+			super::user_listing_path("demo_user", "overview", "t=week", "top"),
+			"/user/demo_user/overview.json?t=week&sort=top&raw_json=1"
+		);
+	}
+
+	#[test]
+	fn user_listing_path_preserves_explicit_sort() {
+		assert_eq!(
+			super::user_listing_path("demo_user", "submitted", "sort=new&t=day", "top"),
+			"/user/demo_user/submitted.json?sort=new&t=day&raw_json=1"
+		);
+	}
 }
 
 // FUNCTIONS
 pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let listing = req.param("listing").unwrap_or_else(|| "overview".to_string());
+	let username = req.param("name").unwrap_or_else(|| "reddit".to_string());
+	let default_sort = default_user_sort(&req);
 
 	// Build the Reddit JSON API path
-	let path = format!(
-		"/user/{}/{listing}.json?{}&raw_json=1",
-		req.param("name").unwrap_or_else(|| "reddit".to_string()),
-		req.uri().query().unwrap_or_default(),
-	);
+	let path = user_listing_path(&username, &listing, req.uri().query().unwrap_or_default(), &default_sort);
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26");
 
 	// Retrieve other variables from Redlib request
 	let sort = param(&path, "sort").unwrap_or_default();
-	let username = req.param("name").unwrap_or_default();
 
 	// Retrieve info from user about page.
 	let user = user(&username).await.unwrap_or_default();

@@ -33,6 +33,7 @@
 
                 // Empty source to enable play event
                 newVideo.src = "about:blank";
+                newVideo.preload = "metadata";
 
                 oldVideo.parentNode.replaceChild(newVideo, oldVideo);
 
@@ -50,7 +51,6 @@
                 }
 
                 function initializeHls() {
-                    newVideo.removeEventListener('play', initializeHls);
                     var hls = new Hls({ autoStartLoad: false });
                     hls.loadSource(playlist);
                     hls.attachMedia(newVideo);
@@ -67,7 +67,9 @@
                         addQualitySelector(newVideo, hls, availableLevels);
 
                         hls.startLoad();
-                        newVideo.play();
+                        if (autoplay) {
+                            newVideo.play();
+                        }
                     });
 
                     hls.on(Hls.Events.ERROR, function (event, data) {
@@ -115,11 +117,7 @@
                     videoElement.parentNode.appendChild(qualitySelector);
                 }
 
-                newVideo.addEventListener('play', initializeHls);
-
-                if (autoplay) {
-                    newVideo.play();
-                }
+                initializeHls();
             });
         } else {
             var videos = container.querySelectorAll("video.hls_autoplay");
