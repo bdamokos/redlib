@@ -279,9 +279,13 @@ impl Media {
 		let secure_media = &data["secure_media"]["reddit_video"];
 		let crosspost_parent_media = &data["crosspost_parent_list"][0]["secure_media"]["reddit_video"];
 		let raw_embed_code = data["secure_media_embed"]["content"].as_str().unwrap_or_default().to_string();
-		let redgifs_url = redgifs::watch_path_from_url(data["url"].as_str().unwrap_or_default())
-			.or_else(|| redgifs::watch_path_from_embed_code(&raw_embed_code))
-			.map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
+		let redgifs_id = redgifs::watch_path_from_url(data["url"].as_str().unwrap_or_default()).or_else(|| redgifs::watch_path_from_embed_code(&raw_embed_code));
+		let redgifs_poster = if let Some(video_id) = redgifs_id.as_ref() {
+			redgifs::fetch_poster_path(video_id).await.unwrap_or_default()
+		} else {
+			String::new()
+		};
+		let redgifs_url = redgifs_id.as_ref().map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
 
 		let embed_code = if redgifs_url.is_some() { String::new() } else { raw_embed_code };
 
@@ -353,6 +357,11 @@ impl Media {
 
 		let hls_url = hls_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
 		let dash_url = dash_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
+		let poster = if redgifs_url.is_some() {
+			redgifs_poster
+		} else {
+			format_url(source["url"].as_str().unwrap_or_default())
+		};
 
 		let download_name = if post_type == "image" || post_type == "gif" || post_type == "video" {
 			let permalink_base = url_path_basename(data["permalink"].as_str().unwrap_or_default());
@@ -371,7 +380,7 @@ impl Media {
 				dash_url,
 				width: source["width"].as_i64().unwrap_or_default(),
 				height: source["height"].as_i64().unwrap_or_default(),
-				poster: format_url(source["url"].as_str().unwrap_or_default()),
+				poster,
 				download_name,
 				embed_code,
 			},

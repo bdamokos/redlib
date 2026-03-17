@@ -1,4 +1,5 @@
 use crate::client::{proxy, CLIENT};
+use cached::proc_macro::cached;
 use hyper::{Body, Request, Response};
 use regex::Regex;
 use serde_json::Value;
@@ -6,7 +7,13 @@ use std::sync::{LazyLock, Mutex};
 
 static REDGIFS_TOKEN: LazyLock<Mutex<(String, i64)>> = LazyLock::new(|| Mutex::new((String::new(), 0)));
 static REDGIFS_ID_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+$").unwrap());
-static REDGIFS_MEDIA_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+(?:-mobile)?\.mp4$").unwrap());
+static REDGIFS_MEDIA_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\.(?:mp4|jpg|jpeg|png|webp)$").unwrap());
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RedgifsMediaPaths {
+	video_path: String,
+	poster_path: String,
+}
 
 pub fn is_redgifs_domain(domain: &str) -> bool {
 	matches!(domain, "redgifs.com" | "www.redgifs.com") || (domain.starts_with('v') && domain.ends_with(".redgifs.com"))
@@ -53,6 +60,15 @@ fn is_valid_media_path(path: &str) -> bool {
 	!path.contains('/') && REDGIFS_MEDIA_PATH_REGEX.is_match(path)
 }
 
+fn media_path_from_url(url: &str) -> Option<String> {
+	let filename = url.strip_prefix("https://media.redgifs.com/")?;
+	if is_valid_media_path(filename) {
+		Some(format!("/redgifs/{filename}"))
+	} else {
+		None
+	}
+}
+
 pub async fn handler(req: Request<Body>) -> Result<Response<Body>, String> {
 	let path = req.uri().path().trim_start_matches("/redgifs/").trim_matches('/').to_string();
 
@@ -64,29 +80,24 @@ pub async fn handler(req: Request<Body>) -> Result<Response<Body>, String> {
 		return Ok(Response::builder().status(404).body("RedGifs video not found".into()).unwrap_or_default());
 	};
 
-	match fetch_video_url(&video_id).await {
-		Ok(video_url) => {
-			let filename = video_url
-				.strip_prefix("https://media.redgifs.com/")
-				.ok_or_else(|| "Unexpected RedGifs media URL".to_string())?;
-
-			if !is_valid_media_path(filename) {
-				return Err("Unexpected RedGifs media filename".to_string());
-			}
-
-			Ok(
-				Response::builder()
-					.status(302)
-					.header("Location", format!("/redgifs/{filename}"))
-					.body(Body::empty())
-					.unwrap_or_default(),
-			)
-		}
+	match fetch_media_paths(video_id.clone()).await {
+		Ok(media_paths) => Ok(
+			Response::builder()
+				.status(302)
+				.header("Location", media_paths.video_path)
+				.body(Body::empty())
+				.unwrap_or_default(),
+		),
 		Err(_) => Ok(Response::builder().status(404).body("RedGifs video not found".into()).unwrap_or_default()),
 	}
 }
 
-async fn fetch_video_url(video_id: &str) -> Result<String, String> {
+pub async fn fetch_poster_path(video_id: &str) -> Result<String, String> {
+	fetch_media_paths(video_id.to_string()).await.map(|paths| paths.poster_path)
+}
+
+#[cached(size = 512, time = 3600, result = true)]
+async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String> {
 	let token = get_token().await?;
 	let api_url = format!("https://api.redgifs.com/v2/gifs/{video_id}?views=yes");
 	let req = create_request(&api_url, Some(&token))?;
@@ -94,11 +105,18 @@ async fn fetch_video_url(video_id: &str) -> Result<String, String> {
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
 	let json: Value = serde_json::from_slice(&body_bytes).map_err(|err| err.to_string())?;
 
-	json["gif"]["urls"]["hd"]
+	let video_path = json["gif"]["urls"]["hd"]
 		.as_str()
 		.or_else(|| json["gif"]["urls"]["sd"].as_str())
-		.map(str::to_string)
-		.ok_or_else(|| "No video URL in RedGifs response".to_string())
+		.and_then(media_path_from_url)
+		.ok_or_else(|| "No video URL in RedGifs response".to_string())?;
+	let poster_path = json["gif"]["urls"]["poster"]
+		.as_str()
+		.or_else(|| json["gif"]["urls"]["thumbnail"].as_str())
+		.and_then(media_path_from_url)
+		.unwrap_or_default();
+
+	Ok(RedgifsMediaPaths { video_path, poster_path })
 }
 
 async fn get_token() -> Result<String, String> {
@@ -151,7 +169,7 @@ fn validate_video_id(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{watch_path_from_embed_code, watch_path_from_url};
+	use super::{is_valid_media_path, media_path_from_url, watch_path_from_embed_code, watch_path_from_url};
 
 	#[test]
 	fn extracts_watch_ids_from_supported_urls() {
@@ -174,5 +192,27 @@ mod tests {
 			watch_path_from_embed_code("<iframe src=\"https://www.redgifs.com/ifr/zanyjudiciousrook\" frameborder=\"0\"></iframe>"),
 			Some("zanyjudiciousrook".to_string())
 		);
+	}
+
+	#[test]
+	fn accepts_media_filenames_used_for_video_and_poster_assets() {
+		assert!(is_valid_media_path("FamiliarFrizzyChevrotain.mp4"));
+		assert!(is_valid_media_path("FamiliarFrizzyChevrotain-mobile.mp4"));
+		assert!(is_valid_media_path("FamiliarFrizzyChevrotain-poster.jpg"));
+		assert!(!is_valid_media_path("../FamiliarFrizzyChevrotain.mp4"));
+	}
+
+	#[test]
+	fn converts_redgifs_media_urls_to_local_proxy_paths() {
+		assert_eq!(
+			media_path_from_url("https://media.redgifs.com/FamiliarFrizzyChevrotain.mp4"),
+			Some("/redgifs/FamiliarFrizzyChevrotain.mp4".to_string())
+		);
+		assert_eq!(
+			media_path_from_url("https://media.redgifs.com/FamiliarFrizzyChevrotain-poster.jpg"),
+			Some("/redgifs/FamiliarFrizzyChevrotain-poster.jpg".to_string())
+		);
+		assert_eq!(media_path_from_url("https://example.com/FamiliarFrizzyChevrotain.mp4"), None);
+		assert_eq!(media_path_from_url("https://media.redgifs.com/../bad.mp4"), None);
 	}
 }
