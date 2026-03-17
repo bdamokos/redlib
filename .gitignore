@@ -11,3 +11,5 @@ redlib.toml
 result
 docker-compose.yml
 logs/reddit_api/
+target-docker/*
+nginx/
