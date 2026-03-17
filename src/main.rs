@@ -276,6 +276,9 @@ async fn main() {
 		.at("/author_links.js")
 		.get(|_| resource(include_str!("../static/author_links.js"), "text/javascript", false).boxed());
 	app
+		.at("/video_visibility.js")
+		.get(|_| resource(include_str!("../static/video_visibility.js"), "text/javascript", false).boxed());
+	app
 		.at("/submitted_duplicates.js")
 		.get(|_| resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).boxed());
 
