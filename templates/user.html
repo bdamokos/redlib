@@ -48,7 +48,7 @@ body %}
         <div id="posts">
             {% for post in posts %} {% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
             <hr class="sep" />
-            {% call utils::post_in_list(post) %} {% endif %} {% endfor %} {% if prefs.use_hls == "on" %}
+            {% call utils::post_in_list(post, true, redirect_url.as_str()) %} {% endif %} {% endfor %} {% if prefs.use_hls == "on" %}
             <script src="/hls.min.js"></script>
             <script src="/playHLSVideo.js"></script>
             {% endif %} {% if str_eq(listing, "submitted") || str_eq(listing, "overview") %}
@@ -124,6 +124,15 @@ body %}
                         <form
                             action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}"
                             method="POST"
+                            data-subscription-form
+                            data-subscription-target="user:{{ name }}"
+                            data-subscription-state="subscribed"
+                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}"
+                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}"
+                            data-subscribe-label="Follow"
+                            data-unsubscribe-label="Unfollow"
+                            data-subscribe-class="subscribe"
+                            data-unsubscribe-class="unsubscribe"
                         >
                             <button class="unsubscribe">Unfollow</button>
                         </form>
@@ -131,6 +140,15 @@ body %}
                         <form
                             action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}"
                             method="POST"
+                            data-subscription-form
+                            data-subscription-target="user:{{ name }}"
+                            data-subscription-state="unsubscribed"
+                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}"
+                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}"
+                            data-subscribe-label="Follow"
+                            data-unsubscribe-label="Unfollow"
+                            data-subscribe-class="subscribe"
+                            data-unsubscribe-class="unsubscribe"
                         >
                             <button class="subscribe">Follow</button>
                         </form>

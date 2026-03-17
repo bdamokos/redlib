@@ -78,7 +78,7 @@
 			{% for post in posts %}
 				{% if post.flags.nsfw && !str_eq(prefs.show_nsfw, "on") %}
 				{% else if !post.title.is_empty() %}
-					{% call utils::post_in_list(post) %}
+					{% call utils::post_in_list(post, false, "") %}
 				{% else %}
 					<div class="comment">
 						<div class="comment_left">

@@ -66,6 +66,10 @@ crate::impl_template_str_eq!(WallTemplate);
 
 static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
 
+fn is_async_subscription_request(req: &Request<Body>) -> bool {
+	req.headers().get("X-Redlib-Ajax").and_then(|value| value.to_str().ok()).is_some_and(|value| value == "1")
+}
+
 // SERVICES
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
@@ -362,7 +366,11 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		format!("/r/{sub}")
 	};
 
-	let mut response = redirect(&path);
+	let mut response = if is_async_subscription_request(&req) {
+		Response::builder().status(204).header("Cache-Control", "no-store").body(Body::empty()).unwrap_or_default()
+	} else {
+		redirect(&path)
+	};
 
 	// If sub_list is empty remove all subscriptions cookies, otherwise update them and remove old ones
 	if sub_list.is_empty() {

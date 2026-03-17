@@ -210,7 +210,7 @@
 </li>
 {% endmacro %}
 
-{% macro post_in_list(post) -%}
+{% macro post_in_list(post, show_subscription_button, redirect_url) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
 <div
 	id="{{ post.id }}"
@@ -225,6 +225,23 @@
 			{% let community = format!("r/{}", post.community) -%}
 		{% endif -%}
 		<a class="post_subreddit" href="/{{ community }}">{{ community }}</a>
+		{% if show_subscription_button && !post.community.starts_with("u_") && !prefs.subscriptions.contains(post.community) %}
+		<form
+			class="inline_subscription_form"
+			action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}"
+			method="POST"
+			data-subscription-form
+			data-subscription-target="subreddit:{{ post.community }}"
+			data-subscription-state="unsubscribed"
+			data-subscribe-action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}"
+			data-unsubscribe-action="/r/{{ post.community }}/unsubscribe?redirect={{ redirect_url }}"
+			data-subscribe-label="Follow"
+			data-unsubscribe-label="Unfollow"
+			data-subscribe-class="subscribe"
+			data-unsubscribe-class="unsubscribe">
+			<button class="subscribe" type="submit">Follow</button>
+		</form>
+		{% endif %}
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
 		{% call external_site_icons(post.author.external_links, post.author.name) %}

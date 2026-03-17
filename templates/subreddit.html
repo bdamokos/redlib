@@ -41,7 +41,18 @@
 			</form>
 
 			{% if sub.name.contains("+") %}
-				<form action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}" method="POST">
+				<form
+					action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+					method="POST"
+					data-subscription-form
+					data-subscription-target="multireddit:{{ sub.name }}"
+					data-subscription-state="unsubscribed"
+					data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+					data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
+					data-subscribe-label="Subscribe to Multireddit"
+					data-unsubscribe-label="Unsubscribe from Multireddit"
+					data-subscribe-class="subscribe"
+					data-unsubscribe-class="unsubscribe">
 					<button id="multisub" class="subscribe" title="Subscribe to each sub in this multireddit">Subscribe to Multireddit</button>
 				</form>
 			{% endif %}
@@ -61,7 +72,7 @@
 			{% for post in posts %}
 			{% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
 			<hr class="sep" />
-			{% call utils::post_in_list(post) %}
+			{% call utils::post_in_list(post, false, "") %}
 			{% endif %}
 			{% endfor %}
 			</div>
@@ -106,11 +117,33 @@
 					<div id="sub_actions">
 						<div id="sub_subscription">
 							{% if prefs.subscriptions.contains(sub.name) %}
-								<form action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}" method="POST">
+								<form
+									action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
+									method="POST"
+									data-subscription-form
+									data-subscription-target="subreddit:{{ sub.name }}"
+									data-subscription-state="subscribed"
+									data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+									data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
+									data-subscribe-label="Subscribe"
+									data-unsubscribe-label="Unsubscribe"
+									data-subscribe-class="subscribe"
+									data-unsubscribe-class="unsubscribe">
 									<button class="unsubscribe">Unsubscribe</button>
 								</form>
 							{% else %}
-								<form action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}" method="POST">
+								<form
+									action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+									method="POST"
+									data-subscription-form
+									data-subscription-target="subreddit:{{ sub.name }}"
+									data-subscription-state="unsubscribed"
+									data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+									data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
+									data-subscribe-label="Subscribe"
+									data-unsubscribe-label="Unsubscribe"
+									data-subscribe-class="subscribe"
+									data-unsubscribe-class="unsubscribe">
 									<button class="subscribe">Subscribe</button>
 								</form>
 							{% endif %}
