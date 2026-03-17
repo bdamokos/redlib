@@ -19,6 +19,7 @@ HOST_PORT=${HOST_PORT:-8081}
 KEYCHAIN_SERVICE=${KEYCHAIN_SERVICE:-redlib-deploy}
 KEYCHAIN_ACCOUNT="$SERVER_USER@$SERVER_HOST"
 SSH_CONTROL_PERSIST=${SSH_CONTROL_PERSIST:-600}
+SSH_CONTROL_DIR_BASE=${SSH_CONTROL_DIR_BASE:-/tmp/redlib-ssh}
 
 FOLLOW_LOGS=false
 DEPLOY_ONLY=false
@@ -69,6 +70,7 @@ Environment overrides:
   HOST_PORT            Default: $HOST_PORT
   KEYCHAIN_SERVICE     Default: $KEYCHAIN_SERVICE
   SSH_CONTROL_PERSIST  Default: $SSH_CONTROL_PERSIST
+  SSH_CONTROL_DIR_BASE Default: $SSH_CONTROL_DIR_BASE
 EOF
 				exit 0
 				;;
@@ -129,12 +131,14 @@ cleanup_ssh_multiplexing() {
 	fi
 
 	if [[ -n "$SSH_CONTROL_DIR" ]]; then
-		rm -rf "$SSH_CONTROL_DIR"
+		rmdir "$SSH_CONTROL_DIR" >/dev/null 2>&1 || true
 	fi
 }
 
 start_ssh_multiplexing() {
-	SSH_CONTROL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/redlib-ssh-XXXXXX")
+	SSH_CONTROL_DIR="$SSH_CONTROL_DIR_BASE"
+	mkdir -p "$SSH_CONTROL_DIR"
+	chmod 700 "$SSH_CONTROL_DIR"
 	SSH_CONTROL_PATH="$SSH_CONTROL_DIR/control-%C"
 	trap cleanup_ssh_multiplexing EXIT
 
