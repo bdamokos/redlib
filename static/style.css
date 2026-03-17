@@ -1130,6 +1130,11 @@ a.search_subreddit:hover {
     color: var(--visited);
 }
 
+.post_context_prefix {
+    opacity: 0.7;
+    margin-right: 0.35em;
+}
+
 .post_notification {
     grid-area: post_notification;
     margin: 5px 15px;

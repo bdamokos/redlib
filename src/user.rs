@@ -210,6 +210,20 @@ fn user_listing_path(username: &str, listing: &str, query: &str, default_sort: &
 	format!("/user/{username}/{listing}.json?{query}")
 }
 
+fn user_reddit_path(username: &str, listing: &str, query: &str) -> String {
+	let base = if listing == "overview" {
+		format!("/user/{username}/")
+	} else {
+		format!("/user/{username}/{listing}")
+	};
+
+	if query.is_empty() {
+		base
+	} else {
+		format!("{base}?{query}")
+	}
+}
+
 async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
 	let should_refill_duplicates = listing == "submitted" || listing == "overview";
 	let mut request_path = path.to_string();
@@ -252,6 +266,7 @@ mod tests {
 	fn test_post(id: &str, title: &str, community: &str, body: &str, post_type: &str, media_url: &str, gallery_urls: &[&str]) -> Post {
 		Post {
 			id: id.to_string(),
+			kind: "t3".to_string(),
 			title: title.to_string(),
 			community: community.to_string(),
 			body: body.to_string(),
@@ -267,7 +282,9 @@ mod tests {
 				external_links: Vec::new(),
 			},
 			permalink: format!("/r/{community}/comments/{id}/"),
+			parent_kind: String::new(),
 			link_title: String::new(),
+			link_permalink: String::new(),
 			poll: None,
 			score: ("1".to_string(), "1".to_string()),
 			upvote_ratio: 100,
@@ -338,6 +355,17 @@ mod tests {
 	fn test_embed_gif_post(id: &str, title: &str, community: &str, embed_src: &str) -> Post {
 		let mut post = test_post(id, title, community, "", "gif", "", &[]);
 		post.media.embed_code = format!("<iframe src=\"{embed_src}\" frameborder=\"0\"></iframe>");
+		post
+	}
+
+	fn test_comment(id: &str, community: &str, body: &str, parent_kind: &str, link_title: &str) -> Post {
+		let mut post = test_post(id, String::new().as_str(), community, body, "comment", "", &[]);
+		post.kind = "t1".to_string();
+		post.parent_kind = parent_kind.to_string();
+		post.link_title = link_title.to_string();
+		post.link_permalink = format!("/r/{community}/comments/thread/");
+		post.permalink = format!("/r/{community}/comments/thread/{id}/");
+		post.comments = ("32".to_string(), "32".to_string());
 		post
 	}
 
@@ -544,6 +572,55 @@ mod tests {
 			"/user/demo_user/submitted.json?sort=new&t=day&raw_json=1"
 		);
 	}
+
+	#[test]
+	fn user_reddit_path_uses_profile_root_for_overview() {
+		assert_eq!(super::user_reddit_path("demo_user", "overview", ""), "/user/demo_user/");
+		assert_eq!(super::user_reddit_path("demo_user", "overview", "sort=new"), "/user/demo_user/?sort=new");
+	}
+
+	#[test]
+	fn user_reddit_path_keeps_non_overview_listings() {
+		assert_eq!(super::user_reddit_path("demo_user", "comments", ""), "/user/demo_user/comments");
+		assert_eq!(
+			super::user_reddit_path("demo_user", "submitted", "sort=top&t=week"),
+			"/user/demo_user/submitted?sort=top&t=week"
+		);
+	}
+
+	#[test]
+	fn renders_comment_entries_without_link_thumbnail() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			posts: vec![test_comment(
+				"comment_one",
+				"demo_sub",
+				"<div class=\"md\"><p>This is a reply.</p></div>",
+				"t1",
+				"Thread title",
+			)],
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("Reply to comment in"));
+		assert!(html.contains("Thread title"));
+		assert!(html.contains("View thread"));
+		assert!(!html.contains("post_thumbnail"));
+	}
 }
 
 // FUNCTIONS
@@ -551,11 +628,13 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let listing = req.param("listing").unwrap_or_else(|| "overview".to_string());
 	let username = req.param("name").unwrap_or_else(|| "reddit".to_string());
 	let default_sort = default_user_sort(&req);
+	let query = req.uri().query().unwrap_or_default();
 
 	// Build the Reddit JSON API path
-	let path = user_listing_path(&username, &listing, req.uri().query().unwrap_or_default(), &default_sort);
-	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
-	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26");
+	let path = user_listing_path(&username, &listing, query, &default_sort);
+	let url = user_reddit_path(&username, &listing, query);
+	let current_url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let redirect_url = current_url[1..].replace('?', "%3F").replace('&', "%26");
 
 	// Retrieve other variables from Redlib request
 	let sort = param(&path, "sort").unwrap_or_default();

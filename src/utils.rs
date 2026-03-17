@@ -258,6 +258,19 @@ pub struct Media {
 }
 
 impl Media {
+	pub fn empty() -> Self {
+		Self {
+			url: String::new(),
+			hls_url: String::new(),
+			dash_url: String::new(),
+			width: 0,
+			height: 0,
+			poster: String::new(),
+			download_name: String::new(),
+			embed_code: String::new(),
+		}
+	}
+
 	pub async fn parse(data: &Value) -> (String, Self, Vec<GalleryMedia>) {
 		let mut gallery = Vec::new();
 
@@ -411,12 +424,15 @@ impl GalleryMedia {
 #[derive(Serialize, PartialEq)]
 pub struct Post {
 	pub id: String,
+	pub kind: String,
 	pub title: String,
 	pub community: String,
 	pub body: String,
 	pub author: Author,
 	pub permalink: String,
+	pub parent_kind: String,
 	pub link_title: String,
+	pub link_permalink: String,
 	pub poll: Option<Poll>,
 	pub score: (String, String),
 	pub upvote_ratio: i64,
@@ -471,6 +487,10 @@ impl Post {
 		// For each post from posts list
 		for post in post_list {
 			let data = &post["data"];
+			let kind = post["kind"].as_str().unwrap_or_default().to_string();
+			let permalink = val(post, "permalink");
+			let parent_kind = parent_kind(&val(post, "parent_id"));
+			let link_permalink = listing_link_permalink(data["link_permalink"].as_str().unwrap_or_default(), &permalink);
 
 			let (rel_time, created) = time(data["created_utc"].as_f64().unwrap_or_default());
 			let created_ts = data["created_utc"].as_f64().unwrap_or_default().round() as u64;
@@ -478,8 +498,12 @@ impl Post {
 			let ratio: f64 = data["upvote_ratio"].as_f64().unwrap_or(1.0) * 100.0;
 			let title = val(post, "title");
 
-			// Determine the type of media along with the media URL
-			let (post_type, media, gallery) = Media::parse(data).await;
+			// User overview/comments listings can contain comment children (`t1`) as well as posts.
+			let (post_type, media, gallery) = if kind == "t1" {
+				("comment".to_string(), Media::empty(), Vec::new())
+			} else {
+				Media::parse(data).await
+			};
 			let awards = Awards::parse(&data["all_awardings"]);
 
 			// selftext_html is set for text posts when browsing.
@@ -490,6 +514,7 @@ impl Post {
 
 			posts.push(Self {
 				id: val(post, "id"),
+				kind,
 				title,
 				community: val(post, "subreddit"),
 				body,
@@ -508,8 +533,10 @@ impl Post {
 					distinguished: val(post, "distinguished"),
 					external_links: Vec::new(),
 				},
-				permalink: val(post, "permalink"),
+				permalink,
+				parent_kind,
 				link_title: val(post, "link_title"),
+				link_permalink,
 				poll: Poll::parse(&data["poll_data"]),
 				score: if data["hide_score"].as_bool().unwrap_or_default() {
 					("\u{2022}".to_string(), "Hidden".to_string())
@@ -1003,6 +1030,7 @@ pub async fn parse_post(post: &Value) -> Post {
 	// Build a post using data parsed from Reddit post API
 	Post {
 		id: val(post, "id"),
+		kind: post["kind"].as_str().unwrap_or("t3").to_string(),
 		title: val(post, "title"),
 		community: val(post, "subreddit"),
 		body,
@@ -1022,7 +1050,9 @@ pub async fn parse_post(post: &Value) -> Post {
 			external_links: author_external_links(&val(post, "author")).await,
 		},
 		permalink,
+		parent_kind: parent_kind(&val(post, "parent_id")),
 		link_title: val(post, "link_title"),
+		link_permalink: listing_link_permalink(post["data"]["link_permalink"].as_str().unwrap_or_default(), &val(post, "permalink")),
 		poll,
 		score: format_num(score),
 		upvote_ratio: ratio as i64,
@@ -1078,6 +1108,30 @@ pub async fn parse_post(post: &Value) -> Post {
 		preview_body: String::new(),
 		collapsed_duplicates: Vec::new(),
 	}
+}
+
+fn parent_kind(parent_id: &str) -> String {
+	parent_id.split_once('_').map_or(String::new(), |(kind, _)| kind.to_string())
+}
+
+fn listing_link_permalink(link_permalink: &str, permalink: &str) -> String {
+	if link_permalink.starts_with('/') {
+		return link_permalink.to_string();
+	}
+
+	if let Ok(parsed) = Url::parse(link_permalink) {
+		let path = parsed.path().to_string();
+		if !path.is_empty() {
+			return path;
+		}
+	}
+
+	let trimmed = permalink.trim_end_matches('/');
+	if let Some((thread_path, _)) = trimmed.rsplit_once('/') {
+		return format!("{thread_path}/");
+	}
+
+	permalink.to_string()
 }
 
 //

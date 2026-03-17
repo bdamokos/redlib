@@ -239,6 +239,12 @@
 		{% endif %}
 	</p>
 	<h2 class="post_title">
+		{% if post.kind == "t1" %}
+			<span class="post_context_prefix">
+				{% if post.parent_kind == "t1" %}Reply to comment in{% else %}Comment on{% endif %}
+			</span>
+			<a href="{{ post.link_permalink }}">{{ post.link_title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}
+		{% else %}
 		{% if post.flair.flair_parts.len() > 0 %}
 			<a href="/r/{{ post.community }}/search?q=flair_name%3A%22{{ post.flair.text }}%22&restrict_sr=on"
 				class="post_flair"
@@ -246,9 +252,10 @@
 				dir="ltr">{% call render_flair(post.flair.flair_parts) %}</a>
 		{% endif %}
 		<a href="{{ post.permalink }}">{{ post.title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}
+		{% endif %}
 	</h2>
 	<!-- POST MEDIA/THUMBNAIL -->
-	{% if prefs.layout.is_empty() || str_eq(prefs.layout, "card") %}
+	{% if post.kind != "t1" && (prefs.layout.is_empty() || str_eq(prefs.layout, "card")) %}
 		{% if post.post_type == "image" %}
 		<div class="post_media_content">
 			<a href="{{ post.media.url }}" class="post_media_image {% if post.media.height < post.media.width*2 %}short{% endif %}" >
@@ -311,7 +318,12 @@
 	{% call poll(post) %}
 
 	<div class="post_footer">
+		{% if post.kind == "t1" %}
+		<a href="{{ post.permalink }}" class="post_comments">View thread</a>
+		<a href="{{ post.link_permalink }}" class="post_comments" title="{{ post.comments.1 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}">{{ post.comments.0 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}</a>
+		{% else %}
 		<a href="{{ post.permalink }}" class="post_comments" title="{{ post.comments.1 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}">{{ post.comments.0 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}</a>
+		{% endif %}
 	</div>
 	{% if post.collapsed_duplicates.len() > 0 %}
 	<div class="post_duplicates">
