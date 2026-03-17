@@ -18,9 +18,17 @@ HOST_PORT=${HOST_PORT:-8081}
 
 KEYCHAIN_SERVICE=${KEYCHAIN_SERVICE:-redlib-deploy}
 KEYCHAIN_ACCOUNT="$SERVER_USER@$SERVER_HOST"
+SSH_CONTROL_PERSIST=${SSH_CONTROL_PERSIST:-600}
 
 FOLLOW_LOGS=false
 DEPLOY_ONLY=false
+
+SSH_COMMON_OPTS=(
+	-o StrictHostKeyChecking=no
+	-o ConnectTimeout=10
+)
+SSH_CONTROL_DIR=""
+SSH_CONTROL_PATH=""
 
 require_command() {
 	if ! command -v "$1" >/dev/null 2>&1; then
@@ -60,6 +68,7 @@ Environment overrides:
   TARGET_PLATFORM      Default: $TARGET_PLATFORM
   HOST_PORT            Default: $HOST_PORT
   KEYCHAIN_SERVICE     Default: $KEYCHAIN_SERVICE
+  SSH_CONTROL_PERSIST  Default: $SSH_CONTROL_PERSIST
 EOF
 				exit 0
 				;;
@@ -73,8 +82,7 @@ EOF
 
 test_ssh_connection() {
 	sshpass -p "$PASSWORD" ssh \
-		-o StrictHostKeyChecking=no \
-		-o ConnectTimeout=10 \
+		"${SSH_COMMON_OPTS[@]}" \
 		"$SERVER_USER@$SERVER_HOST" \
 		"echo ok" >/dev/null 2>&1
 }
@@ -112,12 +120,51 @@ get_password() {
 	fi
 }
 
+cleanup_ssh_multiplexing() {
+	if [[ -n "$SSH_CONTROL_PATH" ]]; then
+		ssh "${SSH_COMMON_OPTS[@]}" \
+			-o ControlPath="$SSH_CONTROL_PATH" \
+			-O exit \
+			"$SERVER_USER@$SERVER_HOST" >/dev/null 2>&1 || true
+	fi
+
+	if [[ -n "$SSH_CONTROL_DIR" ]]; then
+		rm -rf "$SSH_CONTROL_DIR"
+	fi
+}
+
+start_ssh_multiplexing() {
+	SSH_CONTROL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/redlib-ssh-XXXXXX")
+	SSH_CONTROL_PATH="$SSH_CONTROL_DIR/control-%C"
+	trap cleanup_ssh_multiplexing EXIT
+
+	echo "Opening SSH control connection..."
+	sshpass -p "$PASSWORD" ssh \
+		"${SSH_COMMON_OPTS[@]}" \
+		-o ControlMaster=yes \
+		-o ControlPersist="$SSH_CONTROL_PERSIST" \
+		-o ControlPath="$SSH_CONTROL_PATH" \
+		-fN \
+		"$SERVER_USER@$SERVER_HOST"
+}
+
 run_ssh() {
-	sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_HOST" "$1"
+	sshpass -p "$PASSWORD" ssh \
+		"${SSH_COMMON_OPTS[@]}" \
+		-o ControlMaster=auto \
+		-o ControlPersist="$SSH_CONTROL_PERSIST" \
+		-o ControlPath="$SSH_CONTROL_PATH" \
+		"$SERVER_USER@$SERVER_HOST" \
+		"$1"
 }
 
 run_scp() {
-	sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no "$@"
+	sshpass -p "$PASSWORD" scp \
+		"${SSH_COMMON_OPTS[@]}" \
+		-o ControlMaster=auto \
+		-o ControlPersist="$SSH_CONTROL_PERSIST" \
+		-o ControlPath="$SSH_CONTROL_PATH" \
+		"$@"
 }
 
 resolve_remote_dir() {
@@ -242,6 +289,7 @@ echo "Host port: $HOST_PORT"
 echo
 
 get_password
+start_ssh_multiplexing
 
 if [[ "$DEPLOY_ONLY" == false ]]; then
 	build_and_push
