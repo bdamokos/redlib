@@ -459,6 +459,9 @@
 			<a href="{{ post.media.url }}">Video</a>
 		</video>
 	</div>
+	{% if !post.media.duration.is_empty() %}
+	<div class="post_media_duration">{{ post.media.duration }}</div>
+	{% endif %}
 
 	{% if !use_dash && !use_hls && !str_eq(prefs.hide_hls_notification, "on") %}
 	{% if view_type == "list" %}

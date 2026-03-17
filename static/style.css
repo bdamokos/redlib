@@ -1270,6 +1270,14 @@ a.search_subreddit:hover {
     margin: auto;
 }
 
+.post_media_duration {
+    margin: 0 auto 0.5rem auto;
+    max-width: 100%;
+    text-align: center;
+    font-size: 0.85rem;
+    color: var(--fg-2);
+}
+
 .post_media_image.short svg,
 .post_media_image.short img {
     width: auto;

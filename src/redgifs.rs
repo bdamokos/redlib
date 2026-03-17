@@ -13,6 +13,7 @@ static REDGIFS_MEDIA_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r
 struct RedgifsMediaPaths {
 	video_path: String,
 	poster_path: String,
+	duration_seconds: i64,
 }
 
 pub fn is_redgifs_domain(domain: &str) -> bool {
@@ -96,6 +97,10 @@ pub async fn fetch_poster_path(video_id: &str) -> Result<String, String> {
 	fetch_media_paths(video_id.to_string()).await.map(|paths| paths.poster_path)
 }
 
+pub async fn fetch_duration_seconds(video_id: &str) -> Result<i64, String> {
+	fetch_media_paths(video_id.to_string()).await.map(|paths| paths.duration_seconds)
+}
+
 #[cached(size = 512, time = 3600, result = true)]
 async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String> {
 	let token = get_token().await?;
@@ -115,8 +120,13 @@ async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String
 		.or_else(|| json["gif"]["urls"]["thumbnail"].as_str())
 		.and_then(media_path_from_url)
 		.unwrap_or_default();
+	let duration_seconds = json["gif"]["duration"].as_f64().map(|value| value.round() as i64).unwrap_or_default();
 
-	Ok(RedgifsMediaPaths { video_path, poster_path })
+	Ok(RedgifsMediaPaths {
+		video_path,
+		poster_path,
+		duration_seconds,
+	})
 }
 
 async fn get_token() -> Result<String, String> {

@@ -253,6 +253,7 @@ pub struct Media {
 	pub width: i64,
 	pub height: i64,
 	pub poster: String,
+	pub duration: String,
 	pub download_name: String,
 	pub embed_code: String,
 }
@@ -266,6 +267,7 @@ impl Media {
 			width: 0,
 			height: 0,
 			poster: String::new(),
+			duration: String::new(),
 			download_name: String::new(),
 			embed_code: String::new(),
 		}
@@ -284,6 +286,11 @@ impl Media {
 			redgifs::fetch_poster_path(video_id).await.unwrap_or_default()
 		} else {
 			String::new()
+		};
+		let redgifs_duration_seconds = if let Some(video_id) = redgifs_id.as_ref() {
+			redgifs::fetch_duration_seconds(video_id).await.unwrap_or_default()
+		} else {
+			0
 		};
 		let redgifs_url = redgifs_id.as_ref().map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
 
@@ -362,6 +369,17 @@ impl Media {
 		} else {
 			format_url(source["url"].as_str().unwrap_or_default())
 		};
+		let duration_seconds = if redgifs_url.is_some() {
+			redgifs_duration_seconds
+		} else {
+			data_preview["duration"]
+				.as_f64()
+				.or_else(|| secure_media["duration"].as_f64())
+				.or_else(|| crosspost_parent_media["duration"].as_f64())
+				.map(|value| value.round() as i64)
+				.unwrap_or_default()
+		};
+		let duration = format_video_duration(duration_seconds);
 
 		let download_name = if post_type == "image" || post_type == "gif" || post_type == "video" {
 			let permalink_base = url_path_basename(data["permalink"].as_str().unwrap_or_default());
@@ -381,11 +399,28 @@ impl Media {
 				width: source["width"].as_i64().unwrap_or_default(),
 				height: source["height"].as_i64().unwrap_or_default(),
 				poster,
+				duration,
 				download_name,
 				embed_code,
 			},
 			gallery,
 		)
+	}
+}
+
+pub fn format_video_duration(seconds: i64) -> String {
+	if seconds <= 0 {
+		return String::new();
+	}
+
+	let hours = seconds / 3600;
+	let minutes = (seconds % 3600) / 60;
+	let remaining_seconds = seconds % 60;
+
+	if hours > 0 {
+		format!("{hours}:{minutes:02}:{remaining_seconds:02}")
+	} else {
+		format!("{minutes}:{remaining_seconds:02}")
 	}
 }
 
@@ -587,6 +622,7 @@ impl Post {
 					width: data["thumbnail_width"].as_i64().unwrap_or_default(),
 					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
 					poster: String::new(),
+					duration: String::new(),
 					download_name: String::new(),
 					embed_code: String::new(),
 				},
@@ -1074,6 +1110,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
 			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
 			poster: String::new(),
+			duration: String::new(),
 			download_name: String::new(),
 			embed_code: String::new(),
 		},
@@ -1922,7 +1959,9 @@ impl_template_str_eq!(User);
 
 #[cfg(test)]
 mod tests {
-	use super::{dedupe_external_links_by_host, extract_profile_social_links, format_num, format_url, rewrite_urls, user_profile_details, ExternalLink, Preferences};
+	use super::{
+		dedupe_external_links_by_host, extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls, user_profile_details, ExternalLink, Preferences,
+	};
 	use serde_json::json;
 
 	#[test]
@@ -2069,6 +2108,15 @@ mod tests {
 		assert_eq!(format_url("default"), "");
 		assert_eq!(format_url("nsfw"), "");
 		assert_eq!(format_url("spoiler"), "");
+	}
+
+	#[test]
+	fn formats_video_durations() {
+		assert_eq!(format_video_duration(0), "");
+		assert_eq!(format_video_duration(9), "0:09");
+		assert_eq!(format_video_duration(59), "0:59");
+		assert_eq!(format_video_duration(60), "1:00");
+		assert_eq!(format_video_duration(3671), "1:01:11");
 	}
 
 	#[test]
