@@ -390,6 +390,46 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	.boxed()
 }
 
+fn debug_logging_enabled() -> bool {
+	std::env::var("REDLIB_DEBUG_LOGGING").map(|value| value.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
+fn response_preview(text: &str, max_chars: usize) -> String {
+	let mut preview: String = text.chars().take(max_chars).collect();
+	if text.chars().count() > max_chars {
+		preview.push_str("...");
+	}
+	preview.replace('\n', "\\n").replace('\r', "\\r")
+}
+
+fn is_network_security_block(status: hyper::StatusCode, content_type: Option<&str>, text: &str) -> bool {
+	status == hyper::StatusCode::FORBIDDEN && content_type.is_some_and(|value| value.starts_with("text/html")) && text.contains("You've been blocked by network security")
+}
+
+fn persist_debug_response(path: &str, status: hyper::StatusCode, headers: &[(String, String)], text: &str) {
+	use chrono::Utc;
+	use std::fs::{create_dir_all, OpenOptions};
+	use std::io::Write;
+
+	if create_dir_all("logs/reddit_api").is_err() {
+		return;
+	}
+
+	let timestamp = Utc::now().format("%Y%m%d_%H%M%S%.3f");
+	let filename = format!("logs/reddit_api/response_{}.log", timestamp);
+	let Ok(mut file) = OpenOptions::new().write(true).create(true).append(false).open(&filename) else {
+		return;
+	};
+
+	let _ = writeln!(file, "// Path: {path}");
+	let _ = writeln!(file, "// Status: {status}");
+	for (key, value) in headers {
+		let _ = writeln!(file, "// Header: {key}: {value}");
+	}
+	let _ = writeln!(file);
+	let _ = writeln!(file, "{text}");
+}
+
 /// Make a request to a Reddit API and parse the JSON response
 #[cached(size = 100, time = 30, result = true)]
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
@@ -412,8 +452,20 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
+			let content_type = response.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
+			let debug_headers = if debug_logging_enabled() {
+				Some(
+					response
+						.headers()
+						.iter()
+						.map(|(key, value)| (key.as_str().to_owned(), value.to_str().unwrap_or("<non-utf8>").to_owned()))
+						.collect::<Vec<_>>(),
+				)
+			} else {
+				None
+			};
 
-			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
+			let _reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
 				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
 				response.headers().get("x-ratelimit-reset").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
 				response.headers().get("x-ratelimit-used").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
@@ -439,19 +491,8 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					let text = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
 
 					// Save response to debug log if debug logging is enabled
-					if std::env::var("REDLIB_DEBUG_LOGGING").unwrap_or_default() == "true" {
-						use chrono::Utc;
-						use std::fs::{create_dir_all, OpenOptions};
-						use std::io::Write;
-
-						if let Ok(_) = create_dir_all("logs/reddit_api") {
-							let timestamp = Utc::now().format("%Y%m%d_%H%M%S%.3f");
-							let filename = format!("logs/reddit_api/response_{}.json", timestamp);
-							if let Ok(mut file) = OpenOptions::new().write(true).create(true).append(false).open(&filename) {
-								let _ = writeln!(file, "// Path: {}", path);
-								let _ = writeln!(file, "{}", text);
-							}
-						}
+					if let Some(headers) = debug_headers.as_ref() {
+						persist_debug_response(&path, status, headers, &text);
 					}
 
 					// Parse the response as JSON
@@ -500,9 +541,29 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 							}
 						}
 						Err(e) => {
-							error!("Got an invalid response from reddit {e}. Status code: {status}");
+							let content_type = content_type.as_deref().unwrap_or("unknown");
+							let preview = response_preview(&text, 240);
+							error!("Got an invalid response from reddit {e}. Status code: {status}. Content-Type: {content_type}. Body preview: {preview}");
 							if status.is_server_error() {
 								Err("Reddit is having issues, check if there's an outage".to_string())
+							} else if text.trim().is_empty() {
+								err(
+									"Reddit returned an empty response body",
+									format!("Status code: {status}, Content-Type: {content_type}"),
+									path,
+								)
+							} else if is_network_security_block(status, Some(content_type), &text) {
+								err(
+									"Reddit blocked this request with a network security page",
+									format!("Status code: {status}, Content-Type: {content_type}"),
+									path,
+								)
+							} else if content_type.starts_with("text/html") {
+								err(
+									"Reddit returned HTML instead of JSON",
+									format!("Status code: {status}, Content-Type: {content_type}, Body preview: {preview}"),
+									path,
+								)
 							} else {
 								err("Failed to parse page JSON data", e.to_string(), path)
 							}
@@ -557,6 +618,21 @@ use {crate::config::get_setting, sealed_test::prelude::*};
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rate_limit_check() {
 	rate_limit_check().await.unwrap();
+}
+
+#[test]
+fn test_detects_network_security_block_page() {
+	assert!(is_network_security_block(
+		hyper::StatusCode::FORBIDDEN,
+		Some("text/html"),
+		"<body><div>You've been blocked by network security.</div></body>",
+	));
+	assert!(!is_network_security_block(hyper::StatusCode::FORBIDDEN, Some("application/json"), "{\"error\":403}",));
+}
+
+#[test]
+fn test_response_preview_truncates_and_escapes_newlines() {
+	assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
 }
 
 #[test]
