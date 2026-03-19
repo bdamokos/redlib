@@ -508,6 +508,7 @@ pub struct CollapsedDuplicate {
 	pub display_community: String,
 	pub rel_time: String,
 	pub comments: (String, String),
+	pub flair: Flair,
 }
 
 impl Post {

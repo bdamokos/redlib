@@ -151,6 +151,7 @@ fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {
 		display_community: display_community(&post.community),
 		rel_time: post.rel_time,
 		comments: post.comments,
+		flair: post.flair,
 	}
 }
 

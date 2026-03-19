@@ -1202,7 +1202,8 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     font-weight: 600;
 }
 
-.post_duplicates_list span {
+.post_duplicates_list span,
+.post_duplicates_meta {
     display: block;
     opacity: 0.7;
     margin-top: 2px;

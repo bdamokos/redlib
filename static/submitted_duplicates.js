@@ -210,15 +210,32 @@ function appendDuplicate(primary, duplicate) {
     }
 
     const item = document.createElement("li");
+
+    const flairEl = duplicate.querySelector(".post_title .post_flair");
+    if (flairEl) {
+        item.append(flairEl.cloneNode(true), " ");
+    }
+
     const link = document.createElement("a");
     link.href = titleLink.getAttribute("href") || "#";
     link.textContent = titleLink.textContent || "";
     item.append(link);
 
     const meta = document.createElement("span");
-    meta.textContent = [communityLink.textContent || "", created.textContent || "", comments?.textContent?.trim() || ""]
-        .filter(Boolean)
-        .join(" • ");
+    const communityAnchor = document.createElement("a");
+    communityAnchor.href = communityLink.getAttribute("href") || "#";
+    communityAnchor.textContent = communityLink.textContent || "";
+    meta.append(communityAnchor);
+
+    const followForm = duplicate.querySelector(".inline_subscription_form");
+    if (followForm) {
+        meta.append(" ", followForm.cloneNode(true));
+    }
+
+    const restParts = [created.textContent || "", comments?.textContent?.trim() || ""].filter(Boolean).join(" • ");
+    if (restParts) {
+        meta.append(" • ", restParts);
+    }
     item.append(meta);
 
     list.append(item);
