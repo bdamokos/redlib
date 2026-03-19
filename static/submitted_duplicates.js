@@ -467,6 +467,7 @@ async function refillCollapsedPosts(targetPostCount) {
         updateNextLink(fetchedDocument);
         await collapseSubmittedDuplicates();
         globalThis.initializeHlsVideos?.(document.querySelector("#posts"));
+        globalThis.markTruncatedPreviews?.();
         pagesLoaded += 1;
     }
 }

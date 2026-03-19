@@ -273,6 +273,9 @@ async fn main() {
 		.at("/space_scroll.js")
 		.get(|_| resource(include_str!("../static/space_scroll.js"), "text/javascript", false).boxed());
 	app
+		.at("/post_preview.js")
+		.get(|_| resource(include_str!("../static/post_preview.js"), "text/javascript", false).boxed());
+	app
 		.at("/author_links.js")
 		.get(|_| resource(include_str!("../static/author_links.js"), "text/javascript", false).boxed());
 	app

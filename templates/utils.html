@@ -294,6 +294,24 @@
 		</div>
 		{% else if (post.post_type == "gif" || post.post_type == "video") %}
 			{% call render_video_html(post, "list") %}
+		{% else if post.post_type == "gallery" %}
+		<div class="gallery post_preview">
+		{% for image in post.gallery -%}
+			<figure>
+				<a href="{{ image.url }}"><img loading="lazy" alt="Gallery image" src="{{ image.url }}"/></a>
+				{% if !image.caption.is_empty() || image.outbound_url.len() > 0 %}
+				<figcaption>
+					{% if !image.caption.is_empty() %}
+					<p>{{ image.caption }}</p>
+					{% endif %}
+					{% if image.outbound_url.len() > 0 %}
+					<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>
+					{% endif %}
+				</figcaption>
+				{% endif %}
+			</figure>
+		{%- endfor %}
+		</div>
 		{% else if post.post_type != "self" %}
 		<a class="post_thumbnail{% if post.thumbnail.url.is_empty() %} no_thumbnail{% endif %}" href="{% if post.post_type == "link" %}{{ post.media.url }}{% else %}{{ post.permalink }}{% endif %}" rel="nofollow">
 			{% if post.thumbnail.url.is_empty() %}

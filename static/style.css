@@ -1355,11 +1355,42 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 
 .gallery {
     grid-area: post_media;
+    display: grid;
+    gap: 16px;
+    margin: 10px 20px 10px 12px;
+    align-items: start;
+}
+
+.gallery figure {
+    margin: 0;
+}
+
+.gallery a {
+    display: block;
+    overflow: hidden;
+    border-radius: 12px;
+    background: var(--highlighted);
 }
 
 .gallery img {
+    display: block;
+    width: 100%;
     max-width: 100%;
+    height: auto;
     vertical-align: bottom;
+    background: var(--highlighted);
+}
+
+.gallery figcaption {
+    padding: 10px 4px 0;
+}
+
+.gallery figcaption p {
+    margin: 0;
+}
+
+.gallery figcaption p + p {
+    margin-top: 5px;
 }
 
 .gallery .outbound_url {
@@ -1388,35 +1419,14 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 }
 
 .post_page .post.highlighted .gallery {
-    display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
     gap: 20px;
     margin: 18px 20px 8px 12px;
-    align-items: start;
-}
-
-.post_page .post.highlighted .gallery figure {
-    margin: 0;
-}
-
-.post_page .post.highlighted .gallery a {
-    display: block;
-    overflow: hidden;
-    border-radius: 12px;
-    background: var(--highlighted);
 }
 
 .post_page .post.highlighted .gallery img {
-    display: block;
-    width: 100%;
-    height: auto;
     max-height: min(75vh, 900px);
     object-fit: contain;
-    background: var(--highlighted);
-}
-
-.post_page .post.highlighted .gallery figcaption {
-    padding: 10px 4px 0;
 }
 
 #post_url {
@@ -1498,16 +1508,33 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     position: relative;
 }
 
-.post_preview::after {
-    content: "";
+.post_preview.truncated {
+    cursor: pointer;
+}
+
+.post_preview.truncated::after {
+    content: "show more";
     position: absolute;
     bottom: 0;
     left: 0;
     right: 0;
-    height: 3px;
-    border-radius: 2px;
-    background: var(--accent, #3498db);
-    opacity: 0.5;
+    height: 18px;
+    line-height: 18px;
+    text-align: center;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--accent, #3498db);
+    background: linear-gradient(transparent, var(--post) 40%);
+    opacity: 0.8;
+}
+
+.post_preview.truncated:hover::after {
+    opacity: 1;
+}
+
+.post_preview.expanded {
+    max-height: none;
 }
 
 .post_footer {
