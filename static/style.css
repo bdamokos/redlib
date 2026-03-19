@@ -1198,15 +1198,24 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     margin-top: 4px;
 }
 
+.post_duplicates_list li > a {
+    display: block;
+}
+
 .post_duplicates_list a {
     font-weight: 600;
 }
 
-.post_duplicates_list span,
 .post_duplicates_meta {
     display: block;
     opacity: 0.7;
     margin-top: 2px;
+}
+
+.post_duplicates_meta .post_flair {
+    display: inline-block;
+    margin: 0 5px 0 0;
+    opacity: 1;
 }
 
 .post_flair {

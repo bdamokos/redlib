@@ -262,7 +262,7 @@ mod tests {
 	use super::collapse_duplicate_submissions;
 	use askama::Template;
 
-	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, Media, Post, Preferences};
+	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, Media, Post, Preferences};
 
 	fn test_post(id: &str, title: &str, community: &str, body: &str, post_type: &str, media_url: &str, gallery_urls: &[&str]) -> Post {
 		Post {
@@ -493,6 +493,15 @@ mod tests {
 				display_community: "r/other_one".to_string(),
 				rel_time: "2h ago".to_string(),
 				comments: ("12".to_string(), "12".to_string()),
+				flair: Flair {
+					flair_parts: vec![FlairPart {
+						flair_part_type: "text".to_string(),
+						value: "Question".to_string(),
+					}],
+					text: "Question".to_string(),
+					background_color: "#eeeeee".to_string(),
+					foreground_color: "#111111".to_string(),
+				},
 			},
 			CollapsedDuplicate {
 				title: "Other title two".to_string(),
@@ -501,6 +510,12 @@ mod tests {
 				display_community: "r/other_two".to_string(),
 				rel_time: "3h ago".to_string(),
 				comments: ("1".to_string(), "1".to_string()),
+				flair: Flair {
+					flair_parts: Vec::new(),
+					text: String::new(),
+					background_color: String::new(),
+					foreground_color: String::new(),
+				},
 			},
 		];
 
@@ -531,6 +546,15 @@ mod tests {
 		assert!(html.contains("12 comments"));
 		assert!(html.contains("1 comment"));
 		assert!(html.contains("Preview text from a duplicate post."));
+
+		let community_pos = html.find("/r/other_one\">r/other_one</a>").unwrap();
+		let flair_pos = html
+			.find("/r/other_one/search?q=flair_name%3A%22Question%22&restrict_sr=on")
+			.unwrap();
+		let title_pos = html.find("/r/other_one/comments/one/\">Other title one</a>").unwrap();
+		assert!(community_pos < flair_pos);
+		assert!(flair_pos < title_pos);
+		assert!(html.contains("dir=\"ltr\"><span>Question</span></a>"));
 
 		println!("{html}");
 	}
