@@ -13,6 +13,22 @@
 
 {% block content %}
 <div id="settings">
+	{% if !status.is_empty() %}
+	<div class="prefs" id="settings_status">
+		<p>
+			{% match status.as_str() %}
+			{% when "saved" %}
+			<b>Settings saved.</b> Changes were written to your browser cookies.
+			{% when "imported" %}
+			<b>Settings imported.</b> Imported preferences were written to your browser cookies.
+			{% when "restored" %}
+			<b>Settings restored.</b> Preferences from the restore link were written to your browser cookies.
+			{% when _ %}
+			<b>Settings updated.</b> Changes were written to your browser cookies.
+			{% endmatch %}
+		</p>
+	</div>
+	{% endif %}
 	<form action="/settings" method="POST">
 		<div class="prefs">
 			<fieldset>
@@ -196,7 +212,7 @@
 		{% match prefs.to_urlencoded() %}
 		{% when Ok with (encoded_prefs) %}
 		<p>You can restore your current settings and subscriptions after clearing your cookies using <a
-				href="/settings/restore/?{{ encoded_prefs }}">this link</a>.</p>
+				href="/settings/restore/?redirect=settings%3Fstatus%3Drestored&{{ encoded_prefs }}">this link</a>.</p>
 		{% when Err with (err) %}
 		<p>There was an error creating your restore link: {{ err }}</p>
 		<p>Please report this issue</p>

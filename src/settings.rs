@@ -5,7 +5,7 @@ use std::collections::HashMap;
 // CRATES
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, redirect, template, Preferences};
+use crate::utils::{deflate_decompress, param, redirect, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
 use futures_lite::StreamExt;
@@ -19,6 +19,7 @@ use url::form_urlencoded;
 #[template(path = "settings.html")]
 pub struct SettingsTemplate {
 	pub prefs: Preferences,
+	pub status: String,
 	pub url: String,
 }
 
@@ -56,6 +57,7 @@ pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = req.uri().to_string();
 	Ok(template(&SettingsTemplate {
 		prefs: Preferences::new(&req),
+		status: settings_status(&req).unwrap_or_default(),
 		url,
 	}))
 }
@@ -85,7 +87,7 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	let form = url::form_urlencoded::parse(&body_bytes).collect::<HashMap<_, _>>();
 
-	let mut response = redirect("/settings");
+	let mut response = redirect(&settings_redirect_path("saved"));
 
 	for &name in &PREFS {
 		match form.get(name) {
@@ -266,6 +268,14 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	response
 }
 
+fn settings_redirect_path(status: &str) -> String {
+	format!("/settings?status={status}")
+}
+
+fn settings_status(req: &Request<Body>) -> Option<String> {
+	param(&format!("?{}", req.uri().query().unwrap_or_default()), "status")
+}
+
 /// Set cookies using response "Set-Cookie" header
 pub async fn restore(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(set_cookies_method(req, true))
@@ -302,7 +312,24 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 
 	prefs.available_themes = vec![];
 
-	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
+	let url = format!("/settings/restore/?redirect=settings%3Fstatus%3Dimported&{}", prefs.to_urlencoded()?);
 
 	Ok(redirect(&url))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn settings_redirect_path_uses_settings_page() {
+		assert_eq!(settings_redirect_path("saved"), "/settings?status=saved");
+	}
+
+	#[test]
+	fn settings_status_reads_query_string() {
+		let req = Request::builder().uri("/settings?status=imported").body(Body::empty()).unwrap();
+
+		assert_eq!(settings_status(&req), Some("imported".to_string()));
+	}
 }
