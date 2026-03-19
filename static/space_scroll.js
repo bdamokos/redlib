@@ -80,27 +80,64 @@ function findAdjacentScrollTarget(posts, currentTop, direction) {
     return null;
 }
 
-function getNavigationDirection(event) {
+function getKeyName(event) {
+    return typeof event.key === "string" ? event.key.toLowerCase() : "";
+}
+
+function getScrollNavigationDirection(event) {
     if (event.key === " " || event.code === "Space") {
         return event.shiftKey ? -1 : 1;
     }
 
-    if (event.key.toLowerCase() === "j") {
+    if (getKeyName(event) === "j") {
         return 1;
+    }
+
+    if (getKeyName(event) === "k") {
+        return -1;
     }
 
     return 0;
 }
 
+function getPaginationAccessKey(event) {
+    if (getKeyName(event) === "n") {
+        return "N";
+    }
+
+    if (getKeyName(event) === "p") {
+        return "P";
+    }
+
+    return null;
+}
+
+function getPaginationLink(accessKey) {
+    if (accessKey === null) {
+        return null;
+    }
+
+    return document.querySelector(`a[accesskey='${accessKey}']`);
+}
+
 document.addEventListener("keydown", (event) => {
     const isSpaceKey = event.key === " " || event.code === "Space";
-    const isSingleStepForwardKey = event.key.toLowerCase() === "j";
+    const scrollDirection = getScrollNavigationDirection(event);
+    const paginationLink = getPaginationLink(getPaginationAccessKey(event));
+    const isScrollNavigationKey = scrollDirection !== 0;
+    const isPaginationKey = paginationLink !== null;
 
-    if (event.defaultPrevented || (!isSpaceKey && !isSingleStepForwardKey) || event.altKey || event.ctrlKey || event.metaKey) {
+    if (event.defaultPrevented || (!isScrollNavigationKey && !isPaginationKey) || event.altKey || event.ctrlKey || event.metaKey) {
         return;
     }
 
     if (isInteractiveElement(event.target) || isInteractiveElement(document.activeElement)) {
+        return;
+    }
+
+    if (isPaginationKey) {
+        event.preventDefault();
+        paginationLink.click();
         return;
     }
 
@@ -112,7 +149,7 @@ document.addEventListener("keydown", (event) => {
     const scrollPaddingTop = getScrollPaddingTop();
     const targetPost = isSpaceKey && !event.shiftKey
         ? findViewportSkipTarget(targets)
-        : findAdjacentScrollTarget(targets, window.scrollY + scrollPaddingTop, getNavigationDirection(event));
+        : findAdjacentScrollTarget(targets, window.scrollY + scrollPaddingTop, scrollDirection);
 
     if (targetPost === null) {
         return;
