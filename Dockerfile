@@ -1,4 +1,6 @@
-FROM rust:latest as builder
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.94-bookworm as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -6,12 +8,25 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create a new empty shell project
 WORKDIR /usr/src/redlib
+
+# Prime Cargo's dependency cache before copying the full source tree.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && printf 'fn main() {}\n' > src/main.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,target=/usr/src/redlib/target,sharing=locked \
+    cargo build --release --locked --bin redlib
+RUN rm src/main.rs && rmdir src
+
 COPY . .
 
 # Build the application
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,target=/usr/src/redlib/target,sharing=locked \
+    cargo build --release --locked --bin redlib && \
+    cp target/release/redlib /tmp/redlib
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -23,7 +38,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
-COPY --from=builder /usr/src/redlib/target/release/redlib /usr/local/bin/
+COPY --from=builder /tmp/redlib /usr/local/bin/redlib
 
 # Copy the templates directory
 COPY --from=builder /usr/src/redlib/templates /templates
