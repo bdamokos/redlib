@@ -1483,11 +1483,21 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 
 /* Used only for text post preview */
 .post_preview {
-    -webkit-mask-image: linear-gradient(180deg, #000 60%, transparent);
-    mask-image: linear-gradient(180deg, #000 60%, transparent);
-    opacity: 0.8;
     max-height: 250px;
     overflow: hidden;
+    position: relative;
+}
+
+.post_preview::after {
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--accent, #3498db);
+    opacity: 0.5;
 }
 
 .post_footer {
