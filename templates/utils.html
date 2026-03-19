@@ -217,7 +217,7 @@
 	class="post{% if post.flags.stickied %} stickied{% endif %}"
 	data-post-type="{{ post.post_type }}"
 	data-created-ts="{{ post.created_ts }}">
-	<p class="post_header">
+	<div class="post_header">
 		{% let community -%}
 		{% if post.community.starts_with("u_") -%}
 			{% let community = format!("u/{}", &post.community[2..]) -%}
@@ -254,7 +254,7 @@
 			</span>
 			{% endfor %}
 		{% endif %}
-	</p>
+	</div>
 	<h2 class="post_title">
 		{% if post.kind == "t1" %}
 			<span class="post_context_prefix">
