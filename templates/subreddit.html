@@ -75,6 +75,13 @@
 			{% call utils::post_in_list(post, false, "") %}
 			{% endif %}
 			{% endfor %}
+			{% if prefs.use_hls == "on" %}
+			<script src="/hls.min.js"></script>
+			<script src="/playHLSVideo.js"></script>
+			{% endif %}
+			{% if enable_duplicate_collapse %}
+			<script src="/submitted_duplicates.js" defer></script>
+			{% endif %}
 			</div>
 			{% endif %}
 

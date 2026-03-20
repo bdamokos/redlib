@@ -28,6 +28,7 @@ pub struct SubredditTemplate {
 	prefs: Preferences,
 	url: String,
 	redirect_url: String,
+	enable_duplicate_collapse: bool,
 	/// Whether the subreddit itself is filtered.
 	is_filtered: bool,
 	/// Whether all fetched posts are filtered (to differentiate between no posts fetched in the first place,
@@ -65,6 +66,10 @@ pub struct WallTemplate {
 crate::impl_template_str_eq!(WallTemplate);
 
 static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
+
+fn should_enable_duplicate_collapse(sub_name: &str) -> bool {
+	sub_name.is_empty() || sub_name.contains('+') || sub_name == "all" || sub_name == "popular"
+}
 
 fn is_async_subscription_request(req: &Request<Body>) -> bool {
 	req.headers().get("X-Redlib-Ajax").and_then(|value| value.to_str().ok()).is_some_and(|value| value == "1")
@@ -166,6 +171,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			prefs: Preferences::new(&req),
 			url,
 			redirect_url,
+			enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
 			is_filtered: true,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
@@ -190,6 +196,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					prefs: Preferences::new(&req),
 					url,
 					redirect_url,
+					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
@@ -203,6 +210,135 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				_ => error(req, &msg).await,
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{should_enable_duplicate_collapse, SubredditTemplate};
+	use askama::Template;
+
+	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
+
+	fn empty_flair() -> Flair {
+		Flair {
+			flair_parts: Vec::new(),
+			text: String::new(),
+			background_color: String::new(),
+			foreground_color: String::new(),
+		}
+	}
+
+	fn test_prefs() -> Preferences {
+		Preferences {
+			layout: "card".to_string(),
+			show_nsfw: "on".to_string(),
+			use_hls: "off".to_string(),
+			..Default::default()
+		}
+	}
+
+	fn test_post() -> Post {
+		Post {
+			id: "demo".to_string(),
+			kind: "t3".to_string(),
+			title: "Primary post title".to_string(),
+			community: "demo_sub".to_string(),
+			body: String::new(),
+			author: Author {
+				name: "demo_user".to_string(),
+				flair: empty_flair(),
+				distinguished: String::new(),
+				external_links: Vec::new(),
+			},
+			permalink: "/r/demo_sub/comments/demo/".to_string(),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			poll: None,
+			score: ("1".to_string(), "1".to_string()),
+			upvote_ratio: 100,
+			post_type: "image".to_string(),
+			flair: empty_flair(),
+			flags: Flags::new(false, false, false),
+			thumbnail: Media::empty(),
+			media: Media {
+				url: "https://i.redd.it/example.jpg".to_string(),
+				..Media::empty()
+			},
+			domain: "i.redd.it".to_string(),
+			rel_time: "1h ago".to_string(),
+			created: "2026-03-19 00:00:00 UTC".to_string(),
+			created_ts: 1,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
+		}
+	}
+
+	#[test]
+	fn enables_duplicate_collapse_for_aggregate_feeds() {
+		assert!(should_enable_duplicate_collapse(""));
+		assert!(should_enable_duplicate_collapse("popular"));
+		assert!(should_enable_duplicate_collapse("all"));
+		assert!(should_enable_duplicate_collapse("rust+programming"));
+		assert!(!should_enable_duplicate_collapse("rust"));
+	}
+
+	#[test]
+	fn renders_duplicate_script_for_aggregate_feed_pages() {
+		let html = SubredditTemplate {
+			sub: Subreddit {
+				name: "rust+programming".to_string(),
+				..Default::default()
+			},
+			posts: vec![test_post()],
+			sort: ("hot".to_string(), String::new()),
+			ends: (String::new(), String::new()),
+			prefs: test_prefs(),
+			url: "/r/rust+programming".to_string(),
+			redirect_url: "r/rust%2Bprogramming".to_string(),
+			enable_duplicate_collapse: true,
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("submitted_duplicates.js"));
+	}
+
+	#[test]
+	fn does_not_render_duplicate_script_for_single_subreddit_pages() {
+		let html = SubredditTemplate {
+			sub: Subreddit {
+				name: "rust".to_string(),
+				..Default::default()
+			},
+			posts: vec![test_post()],
+			sort: ("hot".to_string(), String::new()),
+			ends: (String::new(), String::new()),
+			prefs: test_prefs(),
+			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
+			enable_duplicate_collapse: false,
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(!html.contains("submitted_duplicates.js"));
 	}
 }
 
