@@ -1,6 +1,7 @@
 use crate::client::{proxy, CLIENT};
 use cached::proc_macro::cached;
 use hyper::{Body, Request, Response};
+use log::warn;
 use regex::Regex;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
@@ -8,6 +9,8 @@ use std::sync::{LazyLock, Mutex};
 static REDGIFS_TOKEN: LazyLock<Mutex<(String, i64)>> = LazyLock::new(|| Mutex::new((String::new(), 0)));
 static REDGIFS_ID_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+$").unwrap());
 static REDGIFS_MEDIA_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\.(?:mp4|jpg|jpeg|png|webp)$").unwrap());
+static REDGIFS_META_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<meta\s+(?:property|name)="(?P<name>[^"]+)"\s+content="(?P<content>[^"]+)""#).unwrap());
+static REDGIFS_LINK_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<link\s+[^>]*rel="(?P<rel>[^"]+)"[^>]*href="(?P<href>[^"]+)""#).unwrap());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RedgifsMediaPaths {
@@ -89,7 +92,10 @@ pub async fn handler(req: Request<Body>) -> Result<Response<Body>, String> {
 				.body(Body::empty())
 				.unwrap_or_default(),
 		),
-		Err(_) => Ok(Response::builder().status(404).body("RedGifs video not found".into()).unwrap_or_default()),
+		Err(err) => {
+			warn!("Failed to resolve RedGifs media for video id {video_id}: {err}");
+			Ok(Response::builder().status(404).body("RedGifs video not found".into()).unwrap_or_default())
+		}
 	}
 }
 
@@ -103,11 +109,28 @@ pub async fn fetch_duration_seconds(video_id: &str) -> Result<i64, String> {
 
 #[cached(size = 512, time = 3600, result = true)]
 async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String> {
+	match fetch_media_paths_from_api(&video_id).await {
+		Ok(paths) => Ok(paths),
+		Err(api_err) => {
+			warn!("Failed RedGifs API lookup for {video_id}: {api_err}; falling back to watch page");
+			fetch_media_paths_from_watch_page(&video_id)
+				.await
+				.map_err(|watch_err| format!("{api_err}; fallback failed: {watch_err}"))
+		}
+	}
+}
+
+async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths, String> {
 	let token = get_token().await?;
 	let api_url = format!("https://api.redgifs.com/v2/gifs/{video_id}?views=yes");
 	let req = create_request(&api_url, Some(&token))?;
 	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
+	let status = res.status();
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
+	if !status.is_success() {
+		let preview = String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>();
+		return Err(format!("RedGifs API returned HTTP {status}: {preview}"));
+	}
 	let json: Value = serde_json::from_slice(&body_bytes).map_err(|err| err.to_string())?;
 
 	let video_path = json["gif"]["urls"]["hd"]
@@ -121,6 +144,78 @@ async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String
 		.and_then(media_path_from_url)
 		.unwrap_or_default();
 	let duration_seconds = json["gif"]["duration"].as_f64().map(|value| value.round() as i64).unwrap_or_default();
+
+	Ok(RedgifsMediaPaths {
+		video_path,
+		poster_path,
+		duration_seconds,
+	})
+}
+
+async fn fetch_media_paths_from_watch_page(video_id: &str) -> Result<RedgifsMediaPaths, String> {
+	let watch_url = format!("https://www.redgifs.com/watch/{video_id}");
+	let req = create_request(&watch_url, None)?;
+	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
+	let status = res.status();
+	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
+	if !status.is_success() {
+		let preview = String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>();
+		return Err(format!("RedGifs watch page returned HTTP {status}: {preview}"));
+	}
+
+	let html = String::from_utf8(body_bytes.to_vec()).map_err(|err| err.to_string())?;
+	parse_watch_page_media_paths(&html)
+}
+
+fn parse_watch_page_media_paths(html: &str) -> Result<RedgifsMediaPaths, String> {
+	let mut og_video = None;
+	let mut twitter_image = None;
+	let mut og_duration = None;
+
+	for captures in REDGIFS_META_TAG_REGEX.captures_iter(html) {
+		let Some(name) = captures.name("name").map(|value| value.as_str()) else {
+			continue;
+		};
+		let Some(content) = captures.name("content").map(|value| value.as_str()) else {
+			continue;
+		};
+
+		match name {
+			"og:video" => og_video = Some(content.to_string()),
+			"twitter:image" | "og:image" => {
+				if twitter_image.is_none() {
+					twitter_image = Some(content.to_string());
+				}
+			}
+			"og:video:duration" => og_duration = content.parse::<f64>().ok(),
+			_ => {}
+		}
+	}
+
+	if twitter_image.is_none() {
+		for captures in REDGIFS_LINK_TAG_REGEX.captures_iter(html) {
+			let Some(rel) = captures.name("rel").map(|value| value.as_str()) else {
+				continue;
+			};
+			if rel != "preload" {
+				continue;
+			}
+			let Some(href) = captures.name("href").map(|value| value.as_str()) else {
+				continue;
+			};
+			if href.starts_with("https://media.redgifs.com/") && href.ends_with(".jpg") {
+				twitter_image = Some(href.to_string());
+				break;
+			}
+		}
+	}
+
+	let video_path = og_video
+		.as_deref()
+		.and_then(media_path_from_url)
+		.ok_or_else(|| "No video URL in RedGifs watch page".to_string())?;
+	let poster_path = twitter_image.as_deref().and_then(media_path_from_url).unwrap_or_default();
+	let duration_seconds = og_duration.map(|value| value.round() as i64).unwrap_or_default();
 
 	Ok(RedgifsMediaPaths {
 		video_path,
@@ -179,7 +274,7 @@ fn validate_video_id(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{is_valid_media_path, media_path_from_url, watch_path_from_embed_code, watch_path_from_url};
+	use super::{is_valid_media_path, media_path_from_url, parse_watch_page_media_paths, watch_path_from_embed_code, watch_path_from_url};
 
 	#[test]
 	fn extracts_watch_ids_from_supported_urls() {
@@ -224,5 +319,48 @@ mod tests {
 		);
 		assert_eq!(media_path_from_url("https://example.com/FamiliarFrizzyChevrotain.mp4"), None);
 		assert_eq!(media_path_from_url("https://media.redgifs.com/../bad.mp4"), None);
+	}
+
+	#[test]
+	fn parses_redgifs_watch_page_metadata_as_fallback() {
+		let html = r#"
+			<html>
+				<head>
+					<meta property="og:video" content="https://media.redgifs.com/ImperturbableLumpyShihtzu-silent.mp4">
+					<meta name="twitter:image" content="https://media.redgifs.com/ImperturbableLumpyShihtzu-mobile.jpg">
+					<meta property="og:video:duration" content="31">
+				</head>
+			</html>
+		"#;
+
+		assert_eq!(
+			parse_watch_page_media_paths(html).unwrap(),
+			super::RedgifsMediaPaths {
+				video_path: "/redgifs/ImperturbableLumpyShihtzu-silent.mp4".to_string(),
+				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
+				duration_seconds: 31,
+			}
+		);
+	}
+
+	#[test]
+	fn falls_back_to_preloaded_image_when_twitter_image_is_missing() {
+		let html = r#"
+			<html>
+				<head>
+					<link rel="preload" as="image" href="https://media.redgifs.com/ImperturbableLumpyShihtzu-mobile.jpg">
+					<meta property="og:video" content="https://media.redgifs.com/ImperturbableLumpyShihtzu.mp4">
+				</head>
+			</html>
+		"#;
+
+		assert_eq!(
+			parse_watch_page_media_paths(html).unwrap(),
+			super::RedgifsMediaPaths {
+				video_path: "/redgifs/ImperturbableLumpyShihtzu.mp4".to_string(),
+				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
+				duration_seconds: 0,
+			}
+		);
 	}
 }
