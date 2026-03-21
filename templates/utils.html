@@ -368,6 +368,13 @@
 		<ul class="post_duplicates_list">
 			{% for duplicate in post.collapsed_duplicates %}
 			<li>
+				{% if duplicate.flair.flair_parts.len() > 0 %}
+				<a href="/r/{{ duplicate.community }}/search?q=flair_name%3A%22{{ duplicate.flair.text }}%22&restrict_sr=on"
+					class="post_flair"
+					style="color:{{ duplicate.flair.foreground_color }}; background:{{ duplicate.flair.background_color }};"
+					dir="ltr">{% call render_flair(duplicate.flair.flair_parts) %}</a>
+				{% endif %}
+				<a href="{{ duplicate.permalink }}">{{ duplicate.title }}</a>
 				<div class="post_duplicates_meta">
 					<a href="/{{ duplicate.display_community }}">{{ duplicate.display_community }}</a>
 					{% if show_subscription_button && !duplicate.community.starts_with("u_") && !prefs.subscriptions.contains(duplicate.community) %}
@@ -387,15 +394,8 @@
 						<button class="subscribe" type="submit">Follow</button>
 					</form>
 					{% endif %}
-					{% if duplicate.flair.flair_parts.len() > 0 %}
-					<a href="/r/{{ duplicate.community }}/search?q=flair_name%3A%22{{ duplicate.flair.text }}%22&restrict_sr=on"
-						class="post_flair"
-						style="color:{{ duplicate.flair.foreground_color }}; background:{{ duplicate.flair.background_color }};"
-						dir="ltr">{% call render_flair(duplicate.flair.flair_parts) %}</a>
-					{% endif %}
 					&bull; {{ duplicate.rel_time }} &bull; {{ duplicate.comments.0 }} {% if duplicate.comments.1 == "1" %}comment{% else %}comments{% endif %}
 				</div>
-				<a href="{{ duplicate.permalink }}">{{ duplicate.title }}</a>
 			</li>
 			{% endfor %}
 		</ul>

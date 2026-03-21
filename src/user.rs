@@ -548,9 +548,7 @@ mod tests {
 		assert!(html.contains("Preview text from a duplicate post."));
 
 		let community_pos = html.find("/r/other_one\">r/other_one</a>").unwrap();
-		let flair_pos = html
-			.find("/r/other_one/search?q=flair_name%3A%22Question%22&restrict_sr=on")
-			.unwrap();
+		let flair_pos = html.find("/r/other_one/search?q=flair_name%3A%22Question%22&restrict_sr=on").unwrap();
 		let title_pos = html.find("/r/other_one/comments/one/\">Other title one</a>").unwrap();
 		assert!(community_pos < flair_pos);
 		assert!(flair_pos < title_pos);

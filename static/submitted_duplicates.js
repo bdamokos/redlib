@@ -211,7 +211,18 @@ function appendDuplicate(primary, duplicate) {
 
     const item = document.createElement("li");
 
-    const meta = document.createElement("span");
+    const flairEl = duplicate.querySelector(".post_title .post_flair");
+    if (flairEl) {
+        item.append(flairEl.cloneNode(true), " ");
+    }
+
+    const link = document.createElement("a");
+    link.href = titleLink.getAttribute("href") || "#";
+    link.textContent = titleLink.textContent || "";
+    item.append(link);
+
+    const meta = document.createElement("div");
+    meta.className = "post_duplicates_meta";
     const communityAnchor = document.createElement("a");
     communityAnchor.href = communityLink.getAttribute("href") || "#";
     communityAnchor.textContent = communityLink.textContent || "";
@@ -222,21 +233,11 @@ function appendDuplicate(primary, duplicate) {
         meta.append(" ", followForm.cloneNode(true));
     }
 
-    const flairEl = duplicate.querySelector(".post_title .post_flair");
-    if (flairEl) {
-        meta.append(" ", flairEl.cloneNode(true));
-    }
-
     const restParts = [created.textContent || "", comments?.textContent?.trim() || ""].filter(Boolean).join(" • ");
     if (restParts) {
         meta.append(" • ", restParts);
     }
     item.append(meta);
-
-    const link = document.createElement("a");
-    link.href = titleLink.getAttribute("href") || "#";
-    link.textContent = titleLink.textContent || "";
-    item.append(link);
 
     list.append(item);
     updateDuplicateLabel(block);
