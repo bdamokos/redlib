@@ -23,10 +23,24 @@ document.addEventListener("click", (event) => {
         return;
     }
 
-    if (event.target.closest("a")) {
-        return;
-    }
+    const isGallery = preview.classList.contains("gallery");
+    const clickedLink = event.target.closest("a");
 
-    preview.classList.add("expanded");
-    preview.classList.remove("truncated");
+    if (isGallery) {
+        const rect = preview.getBoundingClientRect();
+        const clickY = event.clientY - rect.top;
+        const threshold = rect.height - 48;
+        if (clickY >= threshold) {
+            event.preventDefault();
+            preview.classList.add("expanded");
+            preview.classList.remove("truncated");
+            return;
+        }
+    } else {
+        if (clickedLink) {
+            return;
+        }
+        preview.classList.add("expanded");
+        preview.classList.remove("truncated");
+    }
 });

@@ -1539,6 +1539,14 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     opacity: 1;
 }
 
+.gallery.post_preview.truncated::after {
+    height: 48px;
+    line-height: 48px;
+    font-size: 12px;
+    font-weight: 600;
+    background: linear-gradient(transparent, var(--post) 30%);
+}
+
 .post_preview.expanded {
     max-height: none;
 }
