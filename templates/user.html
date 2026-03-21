@@ -52,7 +52,7 @@ body %}
             <script src="/hls.min.js"></script>
             <script src="/playHLSVideo.js"></script>
             {% endif %} {% if str_eq(listing, "submitted") || str_eq(listing, "overview") %}
-            <script src="/submitted_duplicates.js" defer></script>
+            <script src="/submitted_duplicates.js?v={{ env!("CARGO_PKG_VERSION") }}" defer></script>
             {% endif %}
         </div>
         {% endif %}

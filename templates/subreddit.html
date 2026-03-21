@@ -80,7 +80,7 @@
 			<script src="/playHLSVideo.js"></script>
 			{% endif %}
 			{% if enable_duplicate_collapse %}
-			<script src="/submitted_duplicates.js" defer></script>
+			<script src="/submitted_duplicates.js?v={{ env!("CARGO_PKG_VERSION") }}" defer></script>
 			{% endif %}
 			</div>
 			{% endif %}

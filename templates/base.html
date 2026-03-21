@@ -27,14 +27,14 @@
 		<link rel="manifest" type="application/json" href="/manifest.json">
 		<link rel="shortcut icon" type="image/x-icon" href="/favicon.ico"> 
 		<link rel="stylesheet" type="text/css" href="/style.css?v={{ env!("CARGO_PKG_VERSION") }}">
-		<script src="/space_scroll.js" defer></script>
-		<script src="/post_preview.js" defer></script>
-		<script src="/author_links.js" defer></script>
-		<script src="/subscription.js" defer></script>
+		<script src="/space_scroll.js?v={{ env!("CARGO_PKG_VERSION") }}" defer></script>
+		<script src="/post_preview.js?v={{ env!("CARGO_PKG_VERSION") }}" defer></script>
+		<script src="/author_links.js?v={{ env!("CARGO_PKG_VERSION") }}" defer></script>
+		<script src="/subscription.js?v={{ env!("CARGO_PKG_VERSION") }}" defer></script>
 		<!-- Video quality -->
 		<div id="video_quality" data-value="{{ prefs.video_quality }}"></div>
 		{% call utils::render_video_js() %}
-		<script src="/video_visibility.js" defer></script>
+		<script src="/video_visibility.js?v={{ env!("CARGO_PKG_VERSION") }}" defer></script>
 		{% endblock %}
 		</head>
 	<body class="
