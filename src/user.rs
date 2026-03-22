@@ -849,7 +849,7 @@ pub async fn author_links(req: Request<Body>) -> Result<Response<Body>, String> 
 
 		let author_name = author.to_string();
 		pending.spawn(async move {
-			let links = utils::author_external_links(&author_name).await;
+			let links = utils::external_links_with_coomer_flags(utils::author_external_links(&author_name).await).await;
 			(author_name, links)
 		});
 	}

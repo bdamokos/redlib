@@ -31,6 +31,7 @@ use std::string::ToString;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 use time::{macros::format_description, Duration, OffsetDateTime};
+use tokio::task::JoinSet;
 use url::Url;
 
 /// Write a message to stderr on debug mode. This function is a no-op on
@@ -134,6 +135,8 @@ pub struct ExternalLink {
 	pub url: String,
 	pub host: String,
 	pub icon_path: String,
+	#[serde(default)]
+	pub has_coomer: bool,
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -1805,6 +1808,7 @@ fn build_external_link_with_label(raw: &str, label_override: Option<&str>) -> Op
 		url: parsed.into(),
 		host: host.clone(),
 		icon_path: format!("/site_icon/{host}"),
+		has_coomer: false,
 	})
 }
 
@@ -1833,6 +1837,33 @@ pub async fn external_links_with_coomer_lookups(links: Vec<ExternalLink>) -> Vec
 
 	append_external_links(&mut expanded_links, coomer_links);
 	expanded_links
+}
+
+pub async fn external_links_with_coomer_flags(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
+	let mut pending = JoinSet::new();
+
+	for (index, link) in links.iter().enumerate() {
+		let link = link.clone();
+		pending.spawn(async move {
+			let has_coomer = match coomer_lookup_link(&link).await {
+				Some(coomer_link) => coomer_lookup_exists(coomer_link.url).await,
+				None => false,
+			};
+			(index, has_coomer)
+		});
+	}
+
+	let mut flagged_links = links;
+	while let Some(result) = pending.join_next().await {
+		let Ok((index, has_coomer)) = result else {
+			continue;
+		};
+		if let Some(link) = flagged_links.get_mut(index) {
+			link.has_coomer = has_coomer;
+		}
+	}
+
+	flagged_links
 }
 
 fn dedupe_external_links_by_host(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
@@ -1871,6 +1902,7 @@ async fn coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
 		url: format!("https://coomer.st/{service}/user/{profile_id}"),
 		host: "coomer.st".to_string(),
 		icon_path: "/site_icon/coomer.st".to_string(),
+		has_coomer: false,
 	})
 }
 
@@ -2456,18 +2488,21 @@ mod tests {
 				url: "https://onlyfans.com/lady-katarina".to_string(),
 				host: "onlyfans.com".to_string(),
 				icon_path: "/site_icon/onlyfans.com".to_string(),
+				has_coomer: false,
 			},
 			ExternalLink {
 				label: "lady-katarina".to_string(),
 				url: "https://onlyfans.com/lady-katarina".to_string(),
 				host: "onlyfans.com".to_string(),
 				icon_path: "/site_icon/onlyfans.com".to_string(),
+				has_coomer: false,
 			},
 			ExternalLink {
 				label: "Fansly - DM ME".to_string(),
 				url: "https://fansly.com/LadyKatarina".to_string(),
 				host: "fansly.com".to_string(),
 				icon_path: "/site_icon/fansly.com".to_string(),
+				has_coomer: false,
 			},
 		]);
 
@@ -2483,6 +2518,7 @@ mod tests {
 			url: "https://onlyfans.com/lady-katarina".to_string(),
 			host: "onlyfans.com".to_string(),
 			icon_path: "/site_icon/onlyfans.com".to_string(),
+			has_coomer: false,
 		}))
 		.expect("onlyfans profile should map to coomer");
 		let fansly = block_on(coomer_lookup_link(&ExternalLink {
@@ -2490,6 +2526,7 @@ mod tests {
 			url: "https://fansly.com/user/640681284019953664".to_string(),
 			host: "fansly.com".to_string(),
 			icon_path: "/site_icon/fansly.com".to_string(),
+			has_coomer: false,
 		}))
 		.expect("fansly profile should map to coomer");
 
@@ -2504,6 +2541,7 @@ mod tests {
 			url: "https://twitter.com/example".to_string(),
 			host: "twitter.com".to_string(),
 			icon_path: "/site_icon/twitter.com".to_string(),
+			has_coomer: false,
 		}));
 
 		assert!(expanded.is_none());

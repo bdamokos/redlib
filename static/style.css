@@ -647,6 +647,33 @@ aside {
     justify-content: center;
     width: 16px;
     height: 16px;
+    position: relative;
+    border-radius: 6px;
+    transition: transform 140ms ease, filter 140ms ease;
+}
+
+.external_site_link--coomer {
+    background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent) 32%, transparent), transparent 65%),
+        color-mix(in srgb, var(--foreground) 10%, transparent);
+    box-shadow:
+        0 0 0 1px color-mix(in srgb, var(--accent) 72%, transparent),
+        0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.external_site_link--coomer::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border: 1px solid color-mix(in srgb, var(--accent) 92%, white 8%);
+    border-radius: 7px;
+    opacity: 0.95;
+    pointer-events: none;
+}
+
+.external_site_link--coomer:hover {
+    transform: translateY(-1px);
+    filter: saturate(1.08);
 }
 
 .external_site_link img,
