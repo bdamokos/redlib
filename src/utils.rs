@@ -1818,6 +1818,23 @@ fn append_external_links(target: &mut Vec<ExternalLink>, links: Vec<ExternalLink
 	}
 }
 
+pub async fn external_links_with_coomer_lookups(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
+	let mut expanded_links = links.clone();
+	let mut coomer_links = Vec::new();
+
+	for link in links {
+		let Some(coomer_link) = coomer_lookup_link(&link).await else {
+			continue;
+		};
+		if coomer_lookup_exists(coomer_link.url.clone()).await {
+			coomer_links.push(coomer_link);
+		}
+	}
+
+	append_external_links(&mut expanded_links, coomer_links);
+	expanded_links
+}
+
 fn dedupe_external_links_by_host(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
 	let mut seen = HashSet::new();
 	let mut deduped = Vec::new();
@@ -1833,6 +1850,118 @@ fn dedupe_external_links_by_host(links: Vec<ExternalLink>) -> Vec<ExternalLink> 
 
 fn external_link_key(link: &ExternalLink) -> String {
 	format!("{}|{}", link.url.to_lowercase(), link.label.to_lowercase())
+}
+
+async fn coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
+	let parsed = Url::parse(&link.url).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	let (service, profile_id) = match host.as_str() {
+		"onlyfans.com" | "www.onlyfans.com" => ("onlyfans", coomer_profile_id(&parsed, false).await?),
+		"fansly.com" | "www.fansly.com" => ("fansly", coomer_profile_id(&parsed, true).await?),
+		_ => return None,
+	};
+	let label = match service {
+		"onlyfans" => "Coomer (OnlyFans)",
+		"fansly" => "Coomer (Fansly)",
+		_ => return None,
+	};
+
+	Some(ExternalLink {
+		label: label.to_string(),
+		url: format!("https://coomer.st/{service}/user/{profile_id}"),
+		host: "coomer.st".to_string(),
+		icon_path: "/site_icon/coomer.st".to_string(),
+	})
+}
+
+async fn coomer_profile_id(parsed: &Url, is_fansly: bool) -> Option<String> {
+	let segments = parsed.path_segments()?.into_iter().filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+
+	let profile_segment = match segments.as_slice() {
+		["u" | "user" | "users" | "profile", profile, ..] => *profile,
+		[profile, ..] if !is_fansly => *profile,
+		[profile, ..] if is_fansly => {
+			if is_numeric_identifier(profile) {
+				*profile
+			} else {
+				return resolve_fansly_account_id(profile.to_string()).await;
+			}
+		}
+		[] => return None,
+		_ => return None,
+	};
+
+	let profile_id = profile_segment.trim();
+	if profile_id.is_empty() {
+		return None;
+	}
+
+	Some(profile_id.to_string())
+}
+
+fn is_numeric_identifier(value: &str) -> bool {
+	!value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+#[cached(size = 2048, time = 3600)]
+async fn resolve_fansly_account_id(username: String) -> Option<String> {
+	let username = username.trim();
+	if username.is_empty() {
+		return None;
+	}
+
+	let mut url = Url::parse("https://apiv3.fansly.com/api/v1/account").ok()?;
+	url.query_pairs_mut().append_pair("usernames", username);
+	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
+	let request = Request::builder()
+		.method("GET")
+		.uri(url.as_str())
+		.header("Accept-Encoding", "identity")
+		.header("User-Agent", user_agent)
+		.body(Body::empty())
+		.ok()?;
+	let response = CLIENT.request(request).await.ok()?;
+	if !response.status().is_success() {
+		return None;
+	}
+
+	let body = hyper::body::to_bytes(response.into_body()).await.ok()?;
+	let parsed: Value = serde_json::from_slice(&body).ok()?;
+	parsed["response"]
+		.as_array()
+		.and_then(|accounts| accounts.first())
+		.and_then(|account| account["id"].as_str())
+		.map(|id| id.to_string())
+}
+
+#[cached(size = 2048, time = 3600)]
+async fn coomer_lookup_exists(url: String) -> bool {
+	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
+
+	for method in ["HEAD", "GET"] {
+		let request = match Request::builder()
+			.method(method)
+			.uri(&url)
+			.header("Accept-Encoding", "identity")
+			.header("User-Agent", &user_agent)
+			.body(Body::empty())
+		{
+			Ok(request) => request,
+			Err(_) => return false,
+		};
+
+		let Ok(response) = CLIENT.request(request).await else {
+			continue;
+		};
+		if response.status().is_success() {
+			return true;
+		}
+		if response.status().as_u16() != 405 {
+			return false;
+		}
+	}
+
+	false
 }
 
 fn cached_author_links(name: &str) -> Option<Vec<ExternalLink>> {
@@ -2231,8 +2360,10 @@ impl_template_str_eq!(User);
 #[cfg(test)]
 mod tests {
 	use super::{
-		dedupe_external_links_by_host, extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls, user_profile_details, ExternalLink, Preferences,
+		coomer_lookup_link, dedupe_external_links_by_host, extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls, user_profile_details,
+		ExternalLink, Preferences,
 	};
+	use futures_lite::future::block_on;
 	use serde_json::json;
 
 	#[test]
@@ -2343,6 +2474,39 @@ mod tests {
 		assert_eq!(deduped.len(), 2);
 		assert_eq!(deduped[0].host, "onlyfans.com");
 		assert_eq!(deduped[1].host, "fansly.com");
+	}
+
+	#[test]
+	fn maps_onlyfans_and_fansly_profiles_to_coomer_lookup_urls() {
+		let onlyfans = block_on(coomer_lookup_link(&ExternalLink {
+			label: "lady-katarina".to_string(),
+			url: "https://onlyfans.com/lady-katarina".to_string(),
+			host: "onlyfans.com".to_string(),
+			icon_path: "/site_icon/onlyfans.com".to_string(),
+		}))
+		.expect("onlyfans profile should map to coomer");
+		let fansly = block_on(coomer_lookup_link(&ExternalLink {
+			label: "Fansly".to_string(),
+			url: "https://fansly.com/user/640681284019953664".to_string(),
+			host: "fansly.com".to_string(),
+			icon_path: "/site_icon/fansly.com".to_string(),
+		}))
+		.expect("fansly profile should map to coomer");
+
+		assert_eq!(onlyfans.url, "https://coomer.st/onlyfans/user/lady-katarina");
+		assert_eq!(fansly.url, "https://coomer.st/fansly/user/640681284019953664");
+	}
+
+	#[test]
+	fn ignores_non_profile_links_when_building_coomer_lookups() {
+		let expanded = block_on(coomer_lookup_link(&ExternalLink {
+			label: "Twitter".to_string(),
+			url: "https://twitter.com/example".to_string(),
+			host: "twitter.com".to_string(),
+			icon_path: "/site_icon/twitter.com".to_string(),
+		}));
+
+		assert!(expanded.is_none());
 	}
 
 	#[test]

@@ -774,7 +774,7 @@ async fn user(name: &str) -> Result<User, String> {
 		banner: about("banner_img"),
 		description: profile.blurb,
 		bio_html: profile.bio_html,
-		external_links: profile.external_links,
+		external_links: utils::external_links_with_coomer_lookups(profile.external_links).await,
 		nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
 	})
 }
