@@ -49,6 +49,12 @@
 	{% endif %}
 {%- endmacro %}
 
+{% macro pending_external_site_icons(author_name) -%}
+	{% if author_name != "" && author_name != "[deleted]" %}
+	<span class="external_site_icons" data-author-name="{{ author_name }}" data-state="pending"></span>
+	{% endif %}
+{%- endmacro %}
+
 {% macro sub_list(current) -%}
 	<details class="feeds">
 		<summary>Feeds</summary>

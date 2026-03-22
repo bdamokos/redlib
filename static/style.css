@@ -751,6 +751,16 @@ aside {
     column-gap: 8px;
 }
 
+.user_subreddit_link_row {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+}
+
+.user_subreddit_link_row .external_site_icons {
+    flex-shrink: 0;
+}
+
 .user_subreddit_link {
     min-width: 0;
     text-decoration: none;

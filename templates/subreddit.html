@@ -149,7 +149,10 @@
 						<ul class="user_subreddit_list">
 							{% for user in top_users %}
 							<li class="user_subreddit_item">
-								<a class="user_subreddit_link" href="/user/{{ user.name }}">u/{{ user.name }}</a>
+								<span class="user_subreddit_link_row">
+									<a class="user_subreddit_link" href="/user/{{ user.name }}">u/{{ user.name }}</a>
+									{% call utils::pending_external_site_icons(user.name) %}
+								</span>
 								<span class="user_subreddit_meta">{{ user.count }}</span>
 							</li>
 							{% endfor %}
