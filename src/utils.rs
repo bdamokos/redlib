@@ -167,6 +167,12 @@ struct CachedSubredditFlairs {
 	cached_at: Instant,
 }
 
+#[derive(Clone)]
+struct CachedUserSubreddits {
+	subreddits: HashMap<String, u32>,
+	cached_at: Instant,
+}
+
 #[derive(Serialize, PartialEq)]
 pub struct Poll {
 	pub poll_options: Vec<PollOption>,
@@ -799,9 +805,11 @@ pub struct User {
 const AUTHOR_LINKS_CACHE_SIZE: usize = 512;
 const AUTHOR_LINKS_CACHE_TTL: StdDuration = StdDuration::from_secs(3600);
 const SUBREDDIT_FLAIR_CACHE_SIZE: usize = 1000;
+const USER_SUBREDDIT_CACHE_SIZE: usize = 1000;
 
 static AUTHOR_LINKS_CACHE: LazyLock<Mutex<HashMap<String, CachedAuthorLinks>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SUBREDDIT_FLAIR_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditFlairs>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static USER_SUBREDDIT_CACHE: LazyLock<Mutex<HashMap<String, CachedUserSubreddits>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn user_profile_details(subreddit: &Value) -> UserProfileDetails {
 	let blurb = subreddit["public_description"].as_str().unwrap_or_default().trim().to_string();
@@ -948,6 +956,58 @@ pub fn cached_subreddit_flairs(subreddit: &str) -> Vec<Flair> {
 	let mut flairs = entry.flairs.values().cloned().collect::<Vec<_>>();
 	flairs.sort_by(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase()).then_with(|| a.text.cmp(&b.text)));
 	flairs
+}
+
+pub fn store_user_subreddits(username: &str, posts: &[Post]) {
+	let username = username.trim();
+	if username.is_empty() {
+		return;
+	}
+
+	let Ok(mut cache) = USER_SUBREDDIT_CACHE.lock() else {
+		return;
+	};
+	let now = Instant::now();
+	let entry = cache.entry(username.to_string()).or_insert_with(|| CachedUserSubreddits {
+		subreddits: HashMap::new(),
+		cached_at: now,
+	});
+	entry.cached_at = now;
+
+	for post in posts {
+		let subreddit = post.community.trim();
+		if subreddit.is_empty() || subreddit.starts_with("u_") {
+			continue;
+		}
+
+		*entry.subreddits.entry(subreddit.to_string()).or_insert(0) += 1;
+	}
+
+	while cache.len() > USER_SUBREDDIT_CACHE_SIZE {
+		let Some(oldest_key) = cache.iter().min_by_key(|(_, entry)| entry.cached_at).map(|(key, _)| key.clone()) else {
+			break;
+		};
+		cache.remove(&oldest_key);
+	}
+}
+
+pub fn cached_user_subreddits(username: &str) -> Vec<(String, u32)> {
+	let username = username.trim();
+	if username.is_empty() {
+		return Vec::new();
+	}
+
+	let Ok(mut cache) = USER_SUBREDDIT_CACHE.lock() else {
+		return Vec::new();
+	};
+	let Some(entry) = cache.get_mut(username) else {
+		return Vec::new();
+	};
+	entry.cached_at = Instant::now();
+
+	let mut subreddits = entry.subreddits.iter().map(|(name, count)| (name.clone(), *count)).collect::<Vec<_>>();
+	subreddits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())).then_with(|| a.0.cmp(&b.0)));
+	subreddits
 }
 
 #[derive(Default, PartialEq)]

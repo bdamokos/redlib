@@ -26,6 +26,7 @@ const USER_SORT_OPTIONS: [&str; 4] = ["hot", "new", "top", "controversial"];
 pub struct UserTemplate {
 	user: User,
 	posts: Vec<Post>,
+	user_subreddits: Vec<UserSubredditEntry>,
 	sort: (String, String),
 	ends: (String, String),
 	/// "overview", "comments", or "submitted"
@@ -44,6 +45,12 @@ pub struct UserTemplate {
 }
 
 crate::impl_template_str_eq!(UserTemplate);
+
+#[derive(PartialEq)]
+struct UserSubredditEntry {
+	name: String,
+	count: u32,
+}
 
 fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
 	let mut collapsed: Vec<Post> = Vec::new();
@@ -225,7 +232,7 @@ fn user_reddit_path(username: &str, listing: &str, query: &str) -> String {
 	}
 }
 
-async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
+async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
 	let should_refill_duplicates = listing == "submitted" || listing == "overview";
 	let mut request_path = path.to_string();
 	let mut all_posts = Vec::new();
@@ -236,6 +243,7 @@ async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<S
 		let (mut posts, next_after) = Post::fetch(&request_path, false).await?;
 		fetched_raw_posts |= !posts.is_empty();
 		utils::store_post_flairs(&posts);
+		utils::store_user_subreddits(username, &posts);
 
 		filter_posts(&mut posts, filters);
 		all_posts.extend(posts);
@@ -526,6 +534,7 @@ mod tests {
 				..Default::default()
 			},
 			posts: vec![post],
+			user_subreddits: Vec::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "submitted".to_string(),
@@ -548,11 +557,9 @@ mod tests {
 		assert!(html.contains("1 comment"));
 		assert!(html.contains("Preview text from a duplicate post."));
 
-		let community_pos = html.find("/r/other_one\">r/other_one</a>").unwrap();
-		let flair_pos = html.find("/r/other_one/search?q=flair_name%3A%22Question%22&restrict_sr=on").unwrap();
-		let title_pos = html.find("/r/other_one/comments/one/\">Other title one</a>").unwrap();
-		assert!(community_pos < flair_pos);
-		assert!(flair_pos < title_pos);
+		assert!(html.contains("/r/other_one/search?q=flair_name%3A%22Question%22&restrict_sr=on"));
+		assert!(html.contains("/r/other_one/comments/one/\">Other title one</a>"));
+		assert!(html.contains("/r/other_one\">r/other_one</a>"));
 		assert!(html.contains("dir=\"ltr\"><span>Question</span></a>"));
 
 		println!("{html}");
@@ -566,6 +573,7 @@ mod tests {
 				..Default::default()
 			},
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			user_subreddits: Vec::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -628,6 +636,16 @@ mod tests {
 				"t1",
 				"Thread title",
 			)],
+			user_subreddits: vec![
+				super::UserSubredditEntry {
+					name: "demo_sub".to_string(),
+					count: 2,
+				},
+				super::UserSubredditEntry {
+					name: "other_sub".to_string(),
+					count: 1,
+				},
+			],
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -646,6 +664,8 @@ mod tests {
 		assert!(html.contains("Thread title"));
 		assert!(html.contains("View thread"));
 		assert!(!html.contains("post_thumbnail"));
+		assert!(html.contains("/r/demo_sub\">r/demo_sub <span>2</span></a>"));
+		assert!(html.contains("/r/other_sub\">r/other_sub <span>1</span></a>"));
 	}
 }
 
@@ -681,6 +701,10 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		Ok(template(&UserTemplate {
 			user,
 			posts: Vec::new(),
+			user_subreddits: utils::cached_user_subreddits(&username)
+				.into_iter()
+				.map(|(name, count)| UserSubredditEntry { name, count })
+				.collect(),
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			ends: (param(&path, "after").unwrap_or_default(), String::new()),
 			listing,
@@ -694,13 +718,17 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		}))
 	} else {
 		// Request user posts/comments from Reddit
-		match fetch_user_listing_posts(&path, &listing, &filters).await {
+		match fetch_user_listing_posts(&username, &path, &listing, &filters).await {
 			Ok((posts, after, all_posts_filtered)) => {
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				Ok(template(&UserTemplate {
 					user,
 					posts,
+					user_subreddits: utils::cached_user_subreddits(&username)
+						.into_iter()
+						.map(|(name, count)| UserSubredditEntry { name, count })
+						.collect(),
 					sort: (sort, param(&path, "t").unwrap_or_default()),
 					ends: (param(&path, "after").unwrap_or_default(), after),
 					listing,
