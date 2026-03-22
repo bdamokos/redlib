@@ -173,9 +173,10 @@ body.fixed_navbar {
 
 .image_quality_status {
     display: none;
-    align-items: center;
-    margin-right: 10px;
-    padding: 6px 10px;
+    width: fit-content;
+    max-width: calc(100% - 40px);
+    margin: 0 20px 10px auto;
+    padding: 6px 12px;
     border: var(--panel-border);
     border-radius: 999px;
     background: color-mix(in srgb, var(--outside) 92%, black 8%);
@@ -183,19 +184,19 @@ body.fixed_navbar {
     box-shadow: var(--shadow);
     font-size: 12px;
     font-weight: 600;
-    white-space: nowrap;
+    line-height: 1.35;
 }
 
 .image_quality_status.visible {
-    display: inline-flex;
+    display: block;
 }
 
 @media screen and (max-width: 800px) {
     .image_quality_status {
         font-size: 11px;
-        max-width: 48vw;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        max-width: calc(100% - 20px);
+        margin: 8px 10px 10px;
+        width: auto;
     }
 }
 

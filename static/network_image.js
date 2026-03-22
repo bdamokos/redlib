@@ -13,12 +13,12 @@ function qualityBadge() {
   let badge = document.getElementById("image_quality_status");
 
   if (!badge) {
-    badge = document.createElement("span");
+    badge = document.createElement("div");
     badge.id = "image_quality_status";
     badge.className = "image_quality_status";
-    const mountPoint = document.querySelector("nav #links");
-    if (mountPoint) {
-      mountPoint.prepend(badge);
+    const nav = document.querySelector("body > nav");
+    if (nav) {
+      nav.insertAdjacentElement("afterend", badge);
     } else {
       document.body.appendChild(badge);
     }
@@ -68,23 +68,26 @@ function wireAutoImageUpgrade() {
   const mode = getImageMode();
   const allImages = contentImages();
 
-  if (allImages.length === 0) {
-    return;
-  }
-
   if (mode === "best") {
-    showQuality("Images: full resolution");
+    showQuality("Images: downloading full resolution");
     return;
   }
 
   if (mode === "display") {
-    showQuality("Images: resized preview");
+    showQuality("Images: downloading resized previews");
     return;
   }
 
+  if (allImages.length === 0) {
+    showQuality("Images: no inline images");
+    return;
+  }
+
+  showQuality("Images: downloading resized previews");
+
   const images = Array.from(document.querySelectorAll("img[data-full-src]"));
   if (images.length < 2) {
-    showQuality("Images: auto, preview only");
+    showQuality("Images: downloading resized previews");
     return;
   }
 
@@ -92,9 +95,9 @@ function wireAutoImageUpgrade() {
   const decide = () => {
     if (shouldUpgradeAfterPreview(firstImage)) {
       upgradeDeferredImages(remainingImages);
-      showQuality("Images: auto, upgraded later images to full resolution");
+      showQuality("Images: downloading full resolution");
     } else {
-      showQuality("Images: auto, staying on resized previews");
+      showQuality("Images: downloading resized previews");
     }
   };
 
