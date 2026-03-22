@@ -670,6 +670,10 @@ aside {
     margin-top: 20px;
 }
 
+#sub_top_users {
+    margin-top: 20px;
+}
+
 .sub_flairs_header {
     display: flex;
     align-items: center;
@@ -1625,6 +1629,10 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     max-height: 250px;
     overflow: hidden;
     position: relative;
+}
+
+.gallery.post_preview {
+    max-height: none;
 }
 
 .post_preview.truncated {

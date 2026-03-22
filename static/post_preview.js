@@ -1,6 +1,10 @@
 function markTruncatedPreviews() {
     for (const preview of document.querySelectorAll(".post_preview:not(.expanded)")) {
-        preview.classList.toggle("truncated", preview.scrollHeight > preview.clientHeight);
+        const isGallery = preview.classList.contains("gallery");
+        const isTruncated = isGallery
+            ? preview.querySelectorAll("figure").length > 2
+            : preview.scrollHeight > preview.clientHeight;
+        preview.classList.toggle("truncated", isTruncated);
     }
 }
 
