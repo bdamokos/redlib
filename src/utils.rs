@@ -1968,32 +1968,41 @@ async fn resolve_fansly_account_id(username: String) -> Option<String> {
 
 #[cached(size = 2048, time = 3600)]
 async fn coomer_lookup_exists(url: String) -> bool {
+	let Some(api_url) = coomer_profile_api_url(&url) else {
+		return false;
+	};
 	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
+	let request = match Request::builder()
+		.method("GET")
+		.uri(&api_url)
+		.header("Accept", "text/css")
+		.header("Accept-Encoding", "identity")
+		.header("User-Agent", &user_agent)
+		.body(Body::empty())
+	{
+		Ok(request) => request,
+		Err(_) => return false,
+	};
 
-	for method in ["HEAD", "GET"] {
-		let request = match Request::builder()
-			.method(method)
-			.uri(&url)
-			.header("Accept-Encoding", "identity")
-			.header("User-Agent", &user_agent)
-			.body(Body::empty())
-		{
-			Ok(request) => request,
-			Err(_) => return false,
-		};
+	let Ok(response) = CLIENT.request(request).await else {
+		return false;
+	};
+	response.status().is_success()
+}
 
-		let Ok(response) = CLIENT.request(request).await else {
-			continue;
-		};
-		if response.status().is_success() {
-			return true;
-		}
-		if response.status().as_u16() != 405 {
-			return false;
-		}
+fn coomer_profile_api_url(url: &str) -> Option<String> {
+	let parsed = Url::parse(url).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host != "coomer.st" && host != "www.coomer.st" {
+		return None;
 	}
 
-	false
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+	let [service, "user", profile_id, ..] = segments.as_slice() else {
+		return None;
+	};
+
+	Some(format!("https://coomer.st/api/v1/{service}/user/{profile_id}/profile"))
 }
 
 fn cached_author_links(name: &str) -> Option<Vec<ExternalLink>> {
