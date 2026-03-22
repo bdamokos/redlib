@@ -16,6 +16,7 @@ use chrono::DateTime;
 use regex::Regex;
 use std::sync::LazyLock;
 use time::{Duration, OffsetDateTime};
+use url::form_urlencoded;
 
 // STRUCTS
 #[derive(Template)]
@@ -24,7 +25,12 @@ pub struct SubredditTemplate {
 	sub: Subreddit,
 	posts: Vec<Post>,
 	sort: (String, String),
-	ends: (String, String),
+	sort_options: Vec<SortOption>,
+	flair_filters: Vec<FlairFilterOption>,
+	active_flair_filter: String,
+	clear_flair_filter_url: String,
+	prev_page_url: String,
+	next_page_url: String,
 	prefs: Preferences,
 	url: String,
 	redirect_url: String,
@@ -40,6 +46,21 @@ pub struct SubredditTemplate {
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
+
+#[derive(PartialEq)]
+struct SortOption {
+	label: String,
+	url: String,
+	selected: bool,
+}
+
+#[derive(PartialEq)]
+struct FlairFilterOption {
+	name: String,
+	url: String,
+	active: bool,
+	flair: crate::utils::Flair,
+}
 
 #[derive(Template)]
 #[template(path = "wiki.html")]
@@ -73,6 +94,69 @@ fn should_enable_duplicate_collapse(sub_name: &str) -> bool {
 
 fn is_async_subscription_request(req: &Request<Body>) -> bool {
 	req.headers().get("X-Redlib-Ajax").and_then(|value| value.to_str().ok()).is_some_and(|value| value == "1")
+}
+
+fn update_url_query(url: &str, updates: &[(&str, Option<&str>)]) -> String {
+	let (path, query) = url.split_once('?').unwrap_or((url, ""));
+	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+		.into_owned()
+		.filter(|(key, _)| !updates.iter().any(|(updated_key, _)| key == updated_key))
+		.collect();
+
+	for (key, value) in updates {
+		if let Some(value) = value.filter(|value| !value.is_empty()) {
+			query_pairs.push((key.to_string(), value.to_string()));
+		}
+	}
+
+	let query = form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+		.finish();
+
+	if query.is_empty() {
+		path.to_string()
+	} else {
+		format!("{path}?{query}")
+	}
+}
+
+fn filter_posts_by_flair(posts: &mut Vec<Post>, flair: &str) {
+	let flair = flair.trim();
+	if flair.is_empty() {
+		return;
+	}
+
+	posts.retain(|post| post.flair.text.trim() == flair);
+}
+
+fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
+	["hot", "new", "top", "rising", "controversial"]
+		.into_iter()
+		.map(|method| SortOption {
+			label: format!("{}{}", method.get(0..1).unwrap_or_default().to_uppercase(), method.get(1..).unwrap_or_default()),
+			url: update_url_query(
+				&format!("{base_path}/{method}"),
+				&[
+					("flair", (!flair_filter.is_empty()).then_some(flair_filter)),
+					("t", param(current_query_url, "t").as_deref()),
+				],
+			),
+			selected: method == selected_sort,
+		})
+		.collect()
+}
+
+fn build_flair_filters(current_url: &str, active_flair_filter: &str, flairs: Vec<crate::utils::Flair>) -> Vec<FlairFilterOption> {
+	flairs
+		.into_iter()
+		.filter(|flair| !flair.text.trim().is_empty())
+		.map(|flair| FlairFilterOption {
+			name: flair.text.clone(),
+			url: update_url_query(current_url, &[("flair", Some(flair.text.as_str())), ("before", None), ("after", None)]),
+			active: flair.text == active_flair_filter,
+			flair,
+		})
+		.collect()
 }
 
 // SERVICES
@@ -147,18 +231,37 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 	}
 
-	let mut params = String::from("&raw_json=1");
+	let mut extra_query_pairs = vec![("raw_json".to_string(), "1".to_string())];
 	if sub_name == "popular" {
 		let geo_filter = match GEO_FILTER_MATCH.captures(&query) {
 			Some(geo_filter) => geo_filter["region"].to_string(),
 			None => "GLOBAL".to_owned(),
 		};
-		params.push_str(&format!("&geo_filter={geo_filter}"));
+		extra_query_pairs.push(("geo_filter".to_string(), geo_filter));
 	}
 
-	let path = format!("/r/{}/{sort}.json?{}{params}", sub_name.replace('+', "%2B"), req.uri().query().unwrap_or_default());
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
+	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
+	let reddit_query = update_url_query(&format!("?{}", req.uri().query().unwrap_or_default()), &[("flair", None)]);
+	let path = {
+		let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(reddit_query.trim_start_matches('?').as_bytes()).into_owned().collect();
+		query_pairs.extend(extra_query_pairs);
+		let query = form_urlencoded::Serializer::new(String::new())
+			.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+			.finish();
+		format!("/r/{}/{sort}.json?{query}", sub_name.replace('+', "%2B"))
+	};
+	let flair_filters = if !sub.name.is_empty() && sub.name != "all" && sub.name != "popular" && !sub.name.contains('+') {
+		build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub.name))
+	} else {
+		Vec::new()
+	};
+	let sort_options = if sub_name.is_empty() {
+		build_sort_options("", &url, &sort, "")
+	} else {
+		build_sort_options(&format!("/r/{sub_name}"), &url, &sort, &active_flair_filter)
+	};
 	let filters = get_filters(&req);
 
 	// If all requested subs are filtered, we don't need to fetch posts.
@@ -167,7 +270,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			sub,
 			posts: Vec::new(),
 			sort: (sort, param(&path, "t").unwrap_or_default()),
-			ends: (param(&path, "after").unwrap_or_default(), String::new()),
+			sort_options,
+			flair_filters,
+			active_flair_filter,
+			clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None)]),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			prefs: Preferences::new(&req),
 			url,
 			redirect_url,
@@ -180,7 +288,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
+				utils::store_post_flairs(&posts);
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+				filter_posts_by_flair(&mut posts, &active_flair_filter);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				if sort == "new" {
@@ -188,11 +298,46 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
 				}
 				utils::hydrate_post_author_links_from_cache(&mut posts);
+				let timeframe = param(&path, "t").unwrap_or_default();
+				let before = param(&path, "after").unwrap_or_default();
 				Ok(template(&SubredditTemplate {
 					sub,
 					posts,
-					sort: (sort, param(&path, "t").unwrap_or_default()),
-					ends: (param(&path, "after").unwrap_or_default(), after),
+					sort: (sort.clone(), timeframe.clone()),
+					sort_options,
+					flair_filters: if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+						build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub_name))
+					} else {
+						Vec::new()
+					},
+					active_flair_filter: active_flair_filter.clone(),
+					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None)]),
+					prev_page_url: if !before.is_empty() {
+						update_url_query(
+							&url,
+							&[
+								("sort", Some(sort.as_str())),
+								("t", Some(timeframe.as_str())),
+								("before", Some(before.as_str())),
+								("after", None),
+							],
+						)
+					} else {
+						String::new()
+					},
+					next_page_url: if !after.is_empty() {
+						update_url_query(
+							&url,
+							&[
+								("sort", Some(sort.as_str())),
+								("t", Some(timeframe.as_str())),
+								("before", None),
+								("after", Some(after.as_str())),
+							],
+						)
+					} else {
+						String::new()
+					},
 					prefs: Preferences::new(&req),
 					url,
 					redirect_url,
@@ -215,7 +360,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{should_enable_duplicate_collapse, SubredditTemplate};
+	use super::{filter_posts_by_flair, should_enable_duplicate_collapse, update_url_query, SubredditTemplate};
 	use askama::Template;
 
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
@@ -300,7 +445,12 @@ mod tests {
 			},
 			posts: vec![test_post()],
 			sort: ("hot".to_string(), String::new()),
-			ends: (String::new(), String::new()),
+			sort_options: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			clear_flair_filter_url: "/r/rust+programming".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			prefs: test_prefs(),
 			url: "/r/rust+programming".to_string(),
 			redirect_url: "r/rust%2Bprogramming".to_string(),
@@ -325,7 +475,12 @@ mod tests {
 			},
 			posts: vec![test_post()],
 			sort: ("hot".to_string(), String::new()),
-			ends: (String::new(), String::new()),
+			sort_options: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			clear_flair_filter_url: "/r/rust".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			prefs: test_prefs(),
 			url: "/r/rust".to_string(),
 			redirect_url: "r/rust".to_string(),
@@ -339,6 +494,39 @@ mod tests {
 		.unwrap();
 
 		assert!(!html.contains("submitted_duplicates.js"));
+	}
+
+	#[test]
+	fn updates_urls_without_losing_existing_query_pairs() {
+		assert_eq!(
+			update_url_query("/r/rust?sort=hot&after=t3_demo", &[("flair", Some("Discussion")), ("after", None)]),
+			"/r/rust?sort=hot&flair=Discussion"
+		);
+	}
+
+	#[test]
+	fn filters_posts_by_exact_flair_name() {
+		let mut posts = vec![
+			Post {
+				flair: Flair {
+					text: "Discussion".to_string(),
+					..empty_flair()
+				},
+				..test_post()
+			},
+			Post {
+				flair: Flair {
+					text: "News".to_string(),
+					..empty_flair()
+				},
+				..test_post()
+			},
+		];
+
+		filter_posts_by_flair(&mut posts, "Discussion");
+
+		assert_eq!(posts.len(), 1);
+		assert_eq!(posts[0].flair.text, "Discussion");
 	}
 }
 

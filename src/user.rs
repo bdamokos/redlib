@@ -235,6 +235,7 @@ async fn fetch_user_listing_posts(path: &str, listing: &str, filters: &HashSet<S
 	let after = loop {
 		let (mut posts, next_after) = Post::fetch(&request_path, false).await?;
 		fetched_raw_posts |= !posts.is_empty();
+		utils::store_post_flairs(&posts);
 
 		filter_posts(&mut posts, filters);
 		all_posts.extend(posts);
