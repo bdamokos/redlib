@@ -24,6 +24,7 @@ use url::form_urlencoded;
 pub struct SubredditTemplate {
 	sub: Subreddit,
 	posts: Vec<Post>,
+	top_users: Vec<SubredditUserEntry>,
 	sort: (String, String),
 	sort_options: Vec<SortOption>,
 	flair_filters: Vec<FlairFilterOption>,
@@ -46,6 +47,12 @@ pub struct SubredditTemplate {
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
+
+#[derive(PartialEq)]
+struct SubredditUserEntry {
+	name: String,
+	count: u32,
+}
 
 #[derive(PartialEq)]
 struct SortOption {
@@ -257,6 +264,14 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		Vec::new()
 	};
+	let top_users = if !sub.name.is_empty() && sub.name != "all" && sub.name != "popular" && !sub.name.contains('+') {
+		utils::cached_subreddit_users(&sub.name)
+			.into_iter()
+			.map(|(name, count)| SubredditUserEntry { name, count })
+			.collect()
+	} else {
+		Vec::new()
+	};
 	let sort_options = if sub_name.is_empty() {
 		build_sort_options("", &url, &sort, "")
 	} else {
@@ -269,6 +284,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		Ok(template(&SubredditTemplate {
 			sub,
 			posts: Vec::new(),
+			top_users,
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			sort_options,
 			flair_filters,
@@ -289,6 +305,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
 				utils::store_post_flairs(&posts);
+				if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+					utils::store_subreddit_users(&sub_name, &posts);
+				}
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				filter_posts_by_flair(&mut posts, &active_flair_filter);
 				let no_posts = posts.is_empty();
@@ -303,6 +322,14 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				Ok(template(&SubredditTemplate {
 					sub,
 					posts,
+					top_users: if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+						utils::cached_subreddit_users(&sub_name)
+							.into_iter()
+							.map(|(name, count)| SubredditUserEntry { name, count })
+							.collect()
+					} else {
+						Vec::new()
+					},
 					sort: (sort.clone(), timeframe.clone()),
 					sort_options,
 					flair_filters: if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
@@ -444,6 +471,7 @@ mod tests {
 				..Default::default()
 			},
 			posts: vec![test_post()],
+			top_users: Vec::new(),
 			sort: ("hot".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
@@ -474,6 +502,10 @@ mod tests {
 				..Default::default()
 			},
 			posts: vec![test_post()],
+			top_users: vec![super::SubredditUserEntry {
+				name: "demo_user".to_string(),
+				count: 3,
+			}],
 			sort: ("hot".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
@@ -494,6 +526,8 @@ mod tests {
 		.unwrap();
 
 		assert!(!html.contains("submitted_duplicates.js"));
+		assert!(html.contains("/user/demo_user\">u/demo_user</a>"));
+		assert!(html.contains(">3</span>"));
 	}
 
 	#[test]

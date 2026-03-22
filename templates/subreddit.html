@@ -141,6 +141,21 @@
 						</div>
 					</div>
 					{% endif %}
+					{% if top_users.len() > 0 %}
+					<div id="sub_top_users">
+						<div class="sub_flairs_header">
+							<label>Users</label>
+						</div>
+						<ul class="user_subreddit_list">
+							{% for user in top_users %}
+							<li class="user_subreddit_item">
+								<a class="user_subreddit_link" href="/user/{{ user.name }}">u/{{ user.name }}</a>
+								<span class="user_subreddit_meta">{{ user.count }}</span>
+							</li>
+							{% endfor %}
+						</ul>
+					</div>
+					{% endif %}
 					<div id="sub_actions">
 						<div id="sub_subscription">
 							{% if prefs.subscriptions.contains(sub.name) %}
