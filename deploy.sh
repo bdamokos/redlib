@@ -190,6 +190,7 @@ build_and_push() {
 	echo "Building $IMAGE_NAME for $TARGET_PLATFORM..."
 	docker buildx build \
 		--platform "$TARGET_PLATFORM" \
+		--build-arg "GIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo dev)" \
 		--load \
 		-t "$IMAGE_NAME:$IMAGE_TAG" \
 		.

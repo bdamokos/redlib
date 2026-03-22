@@ -8,6 +8,8 @@ use std::os::windows::process::ExitStatusExt;
 
 fn main() {
 	println!("cargo:rerun-if-changed=src/");
+	println!("cargo:rerun-if-changed=static/");
+	println!("cargo:rerun-if-changed=templates/");
 	let output = String::from_utf8(
 		Command::new("git")
 			.args(["rev-parse", "HEAD"])
@@ -20,6 +22,10 @@ fn main() {
 			.stdout,
 	)
 	.unwrap_or_default();
-	let git_hash = if output == String::default() { "dev".into() } else { output };
+	let git_hash = if output == String::default() {
+		std::env::var("GIT_HASH").unwrap_or_else(|_| "dev".into())
+	} else {
+		output
+	};
 	println!("cargo:rustc-env=GIT_HASH={git_hash}");
 }

@@ -2,6 +2,8 @@
 
 FROM rust:1.94-bookworm as builder
 
+ARG GIT_HASH=dev
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \

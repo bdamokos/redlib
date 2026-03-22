@@ -650,6 +650,8 @@ impl Post {
 				},
 				thumbnail: Media {
 					url: format_url(val(post, "thumbnail").as_str()),
+					preview_url: String::new(),
+					preview_srcset: String::new(),
 					hls_url: String::new(),
 					dash_url: String::new(),
 					width: data["thumbnail_width"].as_i64().unwrap_or_default(),

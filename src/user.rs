@@ -308,25 +308,11 @@ mod tests {
 			flags: Flags::new(false, false, false),
 			thumbnail: Media {
 				url: String::new(),
-				hls_url: String::new(),
-				dash_url: String::new(),
-				width: 0,
-				height: 0,
-				poster: String::new(),
-				duration: String::new(),
-				download_name: String::new(),
-				embed_code: String::new(),
+				..Media::empty()
 			},
 			media: Media {
 				url: media_url.to_string(),
-				hls_url: String::new(),
-				dash_url: String::new(),
-				width: 0,
-				height: 0,
-				poster: String::new(),
-				duration: String::new(),
-				download_name: String::new(),
-				embed_code: String::new(),
+				..Media::empty()
 			},
 			domain: "i.redd.it".to_string(),
 			rel_time: "1h ago".to_string(),
@@ -338,6 +324,8 @@ mod tests {
 				.iter()
 				.map(|url| crate::utils::GalleryMedia {
 					url: (*url).to_string(),
+					preview_url: String::new(),
+					preview_srcset: String::new(),
 					width: 0,
 					height: 0,
 					caption: String::new(),
@@ -664,8 +652,10 @@ mod tests {
 		assert!(html.contains("Thread title"));
 		assert!(html.contains("View thread"));
 		assert!(!html.contains("post_thumbnail"));
-		assert!(html.contains("/r/demo_sub\">r/demo_sub <span>2</span></a>"));
-		assert!(html.contains("/r/other_sub\">r/other_sub <span>1</span></a>"));
+		assert!(html.contains("<a class=\"user_subreddit_link\" href=\"/r/demo_sub\">r/demo_sub</a>"));
+		assert!(html.contains("<span class=\"user_subreddit_meta\">2</span>"));
+		assert!(html.contains("<a class=\"user_subreddit_link\" href=\"/r/other_sub\">r/other_sub</a>"));
+		assert!(html.contains("<span class=\"user_subreddit_meta\">1</span>"));
 	}
 }
 

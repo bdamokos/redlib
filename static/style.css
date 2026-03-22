@@ -1706,6 +1706,10 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     background: linear-gradient(transparent, var(--post) 30%);
 }
 
+.gallery.post_preview.truncated:not(.expanded) figure:nth-of-type(n+3) {
+    display: none;
+}
+
 .post_preview.expanded {
     max-height: none;
 }
