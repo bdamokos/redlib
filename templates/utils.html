@@ -111,20 +111,16 @@
 	{% if post.post_type == "image" %}
 	<div class="post_media_content">
 		<a href="{{ post.media.url }}" class="post_media_image" >
-			{% if post.media.height == 0 || post.media.width == 0 %}
-			<!-- i.redd.it images special case -->
-			<img width="100%" height="100%" loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-			{% else %}
-			<svg
-				width="{{ post.media.width }}px"
-				height="{{ post.media.height }}px"
-				xmlns="http://www.w3.org/2000/svg">
-					<image width="100%" height="100%" href="{{ post.media.url }}"/>
-					<desc>
-						<img loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-					</desc>
-			</svg>
-			{% endif %}
+			<img
+				loading="lazy"
+				alt="Post image"
+				src="{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !post.media.preview_url.is_empty() %}{{ post.media.preview_url }}{% else %}{{ post.media.url }}{% endif %}"
+				{% if post.media.width > 0 %}width="{{ post.media.width }}"{% endif %}
+				{% if post.media.height > 0 %}height="{{ post.media.height }}"{% endif %}
+				{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !post.media.preview_srcset.is_empty() %}srcset="{{ post.media.preview_srcset }}"{% endif %}
+				{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !post.media.preview_srcset.is_empty() %}sizes="(max-width: 1040px) calc(100vw - 40px), 1000px"{% endif %}
+				{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto")) && !post.media.preview_url.is_empty() %}data-full-src="{{ post.media.url }}"{% endif %}
+			/>
 		</a>
 	</div>
 	{% else if post.post_type == "video" || post.post_type == "gif" %}
@@ -133,7 +129,18 @@
 	<div class="gallery">
 	{% for image in post.gallery -%}
 		<figure>
-			<a href="{{ image.url }}" ><img loading="lazy" alt="Gallery image" src="{{ image.url }}"/></a>
+			<a href="{{ image.url }}" >
+				<img
+					loading="lazy"
+					alt="Gallery image"
+					src="{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !image.preview_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.url }}{% endif %}"
+					{% if image.width > 0 %}width="{{ image.width }}"{% endif %}
+					{% if image.height > 0 %}height="{{ image.height }}"{% endif %}
+					{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !image.preview_srcset.is_empty() %}srcset="{{ image.preview_srcset }}"{% endif %}
+					{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !image.preview_srcset.is_empty() %}sizes="(max-width: 1040px) calc(100vw - 40px), 1000px"{% endif %}
+					{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto")) && !image.preview_url.is_empty() %}data-full-src="{{ image.url }}"{% endif %}
+				/>
+			</a>
 			<figcaption>
 				<p>{{ image.caption }}</p>
 				{% if image.outbound_url.len() > 0 %}
@@ -276,20 +283,16 @@
 		{% if post.post_type == "image" %}
 		<div class="post_media_content">
 			<a href="{{ post.media.url }}" class="post_media_image {% if post.media.height < post.media.width*2 %}short{% endif %}" >
-				{% if post.media.height == 0 || post.media.width == 0 %}
-				<!-- i.redd.it images speical case -->
-				<img width="100%" height="100%" loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-				{% else %}
-				<svg
-					width="{{ post.media.width }}px"
-					height="{{ post.media.height }}px"
-					xmlns="http://www.w3.org/2000/svg">
-						<image width="100%" height="100%" href="{{ post.media.url }}"/>
-						<desc>
-							<img loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-						</desc>
-				</svg>
-				{% endif %}
+				<img
+					loading="lazy"
+					alt="Post image"
+					src="{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !post.media.preview_url.is_empty() %}{{ post.media.preview_url }}{% else %}{{ post.media.url }}{% endif %}"
+					{% if post.media.width > 0 %}width="{{ post.media.width }}"{% endif %}
+					{% if post.media.height > 0 %}height="{{ post.media.height }}"{% endif %}
+					{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !post.media.preview_srcset.is_empty() %}srcset="{{ post.media.preview_srcset }}"{% endif %}
+					{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !post.media.preview_srcset.is_empty() %}sizes="(max-width: 1040px) calc(100vw - 40px), 1000px"{% endif %}
+					{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto")) && !post.media.preview_url.is_empty() %}data-full-src="{{ post.media.url }}"{% endif %}
+				/>
 			</a>
 		</div>
 		{% else if (post.post_type == "gif" || post.post_type == "video") %}
@@ -298,7 +301,18 @@
 		<div class="gallery post_preview">
 		{% for image in post.gallery -%}
 			<figure>
-				<a href="{{ image.url }}"><img loading="lazy" alt="Gallery image" src="{{ image.url }}"/></a>
+				<a href="{{ image.url }}">
+					<img
+						loading="lazy"
+						alt="Gallery image"
+						src="{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !image.preview_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.url }}{% endif %}"
+						{% if image.width > 0 %}width="{{ image.width }}"{% endif %}
+						{% if image.height > 0 %}height="{{ image.height }}"{% endif %}
+						{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !image.preview_srcset.is_empty() %}srcset="{{ image.preview_srcset }}"{% endif %}
+						{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto") || str_eq(prefs.image_quality, "display")) && !image.preview_srcset.is_empty() %}sizes="(max-width: 1040px) calc(100vw - 40px), 1000px"{% endif %}
+						{% if (prefs.image_quality.is_empty() || str_eq(prefs.image_quality, "auto")) && !image.preview_url.is_empty() %}data-full-src="{{ image.url }}"{% endif %}
+					/>
+				</a>
 				{% if !image.caption.is_empty() || image.outbound_url.len() > 0 %}
 				<figcaption>
 					{% if !image.caption.is_empty() %}

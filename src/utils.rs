@@ -248,6 +248,8 @@ impl Flags {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Media {
 	pub url: String,
+	pub preview_url: String,
+	pub preview_srcset: String,
 	pub hls_url: String,
 	pub dash_url: String,
 	pub width: i64,
@@ -262,6 +264,8 @@ impl Media {
 	pub fn empty() -> Self {
 		Self {
 			url: String::new(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
 			hls_url: String::new(),
 			dash_url: String::new(),
 			width: 0,
@@ -364,6 +368,7 @@ impl Media {
 
 		let hls_url = hls_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
 		let dash_url = dash_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
+		let (preview_url, preview_srcset) = image_preview_variants(&data["preview"]["images"][0]);
 		let poster = if redgifs_url.is_some() {
 			redgifs_poster
 		} else {
@@ -394,6 +399,8 @@ impl Media {
 			post_type.to_string(),
 			Self {
 				url: format_url(url_val.as_str().unwrap_or_default()),
+				preview_url,
+				preview_srcset,
 				hls_url,
 				dash_url,
 				width: source["width"].as_i64().unwrap_or_default(),
@@ -427,6 +434,8 @@ pub fn format_video_duration(seconds: i64) -> String {
 #[derive(Serialize, PartialEq)]
 pub struct GalleryMedia {
 	pub url: String,
+	pub preview_url: String,
+	pub preview_srcset: String,
 	pub width: i64,
 	pub height: i64,
 	pub caption: String,
@@ -454,6 +463,8 @@ impl GalleryMedia {
 				// Construct gallery items
 				Self {
 					url: format_url(url),
+					preview_url: largest_preview_url(&metadata[media_id]["p"]),
+					preview_srcset: preview_srcset(&metadata[media_id]["p"]),
 					width: image["x"].as_i64().unwrap_or_default(),
 					height: image["y"].as_i64().unwrap_or_default(),
 					caption: item["caption"].as_str().unwrap_or_default().to_string(),
@@ -869,7 +880,7 @@ pub struct Params {
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -890,6 +901,8 @@ pub struct Preferences {
 	pub blur_nsfw: String,
 	#[revision(start = 1)]
 	pub hide_hls_notification: String,
+	#[revision(start = 2)]
+	pub image_quality: String,
 	#[revision(start = 1)]
 	pub video_quality: String,
 	#[revision(start = 1)]
@@ -967,6 +980,7 @@ impl Preferences {
 			use_dash: setting(req, "use_dash"),
 			use_hls: setting(req, "use_hls"),
 			hide_hls_notification: setting(req, "hide_hls_notification"),
+			image_quality: setting(req, "image_quality"),
 			video_quality: setting(req, "video_quality"),
 			autoplay_videos: setting(req, "autoplay_videos"),
 			fixed_navbar: setting_or_default(req, "fixed_navbar", "on".to_string()),
@@ -1106,6 +1120,8 @@ pub async fn parse_post(post: &Value) -> Post {
 		media,
 		thumbnail: Media {
 			url: format_url(val(post, "thumbnail").as_str()),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
 			hls_url: String::new(),
 			dash_url: String::new(),
 			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
@@ -1308,6 +1324,44 @@ static REGEX_URL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?
 static REGEX_URL_EXTERNAL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://external\-preview\.redd\.it/(.*)").unwrap());
 static REGEX_URL_STYLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://styles\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_STATIC_MEDIA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://www\.redditstatic\.com/(.*)").unwrap());
+
+fn image_preview_variants(image: &Value) -> (String, String) {
+	let resolutions = &image["resolutions"];
+	let preview_url = largest_preview_url(resolutions);
+	let preview_srcset = preview_srcset(resolutions);
+
+	if preview_url.is_empty() {
+		(format_url(image["source"]["url"].as_str().unwrap_or_default()), preview_srcset)
+	} else {
+		(preview_url, preview_srcset)
+	}
+}
+
+fn largest_preview_url(resolutions: &Value) -> String {
+	resolutions
+		.as_array()
+		.and_then(|items| items.last())
+		.and_then(|item| item["url"].as_str())
+		.map(format_url)
+		.unwrap_or_default()
+}
+
+fn preview_srcset(resolutions: &Value) -> String {
+	resolutions
+		.as_array()
+		.map(|items| {
+			items
+				.iter()
+				.filter_map(|item| {
+					let url = item["url"].as_str()?;
+					let width = item["width"].as_i64()?;
+					Some(format!("{} {}w", format_url(url), width))
+				})
+				.collect::<Vec<_>>()
+				.join(", ")
+		})
+		.unwrap_or_default()
+}
 
 /// Direct urls to proxy if proxy is enabled
 pub fn format_url(url: &str) -> String {
@@ -2132,6 +2186,7 @@ mod tests {
 			show_nsfw: "off".to_owned(),
 			blur_nsfw: "on".to_owned(),
 			hide_hls_notification: "off".to_owned(),
+			image_quality: "auto".to_owned(),
 			video_quality: "best".to_owned(),
 			hide_sidebar_and_summary: "off".to_owned(),
 			use_dash: "on".to_owned(),

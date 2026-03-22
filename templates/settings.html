@@ -69,6 +69,20 @@
 			<fieldset>
 				<legend>Content</legend>
 				<div class="prefs-group">
+					<label for="image_quality">Image quality:</label>
+					<details class="feeds">
+						<summary>Modes</summary>
+						<div class="feed_list helper">
+							<p><b>Auto</b> starts with the Reddit preview image, measures that first transfer, then upgrades later images to full resolution if the connection looks fast.</p>
+							<p><b>Best</b> always loads the original full-resolution image inline.</p>
+							<p><b>Display</b> keeps inline images on Reddit's resized preview variants.</p>
+						</div>
+					</details>
+					<select name="image_quality" id="image_quality">
+						{% call utils::options(prefs.image_quality, ["auto", "best", "display"], "auto") %}
+					</select>
+				</div>
+				<div class="prefs-group">
 					<label for="video_quality">Video quality:</label>
 					<select name="video_quality" id="video_quality">
 						{% call utils::options(prefs.video_quality, ["best", "medium", "worst"], "best") %}

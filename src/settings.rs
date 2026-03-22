@@ -27,7 +27,7 @@ crate::impl_template_str_eq!(SettingsTemplate);
 
 // CONSTANTS
 
-const PREFS: [&str; 20] = [
+const PREFS: [&str; 21] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -46,6 +46,7 @@ const PREFS: [&str; 20] = [
 	"hide_awards",
 	"hide_score",
 	"disable_visit_reddit_confirmation",
+	"image_quality",
 	"video_quality",
 	"remove_default_feeds",
 ];
