@@ -575,7 +575,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		Vec::new()
 	};
 	let sort_base_path = if aggregate_subscriptions {
-		req.uri().path().trim_end_matches('/').to_string()
+		if req.uri().path().starts_with("/r/") {
+			format!("/r/{sub_name}")
+		} else {
+			String::new()
+		}
 	} else if sub_name.is_empty() {
 		String::new()
 	} else {
@@ -933,6 +937,18 @@ mod tests {
 		let options = super::build_sort_options("", "/?sort=hot&front_cursor=abc&after=t3_demo&t=day", "hot", "");
 		assert!(options.iter().all(|option| !option.url.contains(FRONT_CURSOR_PARAM)));
 		assert!(options.iter().all(|option| !option.url.contains("after=")));
+	}
+
+	#[test]
+	fn aggregate_frontpage_sort_links_use_frontpage_routes() {
+		let options = super::build_sort_options("", "/hot?front_cursor=abc&after=t3_demo&t=day", "hot", "");
+		let top = options.iter().find(|option| option.label == "Top").unwrap();
+		let rising = options.iter().find(|option| option.label == "Rising").unwrap();
+		let controversial = options.iter().find(|option| option.label == "Controversial").unwrap();
+
+		assert_eq!(top.url, "/top?t=day");
+		assert_eq!(rising.url, "/rising?t=day");
+		assert_eq!(controversial.url, "/controversial?t=day");
 	}
 
 	#[test]
