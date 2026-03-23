@@ -3,20 +3,30 @@
 use crate::{config, utils};
 // CRATES
 use crate::utils::{
-	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, val, Post, Preferences,
-	Subreddit,
+	catch_random, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting,
+	template, val, Post, Preferences, Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cookie::Cookie;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
+use log::warn;
 
 use chrono::DateTime;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::LazyLock;
 use time::{Duration, OffsetDateTime};
 use url::form_urlencoded;
+
+const FRONT_CURSOR_PARAM: &str = "front_cursor";
+const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
+const TARGET_POST_COUNT: usize = 25;
+const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
+const AFTER_PATH_HEADROOM: usize = 128;
 
 // STRUCTS
 #[derive(Template)]
@@ -67,6 +77,30 @@ struct FlairFilterOption {
 	url: String,
 	active: bool,
 	flair: crate::utils::Flair,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AggregateFrontCursor {
+	v: u8,
+	chunks: Vec<String>,
+	chunk_afters: Vec<String>,
+	prev_stack: Vec<Vec<String>>,
+	sort: String,
+	timeframe: String,
+	query_fingerprint: String,
+}
+
+struct ChunkListingPage {
+	posts: Vec<Post>,
+	after: String,
+}
+
+struct AggregatedFeed {
+	posts: Vec<Post>,
+	next_cursor: Option<String>,
+	prev_cursor: Option<String>,
+	all_posts_filtered: bool,
+	partial_failure: bool,
 }
 
 #[derive(Template)]
@@ -146,6 +180,9 @@ fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &
 				&[
 					("flair", (!flair_filter.is_empty()).then_some(flair_filter)),
 					("t", param(current_query_url, "t").as_deref()),
+					(FRONT_CURSOR_PARAM, None),
+					("before", None),
+					("after", None),
 				],
 			),
 			selected: method == selected_sort,
@@ -159,11 +196,264 @@ fn build_flair_filters(current_url: &str, active_flair_filter: &str, flairs: Vec
 		.filter(|flair| !flair.text.trim().is_empty())
 		.map(|flair| FlairFilterOption {
 			name: flair.text.clone(),
-			url: update_url_query(current_url, &[("flair", Some(flair.text.as_str())), ("before", None), ("after", None)]),
+			url: update_url_query(
+				current_url,
+				&[("flair", Some(flair.text.as_str())), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)],
+			),
 			active: flair.text == active_flair_filter,
 			flair,
 		})
 		.collect()
+}
+
+fn subreddit_listing_query(query: &str, include_geo_filter: bool) -> String {
+	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+		.into_owned()
+		.filter(|(key, _)| key != "flair" && key != "before" && key != "after" && key != FRONT_CURSOR_PARAM)
+		.collect();
+
+	if include_geo_filter && !query_pairs.iter().any(|(key, _)| key == "geo_filter") {
+		let geo_filter = match GEO_FILTER_MATCH.captures(query) {
+			Some(geo_filter) => geo_filter["region"].to_string(),
+			None => "GLOBAL".to_owned(),
+		};
+		query_pairs.push(("geo_filter".to_string(), geo_filter));
+	}
+
+	query_pairs.push(("raw_json".to_string(), "1".to_string()));
+
+	form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+		.finish()
+}
+
+fn listing_query_fingerprint(query: &str) -> String {
+	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+		.into_owned()
+		.filter(|(key, _)| key != FRONT_CURSOR_PARAM && key != "before" && key != "after")
+		.collect();
+	query_pairs.sort();
+
+	form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+		.finish()
+}
+
+fn split_subscriptions_for_listing(subs: &[String], sort: &str, query: &str) -> Vec<String> {
+	let mut chunks = Vec::new();
+	let mut current = Vec::new();
+
+	for sub in subs {
+		let mut next = current.clone();
+		next.push(sub.clone());
+		let chunk = next.join("+");
+		let projected_len = format!("/r/{chunk}/{sort}.json?{query}").len() + AFTER_PATH_HEADROOM;
+
+		if !current.is_empty() && projected_len > REDDIT_LISTING_PATH_SOFT_LIMIT {
+			chunks.push(current.join("+"));
+			current = vec![sub.clone()];
+		} else {
+			current = next;
+		}
+	}
+
+	if !current.is_empty() {
+		chunks.push(current.join("+"));
+	}
+
+	chunks
+}
+
+fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str) -> String {
+	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(base_query.as_bytes()).into_owned().collect();
+	if !after.is_empty() {
+		query_pairs.push(("after".to_string(), after.to_string()));
+	}
+
+	let query = form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+		.finish();
+
+	format!("/r/{}/{sort}.json?{query}", chunk.replace('+', "%2B"))
+}
+
+fn path_needs_frontpage_aggregation(subscribed: &str, sort: &str, reddit_query: &str) -> bool {
+	if subscribed.is_empty() {
+		return false;
+	}
+
+	format!("/r/{subscribed}/{sort}.json?{reddit_query}").len() + AFTER_PATH_HEADROOM > REDDIT_LISTING_PATH_SOFT_LIMIT
+}
+
+fn encode_front_cursor(cursor: &AggregateFrontCursor) -> Option<String> {
+	let serialized = serde_json::to_vec(cursor).ok()?;
+	let compressed = deflate_compress(serialized).ok()?;
+	Some(URL_SAFE_NO_PAD.encode(compressed))
+}
+
+fn decode_front_cursor(encoded: &str) -> Option<AggregateFrontCursor> {
+	let decoded = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+	let decompressed = deflate_decompress(decoded).ok()?;
+	let cursor: AggregateFrontCursor = serde_json::from_slice(&decompressed).ok()?;
+	(cursor.v == 1).then_some(cursor)
+}
+
+fn build_front_cursor_url(current_url: &str, encoded_cursor: &str) -> String {
+	update_url_query(current_url, &[(FRONT_CURSOR_PARAM, Some(encoded_cursor)), ("before", None), ("after", None)])
+}
+
+fn cursor_matches_request(cursor: &AggregateFrontCursor, chunks: &[String], sort: &str, timeframe: &str, query_fingerprint: &str) -> bool {
+	cursor.chunks == chunks && cursor.chunk_afters.len() == chunks.len() && cursor.sort == sort && cursor.timeframe == timeframe && cursor.query_fingerprint == query_fingerprint
+}
+
+async fn fetch_chunk_listing_page(chunk: &str, sort: &str, reddit_query: &str, after: &str, quarantine: bool) -> Result<ChunkListingPage, String> {
+	let path = build_listing_path(chunk, sort, reddit_query, after);
+	let (posts, next_after) = Post::fetch(&path, quarantine).await?;
+	Ok(ChunkListingPage { posts, after: next_after })
+}
+
+fn merge_chunk_posts(
+	chunk_buffers: &mut [VecDeque<Post>],
+	merged_posts: &mut Vec<Post>,
+	filters: &std::collections::HashSet<String>,
+	active_flair_filter: &str,
+	any_post_after_filter: &mut bool,
+) {
+	loop {
+		let mut made_progress = false;
+
+		for buffer in chunk_buffers.iter_mut() {
+			let Some(post) = buffer.pop_front() else {
+				continue;
+			};
+			made_progress = true;
+
+			let is_filtered = filters.contains(&post.community) || filters.contains(&format!("u_{}", post.author.name));
+			if is_filtered {
+				continue;
+			}
+
+			*any_post_after_filter = true;
+			if !active_flair_filter.is_empty() && post.flair.text.trim() != active_flair_filter {
+				continue;
+			}
+
+			merged_posts.push(post);
+			if merged_posts.len() >= TARGET_POST_COUNT {
+				return;
+			}
+		}
+
+		if !made_progress {
+			return;
+		}
+	}
+}
+
+async fn fetch_aggregated_subscription_feed(
+	chunks: &[String],
+	cursor: Option<AggregateFrontCursor>,
+	sort: &str,
+	timeframe: &str,
+	reddit_query: &str,
+	query_fingerprint: &str,
+	filters: &std::collections::HashSet<String>,
+	active_flair_filter: &str,
+	quarantine: bool,
+) -> Result<AggregatedFeed, String> {
+	let current_state = cursor.as_ref().map(|value| value.chunk_afters.clone()).unwrap_or_else(|| vec![String::new(); chunks.len()]);
+	let mut next_state = current_state.clone();
+	let mut prev_stack = cursor.as_ref().map(|value| value.prev_stack.clone()).unwrap_or_default();
+	let page_has_cursor = cursor.is_some();
+	let mut chunk_buffers: Vec<VecDeque<Post>> = (0..chunks.len()).map(|_| VecDeque::new()).collect();
+	let mut merged_posts = Vec::new();
+	let mut fetched_raw_posts = false;
+	let mut any_post_after_filter = false;
+	let mut successful_chunks = 0usize;
+	let mut chunk_errors = Vec::new();
+
+	for round in 0..MAX_AGGREGATE_FILL_ROUNDS {
+		let mut fetched_any_chunk = false;
+
+		for (index, chunk) in chunks.iter().enumerate() {
+			if round > 0 && next_state[index].is_empty() {
+				continue;
+			}
+			if round == 0 && page_has_cursor && current_state[index].is_empty() {
+				continue;
+			}
+
+			let request_after = next_state[index].clone();
+			match fetch_chunk_listing_page(chunk, sort, reddit_query, &request_after, quarantine).await {
+				Ok(page) => {
+					fetched_any_chunk = true;
+					successful_chunks += 1;
+					fetched_raw_posts |= !page.posts.is_empty();
+					utils::store_post_flairs(&page.posts);
+					chunk_buffers[index].extend(page.posts);
+					next_state[index] = page.after;
+				}
+				Err(err) => {
+					chunk_errors.push(format!("chunk {chunk}: {err}"));
+				}
+			}
+		}
+
+		merge_chunk_posts(&mut chunk_buffers, &mut merged_posts, filters, active_flair_filter, &mut any_post_after_filter);
+
+		if merged_posts.len() >= TARGET_POST_COUNT {
+			break;
+		}
+
+		if !fetched_any_chunk || next_state.iter().all(String::is_empty) {
+			break;
+		}
+	}
+
+	if successful_chunks == 0 {
+		let err = chunk_errors.into_iter().next().unwrap_or_else(|| "No aggregated chunk requests succeeded".to_string());
+		return Err(err);
+	}
+
+	for err in &chunk_errors {
+		warn!("Partial aggregate front page failure: {err}");
+	}
+
+	let next_cursor = if next_state.iter().any(|after| !after.is_empty()) {
+		let mut next_prev_stack = prev_stack.clone();
+		next_prev_stack.push(current_state.clone());
+		encode_front_cursor(&AggregateFrontCursor {
+			v: 1,
+			chunks: chunks.to_vec(),
+			chunk_afters: next_state,
+			prev_stack: next_prev_stack,
+			sort: sort.to_string(),
+			timeframe: timeframe.to_string(),
+			query_fingerprint: query_fingerprint.to_string(),
+		})
+	} else {
+		None
+	};
+
+	let prev_cursor = prev_stack.pop().and_then(|previous_state| {
+		encode_front_cursor(&AggregateFrontCursor {
+			v: 1,
+			chunks: chunks.to_vec(),
+			chunk_afters: previous_state,
+			prev_stack,
+			sort: sort.to_string(),
+			timeframe: timeframe.to_string(),
+			query_fingerprint: query_fingerprint.to_string(),
+		})
+	});
+
+	Ok(AggregatedFeed {
+		posts: merged_posts,
+		next_cursor,
+		prev_cursor,
+		all_posts_filtered: fetched_raw_posts && !any_post_after_filter,
+		partial_failure: !chunk_errors.is_empty(),
+	})
 }
 
 // SERVICES
@@ -212,11 +502,14 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		return Ok(redirect(&["/user/", &sub_name[2..]].concat()));
 	}
 
+	let reddit_query = subreddit_listing_query(&query, sub_name == "popular");
+	let aggregate_subscriptions = sub_name == subscribed && path_needs_frontpage_aggregation(&subscribed, &sort, &reddit_query);
+
 	// Request subreddit metadata
 	let sub = if !sub_name.contains('+') && sub_name != subscribed && sub_name != "popular" && sub_name != "all" {
 		// Regular subreddit
 		subreddit(&sub_name, quarantined).await.unwrap_or_default()
-	} else if sub_name == subscribed {
+	} else if sub_name == subscribed && !aggregate_subscriptions {
 		// Subscription feed
 		if req.uri().path().starts_with("/r/") {
 			subreddit(&sub_name, quarantined).await.unwrap_or_default()
@@ -238,27 +531,10 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 	}
 
-	let mut extra_query_pairs = vec![("raw_json".to_string(), "1".to_string())];
-	if sub_name == "popular" {
-		let geo_filter = match GEO_FILTER_MATCH.captures(&query) {
-			Some(geo_filter) => geo_filter["region"].to_string(),
-			None => "GLOBAL".to_owned(),
-		};
-		extra_query_pairs.push(("geo_filter".to_string(), geo_filter));
-	}
-
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
-	let reddit_query = update_url_query(&format!("?{}", req.uri().query().unwrap_or_default()), &[("flair", None)]);
-	let path = {
-		let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(reddit_query.trim_start_matches('?').as_bytes()).into_owned().collect();
-		query_pairs.extend(extra_query_pairs);
-		let query = form_urlencoded::Serializer::new(String::new())
-			.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
-			.finish();
-		format!("/r/{}/{sort}.json?{query}", sub_name.replace('+', "%2B"))
-	};
+	let path = build_listing_path(&sub_name, &sort, &reddit_query, "");
 	let flair_filters = if !sub.name.is_empty() && sub.name != "all" && sub.name != "popular" && !sub.name.contains('+') {
 		build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub.name))
 	} else {
@@ -272,12 +548,16 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		Vec::new()
 	};
-	let sort_options = if sub_name.is_empty() {
-		build_sort_options("", &url, &sort, "")
+	let sort_base_path = if aggregate_subscriptions {
+		req.uri().path().trim_end_matches('/').to_string()
+	} else if sub_name.is_empty() {
+		String::new()
 	} else {
-		build_sort_options(&format!("/r/{sub_name}"), &url, &sort, &active_flair_filter)
+		format!("/r/{sub_name}")
 	};
+	let sort_options = build_sort_options(&sort_base_path, &url, &sort, &active_flair_filter);
 	let filters = get_filters(&req);
+	let timeframe = param(&path, "t").unwrap_or_default();
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if sub_name.split('+').all(|s| filters.contains(s)) {
@@ -289,7 +569,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			sort_options,
 			flair_filters,
 			active_flair_filter,
-			clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None)]),
+			clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			prefs: Preferences::new(&req),
@@ -301,6 +581,62 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
 		}))
+	} else if aggregate_subscriptions {
+		let chunks = split_subscriptions_for_listing(&Preferences::new(&req).subscriptions, &sort, &reddit_query);
+		let query_fingerprint = listing_query_fingerprint(&query);
+		let cursor = req
+			.param(FRONT_CURSOR_PARAM)
+			.and_then(|encoded| decode_front_cursor(&encoded))
+			.filter(|cursor| cursor_matches_request(cursor, &chunks, &sort, &timeframe, &query_fingerprint));
+
+		match fetch_aggregated_subscription_feed(
+			&chunks,
+			cursor,
+			&sort,
+			&timeframe,
+			&reddit_query,
+			&query_fingerprint,
+			&filters,
+			&active_flair_filter,
+			quarantined,
+		)
+		.await
+		{
+			Ok(mut feed) => {
+				if sort == "new" {
+					feed.posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+					feed.posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+				}
+				let no_posts = feed.posts.is_empty();
+				let all_posts_hidden_nsfw = !no_posts && (feed.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+				utils::hydrate_post_author_links_from_cache(&mut feed.posts);
+				if feed.partial_failure && feed.posts.is_empty() {
+					warn!("Aggregate front page rendered without posts after partial failures");
+				}
+
+				Ok(template(&SubredditTemplate {
+					sub,
+					posts: feed.posts,
+					top_users,
+					sort: (sort.clone(), timeframe.clone()),
+					sort_options,
+					flair_filters,
+					active_flair_filter: active_flair_filter.clone(),
+					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+					prev_page_url: feed.prev_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
+					next_page_url: feed.next_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
+					prefs: Preferences::new(&req),
+					url,
+					redirect_url,
+					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+					is_filtered: false,
+					all_posts_filtered: feed.all_posts_filtered,
+					all_posts_hidden_nsfw,
+					no_posts,
+				}))
+			}
+			Err(msg) => error(req, &msg).await,
+		}
 	} else {
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
@@ -338,7 +674,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						Vec::new()
 					},
 					active_flair_filter: active_flair_filter.clone(),
-					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None)]),
+					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 					prev_page_url: if !before.is_empty() {
 						update_url_query(
 							&url,
@@ -387,8 +723,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{filter_posts_by_flair, should_enable_duplicate_collapse, update_url_query, SubredditTemplate};
+	use super::{
+		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, should_enable_duplicate_collapse,
+		split_subscriptions_for_listing, update_url_query, AggregateFrontCursor, SubredditTemplate, FRONT_CURSOR_PARAM,
+	};
 	use askama::Template;
+	use std::collections::{HashSet, VecDeque};
 
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
 
@@ -561,6 +901,108 @@ mod tests {
 
 		assert_eq!(posts.len(), 1);
 		assert_eq!(posts[0].flair.text, "Discussion");
+	}
+
+	#[test]
+	fn sort_links_reset_front_cursor_and_pagination() {
+		let options = super::build_sort_options("", "/?sort=hot&front_cursor=abc&after=t3_demo&t=day", "hot", "");
+		assert!(options.iter().all(|option| !option.url.contains(FRONT_CURSOR_PARAM)));
+		assert!(options.iter().all(|option| !option.url.contains("after=")));
+	}
+
+	#[test]
+	fn splits_large_subscription_lists_into_multiple_listing_chunks() {
+		let subscriptions = (0..1_200).map(|idx| format!("subreddit{idx}")).collect::<Vec<_>>();
+		let chunks = split_subscriptions_for_listing(&subscriptions, "hot", "raw_json=1");
+
+		assert!(chunks.len() > 1);
+		assert_eq!(chunks.join("+"), subscriptions.join("+"));
+		assert!(chunks
+			.iter()
+			.all(|chunk| { format!("/r/{chunk}/hot.json?raw_json=1").len() + super::AFTER_PATH_HEADROOM <= super::REDDIT_LISTING_PATH_SOFT_LIMIT }));
+	}
+
+	#[test]
+	fn aggregate_cursor_round_trips() {
+		let cursor = AggregateFrontCursor {
+			v: 1,
+			chunks: vec!["a+b".to_string(), "c+d".to_string()],
+			chunk_afters: vec!["t3_a".to_string(), String::new()],
+			prev_stack: vec![vec![String::new(), String::new()]],
+			sort: "hot".to_string(),
+			timeframe: String::new(),
+			query_fingerprint: "sort=hot&flair=News".to_string(),
+		};
+
+		let encoded = encode_front_cursor(&cursor).unwrap();
+		let decoded = decode_front_cursor(&encoded).unwrap();
+
+		assert_eq!(decoded, cursor);
+	}
+
+	#[test]
+	fn query_fingerprint_ignores_front_cursor_and_page_tokens() {
+		assert_eq!(
+			listing_query_fingerprint("sort=hot&front_cursor=abc&after=t3_a&flair=News"),
+			listing_query_fingerprint("sort=hot&before=t3_b&flair=News")
+		);
+	}
+
+	#[test]
+	fn merge_round_robins_chunks_and_applies_filters() {
+		let first = VecDeque::from(vec![
+			Post {
+				id: "1".to_string(),
+				community: "rust".to_string(),
+				..test_post()
+			},
+			Post {
+				id: "2".to_string(),
+				community: "rust".to_string(),
+				..test_post()
+			},
+		]);
+		let second = VecDeque::from(vec![Post {
+			id: "3".to_string(),
+			community: "programming".to_string(),
+			..test_post()
+		}]);
+		let mut merged = Vec::new();
+		let mut any_post_after_filter = false;
+		let mut chunk_buffers = [first, second];
+
+		merge_chunk_posts(&mut chunk_buffers, &mut merged, &HashSet::new(), "", &mut any_post_after_filter);
+
+		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "3", "2"]);
+		assert!(any_post_after_filter);
+
+		let mut filtered_merged = Vec::new();
+		let mut filtered_flag = false;
+		let filters = HashSet::from(["programming".to_string()]);
+		let mut filtered_chunk_buffers = [
+			VecDeque::from(vec![
+				Post {
+					id: "1".to_string(),
+					community: "rust".to_string(),
+					..test_post()
+				},
+				Post {
+					id: "2".to_string(),
+					community: "rust".to_string(),
+					..test_post()
+				},
+			]),
+			VecDeque::from(vec![Post {
+				id: "3".to_string(),
+				community: "programming".to_string(),
+				..test_post()
+			}]),
+		];
+
+		merge_chunk_posts(&mut filtered_chunk_buffers, &mut filtered_merged, &filters, "", &mut filtered_flag);
+
+		assert_eq!(filtered_merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "2"]);
+		assert!(filtered_flag);
 	}
 }
 
