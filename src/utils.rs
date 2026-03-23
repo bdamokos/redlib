@@ -20,7 +20,7 @@ use hyper::{Body, Request, Response, Uri};
 use libflate::deflate::{Decoder, Encoder};
 use log::error;
 use regex::Regex;
-use revision::revisioned;
+use revision::{revisioned, Revisioned};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -1216,6 +1216,123 @@ pub struct Preferences {
 	pub remove_default_feeds: String,
 }
 
+#[derive(Deserialize)]
+struct LegacyPreferencesV1 {
+	pub theme: String,
+	pub front_page: String,
+	pub layout: String,
+	pub wide: String,
+	pub blur_spoiler: String,
+	pub show_nsfw: String,
+	pub blur_nsfw: String,
+	pub hide_hls_notification: String,
+	pub video_quality: String,
+	pub hide_sidebar_and_summary: String,
+	pub use_dash: String,
+	pub use_hls: String,
+	pub autoplay_videos: String,
+	pub fixed_navbar: String,
+	pub disable_visit_reddit_confirmation: String,
+	pub comment_sort: String,
+	pub post_sort: String,
+	#[serde(deserialize_with = "deserialize_vec_with_plus")]
+	pub subscriptions: Vec<String>,
+	#[serde(deserialize_with = "deserialize_vec_with_plus")]
+	pub filters: Vec<String>,
+	pub hide_awards: String,
+	pub hide_score: String,
+	pub remove_default_feeds: String,
+}
+
+impl From<LegacyPreferencesV1> for Preferences {
+	fn from(value: LegacyPreferencesV1) -> Self {
+		Self {
+			available_themes: Vec::new(),
+			theme: value.theme,
+			front_page: value.front_page,
+			layout: value.layout,
+			wide: value.wide,
+			blur_spoiler: value.blur_spoiler,
+			show_nsfw: value.show_nsfw,
+			blur_nsfw: value.blur_nsfw,
+			hide_hls_notification: value.hide_hls_notification,
+			image_quality: String::new(),
+			video_quality: value.video_quality,
+			hide_sidebar_and_summary: value.hide_sidebar_and_summary,
+			use_dash: value.use_dash,
+			use_hls: value.use_hls,
+			autoplay_videos: value.autoplay_videos,
+			fixed_navbar: value.fixed_navbar,
+			disable_visit_reddit_confirmation: value.disable_visit_reddit_confirmation,
+			comment_sort: value.comment_sort,
+			post_sort: value.post_sort,
+			subscriptions: value.subscriptions,
+			filters: value.filters,
+			hide_awards: value.hide_awards,
+			hide_score: value.hide_score,
+			remove_default_feeds: value.remove_default_feeds,
+		}
+	}
+}
+
+#[derive(Deserialize)]
+struct LegacyPreferencesV0 {
+	pub theme: String,
+	pub front_page: String,
+	pub layout: String,
+	pub wide: String,
+	pub blur_spoiler: String,
+	pub show_nsfw: String,
+	pub blur_nsfw: String,
+	pub hide_hls_notification: String,
+	pub video_quality: String,
+	pub hide_sidebar_and_summary: String,
+	pub use_dash: String,
+	pub use_hls: String,
+	pub autoplay_videos: String,
+	pub fixed_navbar: String,
+	pub comment_sort: String,
+	pub post_sort: String,
+	#[serde(deserialize_with = "deserialize_vec_with_plus")]
+	pub subscriptions: Vec<String>,
+	#[serde(deserialize_with = "deserialize_vec_with_plus")]
+	pub filters: Vec<String>,
+	pub hide_awards: String,
+	pub hide_score: String,
+	pub remove_default_feeds: String,
+}
+
+impl From<LegacyPreferencesV0> for Preferences {
+	fn from(value: LegacyPreferencesV0) -> Self {
+		Self {
+			available_themes: Vec::new(),
+			theme: value.theme,
+			front_page: value.front_page,
+			layout: value.layout,
+			wide: value.wide,
+			blur_spoiler: value.blur_spoiler,
+			show_nsfw: value.show_nsfw,
+			blur_nsfw: value.blur_nsfw,
+			hide_hls_notification: value.hide_hls_notification,
+			image_quality: String::new(),
+			video_quality: value.video_quality,
+			hide_sidebar_and_summary: value.hide_sidebar_and_summary,
+			use_dash: value.use_dash,
+			use_hls: value.use_hls,
+			autoplay_videos: value.autoplay_videos,
+			fixed_navbar: value.fixed_navbar,
+			disable_visit_reddit_confirmation: String::new(),
+			comment_sort: value.comment_sort,
+			post_sort: value.post_sort,
+			subscriptions: value.subscriptions,
+			filters: value.filters,
+			hide_awards: value.hide_awards,
+			hide_score: value.hide_score,
+			remove_default_feeds: value.remove_default_feeds,
+		}
+	}
+}
+
 fn serialize_vec_with_plus<S>(vec: &[String], serializer: S) -> Result<S::Ok, S::Error>
 where
 	S: Serializer,
@@ -1282,13 +1399,26 @@ impl Preferences {
 	}
 
 	pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
-		bincode::serialize(self).map_err(|e| e.to_string())
+		let mut bytes = Vec::new();
+		self.serialize_revisioned(&mut bytes).map_err(|e| e.to_string())?;
+		Ok(bytes)
 	}
 	pub fn to_compressed_bincode(&self) -> Result<Vec<u8>, String> {
 		deflate_compress(self.to_bincode()?)
 	}
 	pub fn to_bincode_str(&self) -> Result<String, String> {
 		Ok(base2048::encode(&self.to_compressed_bincode()?))
+	}
+}
+
+pub fn preferences_from_bincode(bytes: &[u8]) -> Result<Preferences, String> {
+	let mut reader = bytes;
+	match Preferences::deserialize_revisioned(&mut reader) {
+		Ok(preferences) => Ok(preferences),
+		Err(_) => bincode::deserialize::<Preferences>(bytes)
+			.or_else(|_| bincode::deserialize::<LegacyPreferencesV1>(bytes).map(Preferences::from))
+			.or_else(|_| bincode::deserialize::<LegacyPreferencesV0>(bytes).map(Preferences::from))
+			.map_err(|e| e.to_string()),
 	}
 }
 
@@ -2930,7 +3060,7 @@ mod tests {
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
 	}
 }
 
@@ -3050,7 +3180,7 @@ fn test_known_good_configs_deserialization() {
 	for config in KNOWN_GOOD_CONFIGS {
 		let bytes = base2048::decode(config).unwrap();
 		let decompressed = deflate_decompress(bytes).unwrap();
-		assert!(bincode::deserialize::<Preferences>(&decompressed).is_ok());
+		assert!(preferences_from_bincode(&decompressed).is_ok());
 	}
 }
 
@@ -3059,7 +3189,7 @@ fn test_known_good_configs_full_round_trip() {
 	for config in KNOWN_GOOD_CONFIGS {
 		let bytes = base2048::decode(config).unwrap();
 		let decompressed = deflate_decompress(bytes).unwrap();
-		let prefs: Preferences = bincode::deserialize(&decompressed).unwrap();
+		let prefs = preferences_from_bincode(&decompressed).unwrap();
 		test_round_trip(&prefs, false);
 		test_round_trip(&prefs, true);
 	}
@@ -3069,6 +3199,6 @@ fn test_round_trip(input: &Preferences, compression: bool) {
 	let serialized = bincode::serialize(input).unwrap();
 	let compressed = if compression { deflate_compress(serialized).unwrap() } else { serialized };
 	let decompressed = if compression { deflate_decompress(compressed).unwrap() } else { compressed };
-	let deserialized: Preferences = bincode::deserialize(&decompressed).unwrap();
+	let deserialized = preferences_from_bincode(&decompressed).unwrap();
 	assert_eq!(*input, deserialized);
 }
