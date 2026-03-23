@@ -5,6 +5,18 @@
 <div id="error">
 	<h1>{{ msg }}</h1>
 	<h3><a href="https://www.redditstatus.com/">Reddit Status</a></h3>
+	{% if ratelimit.visible %}
+	<br />
+	<div class="panel">
+		<h3>Reddit rate limit details</h3>
+		<p>Status: {{ ratelimit.status }}</p>
+		<p>Remaining: {{ ratelimit.remaining }}</p>
+		<p>Reset window: {{ ratelimit.reset }}</p>
+		<p>Used: {{ ratelimit.used }}</p>
+		<p>Retry-After: {{ ratelimit.retry_after }}</p>
+		<p>Budget: {{ ratelimit.request_rate }}</p>
+	</div>
+	{% endif %}
 	<br />
 	<h3 id="update-status"></h3>
 	<br />

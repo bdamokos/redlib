@@ -29,6 +29,7 @@ pub async fn instance_info(req: Request<Body>) -> Result<Response<Body>, String>
 			let error = ErrorTemplate {
 				msg: "Error: Invalid info extension".into(),
 				prefs: Preferences::new(&req),
+				ratelimit: Default::default(),
 				url: req.uri().to_string(),
 			}
 			.render()

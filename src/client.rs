@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use std::{io, result::Result};
 
 use crate::dbg_msg;
@@ -72,11 +73,130 @@ pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
+pub static LAST_REDDIT_RATELIMIT: LazyLock<std::sync::Mutex<Option<RedditRateLimitSnapshot>>> = LazyLock::new(|| std::sync::Mutex::new(None));
 
 const URL_PAIRS: [(&str, &str); 2] = [
 	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
 	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
 ];
+
+#[derive(Clone, Debug)]
+pub struct RedditRateLimitSnapshot {
+	pub remaining: Option<f32>,
+	pub reset_seconds: Option<f32>,
+	pub used: Option<f32>,
+	pub retry_after_seconds: Option<f32>,
+	pub status: u16,
+	pub observed_at: Instant,
+}
+
+impl RedditRateLimitSnapshot {
+	pub fn is_rate_limited(&self) -> bool {
+		self.status == 429 || self.retry_after_seconds.is_some()
+	}
+
+	pub fn remaining_requests_per_second(&self) -> Option<f32> {
+		match (self.remaining, self.reset_seconds) {
+			(Some(remaining), Some(reset_seconds)) if remaining > 0.0 && reset_seconds > 0.0 => Some(remaining / reset_seconds),
+			_ => None,
+		}
+	}
+
+	pub fn suggested_wait_duration(&self) -> Option<Duration> {
+		if let Some(retry_after) = self.retry_after_seconds {
+			if retry_after > 0.0 {
+				return Some(Duration::from_secs_f32(retry_after));
+			}
+		}
+
+		match (self.remaining, self.reset_seconds) {
+			(Some(remaining), Some(reset_seconds)) if remaining <= 0.0 && reset_seconds > 0.0 => Some(Duration::from_secs_f32(reset_seconds)),
+			(Some(remaining), Some(reset_seconds)) if remaining > 0.0 && reset_seconds > 0.0 => {
+				let spacing = reset_seconds / remaining.max(1.0);
+				if spacing > 1.0 {
+					Some(Duration::from_secs_f32(spacing.min(5.0)))
+				} else {
+					None
+				}
+			}
+			_ => None,
+		}
+	}
+}
+
+fn parse_header_f32(headers: &hyper::HeaderMap<HeaderValue>, key: &str) -> Option<f32> {
+	headers.get(key).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<f32>().ok())
+}
+
+fn capture_ratelimit_snapshot(response: &Response<Body>) -> Option<RedditRateLimitSnapshot> {
+	let headers = response.headers();
+	let remaining = parse_header_f32(headers, "x-ratelimit-remaining");
+	let reset_seconds = parse_header_f32(headers, "x-ratelimit-reset");
+	let used = parse_header_f32(headers, "x-ratelimit-used");
+	let retry_after_seconds = parse_header_f32(headers, header::RETRY_AFTER.as_str());
+
+	if remaining.is_none() && reset_seconds.is_none() && used.is_none() && retry_after_seconds.is_none() {
+		return None;
+	}
+
+	Some(RedditRateLimitSnapshot {
+		remaining,
+		reset_seconds,
+		used,
+		retry_after_seconds,
+		status: response.status().as_u16(),
+		observed_at: Instant::now(),
+	})
+}
+
+fn store_ratelimit_snapshot(snapshot: RedditRateLimitSnapshot) {
+	if let Some(remaining) = snapshot.remaining {
+		OAUTH_RATELIMIT_REMAINING.store(remaining.round().max(0.0) as u16, Ordering::SeqCst);
+	}
+
+	if let Ok(mut state) = LAST_REDDIT_RATELIMIT.lock() {
+		*state = Some(snapshot);
+	}
+}
+
+pub fn latest_ratelimit_snapshot() -> Option<RedditRateLimitSnapshot> {
+	LAST_REDDIT_RATELIMIT.lock().ok().and_then(|state| state.clone())
+}
+
+async fn pace_reddit_request_if_needed() {
+	let snapshot = latest_ratelimit_snapshot();
+	let Some(snapshot) = snapshot else {
+		return;
+	};
+
+	let Some(wait_duration) = snapshot.suggested_wait_duration() else {
+		return;
+	};
+
+	if wait_duration.is_zero() {
+		return;
+	}
+
+	if snapshot.is_rate_limited() {
+		warn!(
+			"Reddit rate limit hit. Waiting {:?} before next API request. Remaining: {:?}, reset: {:?}, retry-after: {:?}",
+			wait_duration, snapshot.remaining, snapshot.reset_seconds, snapshot.retry_after_seconds
+		);
+		tokio::time::sleep(wait_duration).await;
+		return;
+	}
+
+	if let Some(requests_per_second) = snapshot.remaining_requests_per_second() {
+		if requests_per_second < 1.0 {
+			trace!(
+				"Pacing Reddit API request for {:?} to respect budget of {:.3} requests/sec",
+				wait_duration,
+				requests_per_second
+			);
+			tokio::time::sleep(wait_duration).await;
+		}
+	}
+}
 
 /// Gets the canonical path for a resource on Reddit. This is accomplished by
 /// making a `HEAD` request to Reddit at the path given in `path`.
@@ -286,9 +406,15 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	let builder = builder.body(Body::empty());
 
 	async move {
+		pace_reddit_request_if_needed().await;
+
 		match builder {
 			Ok(req) => match client.request(req).await {
 				Ok(mut response) => {
+					if let Some(snapshot) = capture_ratelimit_snapshot(&response) {
+						store_ratelimit_snapshot(snapshot);
+					}
+
 					// Reddit may respond with a 3xx. Decide whether or not to
 					// redirect based on caller params.
 					if response.status().is_redirection() {
@@ -402,6 +528,10 @@ fn response_preview(text: &str, max_chars: usize) -> String {
 	preview.replace('\n', "\\n").replace('\r', "\\r")
 }
 
+fn is_uri_too_long_response(status: hyper::StatusCode, text: &str) -> bool {
+	status == hyper::StatusCode::URI_TOO_LONG || text.trim().eq_ignore_ascii_case("Error: URI Too Long")
+}
+
 fn is_network_security_block(status: hyper::StatusCode, content_type: Option<&str>, text: &str) -> bool {
 	status == hyper::StatusCode::FORBIDDEN && content_type.is_some_and(|value| value.starts_with("text/html")) && text.contains("You've been blocked by network security")
 }
@@ -452,6 +582,9 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
+			if let Some(snapshot) = capture_ratelimit_snapshot(&response) {
+				store_ratelimit_snapshot(snapshot);
+			}
 			let content_type = response.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
 			let debug_headers = if debug_logging_enabled() {
 				Some(
@@ -475,11 +608,6 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					if is_rolling_over { "yes" } else { "no" },
 				);
 
-				// If can parse remaining as a float, round to a u16 and save
-				if let Ok(val) = remaining.parse::<f32>() {
-					OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
-				}
-
 				Some(reset)
 			} else {
 				None
@@ -493,6 +621,10 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					// Save response to debug log if debug logging is enabled
 					if let Some(headers) = debug_headers.as_ref() {
 						persist_debug_response(&path, status, headers, &text);
+					}
+
+					if status == hyper::StatusCode::TOO_MANY_REQUESTS {
+						return Err("Too many requests.".to_string());
 					}
 
 					// Parse the response as JSON
@@ -546,6 +678,12 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 							error!("Got an invalid response from reddit {e}. Status code: {status}. Content-Type: {content_type}. Body preview: {preview}");
 							if status.is_server_error() {
 								Err("Reddit is having issues, check if there's an outage".to_string())
+							} else if is_uri_too_long_response(status, &text) {
+								err(
+									"Reddit rejected this request because the multireddit URL is too long",
+									format!("Status code: {status}, Content-Type: {content_type}"),
+									path,
+								)
 							} else if text.trim().is_empty() {
 								err(
 									"Reddit returned an empty response body",
@@ -633,6 +771,13 @@ fn test_detects_network_security_block_page() {
 #[test]
 fn test_response_preview_truncates_and_escapes_newlines() {
 	assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
+}
+
+#[test]
+fn test_detects_uri_too_long_response() {
+	assert!(is_uri_too_long_response(hyper::StatusCode::URI_TOO_LONG, "Error: URI Too Long"));
+	assert!(is_uri_too_long_response(hyper::StatusCode::OK, "Error: URI Too Long"));
+	assert!(!is_uri_too_long_response(hyper::StatusCode::OK, "{\"kind\":\"Listing\"}"));
 }
 
 #[test]

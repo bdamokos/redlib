@@ -6,7 +6,7 @@ use crate::config::{self, get_setting};
 // CRATES
 //
 use crate::{
-	client::{json, CLIENT, OAUTH_CLIENT},
+	client::{json, latest_ratelimit_snapshot, CLIENT, OAUTH_CLIENT},
 	redgifs,
 	server::RequestExt,
 };
@@ -14,7 +14,9 @@ use askama::Template;
 use cached::proc_macro::cached;
 use cookie::Cookie;
 use htmlescape::decode_html;
-use hyper::{Body, Request, Response};
+use hyper::body::to_bytes;
+use hyper::header::LOCATION;
+use hyper::{Body, Request, Response, Uri};
 use libflate::deflate::{Decoder, Encoder};
 use log::error;
 use regex::Regex;
@@ -25,6 +27,7 @@ use serde_json::Value;
 use serde_json_path::{JsonPath, JsonPathExt};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::str::FromStr;
 use std::string::ToString;
@@ -769,7 +772,61 @@ impl Awards {
 pub struct ErrorTemplate {
 	pub msg: String,
 	pub prefs: Preferences,
+	pub ratelimit: RateLimitDisplay,
 	pub url: String,
+}
+
+#[derive(Default)]
+pub struct RateLimitDisplay {
+	pub visible: bool,
+	pub status: String,
+	pub remaining: String,
+	pub reset: String,
+	pub used: String,
+	pub retry_after: String,
+	pub request_rate: String,
+}
+
+impl RateLimitDisplay {
+	fn from_error_message(msg: &str) -> Self {
+		let message = msg.to_ascii_lowercase();
+		let mentions_rate_limit = message.contains("too many requests") || message.contains("rate limit") || message.contains("ratelimit");
+		let Some(snapshot) = latest_ratelimit_snapshot() else {
+			return Self::default();
+		};
+
+		if !mentions_rate_limit && !snapshot.is_rate_limited() {
+			return Self::default();
+		}
+
+		let request_rate = snapshot
+			.remaining_requests_per_second()
+			.map(|value| format!("{value:.2} req/s"))
+			.unwrap_or_else(|| "Unavailable".to_string());
+		let reset = snapshot
+			.reset_seconds
+			.map(|value| {
+				if value >= 60.0 {
+					format!("{value:.0} seconds ({:.1} minutes)", value / 60.0)
+				} else {
+					format!("{value:.0} seconds")
+				}
+			})
+			.unwrap_or_else(|| "Unavailable".to_string());
+
+		Self {
+			visible: true,
+			status: snapshot.status.to_string(),
+			remaining: snapshot.remaining.map(|value| format!("{value:.0}")).unwrap_or_else(|| "Unavailable".to_string()),
+			reset,
+			used: snapshot.used.map(|value| format!("{value:.0}")).unwrap_or_else(|| "Unavailable".to_string()),
+			retry_after: snapshot
+				.retry_after_seconds
+				.map(|value| format!("{value:.0} seconds"))
+				.unwrap_or_else(|| "Unavailable".to_string()),
+			request_rate,
+		}
+	}
 }
 
 #[derive(Template)]
@@ -1673,6 +1730,9 @@ static HTML_HREF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="(
 static PLAIN_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
 static BARE_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\b(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>"']*)?"#).unwrap());
 static PROFILE_SOCIAL_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"data-faceplate-tracking-context="([^"]*social_link[^"]*)""#).unwrap());
+static LINKTREE_NEXT_DATA_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>"#).unwrap());
+static ALLMYLINKS_DATA_X_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bdata-x-url="([^"]+)""#).unwrap());
+static ALLMYLINKS_TITLE_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\btitle="(https?://[^"]+)""#).unwrap());
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
@@ -1834,12 +1894,7 @@ pub async fn external_links_with_coomer_lookups(links: Vec<ExternalLink>) -> Vec
 	let mut coomer_links = Vec::new();
 
 	for link in links {
-		let Some(coomer_link) = coomer_lookup_link(&link).await else {
-			continue;
-		};
-		if coomer_lookup_exists(coomer_link.url.clone()).await {
-			coomer_links.push(coomer_link);
-		}
+		append_external_links(&mut coomer_links, coomer_lookup_links(&link).await);
 	}
 
 	append_external_links(&mut expanded_links, coomer_links);
@@ -1852,10 +1907,7 @@ pub async fn external_links_with_coomer_flags(links: Vec<ExternalLink>) -> Vec<E
 	for (index, link) in links.iter().enumerate() {
 		let link = link.clone();
 		pending.spawn(async move {
-			let has_coomer = match coomer_lookup_link(&link).await {
-				Some(coomer_link) => coomer_lookup_exists(coomer_link.url).await,
-				None => false,
-			};
+			let has_coomer = !coomer_lookup_links(&link).await.is_empty();
 			(index, has_coomer)
 		});
 	}
@@ -1890,7 +1942,166 @@ fn external_link_key(link: &ExternalLink) -> String {
 	format!("{}|{}", link.url.to_lowercase(), link.label.to_lowercase())
 }
 
-async fn coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
+async fn coomer_lookup_links(link: &ExternalLink) -> Vec<ExternalLink> {
+	coomer_lookup_links_with_checker(link, coomer_lookup_exists).await
+}
+
+async fn coomer_lookup_links_with_checker<F, Fut>(link: &ExternalLink, exists: F) -> Vec<ExternalLink>
+where
+	F: Fn(String) -> Fut + Copy,
+	Fut: Future<Output = bool>,
+{
+	let mut matches = Vec::new();
+
+	for candidate in coomer_lookup_candidates(link).await {
+		if exists(candidate.url.clone()).await {
+			matches.push(candidate);
+		}
+	}
+
+	matches
+}
+
+async fn coomer_lookup_candidates(link: &ExternalLink) -> Vec<ExternalLink> {
+	if let Some(direct_link) = direct_coomer_lookup_link(link).await {
+		return vec![direct_link];
+	}
+
+	coomer_lookup_candidates_from_links(nested_creator_links(link).await).await
+}
+
+async fn coomer_lookup_candidates_from_links(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
+	let mut candidates = Vec::new();
+
+	for link in links {
+		let Some(coomer_link) = direct_coomer_lookup_link(&link).await else {
+			continue;
+		};
+		append_external_links(&mut candidates, vec![coomer_link]);
+	}
+
+	candidates
+}
+
+async fn nested_creator_links(link: &ExternalLink) -> Vec<ExternalLink> {
+	let Some(host) = normalize_external_page_host(&link.url) else {
+		return Vec::new();
+	};
+	if !matches!(host.as_str(), "linktr.ee" | "www.linktr.ee" | "allmylinks.com" | "www.allmylinks.com") {
+		return Vec::new();
+	}
+	let Ok(html) = fetch_external_page_html(link.url.clone(), 4).await else {
+		return Vec::new();
+	};
+
+	match host.as_str() {
+		"linktr.ee" | "www.linktr.ee" => extract_linktree_creator_links(&html),
+		"allmylinks.com" | "www.allmylinks.com" => extract_allmylinks_creator_links(&html),
+		_ => Vec::new(),
+	}
+}
+
+fn normalize_external_page_host(url: &str) -> Option<String> {
+	let parsed = Url::parse(url).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host.is_empty() {
+		return None;
+	}
+	Some(host)
+}
+
+#[cached(size = 1024, time = 3600, result = true)]
+async fn fetch_external_page_html(url: String, redirects_left: usize) -> Result<String, String> {
+	let mut current_url = url;
+	let mut redirects_remaining = redirects_left;
+
+	loop {
+		let uri = current_url.parse::<Uri>().map_err(|err| err.to_string())?;
+		let request = Request::builder()
+			.method("GET")
+			.uri(uri)
+			.header("Accept", "text/html,*/*;q=0.8")
+			.header("Accept-Encoding", "identity")
+			.header("User-Agent", OAUTH_CLIENT.load_full().user_agent())
+			.body(Body::empty())
+			.map_err(|err| err.to_string())?;
+		let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+
+		if response.status().is_redirection() && redirects_remaining > 0 {
+			let Some(location) = response.headers().get(LOCATION).and_then(|value| value.to_str().ok()) else {
+				return Err(format!("redirect response missing location for {current_url}"));
+			};
+
+			current_url = Url::parse(&current_url)
+				.ok()
+				.and_then(|base| base.join(location).ok())
+				.map(|joined| joined.to_string())
+				.unwrap_or_else(|| location.to_string());
+			redirects_remaining -= 1;
+			continue;
+		}
+
+		if !response.status().is_success() {
+			return Err(format!("external page request failed with status {}", response.status()));
+		}
+
+		let body = to_bytes(response.into_body()).await.map_err(|err| err.to_string())?;
+		return String::from_utf8(body.to_vec()).map_err(|err| err.to_string());
+	}
+}
+
+fn extract_linktree_creator_links(html: &str) -> Vec<ExternalLink> {
+	let Some(next_data) = LINKTREE_NEXT_DATA_REGEX.captures(html).and_then(|captures| captures.get(1)).map(|value| value.as_str()) else {
+		return Vec::new();
+	};
+	let Ok(parsed) = serde_json::from_str::<Value>(next_data) else {
+		return Vec::new();
+	};
+	let Ok(url_path) = JsonPath::parse("$..url") else {
+		return Vec::new();
+	};
+
+	let mut links = Vec::new();
+	for value in url_path.query(&parsed).all() {
+		let Some(raw_url) = value.as_str() else {
+			continue;
+		};
+		let Some(link) = build_external_link(raw_url) else {
+			continue;
+		};
+		if is_creator_link_host(&link.host) {
+			append_external_links(&mut links, vec![link]);
+		}
+	}
+
+	links
+}
+
+fn extract_allmylinks_creator_links(html: &str) -> Vec<ExternalLink> {
+	let mut links = Vec::new();
+
+	for regex in [&ALLMYLINKS_DATA_X_URL_REGEX, &ALLMYLINKS_TITLE_URL_REGEX] {
+		for capture in regex.captures_iter(html) {
+			let Some(raw_url) = capture.get(1).map(|value| value.as_str()) else {
+				continue;
+			};
+			let Some(link) = build_external_link(raw_url) else {
+				continue;
+			};
+			if is_creator_link_host(&link.host) {
+				append_external_links(&mut links, vec![link]);
+			}
+		}
+	}
+
+	links
+}
+
+fn is_creator_link_host(host: &str) -> bool {
+	matches!(host, "onlyfans.com" | "www.onlyfans.com" | "fansly.com" | "www.fansly.com")
+}
+
+async fn direct_coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
 	let parsed = Url::parse(&link.url).ok()?;
 	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
 	let (service, profile_id) = match host.as_str() {
@@ -2258,6 +2469,7 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 	let body = ErrorTemplate {
 		msg: msg.to_string(),
 		prefs: Preferences::new(&req),
+		ratelimit: RateLimitDisplay::from_error_message(msg),
 		url,
 	}
 	.render()
@@ -2408,11 +2620,15 @@ impl_template_str_eq!(User);
 #[cfg(test)]
 mod tests {
 	use super::{
-		coomer_lookup_link, dedupe_external_links_by_host, extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls, user_profile_details,
-		ExternalLink, Preferences,
+		coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, dedupe_external_links_by_host, extract_allmylinks_creator_links, extract_linktree_creator_links,
+		extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls, user_profile_details, ExternalLink, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use serde_json::json;
+
+	async fn always_exists(_: String) -> bool {
+		true
+	}
 
 	#[test]
 	fn format_num_works() {
@@ -2529,21 +2745,31 @@ mod tests {
 
 	#[test]
 	fn maps_onlyfans_and_fansly_profiles_to_coomer_lookup_urls() {
-		let onlyfans = block_on(coomer_lookup_link(&ExternalLink {
-			label: "lady-katarina".to_string(),
-			url: "https://onlyfans.com/lady-katarina".to_string(),
-			host: "onlyfans.com".to_string(),
-			icon_path: "/site_icon/onlyfans.com".to_string(),
-			has_coomer: false,
-		}))
+		let onlyfans = block_on(coomer_lookup_links_with_checker(
+			&ExternalLink {
+				label: "lady-katarina".to_string(),
+				url: "https://onlyfans.com/lady-katarina".to_string(),
+				host: "onlyfans.com".to_string(),
+				icon_path: "/site_icon/onlyfans.com".to_string(),
+				has_coomer: false,
+			},
+			always_exists,
+		))
+		.into_iter()
+		.next()
 		.expect("onlyfans profile should map to coomer");
-		let fansly = block_on(coomer_lookup_link(&ExternalLink {
-			label: "Fansly".to_string(),
-			url: "https://fansly.com/user/640681284019953664".to_string(),
-			host: "fansly.com".to_string(),
-			icon_path: "/site_icon/fansly.com".to_string(),
-			has_coomer: false,
-		}))
+		let fansly = block_on(coomer_lookup_links_with_checker(
+			&ExternalLink {
+				label: "Fansly".to_string(),
+				url: "https://fansly.com/user/640681284019953664".to_string(),
+				host: "fansly.com".to_string(),
+				icon_path: "/site_icon/fansly.com".to_string(),
+				has_coomer: false,
+			},
+			always_exists,
+		))
+		.into_iter()
+		.next()
 		.expect("fansly profile should map to coomer");
 
 		assert_eq!(onlyfans.url, "https://coomer.st/onlyfans/user/lady-katarina");
@@ -2552,15 +2778,81 @@ mod tests {
 
 	#[test]
 	fn ignores_non_profile_links_when_building_coomer_lookups() {
-		let expanded = block_on(coomer_lookup_link(&ExternalLink {
-			label: "Twitter".to_string(),
-			url: "https://twitter.com/example".to_string(),
-			host: "twitter.com".to_string(),
-			icon_path: "/site_icon/twitter.com".to_string(),
-			has_coomer: false,
-		}));
+		let expanded = block_on(coomer_lookup_links_with_checker(
+			&ExternalLink {
+				label: "Twitter".to_string(),
+				url: "https://twitter.com/example".to_string(),
+				host: "twitter.com".to_string(),
+				icon_path: "/site_icon/twitter.com".to_string(),
+				has_coomer: false,
+			},
+			always_exists,
+		));
 
-		assert!(expanded.is_none());
+		assert!(expanded.is_empty());
+	}
+
+	#[test]
+	fn extracts_onlyfans_and_fansly_links_from_linktree_next_data() {
+		let html = r#"
+			<script id="__NEXT_DATA__" type="application/json">
+				{"props":{"pageProps":{"contentWarning":"generic","activeGates":["age"],"links":[
+					{"url":"https://onlyfans.com/example"},
+					{"url":"https://fansly.com/user/640681284019953664"},
+					{"url":"https://twitter.com/example"},
+					{"url":"https://onlyfans.com/example"}
+				]}}}
+			</script>
+		"#;
+
+		let links = extract_linktree_creator_links(html);
+
+		assert_eq!(links.len(), 2);
+		assert_eq!(links[0].host, "onlyfans.com");
+		assert_eq!(links[1].host, "fansly.com");
+	}
+
+	#[test]
+	fn extracts_hidden_adult_links_from_allmylinks_markup() {
+		let html = r#"
+			<div class="sensitive-links-wrapper">
+				<div class="adult-hidden">
+					<a data-x-url="https://fansly.com/ms_dira" title="https://fansly.com/ms_dira"></a>
+					<a title="https://onlyfans.com/example"></a>
+					<a data-x-url="https://twitter.com/example"></a>
+				</div>
+			</div>
+		"#;
+
+		let links = extract_allmylinks_creator_links(html);
+
+		assert_eq!(links.len(), 2);
+		assert_eq!(links[0].host, "fansly.com");
+		assert_eq!(links[1].host, "onlyfans.com");
+	}
+
+	#[test]
+	fn expands_multiple_nested_creator_links_to_multiple_coomer_profiles() {
+		let coomer_links = block_on(coomer_lookup_candidates_from_links(vec![
+			ExternalLink {
+				label: "lady-katarina".to_string(),
+				url: "https://onlyfans.com/lady-katarina".to_string(),
+				host: "onlyfans.com".to_string(),
+				icon_path: "/site_icon/onlyfans.com".to_string(),
+				has_coomer: false,
+			},
+			ExternalLink {
+				label: "Fansly".to_string(),
+				url: "https://fansly.com/user/640681284019953664".to_string(),
+				host: "fansly.com".to_string(),
+				icon_path: "/site_icon/fansly.com".to_string(),
+				has_coomer: false,
+			},
+		]));
+
+		assert_eq!(coomer_links.len(), 2);
+		assert_eq!(coomer_links[0].url, "https://coomer.st/onlyfans/user/lady-katarina");
+		assert_eq!(coomer_links[1].url, "https://coomer.st/fansly/user/640681284019953664");
 	}
 
 	#[test]
