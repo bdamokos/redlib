@@ -29,6 +29,8 @@ FROM alpine:${ALPINE_VERSION} AS release
 # Import redlib binary from builder
 COPY --from=builder /redlib/target/release/redlib /usr/local/bin/redlib
 
+RUN apk add --no-cache ffmpeg wget
+
 # Add non-root user for running redlib
 RUN adduser --home /nonexistent --no-create-home --disabled-password redlib
 USER redlib

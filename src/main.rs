@@ -14,7 +14,7 @@ use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
-use redlib::{config, duplicates, headers, instance_info, post, search, settings, site_icon, subreddit, user};
+use redlib::{config, duplicates, headers, instance_info, post, search, settings, site_icon, subreddit, user, video_preview};
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -205,6 +205,7 @@ async fn main() {
 	LazyLock::force(&instance_info::INSTANCE_INFO);
 	info!("Creating OAUTH client.");
 	LazyLock::force(&OAUTH_CLIENT);
+	video_preview::init();
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -288,8 +289,17 @@ async fn main() {
 		.at("/video_visibility.js")
 		.get(|_| resource(include_str!("../static/video_visibility.js"), "text/javascript", false).boxed());
 	app
+		.at("/video_preview_gallery.js")
+		.get(|_| resource(include_str!("../static/video_preview_gallery.js"), "text/javascript", false).boxed());
+	app
 		.at("/submitted_duplicates.js")
 		.get(|_| resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).boxed());
+
+	app.at("/api/video-previews/lease").post(|r| video_preview::lease(r).boxed());
+	app.at("/api/video-previews/heartbeat").post(|r| video_preview::heartbeat(r).boxed());
+	app.at("/api/video-previews/release").post(|r| video_preview::release(r).boxed());
+	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());
+	app.at("/api/video-previews/:job_id/frame/:index").get(|r| video_preview::frame(r).boxed());
 
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());
