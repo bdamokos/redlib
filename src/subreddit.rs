@@ -17,7 +17,7 @@ use log::warn;
 use chrono::DateTime;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::LazyLock;
 use time::{Duration, OffsetDateTime};
 use url::form_urlencoded;
@@ -85,6 +85,8 @@ struct AggregateFrontCursor {
 	chunks: Vec<String>,
 	chunk_afters: Vec<String>,
 	prev_stack: Vec<Vec<String>>,
+	#[serde(default)]
+	recent_post_ids: Vec<String>,
 	sort: String,
 	timeframe: String,
 	query_fingerprint: String,
@@ -317,6 +319,8 @@ fn merge_chunk_posts(
 	merged_posts: &mut Vec<Post>,
 	filters: &std::collections::HashSet<String>,
 	active_flair_filter: &str,
+	recent_post_ids: &HashSet<String>,
+	seen_post_ids: &mut HashSet<String>,
 	any_post_after_filter: &mut bool,
 ) {
 	loop {
@@ -335,6 +339,9 @@ fn merge_chunk_posts(
 
 			*any_post_after_filter = true;
 			if !active_flair_filter.is_empty() && post.flair.text.trim() != active_flair_filter {
+				continue;
+			}
+			if recent_post_ids.contains(&post.id) || !seen_post_ids.insert(post.id.clone()) {
 				continue;
 			}
 
@@ -367,6 +374,11 @@ async fn fetch_aggregated_subscription_feed(
 	let page_has_cursor = cursor.is_some();
 	let mut chunk_buffers: Vec<VecDeque<Post>> = (0..chunks.len()).map(|_| VecDeque::new()).collect();
 	let mut merged_posts = Vec::new();
+	let recent_post_ids = cursor
+		.as_ref()
+		.map(|value| value.recent_post_ids.iter().cloned().collect::<HashSet<_>>())
+		.unwrap_or_default();
+	let mut seen_post_ids = HashSet::new();
 	let mut fetched_raw_posts = false;
 	let mut any_post_after_filter = false;
 	let mut successful_chunks = 0usize;
@@ -399,7 +411,15 @@ async fn fetch_aggregated_subscription_feed(
 			}
 		}
 
-		merge_chunk_posts(&mut chunk_buffers, &mut merged_posts, filters, active_flair_filter, &mut any_post_after_filter);
+		merge_chunk_posts(
+			&mut chunk_buffers,
+			&mut merged_posts,
+			filters,
+			active_flair_filter,
+			&recent_post_ids,
+			&mut seen_post_ids,
+			&mut any_post_after_filter,
+		);
 
 		if merged_posts.len() >= TARGET_POST_COUNT {
 			break;
@@ -419,6 +439,8 @@ async fn fetch_aggregated_subscription_feed(
 		warn!("Partial aggregate front page failure: {err}");
 	}
 
+	let page_post_ids = merged_posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+
 	let next_cursor = if next_state.iter().any(|after| !after.is_empty()) {
 		let mut next_prev_stack = prev_stack.clone();
 		next_prev_stack.push(current_state.clone());
@@ -427,6 +449,7 @@ async fn fetch_aggregated_subscription_feed(
 			chunks: chunks.to_vec(),
 			chunk_afters: next_state,
 			prev_stack: next_prev_stack,
+			recent_post_ids: page_post_ids.clone(),
 			sort: sort.to_string(),
 			timeframe: timeframe.to_string(),
 			query_fingerprint: query_fingerprint.to_string(),
@@ -441,6 +464,7 @@ async fn fetch_aggregated_subscription_feed(
 			chunks: chunks.to_vec(),
 			chunk_afters: previous_state,
 			prev_stack,
+			recent_post_ids: Vec::new(),
 			sort: sort.to_string(),
 			timeframe: timeframe.to_string(),
 			query_fingerprint: query_fingerprint.to_string(),
@@ -586,8 +610,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else if aggregate_subscriptions {
 		let chunks = split_subscriptions_for_listing(&Preferences::new(&req).subscriptions, &sort, &reddit_query);
 		let query_fingerprint = listing_query_fingerprint(&query);
-		let cursor = req
-			.param(FRONT_CURSOR_PARAM)
+		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
 			.and_then(|encoded| decode_front_cursor(&encoded))
 			.filter(|cursor| cursor_matches_request(cursor, &chunks, &sort, &timeframe, &query_fingerprint));
 
@@ -931,6 +954,7 @@ mod tests {
 			chunks: vec!["a+b".to_string(), "c+d".to_string()],
 			chunk_afters: vec!["t3_a".to_string(), String::new()],
 			prev_stack: vec![vec![String::new(), String::new()]],
+			recent_post_ids: vec!["t3_demo".to_string()],
 			sort: "hot".to_string(),
 			timeframe: String::new(),
 			query_fingerprint: "sort=hot&flair=News".to_string(),
@@ -970,15 +994,27 @@ mod tests {
 			..test_post()
 		}]);
 		let mut merged = Vec::new();
+		let recent_post_ids = HashSet::new();
+		let mut seen_post_ids = HashSet::new();
 		let mut any_post_after_filter = false;
 		let mut chunk_buffers = [first, second];
 
-		merge_chunk_posts(&mut chunk_buffers, &mut merged, &HashSet::new(), "", &mut any_post_after_filter);
+		merge_chunk_posts(
+			&mut chunk_buffers,
+			&mut merged,
+			&HashSet::new(),
+			"",
+			&recent_post_ids,
+			&mut seen_post_ids,
+			&mut any_post_after_filter,
+		);
 
 		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "3", "2"]);
 		assert!(any_post_after_filter);
 
 		let mut filtered_merged = Vec::new();
+		let filtered_recent_post_ids = HashSet::new();
+		let mut filtered_seen_post_ids = HashSet::new();
 		let mut filtered_flag = false;
 		let filters = HashSet::from(["programming".to_string()]);
 		let mut filtered_chunk_buffers = [
@@ -1001,10 +1037,64 @@ mod tests {
 			}]),
 		];
 
-		merge_chunk_posts(&mut filtered_chunk_buffers, &mut filtered_merged, &filters, "", &mut filtered_flag);
+		merge_chunk_posts(
+			&mut filtered_chunk_buffers,
+			&mut filtered_merged,
+			&filters,
+			"",
+			&filtered_recent_post_ids,
+			&mut filtered_seen_post_ids,
+			&mut filtered_flag,
+		);
 
 		assert_eq!(filtered_merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "2"]);
 		assert!(filtered_flag);
+	}
+
+	#[test]
+	fn merge_skips_duplicate_and_recent_posts() {
+		let mut chunk_buffers = [
+			VecDeque::from(vec![
+				Post {
+					id: "1".to_string(),
+					community: "rust".to_string(),
+					..test_post()
+				},
+				Post {
+					id: "2".to_string(),
+					community: "rust".to_string(),
+					..test_post()
+				},
+			]),
+			VecDeque::from(vec![
+				Post {
+					id: "1".to_string(),
+					community: "programming".to_string(),
+					..test_post()
+				},
+				Post {
+					id: "3".to_string(),
+					community: "programming".to_string(),
+					..test_post()
+				},
+			]),
+		];
+		let recent_post_ids = HashSet::from(["2".to_string()]);
+		let mut seen_post_ids = HashSet::new();
+		let mut merged = Vec::new();
+		let mut any_post_after_filter = false;
+
+		merge_chunk_posts(
+			&mut chunk_buffers,
+			&mut merged,
+			&HashSet::new(),
+			"",
+			&recent_post_ids,
+			&mut seen_post_ids,
+			&mut any_post_after_filter,
+		);
+
+		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "3"]);
 	}
 }
 
