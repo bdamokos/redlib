@@ -47,13 +47,32 @@
 			<a href="?q={{ params.q }}&sort={{ params.sort }}&t={{ params.t }}" class="search_subreddit" id="more_subreddits">← Back to post/comment results</a>
 			{% endif %}
 			{% for subreddit in subreddits %}
-			<a href="{{ subreddit.url }}" class="search_subreddit">
-				<div class="search_subreddit_left">{% if subreddit.icon != "" %}<img loading="lazy" src="{{ subreddit.icon|safe }}" alt="r/{{ subreddit.name }} icon">{% endif %}</div>
-				<div class="search_subreddit_right">
-					<h3>r/{{ subreddit.name }}</h3>
-					<p>{{ subreddit.description }}</p>
-				</div>
-			</a>
+			<div class="search_subreddit">
+				<a href="{{ subreddit.url }}" class="search_subreddit_link">
+					<div class="search_subreddit_left">{% if subreddit.icon != "" %}<img loading="lazy" src="{{ subreddit.icon|safe }}" alt="r/{{ subreddit.name }} icon">{% endif %}</div>
+					<div class="search_subreddit_right">
+						<h3>r/{{ subreddit.name }}</h3>
+						<p>{{ subreddit.description }}</p>
+					</div>
+				</a>
+				{% if !subreddit.is_subscribed %}
+				<form
+					class="inline_subscription_form search_subreddit_action"
+					action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}"
+					method="POST"
+					data-subscription-form
+					data-subscription-target="subreddit:{{ subreddit.name }}"
+					data-subscription-state="unsubscribed"
+					data-subscribe-action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}"
+					data-unsubscribe-action="/r/{{ subreddit.name }}/unsubscribe?redirect={{ redirect_url }}"
+					data-subscribe-label="Follow"
+					data-unsubscribe-label="Unfollow"
+					data-subscribe-class="subscribe"
+					data-unsubscribe-class="unsubscribe">
+					<button class="subscribe" type="submit">Follow</button>
+				</form>
+				{% endif %}
+			</div>
 			{% endfor %}
 			{% if !str_eq(params.typed, "sr_user") %}
 			<a href="?q={{ params.q }}&sort={{ params.sort }}&t={{ params.t }}&type=sr_user" class="search_subreddit" id="more_subreddits">More subreddit results →</a>

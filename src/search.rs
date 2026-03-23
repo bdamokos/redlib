@@ -32,6 +32,7 @@ struct Subreddit {
 	icon: String,
 	description: String,
 	subscribers: (String, String),
+	is_subscribed: bool,
 }
 
 #[derive(Template)]
@@ -43,6 +44,7 @@ pub struct SearchTemplate {
 	params: SearchParams,
 	prefs: Preferences,
 	url: String,
+	redirect_url: String,
 	/// Whether the subreddit itself is filtered.
 	is_filtered: bool,
 	/// Whether all fetched posts are filtered (to differentiate between no posts fetched in the first place,
@@ -109,12 +111,14 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	};
 
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let prefs = Preferences::new(&req);
+	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if sub.split('+').all(|s| filters.contains(s)) {
 		Ok(template(&SearchTemplate {
 			posts: Vec::new(),
-			subreddits,
+			subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
 			sub,
 			params: SearchParams {
 				q: query.replace('"', "&quot;"),
@@ -125,8 +129,9 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 				restrict_sr: param(&path, "restrict_sr").unwrap_or_default(),
 				typed,
 			},
-			prefs: Preferences::new(&req),
+			prefs,
 			url,
+			redirect_url,
 			is_filtered: true,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
@@ -142,7 +147,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 				utils::hydrate_post_author_links_from_cache(&mut posts);
 				Ok(template(&SearchTemplate {
 					posts,
-					subreddits,
+					subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
 					sub,
 					params: SearchParams {
 						q: query.replace('"', "&quot;"),
@@ -153,8 +158,9 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 						restrict_sr: param(&path, "restrict_sr").unwrap_or_default(),
 						typed,
 					},
-					prefs: Preferences::new(&req),
+					prefs,
 					url,
+					redirect_url,
 					is_filtered: false,
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
@@ -194,7 +200,18 @@ async fn search_subreddits(q: &str, typed: &str) -> Vec<Subreddit> {
 				icon: format_url(&icon),
 				description: val(subreddit, "public_description"),
 				subscribers: format_num(subreddit["data"]["subscribers"].as_f64().unwrap_or_default() as i64),
+				is_subscribed: false,
 			}
 		})
 		.collect::<Vec<Subreddit>>()
+}
+
+fn mark_subreddit_subscriptions(subreddits: Vec<Subreddit>, subscriptions: &[String]) -> Vec<Subreddit> {
+	subreddits
+		.into_iter()
+		.map(|mut subreddit| {
+			subreddit.is_subscribed = subscriptions.iter().any(|sub| sub.eq_ignore_ascii_case(&subreddit.name));
+			subreddit
+		})
+		.collect()
 }
