@@ -568,9 +568,34 @@ aside {
     #sub_actions { display: unset; }
 }
 
-#user_details > label,
+#user_details > .user_detail_metric,
+#sub_details > label,
+#sub_details > div {
+    min-width: 0;
+}
+
+#user_details {
+    gap: 12px;
+}
+
+#user_details > .user_detail_metric {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+#user_details > .user_detail_metric.user_detail_metric_full {
+    grid-column: 1 / -1;
+}
+
+#user_details > .user_detail_metric > label,
 #sub_details > label {
     color: var(--accent);
+}
+
+.user_detail_meta {
+    color: var(--visited);
+    font-size: 12px;
 }
 
 #user_profile {

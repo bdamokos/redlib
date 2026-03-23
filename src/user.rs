@@ -11,6 +11,8 @@ use chrono::DateTime;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 use time::{macros::format_description, OffsetDateTime};
 use tokio::task::JoinSet;
 use url::form_urlencoded;
@@ -19,6 +21,24 @@ use url::Url;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_DUPLICATE_FILL_REQUESTS: usize = 4;
 const USER_SORT_OPTIONS: [&str; 4] = ["hot", "new", "top", "controversial"];
+const USER_VIDEO_STATS_CACHE_SIZE: usize = 1000;
+const USER_VIDEO_STATS_CACHE_TTL: StdDuration = StdDuration::from_secs(3600);
+
+#[derive(Clone)]
+struct CachedUserVideoStats {
+	seen_keys: HashSet<String>,
+	total_duration_seconds: i64,
+	video_count: usize,
+	cached_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UserVideoStats {
+	average_duration_seconds: i64,
+	video_count: usize,
+}
+
+static USER_VIDEO_STATS_CACHE: LazyLock<Mutex<HashMap<String, CachedUserVideoStats>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // STRUCTS
 #[derive(Template)]
@@ -41,6 +61,7 @@ pub struct UserTemplate {
 	all_posts_filtered: bool,
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
+	avg_video_length: Option<(String, String)>,
 	no_posts: bool,
 }
 
@@ -103,6 +124,37 @@ fn duplicate_gif_key(post: &Post) -> Option<String> {
 	None
 }
 
+fn video_aggregate_key(post: &Post) -> Option<String> {
+	if post.media.duration_seconds <= 0 {
+		return None;
+	}
+
+	let redgifs_video_id = post
+		.media
+		.url
+		.trim()
+		.strip_prefix("/redgifs/")
+		.map(|value| value.trim_matches('/'))
+		.filter(|value| !value.is_empty())
+		.map(str::to_ascii_lowercase)
+		.or_else(|| redgifs::watch_path_from_url(&post.media.url))
+		.or_else(|| redgifs::watch_path_from_embed_code(&post.media.embed_code));
+
+	match post.post_type.as_str() {
+		"gif" => redgifs_video_id.map(|video_id| format!("redgifs:{video_id}")).or_else(|| duplicate_gif_key(post)),
+		"video" => {
+			if redgifs::is_redgifs_domain(&post.domain) || post.media.url.starts_with("/redgifs/") || redgifs_video_id.is_some() {
+				redgifs_video_id.map(|video_id| format!("redgifs:{video_id}")).or_else(|| duplicate_gif_key(post))
+			} else if !post.media.url.is_empty() {
+				Some(format!("video:{}", normalize_duplicate_url(&post.media.url)))
+			} else {
+				extract_embed_src(&post.media.embed_code).map(|src| format!("video:{}", normalize_duplicate_url(&src)))
+			}
+		}
+		_ => None,
+	}
+}
+
 fn extract_embed_src(embed_code: &str) -> Option<String> {
 	for delimiter in ['"', '\''] {
 		let needle = format!("src={delimiter}");
@@ -148,6 +200,78 @@ fn normalize_duplicate_url(url: &str) -> String {
 	}
 
 	parsed.into()
+}
+
+fn normalize_user_video_stats_cache_key(username: &str) -> String {
+	username.trim().to_lowercase()
+}
+
+fn prune_user_video_stats_cache(cache: &mut HashMap<String, CachedUserVideoStats>) {
+	let now = Instant::now();
+	cache.retain(|_, entry| now.duration_since(entry.cached_at) <= USER_VIDEO_STATS_CACHE_TTL);
+}
+
+fn update_user_video_stats(username: &str, posts: &[Post]) {
+	let cache_key = normalize_user_video_stats_cache_key(username);
+	if cache_key.is_empty() {
+		return;
+	}
+
+	let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() else {
+		return;
+	};
+	prune_user_video_stats_cache(&mut cache);
+
+	let now = Instant::now();
+	let entry = cache.entry(cache_key).or_insert_with(|| CachedUserVideoStats {
+		seen_keys: HashSet::new(),
+		total_duration_seconds: 0,
+		video_count: 0,
+		cached_at: now,
+	});
+	entry.cached_at = now;
+
+	for post in posts {
+		let Some(video_key) = video_aggregate_key(post) else {
+			continue;
+		};
+
+		if entry.seen_keys.insert(video_key) {
+			entry.video_count += 1;
+			entry.total_duration_seconds += post.media.duration_seconds;
+		}
+	}
+
+	while cache.len() > USER_VIDEO_STATS_CACHE_SIZE {
+		let Some(oldest_key) = cache.iter().min_by_key(|(_, entry)| entry.cached_at).map(|(key, _)| key.clone()) else {
+			break;
+		};
+		cache.remove(&oldest_key);
+	}
+}
+
+fn cached_user_video_stats(username: &str) -> Option<UserVideoStats> {
+	let cache_key = normalize_user_video_stats_cache_key(username);
+	if cache_key.is_empty() {
+		return None;
+	}
+
+	let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() else {
+		return None;
+	};
+	prune_user_video_stats_cache(&mut cache);
+
+	let entry = cache.get_mut(&cache_key)?;
+	entry.cached_at = Instant::now();
+
+	if entry.video_count == 0 {
+		return None;
+	}
+
+	Some(UserVideoStats {
+		average_duration_seconds: (entry.total_duration_seconds / entry.video_count as i64),
+		video_count: entry.video_count,
+	})
 }
 
 fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {
@@ -262,6 +386,7 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 	};
 
 	utils::hydrate_post_author_links_from_cache(&mut all_posts);
+	update_user_video_stats(username, &all_posts);
 	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
 	Ok((all_posts, after, all_posts_filtered))
 }
@@ -355,6 +480,13 @@ mod tests {
 	fn test_embed_gif_post(id: &str, title: &str, community: &str, embed_src: &str) -> Post {
 		let mut post = test_post(id, title, community, "", "gif", "", &[]);
 		post.media.embed_code = format!("<iframe src=\"{embed_src}\" frameborder=\"0\"></iframe>");
+		post
+	}
+
+	fn test_video_post(id: &str, title: &str, media_url: &str, duration_seconds: i64) -> Post {
+		let mut post = test_post(id, title, "demo_sub", "", "video", media_url, &[]);
+		post.media.duration_seconds = duration_seconds;
+		post.media.duration = crate::utils::format_video_duration(duration_seconds);
 		post
 	}
 
@@ -532,6 +664,7 @@ mod tests {
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
 			no_posts: false,
 		}
 		.render()
@@ -571,6 +704,7 @@ mod tests {
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
 			no_posts: false,
 		}
 		.render()
@@ -643,6 +777,7 @@ mod tests {
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
 			no_posts: false,
 		}
 		.render()
@@ -656,6 +791,138 @@ mod tests {
 		assert!(html.contains("<span class=\"user_subreddit_meta\">2</span>"));
 		assert!(html.contains("<a class=\"user_subreddit_link\" href=\"/r/other_sub\">r/other_sub</a>"));
 		assert!(html.contains("<span class=\"user_subreddit_meta\">1</span>"));
+	}
+
+	#[test]
+	fn video_stats_deduplicate_matching_video_urls() {
+		let username = "demo_user_video_dedupe";
+		let first = test_video_post("one", "Video one", "https://v.redd.it/example/DASH_720.mp4?source=fallback", 31);
+		let second = test_video_post("two", "Video two", "https://v.redd.it/example/DASH_720.mp4?foo=bar", 31);
+
+		super::update_user_video_stats(username, &[first, second]);
+
+		assert_eq!(
+			super::cached_user_video_stats(username),
+			Some(super::UserVideoStats {
+				average_duration_seconds: 31,
+				video_count: 1,
+			})
+		);
+	}
+
+	#[test]
+	fn video_stats_include_distinct_videos_in_average() {
+		let username = "demo_user_video_average";
+		let first = test_video_post("one", "Video one", "https://v.redd.it/first/DASH_720.mp4", 30);
+		let second = test_video_post("two", "Video two", "https://v.redd.it/second/DASH_720.mp4", 90);
+
+		super::update_user_video_stats(username, &[first, second]);
+
+		assert_eq!(
+			super::cached_user_video_stats(username),
+			Some(super::UserVideoStats {
+				average_duration_seconds: 60,
+				video_count: 2,
+			})
+		);
+	}
+
+	#[test]
+	fn video_stats_ignore_zero_duration_posts() {
+		let username = "demo_user_zero_duration";
+		let post = test_video_post("one", "Video one", "https://v.redd.it/example/DASH_720.mp4", 0);
+
+		super::update_user_video_stats(username, &[post]);
+
+		assert_eq!(super::cached_user_video_stats(username), None);
+	}
+
+	#[test]
+	fn video_stats_ignore_non_video_posts() {
+		let username = "demo_user_non_video";
+		let image = test_post("one", "Image", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
+		let comment = test_comment("comment_one", "demo_sub", "body", "t1", "Thread title");
+
+		super::update_user_video_stats(username, &[image, comment]);
+
+		assert_eq!(super::cached_user_video_stats(username), None);
+	}
+
+	#[test]
+	fn video_stats_deduplicate_matching_redgifs_sources() {
+		let username = "demo_user_redgifs_dedupe";
+		let mut first = test_video_post("one", "Video one", "/redgifs/zanyjudiciousrook", 31);
+		first.domain = "www.redgifs.com".to_string();
+
+		let mut second = test_video_post("two", "Video two", "", 31);
+		second.post_type = "gif".to_string();
+		second.media.embed_code = "<iframe src=\"https://www.redgifs.com/ifr/zanyjudiciousrook/\" frameborder=\"0\"></iframe>".to_string();
+
+		super::update_user_video_stats(username, &[first, second]);
+
+		assert_eq!(
+			super::cached_user_video_stats(username),
+			Some(super::UserVideoStats {
+				average_duration_seconds: 31,
+				video_count: 1,
+			})
+		);
+	}
+
+	#[test]
+	fn renders_avg_video_length_in_user_template() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			user_subreddits: Vec::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: Some(("1:01".to_string(), "from 2 seen videos".to_string())),
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("Avg video length"));
+		assert!(html.contains("1:01"));
+		assert!(html.contains("from 2 seen videos"));
+	}
+
+	#[test]
+	fn omits_avg_video_length_when_absent() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			user_subreddits: Vec::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(!html.contains("Avg video length"));
 	}
 }
 
@@ -704,6 +971,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 			is_filtered: true,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
 			no_posts: false,
 		}))
 	} else {
@@ -712,6 +980,13 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 			Ok((posts, after, all_posts_filtered)) => {
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+				let avg_video_length = cached_user_video_stats(&username).map(|stats| {
+					let count_label = if stats.video_count == 1 { "video" } else { "videos" };
+					(
+						utils::format_video_duration(stats.average_duration_seconds),
+						format!("from {} seen {count_label}", stats.video_count),
+					)
+				});
 				Ok(template(&UserTemplate {
 					user,
 					posts,
@@ -728,6 +1003,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 					is_filtered: false,
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
+					avg_video_length,
 					no_posts,
 				}))
 			}

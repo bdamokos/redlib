@@ -89,10 +89,21 @@ body %}
                 />
                 <h1 id="user_name">u/{{ user.name }}</h1>
                 <div id="user_details">
-                    <label>Post Karma</label>
-                    <label>Comment Karma</label>
-                    <div title="{{ user.post_karma.1 }}">{{ user.post_karma.0 }}</div>
-                    <div title="{{ user.comment_karma.1 }}">{{ user.comment_karma.0 }}</div>
+                    <div class="user_detail_metric">
+                        <label>Post Karma</label>
+                        <div title="{{ user.post_karma.1 }}">{{ user.post_karma.0 }}</div>
+                    </div>
+                    <div class="user_detail_metric">
+                        <label>Comment Karma</label>
+                        <div title="{{ user.comment_karma.1 }}">{{ user.comment_karma.0 }}</div>
+                    </div>
+                    {% if let Some(avg_video_length) = avg_video_length %}
+                    <div class="user_detail_metric user_detail_metric_full">
+                        <label>Avg video length</label>
+                        <div title="{{ avg_video_length.1 }}">{{ avg_video_length.0 }}</div>
+                        <span class="user_detail_meta">{{ avg_video_length.1 }}</span>
+                    </div>
+                    {% endif %}
                 </div>
                 {% if !user.description.is_empty() || !user.bio_html.is_empty() || user.external_links.len() > 0 %}
                 <div id="user_profile">
