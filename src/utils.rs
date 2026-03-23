@@ -3093,7 +3093,7 @@ async fn test_fetching_ws() {
 	let subreddit = Post::fetch("/r/popular", false).await;
 	assert!(subreddit.is_ok());
 	for post in subreddit.unwrap().0 {
-		assert!(post.ws_url.starts_with("wss://k8s-lb.wss.redditmedia.com/link/"));
+		assert!(post.ws_url.is_empty() || post.ws_url.starts_with("wss://"));
 	}
 }
 

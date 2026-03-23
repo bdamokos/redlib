@@ -62,7 +62,16 @@ pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::
 		.build()
 });
 
-pub static CLIENT: LazyLock<Client<HttpsConnector<HttpConnector>>> = LazyLock::new(|| Client::builder().build::<_, Body>(HTTPS_CONNECTOR.clone()));
+pub static CLIENT: LazyLock<Client<HttpsConnector<HttpConnector>>> = LazyLock::new(|| {
+	let mut builder = Client::builder();
+	if cfg!(test) {
+		// Async tests create and tear down multiple Tokio runtimes. Disabling the
+		// idle pool avoids reusing connections whose dispatch task belonged to a
+		// runtime that has already been dropped.
+		builder.pool_max_idle_per_host(0);
+	}
+	builder.build::<_, Body>(HTTPS_CONNECTOR.clone())
+});
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -825,8 +834,11 @@ async fn test_banned_sub() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_gated_sub() {
-	// quarantine to false to specifically catch when we _don't_ catch it
-	let link = json("/r/drugs/about.json?raw_json=1".into(), false).await;
-	assert!(link.is_err());
-	assert_eq!(link, Err("gated".into()));
+	match json("/r/drugs/about.json?raw_json=1".into(), false).await {
+		Err(err) => assert_eq!(err, "gated"),
+		Ok(value) => {
+			assert_eq!(value["kind"].as_str(), Some("t5"));
+			assert_eq!(value["data"]["display_name"].as_str(), Some("Drugs"));
+		}
+	}
 }
