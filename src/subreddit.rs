@@ -516,6 +516,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		} else {
 			Subreddit::default()
 		}
+	} else if aggregate_subscriptions && !req.uri().path().starts_with("/r/") {
+		Subreddit::default()
 	} else {
 		// Multireddit, all, popular
 		Subreddit {
