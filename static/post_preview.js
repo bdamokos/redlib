@@ -1,10 +1,22 @@
+function isUserPagePath() {
+    const { pathname } = window.location;
+    return pathname.startsWith("/user/") || pathname.startsWith("/u/");
+}
+
+function shouldTruncatePreview(preview) {
+    const isGallery = preview.classList.contains("gallery");
+    if (isGallery && isUserPagePath()) {
+        return false;
+    }
+
+    return isGallery
+        ? preview.querySelectorAll("figure").length > 2
+        : preview.scrollHeight > preview.clientHeight;
+}
+
 function markTruncatedPreviews() {
     for (const preview of document.querySelectorAll(".post_preview:not(.expanded)")) {
-        const isGallery = preview.classList.contains("gallery");
-        const isTruncated = isGallery
-            ? preview.querySelectorAll("figure").length > 2
-            : preview.scrollHeight > preview.clientHeight;
-        preview.classList.toggle("truncated", isTruncated);
+        preview.classList.toggle("truncated", shouldTruncatePreview(preview));
     }
 }
 
