@@ -274,6 +274,15 @@ fn cached_user_video_stats(username: &str) -> Option<UserVideoStats> {
 	})
 }
 
+pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
+	let stats = cached_user_video_stats(username)?;
+	let count_label = if stats.video_count == 1 { "video" } else { "videos" };
+	Some((
+		utils::format_video_duration(stats.average_duration_seconds),
+		format!("from {} seen {count_label}", stats.video_count),
+	))
+}
+
 fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {
 	crate::utils::CollapsedDuplicate {
 		title: post.title,
@@ -415,6 +424,7 @@ mod tests {
 				},
 				distinguished: String::new(),
 				external_links: Vec::new(),
+				avg_video_length: None,
 			},
 			permalink: format!("/r/{community}/comments/{id}/"),
 			parent_kind: String::new(),
@@ -825,6 +835,7 @@ mod tests {
 				video_count: 2,
 			})
 		);
+		assert_eq!(super::cached_avg_video_length(username), Some(("1:00".to_string(), "from 2 seen videos".to_string())));
 	}
 
 	#[test]
@@ -924,6 +935,45 @@ mod tests {
 
 		assert!(!html.contains("Avg video length"));
 	}
+
+	#[test]
+	fn renders_cached_author_avg_video_length_next_to_external_links() {
+		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
+		post.author.external_links = vec![crate::utils::ExternalLink {
+			label: "Example".to_string(),
+			url: "https://example.com/demo".to_string(),
+			host: "example.com".to_string(),
+			icon_path: "/icon/example.com".to_string(),
+			has_coomer: false,
+		}];
+		post.author.avg_video_length = Some(("1:01".to_string(), "from 2 seen videos".to_string()));
+
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			posts: vec![post],
+			user_subreddits: Vec::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("class=\"author_avg_video_length\""));
+		assert!(html.contains("avg 1:01"));
+		assert!(html.contains("from 2 seen videos"));
+	}
 }
 
 // FUNCTIONS
@@ -980,13 +1030,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 			Ok((posts, after, all_posts_filtered)) => {
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-				let avg_video_length = cached_user_video_stats(&username).map(|stats| {
-					let count_label = if stats.video_count == 1 { "video" } else { "videos" };
-					(
-						utils::format_video_duration(stats.average_duration_seconds),
-						format!("from {} seen {count_label}", stats.video_count),
-					)
-				});
+				let avg_video_length = cached_avg_video_length(&username);
 				Ok(template(&UserTemplate {
 					user,
 					posts,
@@ -1116,14 +1160,22 @@ pub async fn author_links(req: Request<Body>) -> Result<Response<Body>, String> 
 		let author_name = author.to_string();
 		pending.spawn(async move {
 			let links = utils::external_links_with_coomer_flags(utils::author_external_links(&author_name).await).await;
-			(author_name, links)
+			let avg_video_length = cached_avg_video_length(&author_name);
+			(author_name, links, avg_video_length)
 		});
 	}
 
 	let mut links_by_author = HashMap::new();
 	while let Some(result) = pending.join_next().await {
-		if let Ok((author, links)) = result {
-			links_by_author.insert(author, links);
+		if let Ok((author, links, avg_video_length)) = result {
+			links_by_author.insert(
+				author,
+				serde_json::json!({
+					"links": links,
+					"avg_video_length": avg_video_length.as_ref().map(|value| value.0.clone()),
+					"avg_video_length_title": avg_video_length.map(|value| value.1),
+				}),
+			);
 		}
 	}
 

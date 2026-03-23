@@ -661,9 +661,16 @@ aside {
 .external_site_icons {
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 6px;
     margin-left: 6px;
     vertical-align: text-bottom;
+}
+
+.author_avg_video_length {
+    font-size: 0.85em;
+    opacity: 0.75;
+    white-space: nowrap;
 }
 
 .external_site_link {
@@ -1508,6 +1515,44 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     text-align: center;
     font-size: 0.85rem;
     color: var(--fg-2);
+}
+
+.video_preview_gallery {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+    margin: 0 20px 10px 20px;
+}
+
+.video_preview_gallery[hidden] {
+    display: none;
+}
+
+.video_preview_frame_link {
+    color: inherit;
+    display: block;
+    position: relative;
+    text-decoration: none;
+}
+
+.video_preview_frame_link img {
+    aspect-ratio: 16 / 9;
+    border-radius: 8px;
+    display: block;
+    height: auto;
+    object-fit: cover;
+    width: 100%;
+}
+
+.video_preview_frame_time {
+    background: rgba(0, 0, 0, 0.7);
+    border-radius: 999px;
+    bottom: 8px;
+    color: #fff;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.4rem;
+    position: absolute;
+    right: 8px;
 }
 
 .post_media_image.short svg,

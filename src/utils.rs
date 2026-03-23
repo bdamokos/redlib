@@ -8,9 +8,10 @@ use crate::config::{self, get_setting};
 use crate::{
 	client::{json, latest_ratelimit_snapshot, CLIENT, OAUTH_CLIENT},
 	redgifs,
-	server::RequestExt,
+	server::{RequestExt, ResponseExt},
 };
 use askama::Template;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cached::proc_macro::cached;
 use cookie::Cookie;
 use htmlescape::decode_html;
@@ -88,6 +89,13 @@ pub struct FlairPart {
 	pub value: String,
 }
 
+#[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[revisioned(revision = 1)]
+pub struct FlairSubscription {
+	pub subreddit: String,
+	pub flair: String,
+}
+
 impl FlairPart {
 	pub fn parse(flair_type: &str, rich_flair: Option<&Vec<Value>>, text_flair: Option<&str>) -> Vec<Self> {
 		// Parse type of flair
@@ -130,6 +138,7 @@ pub struct Author {
 	pub flair: Flair,
 	pub distinguished: String,
 	pub external_links: Vec<ExternalLink>,
+	pub avg_video_length: Option<(String, String)>,
 }
 
 #[derive(Default, Clone, Serialize, PartialEq, Eq)]
@@ -283,6 +292,8 @@ pub struct Media {
 	pub duration: String,
 	pub download_name: String,
 	pub embed_code: String,
+	pub video_preview_enabled: bool,
+	pub video_preview_job_hint: String,
 }
 
 impl Media {
@@ -300,6 +311,8 @@ impl Media {
 			duration: String::new(),
 			download_name: String::new(),
 			embed_code: String::new(),
+			video_preview_enabled: false,
+			video_preview_job_hint: String::new(),
 		}
 	}
 
@@ -411,6 +424,8 @@ impl Media {
 				.unwrap_or_default()
 		};
 		let duration = format_video_duration(duration_seconds);
+		let video_preview_enabled =
+			crate::video_preview::feature_enabled() && (post_type == "video" || post_type == "gif") && embed_code.is_empty() && !url_val.as_str().unwrap_or_default().is_empty();
 
 		let download_name = if post_type == "image" || post_type == "gif" || post_type == "video" {
 			let permalink_base = url_path_basename(data["permalink"].as_str().unwrap_or_default());
@@ -436,6 +451,8 @@ impl Media {
 				duration,
 				download_name,
 				embed_code,
+				video_preview_enabled,
+				video_preview_job_hint: String::new(),
 			},
 			gallery,
 		)
@@ -615,6 +632,7 @@ impl Post {
 					},
 					distinguished: val(post, "distinguished"),
 					external_links: Vec::new(),
+					avg_video_length: crate::user::cached_avg_video_length(&val(post, "author")),
 				},
 				permalink,
 				parent_kind,
@@ -667,6 +685,8 @@ impl Post {
 					duration: String::new(),
 					download_name: String::new(),
 					embed_code: String::new(),
+					video_preview_enabled: false,
+					video_preview_job_hint: String::new(),
 				},
 				media,
 				domain: val(post, "domain"),
@@ -1162,7 +1182,7 @@ pub struct Params {
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 2)]
+#[revisioned(revision = 3)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -1208,6 +1228,13 @@ pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(serialize_with = "serialize_vec_with_plus", deserialize_with = "deserialize_vec_with_plus")]
 	pub filters: Vec<String>,
+	#[revision(start = 3)]
+	#[serde(
+		default,
+		serialize_with = "serialize_flair_subscriptions",
+		deserialize_with = "deserialize_flair_subscriptions"
+	)]
+	pub flair_subscriptions: Vec<FlairSubscription>,
 	#[revision(start = 1)]
 	pub hide_awards: String,
 	#[revision(start = 1)]
@@ -1268,6 +1295,7 @@ impl From<LegacyPreferencesV1> for Preferences {
 			post_sort: value.post_sort,
 			subscriptions: value.subscriptions,
 			filters: value.filters,
+			flair_subscriptions: Vec::new(),
 			hide_awards: value.hide_awards,
 			hide_score: value.hide_score,
 			remove_default_feeds: value.remove_default_feeds,
@@ -1326,6 +1354,7 @@ impl From<LegacyPreferencesV0> for Preferences {
 			post_sort: value.post_sort,
 			subscriptions: value.subscriptions,
 			filters: value.filters,
+			flair_subscriptions: Vec::new(),
 			hide_awards: value.hide_awards,
 			hide_score: value.hide_score,
 			remove_default_feeds: value.remove_default_feeds,
@@ -1349,6 +1378,143 @@ where
 		return Ok(Vec::new());
 	}
 	Ok(string.split('+').map(|s| s.to_string()).collect())
+}
+
+pub fn encode_flair_subscriptions(subscriptions: &[FlairSubscription]) -> Result<String, String> {
+	if subscriptions.is_empty() {
+		return Ok(String::new());
+	}
+
+	let json = serde_json::to_vec(subscriptions).map_err(|e| e.to_string())?;
+	Ok(URL_SAFE_NO_PAD.encode(json))
+}
+
+pub fn decode_flair_subscriptions(encoded: &str) -> Result<Vec<FlairSubscription>, String> {
+	if encoded.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| e.to_string())?;
+	serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn serialize_flair_subscriptions<S>(subscriptions: &[FlairSubscription], serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: Serializer,
+{
+	serializer.serialize_str(&encode_flair_subscriptions(subscriptions).map_err(serde::ser::Error::custom)?)
+}
+
+fn deserialize_flair_subscriptions<'de, D>(deserializer: D) -> Result<Vec<FlairSubscription>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let encoded = String::deserialize(deserializer)?;
+	decode_flair_subscriptions(&encoded).map_err(serde::de::Error::custom)
+}
+
+fn chunk_cookie_value(value: &str, max_len: usize) -> Vec<String> {
+	if value.is_empty() {
+		return Vec::new();
+	}
+
+	let mut chunks = Vec::new();
+	let mut current = String::new();
+
+	for ch in value.chars() {
+		if !current.is_empty() && current.len() + ch.len_utf8() > max_len {
+			chunks.push(current);
+			current = String::new();
+		}
+		current.push(ch);
+	}
+
+	if !current.is_empty() {
+		chunks.push(current);
+	}
+
+	chunks
+}
+
+pub fn read_sharded_cookie(req: &Request<Body>, base_name: &str) -> String {
+	let mut value = String::new();
+	let mut index = 0usize;
+
+	loop {
+		let cookie_name = if index == 0 {
+			base_name.to_string()
+		} else {
+			format!("{base_name}{index}")
+		};
+
+		let Some(cookie) = req.cookie(&cookie_name) else {
+			break;
+		};
+
+		value.push_str(cookie.value());
+		index += 1;
+	}
+
+	value
+}
+
+pub fn write_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, base_name: &str, value: &str) {
+	let chunks = chunk_cookie_value(value, 3800);
+
+	if chunks.is_empty() {
+		clear_sharded_cookie(response, req, base_name);
+		return;
+	}
+
+	for (index, chunk) in chunks.iter().enumerate() {
+		let cookie_name = if index == 0 {
+			base_name.to_string()
+		} else {
+			format!("{base_name}{index}")
+		};
+
+		response.insert_cookie(
+			Cookie::build((cookie_name, chunk.clone()))
+				.path("/")
+				.http_only(true)
+				.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
+				.into(),
+		);
+	}
+
+	let mut stale_index = chunks.len();
+	loop {
+		let cookie_name = if stale_index == 0 {
+			base_name.to_string()
+		} else {
+			format!("{base_name}{stale_index}")
+		};
+
+		if req.cookie(&cookie_name).is_none() {
+			break;
+		}
+
+		response.remove_cookie(cookie_name);
+		stale_index += 1;
+	}
+}
+
+pub fn clear_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, base_name: &str) {
+	let mut index = 0usize;
+	loop {
+		let cookie_name = if index == 0 {
+			base_name.to_string()
+		} else {
+			format!("{base_name}{index}")
+		};
+
+		if req.cookie(&cookie_name).is_none() {
+			break;
+		}
+
+		response.remove_cookie(cookie_name);
+		index += 1;
+	}
 }
 
 #[derive(RustEmbed)]
@@ -1388,6 +1554,7 @@ impl Preferences {
 			post_sort: setting(req, "post_sort"),
 			subscriptions: setting(req, "subscriptions").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
 			filters: setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+			flair_subscriptions: decode_flair_subscriptions(&setting(req, "flair_subscriptions")).unwrap_or_default(),
 			hide_awards: setting(req, "hide_awards"),
 			hide_score: setting(req, "hide_score"),
 			remove_default_feeds: setting(req, "remove_default_feeds"),
@@ -1520,6 +1687,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			},
 			distinguished: val(post, "distinguished"),
 			external_links: author_external_links(&val(post, "author")).await,
+			avg_video_length: crate::user::cached_avg_video_length(&val(post, "author")),
 		},
 		permalink,
 		parent_kind: parent_kind(&val(post, "parent_id")),
@@ -1543,6 +1711,8 @@ pub async fn parse_post(post: &Value) -> Post {
 			duration: String::new(),
 			download_name: String::new(),
 			embed_code: String::new(),
+			video_preview_enabled: false,
+			video_preview_job_hint: String::new(),
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(
@@ -1627,75 +1797,39 @@ pub fn param(path: &str, value: &str) -> Option<String> {
 	)
 }
 
+pub fn flair_feed_url(subreddit: &str, flair: &str) -> String {
+	let query = url::form_urlencoded::Serializer::new(String::new())
+		.append_pair("flair", flair)
+		.finish();
+	format!("/r/{subreddit}?{query}")
+}
+
+pub fn flair_subscription_target(subreddit: &str, flair: &str) -> String {
+	let encoded = URL_SAFE_NO_PAD.encode(flair.as_bytes());
+	format!("flair:{subreddit}:{encoded}")
+}
+
 /// Retrieve the value of a setting by name
 pub fn setting(req: &Request<Body>, name: &str) -> String {
-	// Parse a cookie value from request
-
-	// If this was called with "subscriptions" and the "subscriptions" cookie has a value
-	if name == "subscriptions" && req.cookie("subscriptions").is_some() {
-		// Create subscriptions string
-		let mut subscriptions = String::new();
-
-		// Default subscriptions cookie
-		if req.cookie("subscriptions").is_some() {
-			subscriptions.push_str(req.cookie("subscriptions").unwrap().value());
+	if matches!(name, "subscriptions" | "filters" | "flair_subscriptions") {
+		let value = read_sharded_cookie(req, name);
+		if !value.is_empty() {
+			return value;
 		}
-
-		// Start with first numbered subscription cookie
-		let mut subscriptions_number = 1;
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number}")).is_some() {
-			// Push whatever subscriptionsNUMBER cookie we're looking at into the subscriptions string
-			subscriptions.push_str(req.cookie(&format!("subscriptions{subscriptions_number}")).unwrap().value());
-
-			// Increment subscription cookie number
-			subscriptions_number += 1;
-		}
-
-		// Return the subscriptions cookies as one large string
-		subscriptions
 	}
-	// If this was called with "filters" and the "filters" cookie has a value
-	else if name == "filters" && req.cookie("filters").is_some() {
-		// Create filters string
-		let mut filters = String::new();
 
-		// Default filters cookie
-		if req.cookie("filters").is_some() {
-			filters.push_str(req.cookie("filters").unwrap().value());
-		}
-
-		// Start with first numbered filters cookie
-		let mut filters_number = 1;
-
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number}")).is_some() {
-			// Push whatever filtersNUMBER cookie we're looking at into the filters string
-			filters.push_str(req.cookie(&format!("filters{filters_number}")).unwrap().value());
-
-			// Increment filters cookie number
-			filters_number += 1;
-		}
-
-		// Return the filters cookies as one large string
-		filters
-	}
-	// The above two still come to this if there was no existing value
-	else {
-		req
-			.cookie(name)
-			.unwrap_or_else(|| {
-				// If there is no cookie for this setting, try receiving a default from the config
-				if let Some(default) = get_setting(&format!("REDLIB_DEFAULT_{}", name.to_uppercase())) {
-					Cookie::new(name, default)
-				} else {
-					Cookie::from(name)
-				}
-			})
-			.value()
-			.to_string()
-	}
+	req
+		.cookie(name)
+		.unwrap_or_else(|| {
+			// If there is no cookie for this setting, try receiving a default from the config
+			if let Some(default) = get_setting(&format!("REDLIB_DEFAULT_{}", name.to_uppercase())) {
+				Cookie::new(name, default)
+			} else {
+				Cookie::from(name)
+			}
+		})
+		.value()
+		.to_string()
 }
 
 /// Retrieve the value of a setting by name or the default value

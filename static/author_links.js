@@ -4,6 +4,24 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
     }
 
+    const renderAverageVideoLength = (container, avgVideoLength, avgVideoLengthTitle) => {
+        const existing = container.querySelector(".author_avg_video_length");
+        if (!avgVideoLength) {
+            if (existing) {
+                existing.remove();
+            }
+            return;
+        }
+
+        const label = existing || document.createElement("span");
+        label.className = "author_avg_video_length";
+        label.textContent = `avg ${avgVideoLength}`;
+        label.title = avgVideoLengthTitle || "";
+        if (!existing) {
+            container.appendChild(label);
+        }
+    };
+
     const authors = [...new Set(
         containers
             .map((container) => container.getAttribute("data-author-name") || "")
@@ -27,7 +45,8 @@ document.addEventListener("DOMContentLoaded", () => {
         .then((linksByAuthor) => {
             for (const container of containers) {
                 const author = (container.getAttribute("data-author-name") || "").trim();
-                const links = Array.isArray(linksByAuthor[author]) ? linksByAuthor[author] : [];
+                const authorData = linksByAuthor[author] || {};
+                const links = Array.isArray(authorData.links) ? authorData.links : [];
                 container.replaceChildren();
 
                 for (const link of links) {
@@ -50,6 +69,8 @@ document.addEventListener("DOMContentLoaded", () => {
                     anchor.appendChild(image);
                     container.appendChild(anchor);
                 }
+
+                renderAverageVideoLength(container, authorData.avg_video_length, authorData.avg_video_length_title);
 
                 container.dataset.state = "loaded";
             }

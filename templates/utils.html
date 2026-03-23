@@ -37,7 +37,7 @@
 	{% for flair_part in flair_parts.clone() %}{% if flair_part.flair_part_type == "emoji" %}<span class="emoji" style="background-image:url('{{ flair_part.value }}');"></span>{% else if flair_part.flair_part_type == "text" && !flair_part.value.is_empty() %}<span>{{ flair_part.value }}</span>{% endif %}{% endfor %}
 {%- endmacro %}
 
-{% macro external_site_icons(links, author_name) -%}
+{% macro external_site_icons(links, author_name, avg_video_length) -%}
 	{% if author_name != "" && author_name != "[deleted]" %}
 	<span class="external_site_icons" data-author-name="{{ author_name }}" data-state="{% if links.len() > 0 %}loaded{% else %}pending{% endif %}">
 		{% for link in links.clone() %}
@@ -45,6 +45,9 @@
 				<img loading="lazy" src="{{ link.icon_path }}" alt="{{ link.label }}" width="16" height="16">
 			</a>
 		{% endfor %}
+		{% if let Some(avg_video_length) = avg_video_length %}
+			<span class="author_avg_video_length" title="{{ avg_video_length.1 }}">avg {{ avg_video_length.0 }}</span>
+		{% endif %}
 	</span>
 	{% endif %}
 {%- endmacro %}
@@ -83,7 +86,7 @@
 		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/user/{{ post.author.name }}">u/{{ post.author.name }}</a>
-		{% call external_site_icons(post.author.external_links, post.author.name) %}
+		{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
 		{% if post.author.flair.flair_parts.len() > 0 %}
 			<small class="author_flair">{% call render_flair(post.author.flair.flair_parts) %}</small>
 		{% endif %}
@@ -257,7 +260,7 @@
 		{% endif %}
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
-		{% call external_site_icons(post.author.external_links, post.author.name) %}
+		{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
 		<span class="dot">&bull;</span>
 		<span class="created" title="{{ post.created }}">{{ post.rel_time }}</span>
 		{% if !post.awards.is_empty() && prefs.hide_awards != "on" %}
@@ -509,36 +512,52 @@
 	{% else %}
 	{% set use_dash = str_eq(prefs.use_dash, "on") && !post.media.dash_url.is_empty() %}
 	{% set use_hls = !use_dash && str_eq(prefs.use_hls, "on") && !post.media.hls_url.is_empty() %}
-	<div class="post_media_content">
-		<video
-			id="vid_{{ post.id }}"
-			class="post_media_video short{% if use_dash %} video-dash{% endif %}{% if str_eq(prefs.autoplay_videos, "on") %} autoplay{% endif -%}"
-			poster="{{ post.media.poster }}"
-			preload="metadata"
-			playsinline
-			controls
-			{% if post.post_type == "gif" -%}
-			loop
-			muted
-			{% endif -%}
-			{% if post.media.width > 0 && post.media.height > 0 -%}
-			width="{{ post.media.width }}"
-			height="{{ post.media.height }}"
-			{% endif -%}
-			{% if use_dash -%}
-			data-dash="{{ post.media.dash_url }}"
-			data-hls="{{ post.media.hls_url }}"
-			{% endif -%}
-			{% if str_eq(prefs.autoplay_videos, "on") -%}
-			autoplay
-			{% endif -%}
-		>
-			{% if use_hls -%}
-			<source src="{{ post.media.hls_url }}" type="application/vnd.apple.mpegurl" />
-			{% endif -%}
-			<source src="{{ post.media.url }}" type="video/mp4" />
-			<a href="{{ post.media.url }}">Video</a>
-		</video>
+	<div
+		class="video_preview_host"
+		{% if post.media.video_preview_enabled %}
+		data-post-id="{{ post.id }}"
+		data-media-url="{{ post.media.url }}"
+		data-poster-url="{{ post.media.poster }}"
+		data-duration-seconds="{{ post.media.duration_seconds }}"
+		data-width="{{ post.media.width }}"
+		data-height="{{ post.media.height }}"
+		data-page-path="{{ post.permalink }}"
+		{% endif %}
+	>
+		<div class="post_media_content">
+			<video
+				id="vid_{{ post.id }}"
+				class="post_media_video short{% if use_dash %} video-dash{% endif %}{% if str_eq(prefs.autoplay_videos, "on") %} autoplay{% endif -%}"
+				poster="{{ post.media.poster }}"
+				preload="metadata"
+				playsinline
+				controls
+				{% if post.post_type == "gif" -%}
+				loop
+				muted
+				{% endif -%}
+				{% if post.media.width > 0 && post.media.height > 0 -%}
+				width="{{ post.media.width }}"
+				height="{{ post.media.height }}"
+				{% endif -%}
+				{% if use_dash -%}
+				data-dash="{{ post.media.dash_url }}"
+				data-hls="{{ post.media.hls_url }}"
+				{% endif -%}
+				{% if str_eq(prefs.autoplay_videos, "on") -%}
+				autoplay
+				{% endif -%}
+			>
+				{% if use_hls -%}
+				<source src="{{ post.media.hls_url }}" type="application/vnd.apple.mpegurl" />
+				{% endif -%}
+				<source src="{{ post.media.url }}" type="video/mp4" />
+				<a href="{{ post.media.url }}">Video</a>
+			</video>
+		</div>
+		{% if post.media.video_preview_enabled %}
+		<div class="video_preview_gallery" hidden></div>
+		{% endif %}
 	</div>
 	{% if !post.media.duration.is_empty() %}
 	<div class="post_media_duration">{{ post.media.duration }}</div>

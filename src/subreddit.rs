@@ -3,13 +3,12 @@
 use crate::{config, utils};
 // CRATES
 use crate::utils::{
-	catch_random, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting,
-	template, val, Post, Preferences, Subreddit,
+	catch_random, clear_sharded_cookie, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info,
+	nsfw_landing, param, redirect, rewrite_urls, setting, template, val, write_sharded_cookie, FlairSubscription, Post, Preferences, Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use cookie::Cookie;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 use log::warn;
@@ -19,7 +18,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::LazyLock;
-use time::{Duration, OffsetDateTime};
 use url::form_urlencoded;
 
 const FRONT_CURSOR_PARAM: &str = "front_cursor";
@@ -54,6 +52,7 @@ pub struct SubredditTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	is_flair_subscribed: bool,
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
@@ -80,10 +79,16 @@ struct FlairFilterOption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum AggregateFeedSource {
+	SubredditChunk { chunk: String },
+	Flair { subreddit: String, flair: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct AggregateFrontCursor {
 	v: u8,
-	chunks: Vec<String>,
-	chunk_afters: Vec<String>,
+	sources: Vec<AggregateFeedSource>,
+	source_afters: Vec<String>,
 	prev_stack: Vec<Vec<String>>,
 	#[serde(default)]
 	recent_post_ids: Vec<String>,
@@ -95,6 +100,12 @@ struct AggregateFrontCursor {
 struct ChunkListingPage {
 	posts: Vec<Post>,
 	after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SavedFeed {
+	Subreddit { name: String },
+	Flair { subreddit: String, flair: String },
 }
 
 struct AggregatedFeed {
@@ -266,6 +277,36 @@ fn split_subscriptions_for_listing(subs: &[String], sort: &str, query: &str) -> 
 	chunks
 }
 
+fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
+	let mut feeds = preferences
+		.subscriptions
+		.iter()
+		cloned()
+		.map(|name| SavedFeed::Subreddit { name })
+		.collect::<Vec<_>>();
+
+	feeds.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| SavedFeed::Flair {
+		subreddit: subscription.subreddit,
+		flair: subscription.flair,
+	}));
+
+	feeds
+}
+
+fn build_aggregate_sources(preferences: &Preferences, sort: &str, reddit_query: &str) -> Vec<AggregateFeedSource> {
+	let mut sources = split_subscriptions_for_listing(&preferences.subscriptions, sort, reddit_query)
+		into_iter()
+		.map(|chunk| AggregateFeedSource::SubredditChunk { chunk })
+		.collect::<Vec<_>>();
+
+	sources.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| AggregateFeedSource::Flair {
+		subreddit: subscription.subreddit,
+		flair: subscription.flair,
+	}));
+
+	sources
+}
+
 fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str) -> String {
 	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(base_query.as_bytes()).into_owned().collect();
 	if !after.is_empty() {
@@ -277,14 +318,6 @@ fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str) ->
 		.finish();
 
 	format!("/r/{}/{sort}.json?{query}", chunk.replace('+', "%2B"))
-}
-
-fn path_needs_frontpage_aggregation(subscribed: &str, sort: &str, reddit_query: &str) -> bool {
-	if subscribed.is_empty() {
-		return false;
-	}
-
-	format!("/r/{subscribed}/{sort}.json?{reddit_query}").len() + AFTER_PATH_HEADROOM > REDDIT_LISTING_PATH_SOFT_LIMIT
 }
 
 fn encode_front_cursor(cursor: &AggregateFrontCursor) -> Option<String> {
@@ -304,13 +337,24 @@ fn build_front_cursor_url(current_url: &str, encoded_cursor: &str) -> String {
 	update_url_query(current_url, &[(FRONT_CURSOR_PARAM, Some(encoded_cursor)), ("before", None), ("after", None)])
 }
 
-fn cursor_matches_request(cursor: &AggregateFrontCursor, chunks: &[String], sort: &str, timeframe: &str, query_fingerprint: &str) -> bool {
-	cursor.chunks == chunks && cursor.chunk_afters.len() == chunks.len() && cursor.sort == sort && cursor.timeframe == timeframe && cursor.query_fingerprint == query_fingerprint
+fn cursor_matches_request(cursor: &AggregateFrontCursor, sources: &[AggregateFeedSource], sort: &str, timeframe: &str, query_fingerprint: &str) -> bool {
+	cursor.sources == sources
+		&& cursor.source_afters.len() == sources.len()
+		&& cursor.sort == sort
+		&& cursor.timeframe == timeframe
+		&& cursor.query_fingerprint == query_fingerprint
 }
 
-async fn fetch_chunk_listing_page(chunk: &str, sort: &str, reddit_query: &str, after: &str, quarantine: bool) -> Result<ChunkListingPage, String> {
-	let path = build_listing_path(chunk, sort, reddit_query, after);
-	let (posts, next_after) = Post::fetch(&path, quarantine).await?;
+async fn fetch_source_listing_page(source: &AggregateFeedSource, sort: &str, reddit_query: &str, after: &str, quarantine: bool) -> Result<ChunkListingPage, String> {
+	let (mut posts, next_after) = match source {
+		AggregateFeedSource::SubredditChunk { chunk } => Post::fetch(&build_listing_path(chunk, sort, reddit_query, after), quarantine).await?,
+		AggregateFeedSource::Flair { subreddit, flair } => {
+			let (mut posts, next_after) = Post::fetch(&build_listing_path(subreddit, sort, reddit_query, after), quarantine).await?;
+			filter_posts_by_flair(&mut posts, flair);
+			(posts, next_after)
+		}
+	};
+	utils::store_post_flairs(&posts);
 	Ok(ChunkListingPage { posts, after: next_after })
 }
 
@@ -358,7 +402,7 @@ fn merge_chunk_posts(
 }
 
 async fn fetch_aggregated_subscription_feed(
-	chunks: &[String],
+	sources: &[AggregateFeedSource],
 	cursor: Option<AggregateFrontCursor>,
 	sort: &str,
 	timeframe: &str,
@@ -368,11 +412,11 @@ async fn fetch_aggregated_subscription_feed(
 	active_flair_filter: &str,
 	quarantine: bool,
 ) -> Result<AggregatedFeed, String> {
-	let current_state = cursor.as_ref().map(|value| value.chunk_afters.clone()).unwrap_or_else(|| vec![String::new(); chunks.len()]);
+	let current_state = cursor.as_ref().map(|value| value.source_afters.clone()).unwrap_or_else(|| vec![String::new(); sources.len()]);
 	let mut next_state = current_state.clone();
 	let mut prev_stack = cursor.as_ref().map(|value| value.prev_stack.clone()).unwrap_or_default();
 	let page_has_cursor = cursor.is_some();
-	let mut chunk_buffers: Vec<VecDeque<Post>> = (0..chunks.len()).map(|_| VecDeque::new()).collect();
+	let mut chunk_buffers: Vec<VecDeque<Post>> = (0..sources.len()).map(|_| VecDeque::new()).collect();
 	let mut merged_posts = Vec::new();
 	let recent_post_ids = cursor
 		.as_ref()
@@ -387,7 +431,7 @@ async fn fetch_aggregated_subscription_feed(
 	for round in 0..MAX_AGGREGATE_FILL_ROUNDS {
 		let mut fetched_any_chunk = false;
 
-		for (index, chunk) in chunks.iter().enumerate() {
+		for (index, source) in sources.iter().enumerate() {
 			if round > 0 && next_state[index].is_empty() {
 				continue;
 			}
@@ -396,17 +440,16 @@ async fn fetch_aggregated_subscription_feed(
 			}
 
 			let request_after = next_state[index].clone();
-			match fetch_chunk_listing_page(chunk, sort, reddit_query, &request_after, quarantine).await {
+			match fetch_source_listing_page(source, sort, reddit_query, &request_after, quarantine).await {
 				Ok(page) => {
 					fetched_any_chunk = true;
 					successful_chunks += 1;
 					fetched_raw_posts |= !page.posts.is_empty();
-					utils::store_post_flairs(&page.posts);
 					chunk_buffers[index].extend(page.posts);
 					next_state[index] = page.after;
 				}
 				Err(err) => {
-					chunk_errors.push(format!("chunk {chunk}: {err}"));
+					chunk_errors.push(format!("source {source:?}: {err}"));
 				}
 			}
 		}
@@ -446,8 +489,8 @@ async fn fetch_aggregated_subscription_feed(
 		next_prev_stack.push(current_state.clone());
 		encode_front_cursor(&AggregateFrontCursor {
 			v: 1,
-			chunks: chunks.to_vec(),
-			chunk_afters: next_state,
+			sources: sources.to_vec(),
+			source_afters: next_state,
 			prev_stack: next_prev_stack,
 			recent_post_ids: page_post_ids.clone(),
 			sort: sort.to_string(),
@@ -461,8 +504,8 @@ async fn fetch_aggregated_subscription_feed(
 	let prev_cursor = prev_stack.pop().and_then(|previous_state| {
 		encode_front_cursor(&AggregateFrontCursor {
 			v: 1,
-			chunks: chunks.to_vec(),
-			chunk_afters: previous_state,
+			sources: sources.to_vec(),
+			source_afters: previous_state,
 			prev_stack,
 			recent_post_ids: Vec::new(),
 			sort: sort.to_string(),
@@ -791,6 +834,7 @@ mod tests {
 				flair: empty_flair(),
 				distinguished: String::new(),
 				external_links: Vec::new(),
+				avg_video_length: None,
 			},
 			permalink: "/r/demo_sub/comments/demo/".to_string(),
 			parent_kind: String::new(),
