@@ -335,6 +335,15 @@ impl Media {
 		} else {
 			0
 		};
+		let redgifs_preview_media_url = if let Some(video_id) = redgifs_id.as_ref() {
+			redgifs::fetch_video_path(video_id)
+				.await
+				.ok()
+				.and_then(|path| redgifs::direct_media_url_from_path(&path))
+				.unwrap_or_default()
+		} else {
+			String::new()
+		};
 		let redgifs_url = redgifs_id.as_ref().map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
 
 		let embed_code = if redgifs_url.is_some() { String::new() } else { raw_embed_code };
@@ -426,6 +435,13 @@ impl Media {
 		let duration = format_video_duration(duration_seconds);
 		let video_preview_enabled =
 			crate::video_preview::feature_enabled() && (post_type == "video" || post_type == "gif") && embed_code.is_empty() && !url_val.as_str().unwrap_or_default().is_empty();
+		let video_preview_job_hint = if redgifs_url.is_some() {
+			redgifs_preview_media_url
+		} else if post_type == "video" || post_type == "gif" {
+			url_val.as_str().unwrap_or_default().to_string()
+		} else {
+			String::new()
+		};
 
 		let download_name = if post_type == "image" || post_type == "gif" || post_type == "video" {
 			let permalink_base = url_path_basename(data["permalink"].as_str().unwrap_or_default());
@@ -452,7 +468,7 @@ impl Media {
 				download_name,
 				embed_code,
 				video_preview_enabled,
-				video_preview_job_hint: String::new(),
+				video_preview_job_hint,
 			},
 			gallery,
 		)

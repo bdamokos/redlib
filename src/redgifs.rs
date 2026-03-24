@@ -13,7 +13,7 @@ static REDGIFS_META_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"
 static REDGIFS_LINK_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<link\s+[^>]*rel="(?P<rel>[^"]+)"[^>]*href="(?P<href>[^"]+)""#).unwrap());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RedgifsMediaPaths {
+pub struct RedgifsMediaPaths {
 	video_path: String,
 	poster_path: String,
 	duration_seconds: i64,
@@ -73,6 +73,15 @@ fn media_path_from_url(url: &str) -> Option<String> {
 	}
 }
 
+pub fn direct_media_url_from_path(path: &str) -> Option<String> {
+	let filename = path.strip_prefix("/redgifs/")?;
+	if is_valid_media_path(filename) {
+		Some(format!("https://media.redgifs.com/{filename}"))
+	} else {
+		None
+	}
+}
+
 pub async fn handler(req: Request<Body>) -> Result<Response<Body>, String> {
 	let path = req.uri().path().trim_start_matches("/redgifs/").trim_matches('/').to_string();
 
@@ -105,6 +114,10 @@ pub async fn fetch_poster_path(video_id: &str) -> Result<String, String> {
 
 pub async fn fetch_duration_seconds(video_id: &str) -> Result<i64, String> {
 	fetch_media_paths(video_id.to_string()).await.map(|paths| paths.duration_seconds)
+}
+
+pub async fn fetch_video_path(video_id: &str) -> Result<String, String> {
+	fetch_media_paths(video_id.to_string()).await.map(|paths| paths.video_path)
 }
 
 #[cached(size = 512, time = 3600, result = true)]

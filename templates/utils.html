@@ -523,7 +523,7 @@
 			class="video_preview_host"
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
 			data-post-id="{{ post.id }}"
-			data-media-url="{{ post.media.url }}"
+			data-media-url="{{ post.media.video_preview_job_hint }}"
 			data-poster-url="{{ post.media.poster }}"
 			data-duration-seconds="{{ post.media.duration_seconds }}"
 			data-width="{{ post.media.width }}"

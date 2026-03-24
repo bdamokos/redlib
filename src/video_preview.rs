@@ -460,8 +460,11 @@ pub fn preview_timestamps(duration_seconds: i64) -> Vec<i64> {
 	let start = 0.5f64.max(duration * 0.05);
 	let end = start.max(duration * 0.95);
 	let step = if count > 1 { (end - start) / ((count - 1) as f64) } else { 0.0 };
+	let max_timestamp = (duration_seconds - 1).max(0) as f64;
 
-	(0..count).map(|index| (start + step * (index as f64)).round().max(1.0) as i64).collect()
+	(0..count)
+		.map(|index| (start + step * (index as f64)).round().clamp(0.0, max_timestamp) as i64)
+		.collect()
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -1056,8 +1059,9 @@ mod tests {
 		let values = preview_timestamps(60);
 		assert_eq!(values.len(), computed_frame_count(60));
 		assert!(values.windows(2).all(|window| window[0] <= window[1]));
-		assert!(values.first().copied().unwrap_or_default() >= 1);
-		assert!(values.last().copied().unwrap_or_default() <= 60);
+		assert!(values.first().copied().unwrap_or_default() >= 0);
+		assert!(values.last().copied().unwrap_or_default() < 60);
+		assert_eq!(preview_timestamps(9), vec![1, 2, 4, 5, 7, 8]);
 	}
 
 	#[test]
