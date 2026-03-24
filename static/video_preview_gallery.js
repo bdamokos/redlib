@@ -1,13 +1,12 @@
 // @license http://www.gnu.org/licenses/agpl-3.0.html AGPL-3.0
 (function () {
-    if (!("IntersectionObserver" in window) || !window.fetch || !window.crypto || typeof window.crypto.randomUUID !== "function") {
+    if (!window.fetch || !window.crypto || typeof window.crypto.randomUUID !== "function") {
         return;
     }
 
     var pageSessionId = window.crypto.randomUUID();
     var activeHosts = new Map();
     var heartbeatTimer = null;
-    var hostObserver;
 
     function jsonHeaders() {
         return {
@@ -131,9 +130,6 @@
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
                     renderGallery(host, payload.frames || []);
-                    if (hostObserver) {
-                        hostObserver.unobserve(host);
-                    }
                     return;
                 }
 
@@ -210,9 +206,6 @@
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
                     renderGallery(host, payload.frames || []);
-                    if (hostObserver) {
-                        hostObserver.unobserve(host);
-                    }
                     return;
                 }
 
@@ -251,24 +244,11 @@
     }
 
     function observeHosts(root) {
-        if (!hostObserver) {
-            hostObserver = new IntersectionObserver(function (entries) {
-                entries.forEach(function (entry) {
-                    if (entry.isIntersecting) {
-                        leaseHost(entry.target);
-                    }
-                });
-            }, {
-                rootMargin: "400px 0px",
-                threshold: 0
-            });
-        }
-
         (root || document).querySelectorAll(".video_preview_host[data-media-url]").forEach(function (host) {
             if (!activeHosts.has(host)) {
                 activeHosts.set(host, {});
             }
-            hostObserver.observe(host);
+            leaseHost(host);
         });
     }
 

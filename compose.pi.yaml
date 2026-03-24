@@ -12,6 +12,8 @@ services:
     cap_drop:
       - ALL
     env_file: .env
+    environment:
+      REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT: "${REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT:-3}"
     networks:
       - redlib
     healthcheck:

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 
-const DEFAULT_MAX_CONCURRENT: usize = 2;
+const DEFAULT_MAX_CONCURRENT: usize = 3;
 const DEFAULT_MAX_READY_JOBS: usize = 128;
 const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_QUEUE: usize = 256;
