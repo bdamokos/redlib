@@ -397,7 +397,10 @@ REDLIB_DEFAULT_USE_HLS = "on"
 > docker run -d --name redlib -p 8080:8080 --env-file .env quay.io/redlib/redlib:latest
 > ```
 >
-> If using Docker Compose, no changes are needed as the `.env` file is already referenced in `compose.yaml` via the `env_file: .env` line.
+> If using Docker Compose, no changes are needed as the `.env` file is already referenced in the compose file via the `env_file: .env` line.
+
+> [!IMPORTANT]
+> The video preview gallery feature is disabled unless `REDLIB_VIDEO_PREVIEW_ENABLED=on` is set in the runtime environment. Updating the image alone is not enough if your deployment keeps an older `.env` file.
 
 ## Command Line Flags
 
@@ -419,6 +422,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `SFW_ONLY`                | `["on", "off"]` | `off`                  | Enables SFW-only mode for the instance, i.e. all NSFW content is filtered.                                |
 | `BANNER`                  | String          | (empty)                | Allows the server to set a banner to be displayed. Currently this is displayed on the instance info page. |
 | `ROBOTS_DISABLE_INDEXING` | `["on", "off"]` | `off`                  | Disables indexing of the instance by search engines.                                                      |
+| `VIDEO_PREVIEW_ENABLED`   | `["on", "off"]` | `off`                  | Enables server-side asynchronous video preview gallery generation for video posts.                        |
 | `PUSHSHIFT_FRONTEND`      | String          | `undelete.pullpush.io` | Allows the server to set the Pushshift frontend to be used with "removed" links.                          |
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |

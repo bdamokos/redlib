@@ -1182,7 +1182,7 @@ pub struct Params {
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 3)]
+#[revisioned(revision = 4)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -1214,6 +1214,8 @@ pub struct Preferences {
 	pub use_hls: String,
 	#[revision(start = 1)]
 	pub autoplay_videos: String,
+	#[revision(start = 4)]
+	pub video_previews: String,
 	#[revision(start = 1)]
 	pub fixed_navbar: String,
 	#[revision(start = 1)]
@@ -1285,6 +1287,7 @@ impl From<LegacyPreferencesV1> for Preferences {
 			use_dash: value.use_dash,
 			use_hls: value.use_hls,
 			autoplay_videos: value.autoplay_videos,
+			video_previews: "on".to_string(),
 			fixed_navbar: value.fixed_navbar,
 			disable_visit_reddit_confirmation: value.disable_visit_reddit_confirmation,
 			comment_sort: value.comment_sort,
@@ -1344,6 +1347,7 @@ impl From<LegacyPreferencesV0> for Preferences {
 			use_dash: value.use_dash,
 			use_hls: value.use_hls,
 			autoplay_videos: value.autoplay_videos,
+			video_previews: "on".to_string(),
 			fixed_navbar: value.fixed_navbar,
 			disable_visit_reddit_confirmation: String::new(),
 			comment_sort: value.comment_sort,
@@ -1528,6 +1532,7 @@ impl Preferences {
 			image_quality: setting(req, "image_quality"),
 			video_quality: setting(req, "video_quality"),
 			autoplay_videos: setting(req, "autoplay_videos"),
+			video_previews: setting_or_default(req, "video_previews", "on".to_string()),
 			fixed_navbar: setting_or_default(req, "fixed_navbar", "on".to_string()),
 			disable_visit_reddit_confirmation: setting(req, "disable_visit_reddit_confirmation"),
 			comment_sort: setting(req, "comment_sort"),
@@ -3171,6 +3176,7 @@ mod tests {
 			use_dash: "on".to_owned(),
 			use_hls: "on".to_owned(),
 			autoplay_videos: "on".to_owned(),
+			video_previews: "on".to_owned(),
 			fixed_navbar: "on".to_owned(),
 			disable_visit_reddit_confirmation: "on".to_owned(),
 			comment_sort: "confidence".to_owned(),
@@ -3184,7 +3190,7 @@ mod tests {
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
 	}
 
 	#[test]

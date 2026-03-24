@@ -26,7 +26,7 @@ crate::impl_template_str_eq!(SettingsTemplate);
 
 // CONSTANTS
 
-const PREFS: [&str; 21] = [
+const PREFS: [&str; 22] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -40,6 +40,7 @@ const PREFS: [&str; 21] = [
 	"use_hls",
 	"hide_hls_notification",
 	"autoplay_videos",
+	"video_previews",
 	"hide_sidebar_and_summary",
 	"fixed_navbar",
 	"hide_awards",

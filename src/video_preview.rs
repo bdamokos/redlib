@@ -110,9 +110,41 @@ pub struct FrameRequest {
 
 struct FfmpegFrameGenerator;
 
+#[derive(Clone, Copy)]
+enum PreviewImageFormat {
+	Webp,
+	Jpeg,
+}
+
+impl PreviewImageFormat {
+	fn codec_name(self) -> &'static str {
+		match self {
+			Self::Webp => "libwebp",
+			Self::Jpeg => "mjpeg",
+		}
+	}
+
+	fn content_type(self) -> &'static str {
+		match self {
+			Self::Webp => "image/webp",
+			Self::Jpeg => "image/jpeg",
+		}
+	}
+}
+
 impl PreviewFrameGenerator for FfmpegFrameGenerator {
 	fn extract_frame<'a>(&'a self, request: &'a FrameRequest) -> FrameFuture<'a> {
 		Box::pin(async move {
+			let started_at = Instant::now();
+			let image_format = preferred_image_format();
+			info!(
+				"Invoking ffmpeg for video preview frame: url={} timestamp={}s width={} height={} codec={}",
+				request.media_url,
+				request.timestamp_seconds,
+				request.width,
+				request.height,
+				image_format.codec_name()
+			);
 			let scale_filter = format!("scale='min({PREVIEW_MAX_WIDTH},iw)':-2");
 			let output = Command::new("ffmpeg")
 				.arg("-hide_banner")
@@ -130,26 +162,56 @@ impl PreviewFrameGenerator for FfmpegFrameGenerator {
 				.arg("-f")
 				.arg("image2pipe")
 				.arg("-vcodec")
-				.arg("webp")
+				.arg(image_format.codec_name())
 				.arg("-")
 				.stdin(Stdio::null())
 				.stdout(Stdio::piped())
 				.stderr(Stdio::piped())
 				.output()
 				.await
-				.map_err(|err| format!("ffmpeg execution failed: {err}"))?;
+				.map_err(|err| {
+					warn!(
+						"ffmpeg spawn failed after {:?} for url={} timestamp={}s: {}",
+						started_at.elapsed(),
+						request.media_url,
+						request.timestamp_seconds,
+						err
+					);
+					format!("ffmpeg execution failed: {err}")
+				})?;
 
 			if !output.status.success() {
 				let stderr = String::from_utf8_lossy(&output.stderr).chars().take(300).collect::<String>();
+				warn!(
+					"ffmpeg failed after {:?} for url={} timestamp={}s with status {}",
+					started_at.elapsed(),
+					request.media_url,
+					request.timestamp_seconds,
+					output.status
+				);
 				return Err(format!("ffmpeg exited with {}: {stderr}", output.status));
 			}
 
 			if output.stdout.is_empty() {
+				warn!(
+					"ffmpeg returned an empty frame after {:?} for url={} timestamp={}s",
+					started_at.elapsed(),
+					request.media_url,
+					request.timestamp_seconds
+				);
 				return Err("ffmpeg returned an empty frame".to_string());
 			}
 
+			info!(
+				"ffmpeg completed in {:?} for url={} timestamp={}s ({} bytes)",
+				started_at.elapsed(),
+				request.media_url,
+				request.timestamp_seconds,
+				output.stdout.len()
+			);
+
 			Ok(FrameBlob {
-				content_type: "image/webp",
+				content_type: image_format.content_type(),
 				bytes: output.stdout,
 			})
 		})
@@ -162,6 +224,7 @@ static VIDEO_PREVIEW_FRAMES: LazyLock<Mutex<FrameCache>> = LazyLock::new(|| Mute
 static JOB_QUEUE_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
 static INIT_ONCE: OnceLock<()> = OnceLock::new();
 static GENERATOR: LazyLock<Mutex<Arc<dyn PreviewFrameGenerator>>> = LazyLock::new(|| Mutex::new(Arc::new(FfmpegFrameGenerator) as Arc<dyn PreviewFrameGenerator>));
+static PREFERRED_IMAGE_FORMAT: OnceLock<PreviewImageFormat> = OnceLock::new();
 static MAX_CONCURRENT: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT));
 static MAX_READY_JOBS: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PREVIEW_MAX_JOBS", DEFAULT_MAX_READY_JOBS));
 static MAX_BYTES: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PREVIEW_MAX_BYTES", DEFAULT_MAX_BYTES));
@@ -171,6 +234,7 @@ static MAX_QUEUE: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PRE
 struct LeaseRequest {
 	page_session_id: String,
 	page_path: String,
+	page_origin: String,
 	post_id: String,
 	media_url: String,
 	poster_url: String,
@@ -268,8 +332,8 @@ pub async fn lease(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	let request: LeaseRequest = parse_json_body(req).await?;
 	let key = VideoPreviewJobKey {
-		media_url: absolutize_media_url(&request.media_url),
-		poster_url: absolutize_media_url(&request.poster_url),
+		media_url: absolutize_media_url(&request.media_url, &request.page_origin),
+		poster_url: absolutize_media_url(&request.poster_url, &request.page_origin),
 		duration_seconds: request.duration_seconds,
 		width: request.width,
 		height: request.height,
@@ -408,6 +472,95 @@ fn current_generator() -> Arc<dyn PreviewFrameGenerator> {
 	GENERATOR.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
+fn preferred_image_format() -> PreviewImageFormat {
+	*PREFERRED_IMAGE_FORMAT.get_or_init(detect_preferred_image_format)
+}
+
+fn detect_preferred_image_format() -> PreviewImageFormat {
+	let output = std::process::Command::new("ffmpeg")
+		.arg("-hide_banner")
+		.arg("-encoders")
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.output();
+
+	let format = match output {
+		Ok(output) => {
+			let encoders = String::from_utf8_lossy(&output.stdout);
+			if encoders.contains(" libwebp ") || encoders.contains(" libwebp_anim ") {
+				PreviewImageFormat::Webp
+			} else {
+				PreviewImageFormat::Jpeg
+			}
+		}
+		Err(err) => {
+			warn!("Failed to inspect ffmpeg encoders, falling back to mjpeg: {err}");
+			PreviewImageFormat::Jpeg
+		}
+	};
+
+	info!(
+		"Video preview encoder selected: {}",
+		match format {
+			PreviewImageFormat::Webp => "libwebp",
+			PreviewImageFormat::Jpeg => "mjpeg",
+		}
+	);
+
+	format
+}
+
+fn effective_duration_seconds(metadata_duration_seconds: i64, probed_duration_seconds: Option<i64>) -> i64 {
+	if metadata_duration_seconds > 0 {
+		metadata_duration_seconds
+	} else {
+		probed_duration_seconds.unwrap_or(metadata_duration_seconds)
+	}
+}
+
+async fn probe_duration_seconds(media_url: &str) -> Option<i64> {
+	let started_at = Instant::now();
+	let output = Command::new("ffprobe")
+		.arg("-v")
+		.arg("error")
+		.arg("-show_entries")
+		.arg("format=duration")
+		.arg("-of")
+		.arg("default=noprint_wrappers=1:nokey=1")
+		.arg(media_url)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.output()
+		.await
+		.ok()?;
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).chars().take(300).collect::<String>();
+		warn!(
+			"ffprobe failed after {:?} for url={}: {}",
+			started_at.elapsed(),
+			media_url,
+			stderr
+		);
+		return None;
+	}
+
+	let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+	let duration = stdout.parse::<f64>().ok()?.round() as i64;
+	if duration > 0 {
+		info!(
+			"ffprobe resolved duration={}s in {:?} for url={}",
+			duration,
+			started_at.elapsed(),
+			media_url
+		);
+		Some(duration)
+	} else {
+		None
+	}
+}
+
 #[cfg(test)]
 fn set_generator(generator: Arc<dyn PreviewFrameGenerator>) {
 	if let Ok(mut state) = GENERATOR.lock() {
@@ -423,9 +576,13 @@ fn job_id_for_key(key: &VideoPreviewJobKey) -> String {
 	URL_SAFE_NO_PAD.encode(key.canonical_string())
 }
 
-fn absolutize_media_url(value: &str) -> String {
+fn absolutize_media_url(value: &str, page_origin: &str) -> String {
 	if value.starts_with("http://") || value.starts_with("https://") || value.is_empty() {
 		return value.to_string();
+	}
+
+	if !page_origin.trim().is_empty() {
+		return join_base_and_path(page_origin, value);
 	}
 
 	if let Some(base) = get_setting("REDLIB_FULL_URL") {
@@ -573,7 +730,8 @@ fn snapshot_job(job_id: &str) -> (ApiJobState, Vec<VideoPreviewFrame>, u64) {
 }
 
 async fn process_job(job_id: String) {
-	let key = {
+	let job_started_at = Instant::now();
+	let mut key = {
 		let mut jobs = match VIDEO_PREVIEW_JOBS.lock() {
 			Ok(jobs) => jobs,
 			Err(_) => return,
@@ -598,6 +756,23 @@ async fn process_job(job_id: String) {
 		};
 		job.key.clone()
 	};
+
+	if key.duration_seconds <= 0 {
+		let probed_duration_seconds = probe_duration_seconds(&key.media_url).await;
+		let resolved_duration_seconds = effective_duration_seconds(key.duration_seconds, probed_duration_seconds);
+		if resolved_duration_seconds > 0 && resolved_duration_seconds != key.duration_seconds {
+			key.duration_seconds = resolved_duration_seconds;
+			if let Ok(mut jobs) = VIDEO_PREVIEW_JOBS.lock() {
+				if let Some(job) = jobs.get_mut(&job_id) {
+					job.key.duration_seconds = resolved_duration_seconds;
+					job.state = VideoPreviewJobState::Running {
+						completed_frames: 0,
+						total_frames: computed_frame_count(resolved_duration_seconds),
+					};
+				}
+			}
+		}
+	}
 
 	info!("Starting video preview job {job_id}");
 
@@ -655,7 +830,7 @@ async fn process_job(job_id: String) {
 	}
 
 	publish_ready_job(&job_id, produced_frames, produced_blobs);
-	info!("Completed video preview job {job_id}");
+	info!("Completed video preview job {job_id} in {:?} with {} frames", job_started_at.elapsed(), timestamps.len());
 }
 
 fn publish_ready_job(job_id: &str, frames: Vec<VideoPreviewFrame>, blobs: Vec<(usize, FrameBlob)>) {
@@ -856,7 +1031,7 @@ mod tests {
 					return Err("forced failure".to_string());
 				}
 				Ok(FrameBlob {
-					content_type: "image/webp",
+					content_type: "image/jpeg",
 					bytes: format!("frame-{}", request.timestamp_seconds).into_bytes(),
 				})
 			})
@@ -883,6 +1058,14 @@ mod tests {
 		assert!(values.windows(2).all(|window| window[0] <= window[1]));
 		assert!(values.first().copied().unwrap_or_default() >= 1);
 		assert!(values.last().copied().unwrap_or_default() <= 60);
+	}
+
+	#[test]
+	fn prefers_probed_duration_when_metadata_is_missing() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		assert_eq!(effective_duration_seconds(46, Some(30)), 46);
+		assert_eq!(effective_duration_seconds(0, Some(46)), 46);
+		assert_eq!(effective_duration_seconds(0, None), 0);
 	}
 
 	#[test]
@@ -954,7 +1137,7 @@ mod tests {
 			cache.blobs.insert(
 				frame_cache_key(&job_id, 0),
 				FrameBlob {
-					content_type: "image/webp",
+					content_type: "image/jpeg",
 					bytes: vec![0; 10],
 				},
 			);
@@ -977,6 +1160,7 @@ mod tests {
 		let request = LeaseRequest {
 			page_session_id: "page-a".to_string(),
 			page_path: "/r/test".to_string(),
+			page_origin: "http://127.0.0.1:18082".to_string(),
 			post_id: "abc".to_string(),
 			media_url: "/vid/test".to_string(),
 			poster_url: String::new(),
@@ -1100,7 +1284,7 @@ mod tests {
 		let req = Request::builder()
 			.uri("/api/video-previews/lease")
 			.body(Body::from(
-				r#"{"page_session_id":"page","page_path":"/r/test","post_id":"abc","media_url":"/vid/test/123","poster_url":"/thumb/test","duration_seconds":30,"width":320,"height":180}"#,
+				r#"{"page_session_id":"page","page_path":"/r/test","page_origin":"http://127.0.0.1:18082","post_id":"abc","media_url":"/vid/test/123","poster_url":"/thumb/test","duration_seconds":30,"width":320,"height":180}"#,
 			))
 			.unwrap();
 		let response = lease(req).await.unwrap();

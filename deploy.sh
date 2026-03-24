@@ -226,6 +226,13 @@ deploy_remote() {
 	echo "Copying compose.pi.yaml to server..."
 	run_scp compose.pi.yaml "$SERVER_USER@$SERVER_HOST:$REMOTE_DEPLOY_DIR/compose.pi.yaml"
 
+	if [[ -f .env ]]; then
+		echo "Copying .env to server..."
+		run_scp .env "$SERVER_USER@$SERVER_HOST:$REMOTE_DEPLOY_DIR/.env"
+	else
+		echo "Local .env not found; leaving remote .env unchanged."
+	fi
+
 	echo "Updating Redlib on the Raspberry Pi..."
 	run_ssh "
 		set -e

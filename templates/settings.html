@@ -129,6 +129,12 @@
 						%}checked{% endif %}>
 				</div>
 				<div class="prefs-group">
+					<label for="video_previews">Generate video previews</label>
+					<input type="hidden" value="off" name="video_previews">
+					<input type="checkbox" name="video_previews" id="video_previews" {% if prefs.video_previews=="on"
+						%}checked{% endif %}>
+				</div>
+				<div class="prefs-group">
 					<label for="fixed_navbar">Keep navbar fixed</label>
 					<input type="hidden" value="off" name="fixed_navbar">
 					<input type="checkbox" name="fixed_navbar" {% if prefs.fixed_navbar=="on" %}checked{% endif %}>

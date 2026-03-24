@@ -521,7 +521,7 @@
 	<div class="post_media_content">
 		<div
 			class="video_preview_host"
-			{% if post.media.video_preview_enabled %}
+			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
 			data-post-id="{{ post.id }}"
 			data-media-url="{{ post.media.url }}"
 			data-poster-url="{{ post.media.poster }}"
@@ -560,9 +560,9 @@
 				<source src="{{ post.media.url }}" type="video/mp4" />
 				<a href="{{ post.media.url }}">Video</a>
 			</video>
-			{% if post.media.video_preview_enabled %}
-			<div class="video_preview_gallery" hidden></div>
-			{% endif %}
+				{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
+				<div class="video_preview_gallery" hidden></div>
+				{% endif %}
 		</div>
 	</div>
 	{% if !post.media.duration.is_empty() %}

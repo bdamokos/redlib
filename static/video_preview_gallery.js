@@ -182,6 +182,7 @@
             body: JSON.stringify({
                 page_session_id: pageSessionId,
                 page_path: host.dataset.pagePath || window.location.pathname,
+                page_origin: window.location.origin,
                 post_id: host.dataset.postId || "",
                 media_url: host.dataset.mediaUrl || "",
                 poster_url: host.dataset.posterUrl || "",
