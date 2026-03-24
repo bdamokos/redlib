@@ -1521,7 +1521,8 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
     gap: 10px;
-    margin: 0 20px 10px 20px;
+    margin: 12px auto 10px auto;
+    max-width: 100%;
 }
 
 .video_preview_gallery[hidden] {
@@ -1533,6 +1534,10 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     display: block;
     position: relative;
     text-decoration: none;
+}
+
+.video_preview_host {
+    width: 100%;
 }
 
 .video_preview_frame_link img {

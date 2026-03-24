@@ -58,7 +58,7 @@
 	{% endif %}
 {%- endmacro %}
 
-{% macro sub_list(current) -%}
+{% macro sub_list(current, current_flair) -%}
 	<details class="feeds">
 		<summary>Feeds</summary>
 		<div class="feed_list">
@@ -71,7 +71,13 @@
 			{% if prefs.subscriptions.len() > 0 %}
 				<p>REDDIT FEEDS</p>
 				{% for sub in prefs.subscriptions %}
-					<a href="/r/{{ sub }}" {% if sub == current %}class="selected"{% endif %}>{{ sub }}</a>
+					<a href="/r/{{ sub }}" {% if sub == current && current_flair.is_empty() %}class="selected"{% endif %}>{{ sub }}</a>
+				{% endfor %}
+			{% endif %}
+			{% if prefs.flair_subscriptions.len() > 0 %}
+				<p>FLAIR FEEDS</p>
+				{% for subscription in prefs.flair_subscriptions %}
+					<a href="{{ crate::utils::flair_feed_url(subscription.subreddit.as_str(), subscription.flair.as_str()) }}" {% if subscription.subreddit == current && subscription.flair == current_flair %}class="selected"{% endif %}>r/{{ subscription.subreddit }} [{{ subscription.flair }}]</a>
 				{% endfor %}
 			{% endif %}
 		</div>
@@ -512,19 +518,19 @@
 	{% else %}
 	{% set use_dash = str_eq(prefs.use_dash, "on") && !post.media.dash_url.is_empty() %}
 	{% set use_hls = !use_dash && str_eq(prefs.use_hls, "on") && !post.media.hls_url.is_empty() %}
-	<div
-		class="video_preview_host"
-		{% if post.media.video_preview_enabled %}
-		data-post-id="{{ post.id }}"
-		data-media-url="{{ post.media.url }}"
-		data-poster-url="{{ post.media.poster }}"
-		data-duration-seconds="{{ post.media.duration_seconds }}"
-		data-width="{{ post.media.width }}"
-		data-height="{{ post.media.height }}"
-		data-page-path="{{ post.permalink }}"
-		{% endif %}
-	>
-		<div class="post_media_content">
+	<div class="post_media_content">
+		<div
+			class="video_preview_host"
+			{% if post.media.video_preview_enabled %}
+			data-post-id="{{ post.id }}"
+			data-media-url="{{ post.media.url }}"
+			data-poster-url="{{ post.media.poster }}"
+			data-duration-seconds="{{ post.media.duration_seconds }}"
+			data-width="{{ post.media.width }}"
+			data-height="{{ post.media.height }}"
+			data-page-path="{{ post.permalink }}"
+			{% endif %}
+		>
 			<video
 				id="vid_{{ post.id }}"
 				class="post_media_video short{% if use_dash %} video-dash{% endif %}{% if str_eq(prefs.autoplay_videos, "on") %} autoplay{% endif -%}"
@@ -554,10 +560,10 @@
 				<source src="{{ post.media.url }}" type="video/mp4" />
 				<a href="{{ post.media.url }}">Video</a>
 			</video>
+			{% if post.media.video_preview_enabled %}
+			<div class="video_preview_gallery" hidden></div>
+			{% endif %}
 		</div>
-		{% if post.media.video_preview_enabled %}
-		<div class="video_preview_gallery" hidden></div>
-		{% endif %}
 	</div>
 	{% if !post.media.duration.is_empty() %}
 	<div class="post_media_duration">{{ post.media.duration }}</div>
