@@ -1519,10 +1519,10 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 
 .video_preview_gallery {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
     gap: 12px;
     margin: 12px auto 10px auto;
-    width: min(720px, calc(100vw - 56px));
+    width: min(820px, calc(100vw - 56px));
     max-width: 100%;
 }
 
@@ -1534,7 +1534,6 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     color: inherit;
     display: block;
     line-height: 0;
-    overflow: hidden;
     position: relative;
     text-decoration: none;
     width: 100%;
@@ -1549,6 +1548,7 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     display: block;
     height: auto;
     width: 100%;
+    object-fit: contain;
 }
 
 .video_preview_frame_time {
@@ -1568,7 +1568,7 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 
 @media screen and (max-width: 800px) {
     .video_preview_gallery {
-        grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
         width: min(100%, calc(100vw - 24px));
         gap: 10px;
     }
