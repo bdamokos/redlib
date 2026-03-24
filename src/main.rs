@@ -359,6 +359,8 @@ async fn main() {
 
 	app.at("/r/:sub/subscribe").post(|r| subreddit::subscriptions_filters(r).boxed());
 	app.at("/r/:sub/unsubscribe").post(|r| subreddit::subscriptions_filters(r).boxed());
+	app.at("/r/:sub/flair/subscribe").post(|r| subreddit::flair_subscriptions(r).boxed());
+	app.at("/r/:sub/flair/unsubscribe").post(|r| subreddit::flair_subscriptions(r).boxed());
 	app.at("/r/:sub/filter").post(|r| subreddit::subscriptions_filters(r).boxed());
 	app.at("/r/:sub/unfilter").post(|r| subreddit::subscriptions_filters(r).boxed());
 

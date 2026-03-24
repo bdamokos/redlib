@@ -3,12 +3,13 @@
 use crate::{config, utils};
 // CRATES
 use crate::utils::{
-	catch_random, clear_sharded_cookie, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info,
-	nsfw_landing, param, redirect, rewrite_urls, setting, template, val, write_sharded_cookie, FlairSubscription, Post, Preferences, Subreddit,
+	catch_random, clear_sharded_cookie, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect,
+	rewrite_urls, setting, template, val, write_sharded_cookie, FlairSubscription, Post, Preferences, Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use cookie::Cookie;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
 use log::warn;
@@ -278,12 +279,7 @@ fn split_subscriptions_for_listing(subs: &[String], sort: &str, query: &str) -> 
 }
 
 fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
-	let mut feeds = preferences
-		.subscriptions
-		.iter()
-		cloned()
-		.map(|name| SavedFeed::Subreddit { name })
-		.collect::<Vec<_>>();
+	let mut feeds = preferences.subscriptions.iter().cloned().map(|name| SavedFeed::Subreddit { name }).collect::<Vec<_>>();
 
 	feeds.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| SavedFeed::Flair {
 		subreddit: subscription.subreddit,
@@ -295,7 +291,7 @@ fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
 
 fn build_aggregate_sources(preferences: &Preferences, sort: &str, reddit_query: &str) -> Vec<AggregateFeedSource> {
 	let mut sources = split_subscriptions_for_listing(&preferences.subscriptions, sort, reddit_query)
-		into_iter()
+		.into_iter()
 		.map(|chunk| AggregateFeedSource::SubredditChunk { chunk })
 		.collect::<Vec<_>>();
 
@@ -346,7 +342,7 @@ fn cursor_matches_request(cursor: &AggregateFrontCursor, sources: &[AggregateFee
 }
 
 async fn fetch_source_listing_page(source: &AggregateFeedSource, sort: &str, reddit_query: &str, after: &str, quarantine: bool) -> Result<ChunkListingPage, String> {
-	let (mut posts, next_after) = match source {
+	let (posts, next_after) = match source {
 		AggregateFeedSource::SubredditChunk { chunk } => Post::fetch(&build_listing_path(chunk, sort, reddit_query, after), quarantine).await?,
 		AggregateFeedSource::Flair { subreddit, flair } => {
 			let (mut posts, next_after) = Post::fetch(&build_listing_path(subreddit, sort, reddit_query, after), quarantine).await?;
@@ -412,7 +408,10 @@ async fn fetch_aggregated_subscription_feed(
 	active_flair_filter: &str,
 	quarantine: bool,
 ) -> Result<AggregatedFeed, String> {
-	let current_state = cursor.as_ref().map(|value| value.source_afters.clone()).unwrap_or_else(|| vec![String::new(); sources.len()]);
+	let current_state = cursor
+		.as_ref()
+		.map(|value| value.source_afters.clone())
+		.unwrap_or_else(|| vec![String::new(); sources.len()]);
 	let mut next_state = current_state.clone();
 	let mut prev_stack = cursor.as_ref().map(|value| value.prev_stack.clone()).unwrap_or_default();
 	let page_has_cursor = cursor.is_some();
@@ -526,26 +525,29 @@ async fn fetch_aggregated_subscription_feed(
 // SERVICES
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
-	let root = req.uri().path() == "/";
 	let query = req.uri().query().unwrap_or_default().to_string();
-	let subscribed = setting(&req, "subscriptions");
+	let prefs = Preferences::new(&req);
+	let subscribed = prefs.subscriptions.join("+");
+	let has_saved_feeds = !saved_feeds(&prefs).is_empty();
 	let front_page = setting(&req, "front_page");
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
+	let is_subreddit_route = req.uri().path().starts_with("/r/");
+	let front_page_is_default = front_page == "default" || front_page.is_empty();
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 
-	let sub_name = req.param("sub").unwrap_or(if front_page == "default" || front_page.is_empty() {
-		if subscribed.is_empty() {
-			"popular".to_string()
-		} else {
+	let sub_name = req.param("sub").unwrap_or(if front_page_is_default {
+		if has_saved_feeds {
 			subscribed.clone()
+		} else {
+			"popular".to_string()
 		}
 	} else {
 		front_page.clone()
 	});
 
 	if (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
-		if subscribed.is_empty() {
+		if !has_saved_feeds {
 			return info(req, "Subscribe to some subreddits! (Default feeds disabled in settings)").await;
 		} else {
 			// If there are subscribed subs, but we get here, then the problem is that front_page pref is set to something besides default.
@@ -558,7 +560,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		}
 	}
 
-	let quarantined = can_access_quarantine(&req, &sub_name) || root;
+	let quarantined = can_access_quarantine(&req, &sub_name) || !is_subreddit_route;
 
 	// Handle random subreddits
 	if let Ok(random) = catch_random(&sub_name, "").await {
@@ -570,23 +572,15 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let reddit_query = subreddit_listing_query(&query, sub_name == "popular");
-	let aggregate_subscriptions = sub_name == subscribed && path_needs_frontpage_aggregation(&subscribed, &sort, &reddit_query);
+	let aggregate_sources = build_aggregate_sources(&prefs, &sort, &reddit_query);
+	let aggregate_saved_feeds = !is_subreddit_route && front_page_is_default && !aggregate_sources.is_empty();
 
 	// Request subreddit metadata
-	let sub = if !sub_name.contains('+') && sub_name != subscribed && sub_name != "popular" && sub_name != "all" {
-		// Regular subreddit
+	let sub = if is_subreddit_route && !sub_name.is_empty() && !sub_name.contains('+') && sub_name != "popular" && sub_name != "all" {
 		subreddit(&sub_name, quarantined).await.unwrap_or_default()
-	} else if sub_name == subscribed && !aggregate_subscriptions {
-		// Subscription feed
-		if req.uri().path().starts_with("/r/") {
-			subreddit(&sub_name, quarantined).await.unwrap_or_default()
-		} else {
-			Subreddit::default()
-		}
-	} else if aggregate_subscriptions && !req.uri().path().starts_with("/r/") {
+	} else if aggregate_saved_feeds && !is_subreddit_route {
 		Subreddit::default()
 	} else {
-		// Multireddit, all, popular
 		Subreddit {
 			name: sub_name.clone(),
 			..Subreddit::default()
@@ -603,7 +597,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
-	let path = build_listing_path(&sub_name, &sort, &reddit_query, "");
+	let path = if aggregate_saved_feeds || sub_name.is_empty() {
+		String::new()
+	} else {
+		build_listing_path(&sub_name, &sort, &reddit_query, "")
+	};
 	let flair_filters = if !sub.name.is_empty() && sub.name != "all" && sub.name != "popular" && !sub.name.contains('+') {
 		build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub.name))
 	} else {
@@ -617,12 +615,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		Vec::new()
 	};
-	let sort_base_path = if aggregate_subscriptions {
-		if req.uri().path().starts_with("/r/") {
-			format!("/r/{sub_name}")
-		} else {
-			String::new()
-		}
+	let sort_base_path = if aggregate_saved_feeds {
+		String::new()
 	} else if sub_name.is_empty() {
 		String::new()
 	} else {
@@ -631,9 +625,18 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sort_options = build_sort_options(&sort_base_path, &url, &sort, &active_flair_filter);
 	let filters = get_filters(&req);
 	let timeframe = param(&path, "t").unwrap_or_default();
+	let is_flair_subscribed = !active_flair_filter.is_empty()
+		&& !sub.name.is_empty()
+		&& sub.name != "all"
+		&& sub.name != "popular"
+		&& !sub.name.contains('+')
+		&& prefs
+			.flair_subscriptions
+			.iter()
+			.any(|subscription| subscription.subreddit == sub.name && subscription.flair == active_flair_filter);
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-	if sub_name.split('+').all(|s| filters.contains(s)) {
+	if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
 		Ok(template(&SubredditTemplate {
 			sub,
 			posts: Vec::new(),
@@ -648,21 +651,21 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			prefs: Preferences::new(&req),
 			url,
 			redirect_url,
-			enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+			enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 			is_filtered: true,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			is_flair_subscribed,
 		}))
-	} else if aggregate_subscriptions {
-		let chunks = split_subscriptions_for_listing(&Preferences::new(&req).subscriptions, &sort, &reddit_query);
+	} else if aggregate_saved_feeds {
 		let query_fingerprint = listing_query_fingerprint(&query);
 		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
 			.and_then(|encoded| decode_front_cursor(&encoded))
-			.filter(|cursor| cursor_matches_request(cursor, &chunks, &sort, &timeframe, &query_fingerprint));
+			.filter(|cursor| cursor_matches_request(cursor, &aggregate_sources, &sort, &timeframe, &query_fingerprint));
 
 		match fetch_aggregated_subscription_feed(
-			&chunks,
+			&aggregate_sources,
 			cursor,
 			&sort,
 			&timeframe,
@@ -700,11 +703,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					prefs: Preferences::new(&req),
 					url,
 					redirect_url,
-					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
 					all_posts_filtered: feed.all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					is_flair_subscribed,
 				}))
 			}
 			Err(msg) => error(req, &msg).await,
@@ -776,11 +780,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					prefs: Preferences::new(&req),
 					url,
 					redirect_url,
-					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					is_flair_subscribed,
 				}))
 			}
 			Err(msg) => match msg.as_str() {
@@ -797,7 +802,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 mod tests {
 	use super::{
 		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, should_enable_duplicate_collapse,
-		split_subscriptions_for_listing, update_url_query, AggregateFrontCursor, SubredditTemplate, FRONT_CURSOR_PARAM,
+		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use std::collections::{HashSet, VecDeque};
@@ -900,6 +905,7 @@ mod tests {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			is_flair_subscribed: false,
 		}
 		.render()
 		.unwrap();
@@ -934,6 +940,7 @@ mod tests {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			is_flair_subscribed: false,
 		}
 		.render()
 		.unwrap();
@@ -1011,8 +1018,14 @@ mod tests {
 	fn aggregate_cursor_round_trips() {
 		let cursor = AggregateFrontCursor {
 			v: 1,
-			chunks: vec!["a+b".to_string(), "c+d".to_string()],
-			chunk_afters: vec!["t3_a".to_string(), String::new()],
+			sources: vec![
+				AggregateFeedSource::SubredditChunk { chunk: "a+b".to_string() },
+				AggregateFeedSource::Flair {
+					subreddit: "rust".to_string(),
+					flair: "News".to_string(),
+				},
+			],
+			source_afters: vec!["t3_a".to_string(), String::new()],
 			prev_stack: vec![vec![String::new(), String::new()]],
 			recent_post_ids: vec!["t3_demo".to_string()],
 			sort: "hot".to_string(),
@@ -1228,6 +1241,21 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 	result
 }
 
+async fn resolve_subreddit_display_name(part: &str, display_lookup: &[(String, &str)]) -> String {
+	if part.starts_with("u_") {
+		return part.to_string();
+	}
+
+	if let Some(&(_, display)) = display_lookup.iter().find(|entry| entry.0 == part.to_lowercase()) {
+		return display.to_string();
+	}
+
+	match json(format!("/r/{part}/about.json?raw_json=1"), true).await {
+		Ok(display) => display["data"]["display_name"].as_str().unwrap_or(part).to_string(),
+		Err(_) => part.to_string(),
+	}
+}
+
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
 pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sub = req.param("sub").unwrap_or_default();
@@ -1268,28 +1296,12 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 
 	// Find each subreddit name (separated by '+') in sub parameter
 	for part in sub.split('+').filter(|x| x != &"") {
-		// Retrieve display name for the subreddit
-		let display;
-		let part = if part.starts_with("u_") {
-			part
-		} else if let Some(&(_, display)) = display_lookup.iter().find(|x| x.0 == part.to_lowercase()) {
-			// This is already known, doesn't require separate request
-			display
-		} else {
-			// This subreddit display name isn't known, retrieve it
-			let path: String = format!("/r/{part}/about.json?raw_json=1");
-			display = json(path, true).await;
-			match &display {
-				Ok(display) => display["data"]["display_name"].as_str(),
-				Err(_) => None,
-			}
-			.unwrap_or(part)
-		};
+		let part = resolve_subreddit_display_name(part, &display_lookup).await;
 
 		// Modify sub list based on action
-		if action.contains(&"subscribe".to_string()) && !sub_list.contains(&part.to_owned()) {
+		if action.contains(&"subscribe".to_string()) && !sub_list.iter().any(|sub| sub.eq_ignore_ascii_case(&part)) {
 			// Add each sub name to the subscribed list
-			sub_list.push(part.to_owned());
+			sub_list.push(part.clone());
 			filters.retain(|s| s.to_lowercase() != part.to_lowercase());
 			// Reorder sub names alphabetically
 			sub_list.sort_by_key(|a| a.to_lowercase());
@@ -1324,101 +1336,88 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		redirect(&path)
 	};
 
-	// If sub_list is empty remove all subscriptions cookies, otherwise update them and remove old ones
 	if sub_list.is_empty() {
-		// Remove subscriptions cookie
-		response.remove_cookie("subscriptions".to_string());
-
-		// Start with first numbered subscriptions cookie
-		let mut subscriptions_number = 1;
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number}")).is_some() {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number += 1;
-		}
+		clear_sharded_cookie(&mut response, &req, "subscriptions");
 	} else {
-		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
-		let mut subscriptions_number_to_delete_from = 0;
-
-		// Starting at 0 so we handle the subscription cookie without a number first
-		for (subscriptions_number, list) in join_until_size_limit(&sub_list).into_iter().enumerate() {
-			let subscriptions_cookie = if subscriptions_number == 0 {
-				"subscriptions".to_string()
-			} else {
-				format!("subscriptions{subscriptions_number}")
-			};
-
-			response.insert_cookie(
-				Cookie::build((subscriptions_cookie, list))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			);
-
-			subscriptions_number_to_delete_from += 1;
-		}
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number_to_delete_from}")).is_some() {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number_to_delete_from += 1;
-		}
+		write_sharded_cookie(&mut response, &req, "subscriptions", &sub_list.join("+"));
 	}
 
-	// If filters is empty remove all filters cookies, otherwise update them and remove old ones
 	if filters.is_empty() {
-		// Remove filters cookie
-		response.remove_cookie("filters".to_string());
-
-		// Start with first numbered filters cookie
-		let mut filters_number = 1;
-
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number}")).is_some() {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number}"));
-
-			// Increment filters cookie number
-			filters_number += 1;
-		}
+		clear_sharded_cookie(&mut response, &req, "filters");
 	} else {
-		// Start at 0 to keep track of what number we need to start deleting old filters cookies from
-		let mut filters_number_to_delete_from = 0;
+		write_sharded_cookie(&mut response, &req, "filters", &filters.join("+"));
+	}
 
-		for (filters_number, list) in join_until_size_limit(&filters).into_iter().enumerate() {
-			let filters_cookie = if filters_number == 0 {
-				"filters".to_string()
-			} else {
-				format!("filters{filters_number}")
-			};
+	Ok(response)
+}
 
-			response.insert_cookie(
-				Cookie::build((filters_cookie, list))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			);
+pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, String> {
+	let sub = req.param("sub").unwrap_or_default();
+	let action: Vec<String> = req.uri().path().split('/').map(String::from).collect();
+	let query = req.uri().query().unwrap_or_default().to_string();
+	let flair = param(&format!("?{query}"), "name").unwrap_or_default().trim().to_string();
 
-			filters_number_to_delete_from += 1;
+	if sub == "random" || sub == "randnsfw" {
+		return Err("Can't subscribe to random subreddit flair!".to_string());
+	}
+	if flair.is_empty() {
+		return Err("Flair name is required.".to_string());
+	}
+
+	let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
+	let display_lookup: Vec<(String, &str)> = match &posts {
+		Ok(posts) => posts["data"]["children"]
+			.as_array()
+			.map(|list| {
+				list
+					.iter()
+					.map(|post| {
+						let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
+						(display_name.to_lowercase(), display_name)
+					})
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_default(),
+		Err(_) => vec![],
+	};
+	let subreddit = resolve_subreddit_display_name(&sub, &display_lookup).await;
+
+	let mut flair_subscriptions = Preferences::new(&req).flair_subscriptions;
+	let target = FlairSubscription { subreddit, flair: flair.clone() };
+
+	if action.contains(&"subscribe".to_string()) {
+		if !flair_subscriptions.iter().any(|subscription| subscription == &target) {
+			flair_subscriptions.push(target.clone());
+			flair_subscriptions.sort_by(|left, right| {
+				left
+					.subreddit
+					.to_lowercase()
+					.cmp(&right.subreddit.to_lowercase())
+					.then_with(|| left.subreddit.cmp(&right.subreddit))
+					.then_with(|| left.flair.to_lowercase().cmp(&right.flair.to_lowercase()))
+					.then_with(|| left.flair.cmp(&right.flair))
+			});
 		}
+	} else if action.contains(&"unsubscribe".to_string()) {
+		flair_subscriptions.retain(|subscription| subscription != &target);
+	}
 
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number_to_delete_from}")).is_some() {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
+	let path = if let Some(redirect_path) = param(&format!("?{query}"), "redirect") {
+		format!("/{redirect_path}")
+	} else {
+		utils::flair_feed_url(&target.subreddit, &flair)
+	};
 
-			// Increment filters cookie number
-			filters_number_to_delete_from += 1;
-		}
+	let mut response = if is_async_subscription_request(&req) {
+		Response::builder().status(204).header("Cache-Control", "no-store").body(Body::empty()).unwrap_or_default()
+	} else {
+		redirect(&path)
+	};
+
+	if flair_subscriptions.is_empty() {
+		clear_sharded_cookie(&mut response, &req, "flair_subscriptions");
+	} else {
+		write_sharded_cookie(&mut response, &req, "flair_subscriptions", &utils::encode_flair_subscriptions(&flair_subscriptions)?);
 	}
 
 	Ok(response)

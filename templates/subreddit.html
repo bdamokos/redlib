@@ -13,7 +13,7 @@
 {% endblock %}
 
 {% block subscriptions %}
-	{% call utils::sub_list(sub.name.as_str()) %}
+	{% call utils::sub_list(sub.name.as_str(), active_flair_filter.as_str()) %}
 {% endblock %}
 
 {% block body %}
@@ -194,6 +194,41 @@
 								</form>
 							{% endif %}
 						</div>
+						{% if !active_flair_filter.is_empty() && !str_eq(sub.name, "") && !str_eq(sub.name, "all") && !str_eq(sub.name, "popular") && !sub.name.contains("+") %}
+						<div id="sub_flair_subscription">
+							{% if is_flair_subscribed %}
+							<form
+								action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+								method="POST"
+								data-subscription-form
+								data-subscription-target="{{ crate::utils::flair_subscription_target(sub.name.as_str(), active_flair_filter.as_str()) }}"
+								data-subscription-state="subscribed"
+								data-subscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+								data-unsubscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+								data-subscribe-label="Subscribe to Flair"
+								data-unsubscribe-label="Unsubscribe from Flair"
+								data-subscribe-class="subscribe"
+								data-unsubscribe-class="unsubscribe">
+								<button class="unsubscribe">Unsubscribe from Flair</button>
+							</form>
+							{% else %}
+							<form
+								action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+								method="POST"
+								data-subscription-form
+								data-subscription-target="{{ crate::utils::flair_subscription_target(sub.name.as_str(), active_flair_filter.as_str()) }}"
+								data-subscription-state="unsubscribed"
+								data-subscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+								data-unsubscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+								data-subscribe-label="Subscribe to Flair"
+								data-unsubscribe-label="Unsubscribe from Flair"
+								data-subscribe-class="subscribe"
+								data-unsubscribe-class="unsubscribe">
+								<button class="subscribe">Subscribe to Flair</button>
+							</form>
+							{% endif %}
+						</div>
+						{% endif %}
 						<div id="sub_filter">
 							{% if prefs.filters.contains(sub.name) %}
 								<form action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}" method="POST">

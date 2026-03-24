@@ -4,7 +4,7 @@
 {% block title %}Redlib Settings{% endblock %}
 
 {% block subscriptions %}
-{% call utils::sub_list("") %}
+{% call utils::sub_list("", "") %}
 {% endblock %}
 
 {% block search %}
@@ -196,6 +196,19 @@
 			format!("r/{}", sub) -%}{% endif -%}
 			<a href="/{{ feed }}">{{ feed }}</a>
 			<form action="/r/{{ sub }}/unsubscribe/?redirect=settings" method="POST">
+				<button class="unsubscribe">Unsubscribe</button>
+			</form>
+		</div>
+		{% endfor %}
+	</div>
+	{% endif %}
+	{% if !prefs.flair_subscriptions.is_empty() %}
+	<div class="prefs" id="settings_flair_subs">
+		<legend>Subscribed Flair Feeds</legend>
+		{% for subscription in prefs.flair_subscriptions %}
+		<div>
+			<a href="{{ crate::utils::flair_feed_url(subscription.subreddit.as_str(), subscription.flair.as_str()) }}">r/{{ subscription.subreddit }} [{{ subscription.flair }}]</a>
+			<form action="{{ crate::utils::flair_subscription_action_url(subscription.subreddit.as_str(), "unsubscribe", subscription.flair.as_str(), Some("settings")) }}" method="POST">
 				<button class="unsubscribe">Unsubscribe</button>
 			</form>
 		</div>

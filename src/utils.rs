@@ -1229,11 +1229,7 @@ pub struct Preferences {
 	#[serde(serialize_with = "serialize_vec_with_plus", deserialize_with = "deserialize_vec_with_plus")]
 	pub filters: Vec<String>,
 	#[revision(start = 3)]
-	#[serde(
-		default,
-		serialize_with = "serialize_flair_subscriptions",
-		deserialize_with = "deserialize_flair_subscriptions"
-	)]
+	#[serde(default, serialize_with = "serialize_flair_subscriptions", deserialize_with = "deserialize_flair_subscriptions")]
 	pub flair_subscriptions: Vec<FlairSubscription>,
 	#[revision(start = 1)]
 	pub hide_awards: String,
@@ -1441,11 +1437,7 @@ pub fn read_sharded_cookie(req: &Request<Body>, base_name: &str) -> String {
 	let mut index = 0usize;
 
 	loop {
-		let cookie_name = if index == 0 {
-			base_name.to_string()
-		} else {
-			format!("{base_name}{index}")
-		};
+		let cookie_name = if index == 0 { base_name.to_string() } else { format!("{base_name}{index}") };
 
 		let Some(cookie) = req.cookie(&cookie_name) else {
 			break;
@@ -1467,11 +1459,7 @@ pub fn write_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, 
 	}
 
 	for (index, chunk) in chunks.iter().enumerate() {
-		let cookie_name = if index == 0 {
-			base_name.to_string()
-		} else {
-			format!("{base_name}{index}")
-		};
+		let cookie_name = if index == 0 { base_name.to_string() } else { format!("{base_name}{index}") };
 
 		response.insert_cookie(
 			Cookie::build((cookie_name, chunk.clone()))
@@ -1484,11 +1472,7 @@ pub fn write_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, 
 
 	let mut stale_index = chunks.len();
 	loop {
-		let cookie_name = if stale_index == 0 {
-			base_name.to_string()
-		} else {
-			format!("{base_name}{stale_index}")
-		};
+		let cookie_name = if stale_index == 0 { base_name.to_string() } else { format!("{base_name}{stale_index}") };
 
 		if req.cookie(&cookie_name).is_none() {
 			break;
@@ -1502,11 +1486,7 @@ pub fn write_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, 
 pub fn clear_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, base_name: &str) {
 	let mut index = 0usize;
 	loop {
-		let cookie_name = if index == 0 {
-			base_name.to_string()
-		} else {
-			format!("{base_name}{index}")
-		};
+		let cookie_name = if index == 0 { base_name.to_string() } else { format!("{base_name}{index}") };
 
 		if req.cookie(&cookie_name).is_none() {
 			break;
@@ -1798,15 +1778,23 @@ pub fn param(path: &str, value: &str) -> Option<String> {
 }
 
 pub fn flair_feed_url(subreddit: &str, flair: &str) -> String {
-	let query = url::form_urlencoded::Serializer::new(String::new())
-		.append_pair("flair", flair)
-		.finish();
+	let query = url::form_urlencoded::Serializer::new(String::new()).append_pair("flair", flair).finish();
 	format!("/r/{subreddit}?{query}")
 }
 
 pub fn flair_subscription_target(subreddit: &str, flair: &str) -> String {
 	let encoded = URL_SAFE_NO_PAD.encode(flair.as_bytes());
 	format!("flair:{subreddit}:{encoded}")
+}
+
+pub fn flair_subscription_action_url(subreddit: &str, action: &str, flair: &str, redirect: Option<&str>) -> String {
+	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	serializer.append_pair("name", flair);
+	if let Some(redirect) = redirect.filter(|value| !value.is_empty()) {
+		serializer.append_pair("redirect", redirect);
+	}
+
+	format!("/r/{subreddit}/flair/{action}?{}", serializer.finish())
 }
 
 /// Retrieve the value of a setting by name
@@ -2884,8 +2872,9 @@ impl_template_str_eq!(User);
 #[cfg(test)]
 mod tests {
 	use super::{
-		coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, dedupe_external_links_by_host, extract_allmylinks_creator_links, extract_linktree_creator_links,
-		extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls, user_profile_details, ExternalLink, Preferences,
+		coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions,
+		extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls,
+		user_profile_details, ExternalLink, FlairSubscription, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use serde_json::json;
@@ -3188,13 +3177,33 @@ mod tests {
 			post_sort: "top".to_owned(),
 			subscriptions: vec!["memes".to_owned(), "mildlyinteresting".to_owned()],
 			filters: vec![],
+			flair_subscriptions: vec![],
 			hide_awards: "off".to_owned(),
 			hide_score: "off".to_owned(),
 			remove_default_feeds: "off".to_owned(),
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+	}
+
+	#[test]
+	fn flair_subscriptions_round_trip_through_encoded_string() {
+		let subscriptions = vec![
+			FlairSubscription {
+				subreddit: "rust".to_string(),
+				flair: "News".to_string(),
+			},
+			FlairSubscription {
+				subreddit: "programming".to_string(),
+				flair: "Question / Help".to_string(),
+			},
+		];
+
+		let encoded = encode_flair_subscriptions(&subscriptions).unwrap();
+		let decoded = decode_flair_subscriptions(&encoded).unwrap();
+
+		assert_eq!(decoded, subscriptions);
 	}
 }
 
