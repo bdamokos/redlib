@@ -26,6 +26,7 @@ const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
 const AFTER_PATH_HEADROOM: usize = 128;
+static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
 
 // STRUCTS
 #[derive(Template)]
@@ -918,6 +919,7 @@ mod tests {
 		let html = SubredditTemplate {
 			sub: Subreddit {
 				name: "rust".to_string(),
+				has_sidebar: true,
 				..Default::default()
 			},
 			posts: vec![test_post()],
@@ -948,6 +950,49 @@ mod tests {
 		assert!(!html.contains("submitted_duplicates.js"));
 		assert!(html.contains("/user/demo_user\">u/demo_user</a>"));
 		assert!(html.contains(">3</span>"));
+	}
+
+	#[test]
+	fn does_not_render_sidebar_panel_when_subreddit_sidebar_is_empty() {
+		let html = SubredditTemplate {
+			sub: Subreddit {
+				name: "rust".to_string(),
+				info: "<div class=\"md\"></div>".to_string(),
+				has_sidebar: false,
+				..Default::default()
+			},
+			posts: vec![test_post()],
+			top_users: Vec::new(),
+			sort: ("hot".to_string(), String::new()),
+			sort_options: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			clear_flair_filter_url: "/r/rust".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
+			enable_duplicate_collapse: false,
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			is_flair_subscribed: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(!html.contains("id=\"sidebar\""));
+	}
+
+	#[test]
+	fn detects_empty_sidebar_markup_as_empty() {
+		assert!(!super::subreddit_sidebar_has_content(""));
+		assert!(!super::subreddit_sidebar_has_content("   "));
+		assert!(!super::subreddit_sidebar_has_content("<div class=\"md\"></div>"));
+		assert!(!super::subreddit_sidebar_has_content("<div class=\"md\"><p> </p></div>"));
+		assert!(super::subreddit_sidebar_has_content("<div class=\"md\"><p>Rules</p></div>"));
 	}
 
 	#[test]
@@ -1540,12 +1585,14 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 	// Fetch subreddit icon either from the community_icon or icon_img value
 	let community_icon: &str = res["data"]["community_icon"].as_str().unwrap_or_default();
 	let icon = if community_icon.is_empty() { val(&res, "icon_img") } else { community_icon.to_string() };
+	let info = rewrite_urls(&val(&res, "description_html"));
 
 	Ok(Subreddit {
 		name: val(&res, "display_name"),
 		title: val(&res, "title"),
 		description: val(&res, "public_description"),
-		info: rewrite_urls(&val(&res, "description_html")),
+		has_sidebar: subreddit_sidebar_has_content(&info),
+		info,
 		// moderators: moderators_list(sub, quarantined).await.unwrap_or_default(),
 		icon: format_url(&icon),
 		members: format_num(members),
@@ -1553,6 +1600,11 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 		wiki: res["data"]["wiki_enabled"].as_bool().unwrap_or_default(),
 		nsfw: res["data"]["over18"].as_bool().unwrap_or_default(),
 	})
+}
+
+fn subreddit_sidebar_has_content(info: &str) -> bool {
+	let text = HTML_TAG_REGEX.replace_all(info, "");
+	!decode_html(&text).unwrap_or_else(|_| text.into_owned()).trim().is_empty()
 }
 
 pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {

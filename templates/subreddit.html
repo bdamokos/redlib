@@ -249,6 +249,7 @@
 						{% endif %}
 				</div>
 			</details>
+			{% if sub.has_sidebar %}
 			<details class="panel" id="sidebar">
 				<summary id="sidebar_label">Sidebar</summary>
 				<div id="sidebar_contents">
@@ -263,6 +264,7 @@
 					</ul> #}
 				</div>
 			</details>
+			{% endif %}
 			{% endif %}
 		</aside>
 		{% endif %}
