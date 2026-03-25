@@ -99,7 +99,17 @@
         }
 
         host.dataset.previewState = state;
-        loading.hidden = state !== "loading";
+        var visible = state === "loading" || state === "queued";
+        loading.hidden = !visible;
+
+        var spinner = loading.querySelector(".video_preview_spinner");
+        var statusText = loading.querySelector(".video_preview_status_text");
+        if (statusText) {
+            statusText.textContent = state === "queued" ? "Queued for preview generation…" : "Generating preview frames…";
+        }
+        if (spinner) {
+            spinner.hidden = state === "queued";
+        }
     }
 
     function formatTimestamp(seconds) {
@@ -150,6 +160,12 @@
                     return;
                 }
 
+                if (payload.state && payload.state.status === "pending") {
+                    setLoadingState(host, "queued");
+                } else {
+                    setLoadingState(host, "loading");
+                }
+
                 var delay = payload.poll_after_ms || 1500;
                 current.pollTimer = window.setTimeout(function () {
                     pollStatus(host, current);
@@ -183,7 +199,7 @@
         }
 
         state.leasing = true;
-        setLoadingState(host, "loading");
+        setLoadingState(host, "queued");
 
         fetch("/api/video-previews/lease", {
             method: "POST",
@@ -221,6 +237,12 @@
                     setLoadingState(host, "ready");
                     renderGallery(host, payload.frames || []);
                     return;
+                }
+
+                if (payload.state && payload.state.status === "pending") {
+                    setLoadingState(host, "queued");
+                } else {
+                    setLoadingState(host, "loading");
                 }
 
                 pollStatus(host, current);
