@@ -92,6 +92,16 @@
         gallery.hidden = frames.length === 0;
     }
 
+    function setLoadingState(host, state) {
+        var loading = host.querySelector(".video_preview_loading");
+        if (!loading) {
+            return;
+        }
+
+        host.dataset.previewState = state;
+        loading.hidden = state !== "loading";
+    }
+
     function formatTimestamp(seconds) {
         var total = Math.max(0, parseInt(seconds, 10) || 0);
         var hours = Math.floor(total / 3600);
@@ -129,12 +139,14 @@
 
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
+                    setLoadingState(host, "ready");
                     renderGallery(host, payload.frames || []);
                     return;
                 }
 
                 if (payload.state && payload.state.status === "failed") {
                     current.failed = true;
+                    setLoadingState(host, "failed");
                     return;
                 }
 
@@ -171,6 +183,7 @@
         }
 
         state.leasing = true;
+        setLoadingState(host, "loading");
 
         fetch("/api/video-previews/lease", {
             method: "POST",
@@ -205,6 +218,7 @@
 
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
+                    setLoadingState(host, "ready");
                     renderGallery(host, payload.frames || []);
                     return;
                 }
@@ -215,6 +229,7 @@
                 var current = activeHosts.get(host);
                 if (current) {
                     current.leasing = false;
+                    setLoadingState(host, "failed");
                 }
             });
     }

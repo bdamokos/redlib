@@ -1543,6 +1543,39 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     width: 100%;
 }
 
+.video_preview_loading {
+    align-items: center;
+    color: var(--text);
+    display: flex;
+    gap: 0.6rem;
+    justify-content: center;
+    margin: 12px auto 8px auto;
+    opacity: 0.85;
+    width: min(820px, calc(100vw - 56px));
+    max-width: 100%;
+}
+
+.video_preview_loading[hidden] {
+    display: none;
+}
+
+.video_preview_spinner {
+    animation: video_preview_spin 0.9s linear infinite;
+    border: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    display: inline-block;
+    flex: 0 0 auto;
+    height: 1rem;
+    width: 1rem;
+}
+
+@keyframes video_preview_spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
 .video_preview_frame_link img {
     border-radius: 8px;
     display: block;
@@ -1571,6 +1604,10 @@ form[data-subscription-form][data-subscription-pending="true"] button {
         grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
         width: min(100%, calc(100vw - 24px));
         gap: 10px;
+    }
+
+    .video_preview_loading {
+        width: min(100%, calc(100vw - 24px));
     }
 }
 
