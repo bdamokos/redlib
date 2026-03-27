@@ -273,40 +273,70 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 		}
 	}
 
-	let active_keys = active_source_keys(&queues);
 	let mut all_posts = Vec::new();
 	let mut seen_ids = HashSet::new();
+	let mut exhausted_sources = HashSet::new();
+	let mut consecutive_stalled_rounds = 0usize;
 
-	loop {
+	while exhausted_sources.len() < queues.len() {
+		let active_keys = active_source_keys(&queues, &exhausted_sources);
+		if active_keys.is_empty() {
+			break;
+		}
+
 		let mut made_progress = false;
 
 		for (source, queue) in &mut queues {
-			if !active_keys.contains(&source.cache_key()) {
+			let cache_key = source.cache_key();
+			if exhausted_sources.contains(&cache_key) || !active_keys.contains(&cache_key) {
 				continue;
 			}
 
+			let mut emitted = false;
 			while let Some(post) = queue.pop_front() {
 				if seen_ids.insert(post.id.clone()) {
 					all_posts.push(post);
+					emitted = true;
 					made_progress = true;
 					break;
 				}
 			}
+
+			if !emitted && queue.is_empty() {
+				exhausted_sources.insert(cache_key);
+			}
 		}
 
 		if !made_progress {
-			break;
+			consecutive_stalled_rounds += 1;
+			if consecutive_stalled_rounds >= 2 {
+				break;
+			}
+
+			for (source, queue) in &queues {
+				if queue.is_empty() {
+					exhausted_sources.insert(source.cache_key());
+				}
+			}
+		} else {
+			consecutive_stalled_rounds = 0;
 		}
 	}
 
 	collapse_duplicate_submissions(all_posts)
 }
 
-fn active_source_keys(queues: &[(FeedSource, VecDeque<Post>)]) -> HashSet<String> {
+fn active_source_keys(queues: &[(FeedSource, VecDeque<Post>)], exhausted_sources: &HashSet<String>) -> HashSet<String> {
 	let now = chrono::Utc::now().timestamp() as u64;
 	let mut heads = queues
 		.iter()
-		.filter_map(|(source, queue)| queue.front().map(|post| (source.cache_key(), post.created_ts)))
+		.filter_map(|(source, queue)| {
+			let key = source.cache_key();
+			if exhausted_sources.contains(&key) {
+				return None;
+			}
+			queue.front().map(|post| (key, post.created_ts))
+		})
 		.collect::<Vec<_>>();
 
 	if heads.is_empty() {
@@ -676,8 +706,8 @@ pub fn cache_stats() -> (usize, usize) {
 mod tests {
 	use super::{
 		active_source_keys, background_target_reached, background_target_sources, initial_sync_source_target, max_sync_source_budget,
-		session_status_from_posts, sort_sources, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry,
-		SessionSourceState,
+		merged_posts_for_session, session_status_from_posts, sort_sources, sync_sources_to_request, FeedSession, FeedSessionRequest,
+		FeedSource, SessionSourceEntry, SessionSourceState,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
 	use std::collections::{HashSet, VecDeque};
@@ -780,7 +810,7 @@ mod tests {
 			),
 		];
 
-		let active = active_source_keys(&queues);
+		let active = active_source_keys(&queues, &HashSet::new());
 
 		assert!(active.contains("subreddit:fresh"));
 		assert!(active.contains("subreddit:recent"));
@@ -977,5 +1007,49 @@ mod tests {
 		};
 
 		assert!(!background_target_reached(&session));
+	}
+
+	#[test]
+	fn older_sources_reenter_after_fresher_sources_are_exhausted() {
+		let now = chrono::Utc::now().timestamp() as u64;
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![
+				SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: "fresh".to_string(),
+					},
+					state: SessionSourceState::Ready,
+					posts: vec![test_post("fresh-post", "fresh", now - 60)],
+					after: String::new(),
+					head_created_ts: Some(now - 60),
+					last_error: None,
+				},
+				SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: "stale".to_string(),
+					},
+					state: SessionSourceState::Ready,
+					posts: vec![test_post("stale-post", "stale", now - 172_800)],
+					after: String::new(),
+					head_created_ts: Some(now - 172_800),
+					last_error: None,
+				},
+			],
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+		};
+
+		let merged = merged_posts_for_session(&session);
+		let ids = merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>();
+		assert_eq!(ids, vec!["fresh-post", "stale-post"]);
 	}
 }
