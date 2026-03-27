@@ -143,6 +143,7 @@ require(
 heavy_front_fragment = fetch("/subreddit-fragment/new", cookie=heavy_cookie, timeout=20)
 require(r'data-feed-session-id="', heavy_front_fragment, "heavy front fragment session id")
 require(r'id="feed_content"', heavy_front_fragment, "heavy front fragment feed content")
+require(r'accesskey="N"', heavy_front_fragment, "heavy front next page link")
 
 status_path = extract(r'data-feed-status-url="([^"]+)"', heavy_front_fragment, "heavy feed status url")
 status_body = fetch(status_path, cookie=heavy_cookie, timeout=20)
@@ -152,6 +153,15 @@ require(r'"ready_sources":[0-9]+', status_body, "heavy front status ready source
 reloaded_fragment = fetch("/subreddit-fragment/new", cookie=heavy_cookie, timeout=20)
 require(r'data-feed-session-id="', reloaded_fragment, "heavy front reload session id")
 require(r'id="feed_content"', reloaded_fragment, "heavy front reload feed content")
+
+feed_session_id = extract(r'data-feed-session-id="([^"]+)"', heavy_front_fragment, "heavy feed session id")
+next_page_fragment = fetch(
+    f"/feed-fragment?feed_session={feed_session_id}&cache_page=1&current_url=%2Fnew",
+    cookie=heavy_cookie,
+    timeout=20,
+)
+require(r'id="posts"', next_page_fragment, "heavy front next page posts")
+require(r'post_comments', next_page_fragment, "heavy front next page content")
 
 heavy_sub_fragment = fetch("/subreddit-fragment/r/rust", cookie=heavy_cookie, timeout=20)
 require(r'data-subscription-state="subscribed"', heavy_sub_fragment, "heavy subscribed subreddit state")
