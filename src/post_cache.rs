@@ -12,6 +12,7 @@ const FETCH_CONCURRENCY: usize = 5;
 const PER_SOURCE_LIMIT: usize = 100;
 const INITIAL_SOURCE_WINDOW: usize = 32;
 const PAGE_FILL_BATCH: usize = 4;
+const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
 const FRESH_RECENT_SECONDS: i64 = 6 * 60 * 60;
 const FRESH_CUTOFF_SECONDS: i64 = 24 * 60 * 60;
 const MID_CUTOFF_SECONDS: i64 = 48 * 60 * 60;
@@ -99,8 +100,9 @@ struct FeedSession {
 	id: String,
 	request: FeedSessionRequest,
 	sources: Vec<SessionSourceEntry>,
-	background_started: bool,
+	background_active: bool,
 	background_complete: bool,
+	requested_page: usize,
 	last_updated: Instant,
 }
 
@@ -236,8 +238,9 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 		id,
 		request,
 		sources,
-		background_started: false,
+		background_active: false,
 		background_complete: false,
+		requested_page: 0,
 		last_updated: Instant::now(),
 	}
 }
@@ -359,7 +362,7 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 		.count();
 	let current_page_ready = posts.len() >= ((page + 1) * per_page) || session.background_complete;
 	let next_page_ready = posts.len() >= ((page + 2) * per_page);
-	let warming = !session.background_complete;
+	let warming = session.background_active;
 	let status_message = if warming {
 		if ready_user_sources < total_user_sources {
 			format!(
@@ -382,8 +385,20 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 				session.sources.len()
 			)
 		}
-	} else {
+	} else if session.background_complete {
 		format!("Warmed all {} feeds.", session.sources.len())
+	} else if next_page_ready {
+		format!(
+			"Warmed {} of {} feeds. More feeds will load as you paginate.",
+			ready_sources,
+			session.sources.len()
+		)
+	} else {
+		format!(
+			"Warmed {} of {} feeds for now. More feeds will load as needed.",
+			ready_sources,
+			session.sources.len()
+		)
 	};
 
 	FeedSessionStatus {
@@ -398,6 +413,14 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 		status_message,
 		refresh_token: session.last_updated.elapsed().as_millis() as u64 ^ (posts.len() as u64) ^ (ready_sources as u64),
 	}
+}
+
+fn background_target_posts(session: &FeedSession) -> usize {
+	(session.requested_page + 1 + BACKGROUND_LOOKAHEAD_PAGES) * POSTS_PER_PAGE
+}
+
+fn session_has_remaining_sources(session: &FeedSession) -> bool {
+	session.sources.iter().any(|entry| entry.state == SessionSourceState::Unstarted)
 }
 
 fn warm_targets(session: &FeedSession, target_count: usize) -> Vec<usize> {
@@ -500,21 +523,33 @@ async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize) {
 
 async fn warm_session_background(session_id: String) {
 	loop {
-		let remaining = {
+		let (remaining, target_reached) = {
 			let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(session) = sessions.get(&session_id) else {
 				return;
 			};
-			warm_targets(session, PAGE_FILL_BATCH)
+			let target_reached = merged_posts_for_session(session).len() >= background_target_posts(session);
+			(warm_targets(session, PAGE_FILL_BATCH), target_reached)
 		};
 
 		if remaining.is_empty() {
 			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			if let Some(session) = sessions.get_mut(&session_id) {
+				session.background_active = false;
 				session.background_complete = true;
 				session.last_updated = Instant::now();
 			}
 			info!("post_cache: feed session {session_id} warm complete");
+			return;
+		}
+
+		if target_reached {
+			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+			if let Some(session) = sessions.get_mut(&session_id) {
+				session.background_active = false;
+				session.last_updated = Instant::now();
+			}
+			info!("post_cache: feed session {session_id} warm paused");
 			return;
 		}
 
@@ -524,7 +559,6 @@ async fn warm_session_background(session_id: String) {
 
 pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
 	let session_id = build_session_id(&request);
-	let mut spawn_background = false;
 
 	{
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -532,11 +566,7 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 
 		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
 		session.last_updated = Instant::now();
-
-		if !session.background_started {
-			session.background_started = true;
-			spawn_background = true;
-		}
+		session.requested_page = session.requested_page.max(page);
 	}
 
 	let sync_target = {
@@ -550,6 +580,26 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 
 	warm_session_indices(&session_id, sync_target).await;
 	warm_session_to_fill(&session_id, page, per_page).await;
+
+	let spawn_background = {
+		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(session) = sessions.get_mut(&session_id) else {
+			return session_id;
+		};
+
+		if !session_has_remaining_sources(session) {
+			session.background_complete = true;
+			session.background_active = false;
+			false
+		} else if session.background_active {
+			false
+		} else if merged_posts_for_session(session).len() >= background_target_posts(session) {
+			false
+		} else {
+			session.background_active = true;
+			true
+		}
+	};
 
 	if spawn_background {
 		let background_id = session_id.clone();
@@ -569,7 +619,8 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	}
 
 	let posts = merged_posts_for_session(session);
-	Some(session_page_from_posts(&posts, page, per_page, !session.background_complete))
+	let has_more_available = session.background_active || page < session.requested_page || session_has_remaining_sources(session);
+	Some(session_page_from_posts(&posts, page, per_page, has_more_available))
 }
 
 pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<FeedSessionStatus> {
@@ -735,8 +786,9 @@ mod tests {
 					last_error: None,
 				},
 			],
-			background_started: true,
+			background_active: true,
 			background_complete: false,
+			requested_page: 0,
 			last_updated: Instant::now(),
 		};
 
@@ -769,8 +821,9 @@ mod tests {
 				head_created_ts: None,
 				last_error: None,
 			}],
-			background_started: true,
+			background_active: true,
 			background_complete: false,
+			requested_page: 0,
 			last_updated: Instant::now(),
 		};
 

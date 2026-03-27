@@ -292,6 +292,9 @@ async fn main() {
 		.at("/page_fragment.js")
 		.get(|_| resource(include_str!("../static/page_fragment.js"), "text/javascript", false).boxed());
 	app
+		.at("/dynamic_content.js")
+		.get(|_| resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).boxed());
+	app
 		.at("/video_visibility.js")
 		.get(|_| resource(include_str!("../static/video_visibility.js"), "text/javascript", false).boxed());
 	app

@@ -1,11 +1,7 @@
-document.addEventListener("DOMContentLoaded", () => {
-    const forms = Array.from(document.querySelectorAll("form[data-subscription-form]"));
-    if (forms.length === 0) {
-        return;
-    }
-
+(() => {
     const nativeSubmit = HTMLFormElement.prototype.submit;
     const oneYearFromNow = () => new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString();
+    const getForms = () => Array.from(document.querySelectorAll("form[data-subscription-form]"));
 
     const base64UrlEncode = (value) =>
         btoa(unescape(encodeURIComponent(value)))
@@ -144,7 +140,7 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const setPending = (target, pending) => {
-        for (const form of forms) {
+        for (const form of getForms()) {
             if (form.dataset.subscriptionTarget !== target) {
                 continue;
             }
@@ -157,7 +153,7 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const toggleTarget = (target) => {
-        for (const form of forms) {
+        for (const form of getForms()) {
             if (form.dataset.subscriptionTarget !== target) {
                 continue;
             }
@@ -195,7 +191,7 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const syncTargetStateFromCookies = (target) => {
-        for (const form of forms) {
+        for (const form of getForms()) {
             if (form.dataset.subscriptionTarget !== target) {
                 continue;
             }
@@ -249,7 +245,12 @@ document.addEventListener("DOMContentLoaded", () => {
         writeListCookie(cookieName, values);
     };
 
-    for (const form of forms) {
+    const bindForm = (form) => {
+        if (form.dataset.subscriptionBound === "true") {
+            return;
+        }
+
+        form.dataset.subscriptionBound = "true";
         updateFormState(form, currentCookieState(form));
         form.addEventListener("submit", async (event) => {
             event.preventDefault();
@@ -273,13 +274,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
             setPending(target, false);
         });
-    }
+    };
 
     const syncAllForms = () => {
-        for (const form of forms) {
+        for (const form of getForms()) {
             updateFormState(form, currentCookieState(form));
         }
     };
+
+    const initializeSubscriptionForms = (root = document) => {
+        const scopedForms = Array.from(root.querySelectorAll?.("form[data-subscription-form]") || []);
+        for (const form of scopedForms) {
+            bindForm(form);
+        }
+        syncAllForms();
+    };
+
+    window.initializeSubscriptionForms = initializeSubscriptionForms;
 
     window.addEventListener("focus", syncAllForms);
     document.addEventListener("visibilitychange", () => {
@@ -287,4 +298,5 @@ document.addEventListener("DOMContentLoaded", () => {
             syncAllForms();
         }
     });
-});
+    document.addEventListener("DOMContentLoaded", () => initializeSubscriptionForms(document));
+})();

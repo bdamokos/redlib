@@ -14,6 +14,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const pollIntervalMs = 2000;
     const requestTimeoutMs = 15000;
     let lastRefreshToken = null;
+    let lastFragmentHtml = null;
 
     const fetchWithTimeout = async (url, options = {}) => {
         const controller = new AbortController();
@@ -34,6 +35,43 @@ document.addEventListener("DOMContentLoaded", () => {
             banner.textContent = "Updating the feed is taking longer than expected.";
             banner.classList.remove("warming");
         }
+    };
+
+    const refreshDynamicContent = (root) => {
+        window.refreshDynamicContent?.(root || document);
+    };
+
+    const updateFeedContent = (html) => {
+        if (lastFragmentHtml === html) {
+            return;
+        }
+
+        const fragmentTemplate = document.createElement("template");
+        fragmentTemplate.innerHTML = html.trim();
+        const nextRoot = fragmentTemplate.content.firstElementChild;
+        if (!nextRoot) {
+            return;
+        }
+
+        const nextPosts = nextRoot.querySelector("#posts");
+        const currentPosts = container.querySelector("#posts");
+        if (nextPosts && currentPosts && nextPosts.innerHTML !== currentPosts.innerHTML) {
+            currentPosts.innerHTML = nextPosts.innerHTML;
+            refreshDynamicContent(currentPosts);
+        }
+
+        const nextFooter = nextRoot.querySelector("footer");
+        const currentFooter = container.querySelector("footer");
+        if (nextFooter && currentFooter && nextFooter.innerHTML !== currentFooter.innerHTML) {
+            currentFooter.innerHTML = nextFooter.innerHTML;
+        }
+
+        if (!currentPosts || !nextPosts) {
+            container.innerHTML = html;
+            refreshDynamicContent(container);
+        }
+
+        lastFragmentHtml = html;
     };
 
     const refresh = async () => {
@@ -65,7 +103,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }).catch(() => null);
 
             if (fragmentResponse && fragmentResponse.ok) {
-                container.innerHTML = await fragmentResponse.text();
+                updateFeedContent(await fragmentResponse.text());
                 lastRefreshToken = status.refresh_token;
             } else {
                 showErrorState();

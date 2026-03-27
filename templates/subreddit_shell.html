@@ -8,7 +8,11 @@
 {% endblock %}
 
 {% block search %}
+	{% if (str_eq(url, "/") || url.starts_with("/?")) && sub.name.contains("+") %}
+	{% call utils::search("".to_string(), "") %}
+	{% else %}
 	{% call utils::search(["/r/", sub.name.as_str()].concat(), "") %}
+	{% endif %}
 {% endblock %}
 
 {% block subscriptions %}

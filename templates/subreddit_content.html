@@ -58,18 +58,12 @@
 			{% if all_posts_filtered %}
 				 <center>(All content on this page has been filtered)</center>
 			{% else %}
-			{% if !feed_status_message.is_empty() %}
-			<div class="feed_status_banner{% if feed_warming %} warming{% endif %}">
-				{{ feed_status_message }}
-			</div>
-			{% endif %}
 			<div
 				id="feed_content"
 				{% if !feed_session_id.is_empty() %}
 				data-feed-session-id="{{ feed_session_id }}"
 				data-feed-status-url="{{ feed_status_url }}"
 				data-feed-fragment-url="{{ feed_fragment_url }}"
-				data-feed-warming="{% if feed_warming %}true{% else %}false{% endif %}"
 				{% endif %}>
 				<div id="posts">
 				{% for post in posts %}

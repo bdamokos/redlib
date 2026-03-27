@@ -28,6 +28,10 @@ document.addEventListener("DOMContentLoaded", () => {
         `;
     };
 
+    const refreshDynamicContent = (root) => {
+        window.refreshDynamicContent?.(root || document);
+    };
+
     const loadFragment = async () => {
         if (banner) {
             banner.textContent = loadingMessage;
@@ -51,6 +55,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const html = await response.text();
             container.outerHTML = html;
+            refreshDynamicContent(document);
         } catch (_) {
             showErrorState();
         } finally {

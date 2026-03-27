@@ -486,4 +486,5 @@ async function initializeSubmittedDuplicates() {
     }
 }
 
+globalThis.initializeSubmittedDuplicates = initializeSubmittedDuplicates;
 initializeSubmittedDuplicates();

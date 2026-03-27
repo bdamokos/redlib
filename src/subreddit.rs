@@ -61,8 +61,6 @@ pub struct SubredditTemplate {
 	feed_session_id: String,
 	feed_status_url: String,
 	feed_fragment_url: String,
-	feed_status_message: String,
-	feed_warming: bool,
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
@@ -106,8 +104,6 @@ struct SubredditFragmentTemplate {
 	feed_session_id: String,
 	feed_status_url: String,
 	feed_fragment_url: String,
-	feed_status_message: String,
-	feed_warming: bool,
 }
 
 crate::impl_template_str_eq!(SubredditFragmentTemplate);
@@ -124,8 +120,6 @@ struct FeedFragmentTemplate {
 	all_posts_filtered: bool,
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
-	feed_status_message: String,
-	feed_warming: bool,
 }
 
 impl FeedFragmentTemplate {
@@ -874,8 +868,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
 				feed_fragment_url: String::new(),
-				feed_status_message: String::new(),
-				feed_warming: false,
 			})
 		} else if aggregate_saved_feeds {
 			if sort == "new" {
@@ -896,10 +888,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				)
 				.await;
 
-				if let (Some(mut page), Some(status)) = (
-					crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE),
-					crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE),
-				) {
+				if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
 					let (cached_subs, cached_posts) = crate::post_cache::cache_stats();
 					info!(
 						"post_cache: serving page {} from session {} ({} sources cached, {} total posts)",
@@ -962,8 +951,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						feed_session_id: feed_session_id.clone(),
 						feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
 						feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
-						feed_status_message: status.status_message,
-						feed_warming: status.warming,
 					});
 				}
 			}
@@ -1022,8 +1009,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						feed_session_id: String::new(),
 						feed_status_url: String::new(),
 						feed_fragment_url: String::new(),
-						feed_status_message: String::new(),
-						feed_warming: false,
 					})
 				}
 			Err(msg) => error(req, &msg).await,
@@ -1085,8 +1070,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						feed_session_id: String::new(),
 						feed_status_url: String::new(),
 						feed_fragment_url: String::new(),
-						feed_status_message: String::new(),
-						feed_warming: false,
 					});
 			}
 			// Fall through to normal fetch if not cached.
@@ -1168,8 +1151,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						feed_session_id: String::new(),
 						feed_status_url: String::new(),
 						feed_fragment_url: String::new(),
-						feed_status_message: String::new(),
-						feed_warming: false,
 					})
 				}
 			Err(msg) => match msg.as_str() {
@@ -1294,8 +1275,6 @@ mod tests {
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
 				feed_fragment_url: String::new(),
-				feed_status_message: String::new(),
-				feed_warming: false,
 			}
 		.render()
 		.unwrap();
@@ -1336,8 +1315,6 @@ mod tests {
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
 				feed_fragment_url: String::new(),
-				feed_status_message: String::new(),
-				feed_warming: false,
 			}
 		.render()
 		.unwrap();
@@ -1367,6 +1344,63 @@ mod tests {
 		assert!(html.contains("data-error-message=\"Loading posts is taking longer than expected.\""));
 		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading posts..."));
+	}
+
+	#[test]
+	fn renders_home_shell_search_as_global_search() {
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit {
+				name: "rust+programming".to_string(),
+				..Default::default()
+			},
+			active_flair_filter: String::new(),
+			prefs: test_prefs(),
+			url: "/".to_string(),
+			fragment_url: "/subreddit-fragment".to_string(),
+			loading_message: "Loading posts...".to_string(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("action=\"/search\""));
+		assert!(!html.contains("action=\"/r/rust+programming/search\""));
+	}
+
+	#[test]
+	fn subreddit_fragment_does_not_render_duplicate_feed_status_banner() {
+		let html = super::SubredditFragmentTemplate {
+			sub: Subreddit {
+				name: "rust+programming".to_string(),
+				..Default::default()
+			},
+			posts: vec![test_post()],
+			top_users: Vec::new(),
+			sort: ("new".to_string(), String::new()),
+			sort_options: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: "/".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/".to_string(),
+			redirect_url: String::new(),
+			enable_duplicate_collapse: true,
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			is_flair_subscribed: false,
+			feed_session_id: "demo".to_string(),
+			feed_status_url: "/feed-status?feed_session=demo".to_string(),
+			feed_fragment_url: "/feed-fragment?feed_session=demo".to_string(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(!html.contains("feed_status_banner"));
+		assert!(html.contains("id=\"feed_content\""));
 	}
 
 	#[test]
@@ -1400,8 +1434,6 @@ mod tests {
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
 				feed_fragment_url: String::new(),
-				feed_status_message: String::new(),
-				feed_warming: false,
 			}
 		.render()
 		.unwrap();
@@ -1778,9 +1810,6 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let Some(mut feed_page) = crate::post_cache::feed_page(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
 		return error(req, "Feed session not found or expired").await;
 	};
-	let Some(status) = crate::post_cache::feed_status(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
-		return error(req, "Feed session not found or expired").await;
-	};
 	utils::hydrate_post_author_links_from_cache(&mut feed_page.posts);
 
 	let current_url = param(&format!("?{}", req.uri().query().unwrap_or_default()), "current_url").unwrap_or_else(|| "/".to_string());
@@ -1825,8 +1854,6 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		all_posts_filtered: false,
 		all_posts_hidden_nsfw,
 		no_posts,
-		feed_status_message: status.status_message,
-		feed_warming: status.warming,
 	})
 }
 

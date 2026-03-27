@@ -11,13 +11,22 @@ var streamProto = {
 };
 
 var players = {}
+var dashObserver;
 
-document.addEventListener('DOMContentLoaded', function () {
-    var observer = new IntersectionObserver(handleVideoIntersect, {
-        rootMargin: '100px'
-    });
-    
-    var videoElements = document.querySelectorAll(".post_media_content > video[data-dash]");
+function getDashObserver() {
+    if (!dashObserver && 'IntersectionObserver' in window) {
+        dashObserver = new IntersectionObserver(handleVideoIntersect, {
+            rootMargin: '100px'
+        });
+    }
+
+    return dashObserver;
+}
+
+function initializeDashVideos(root) {
+    var observer = getDashObserver();
+    var container = root || document;
+    var videoElements = container.querySelectorAll(".post_media_content > video[data-dash]");
 
     // Check if native hls playback is supported, if so we are probably on an apple device
     var videoEl = videoElements[0];
@@ -27,7 +36,16 @@ document.addEventListener('DOMContentLoaded', function () {
         streamProto.hls.isSupported = canPlayHls === 'probably' || canPlayHls === 'maybe';
     }
 
+    if (!observer) {
+        return;
+    }
+
     videoElements.forEach(function (el) { observer.observe(el) });
+}
+
+window.initializeDashVideos = initializeDashVideos;
+document.addEventListener('DOMContentLoaded', function () {
+    initializeDashVideos(document);
 });
 
 function handleVideoIntersect(entries) {

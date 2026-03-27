@@ -106,13 +106,20 @@ fn empty_post_for_shell(community: &str, permalink: &str) -> Post {
 }
 
 fn post_fragment_path(req: &Request<Body>) -> String {
-	let path = req.uri().path();
+	let path = req.uri().path().trim_end_matches('/');
+	let path = if path.is_empty() { "/" } else { path };
 	let query = req.uri().query().unwrap_or_default();
 	if query.is_empty() {
 		format!("/post-fragment{path}")
 	} else {
 		format!("/post-fragment{path}?{query}")
 	}
+}
+
+fn post_source_path(req: &Request<Body>) -> String {
+	let path = req.uri().path().trim_end_matches('/');
+	let path = if path.is_empty() { "/" } else { path };
+	path.replacen("/post-fragment", "", 1)
 }
 
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -137,7 +144,9 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 
 pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
-	let mut path: String = format!("{}.json?{}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default());
+	let request_path = post_source_path(&req);
+	let reddit_path = if request_path.ends_with('/') { request_path.clone() } else { format!("{request_path}/") };
+	let mut path: String = format!("{}.json?{}&raw_json=1", reddit_path, req.uri().query().unwrap_or_default());
 	let sub = req.param("sub").unwrap_or_default();
 	let quarantined = can_access_quarantine(&req, &sub);
 	let url = req.uri().to_string();
@@ -151,7 +160,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		if default_sort.is_empty() {
 			String::new()
 		} else {
-			path = format!("{}.json?{}&sort={}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default(), default_sort);
+			path = format!("{}.json?{}&sort={}&raw_json=1", reddit_path, req.uri().query().unwrap_or_default(), default_sort);
 			default_sort
 		}
 	});
@@ -227,9 +236,10 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 
 #[cfg(test)]
 mod tests {
-	use super::PostTemplate;
+	use super::{post_fragment_path, post_source_path, PostTemplate};
 	use crate::utils::Preferences;
 	use askama::Template;
+	use hyper::{Body, Request};
 
 	fn test_prefs() -> Preferences {
 		Preferences {
@@ -266,6 +276,29 @@ mod tests {
 		assert!(html.contains("data-error-message=\"Loading the post is taking longer than expected.\""));
 		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading post and comments..."));
+	}
+
+	#[test]
+	fn post_fragment_path_trims_trailing_slash() {
+		let request = Request::builder()
+			.uri("/r/rust/comments/demo/title/?sort=new")
+			.body(Body::empty())
+			.unwrap();
+
+		assert_eq!(
+			post_fragment_path(&request),
+			"/post-fragment/r/rust/comments/demo/title?sort=new"
+		);
+	}
+
+	#[test]
+	fn post_source_path_removes_fragment_prefix() {
+		let request = Request::builder()
+			.uri("/post-fragment/r/rust/comments/demo/title")
+			.body(Body::empty())
+			.unwrap();
+
+		assert_eq!(post_source_path(&request), "/r/rust/comments/demo/title");
 	}
 }
 
