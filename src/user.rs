@@ -806,6 +806,8 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-fragment-url=\"/user-fragment/demo_user\""));
+		assert!(html.contains("data-error-message=\"Loading the user page is taking longer than expected.\""));
+		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading user page..."));
 	}
 

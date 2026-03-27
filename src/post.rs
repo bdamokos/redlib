@@ -263,6 +263,8 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-fragment-url=\"/post-fragment/r/rust/comments/demo/title\""));
+		assert!(html.contains("data-error-message=\"Loading the post is taking longer than expected.\""));
+		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading post and comments..."));
 	}
 }

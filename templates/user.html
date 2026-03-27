@@ -17,7 +17,12 @@
 <main>
     {% if shell_mode %}
     <div class="feed_status_banner warming">{{ loading_message }}</div>
-    <div id="page_fragment" data-fragment-url="{{ fragment_url }}">
+    <div
+        id="page_fragment"
+        data-fragment-url="{{ fragment_url }}"
+        data-loading-message="{{ loading_message }}"
+        data-error-message="Loading the user page is taking longer than expected."
+        data-timeout-ms="20000">
         <div id="column_one">
             <center>Loading posts and profile details...</center>
         </div>

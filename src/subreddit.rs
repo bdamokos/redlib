@@ -1364,6 +1364,8 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-fragment-url=\"/subreddit-fragment/r/rust\""));
+		assert!(html.contains("data-error-message=\"Loading posts is taking longer than expected.\""));
+		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading posts..."));
 	}
 
