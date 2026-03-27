@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::LazyLock;
+use tokio::task::JoinSet;
 use url::form_urlencoded;
 
 const FRONT_CURSOR_PARAM: &str = "front_cursor";
@@ -28,6 +29,8 @@ const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
 const AFTER_PATH_HEADROOM: usize = 128;
+const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 100;
+const AGGREGATE_FETCH_CONCURRENCY: usize = 4;
 static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
 
 // STRUCTS
@@ -412,8 +415,9 @@ fn split_subscriptions_for_listing(subs: &[String], sort: &str, query: &str) -> 
 		next.push(sub.clone());
 		let chunk = next.join("+");
 		let projected_len = format!("/r/{chunk}/{sort}.json?{query}").len() + AFTER_PATH_HEADROOM;
+		let projected_count = next.len();
 
-		if !current.is_empty() && projected_len > REDDIT_LISTING_PATH_SOFT_LIMIT {
+		if !current.is_empty() && (projected_len > REDDIT_LISTING_PATH_SOFT_LIMIT || projected_count > MAX_SUBREDDITS_PER_LISTING_CHUNK) {
 			chunks.push(current.join("+"));
 			current = vec![sub.clone()];
 		} else {
@@ -600,25 +604,43 @@ async fn fetch_aggregated_subscription_feed(
 	for round in 0..MAX_AGGREGATE_FILL_ROUNDS {
 		let mut fetched_any_chunk = false;
 
-		for (index, source) in sources.iter().enumerate() {
-			if round > 0 && next_state[index].is_empty() {
-				continue;
-			}
-			if round == 0 && page_has_cursor && current_state[index].is_empty() {
-				continue;
+		let eligible = sources
+			.iter()
+			.enumerate()
+			.filter_map(|(index, source)| {
+				if round > 0 && next_state[index].is_empty() {
+					return None;
+				}
+				if round == 0 && page_has_cursor && current_state[index].is_empty() {
+					return None;
+				}
+
+				Some((index, source.clone(), next_state[index].clone()))
+			})
+			.collect::<Vec<_>>();
+
+		for batch in eligible.chunks(AGGREGATE_FETCH_CONCURRENCY) {
+			let mut join_set = JoinSet::new();
+
+			for (index, source, request_after) in batch.iter().cloned() {
+				let sort = sort.to_string();
+				let reddit_query = reddit_query.to_string();
+				join_set.spawn(async move { (index, source.clone(), fetch_source_listing_page(&source, &sort, &reddit_query, &request_after, quarantine).await) });
 			}
 
-			let request_after = next_state[index].clone();
-			match fetch_source_listing_page(source, sort, reddit_query, &request_after, quarantine).await {
-				Ok(page) => {
-					fetched_any_chunk = true;
-					successful_chunks += 1;
-					fetched_raw_posts |= !page.posts.is_empty();
-					chunk_buffers[index].extend(page.posts);
-					next_state[index] = page.after;
-				}
-				Err(err) => {
-					chunk_errors.push(format!("source {source:?}: {err}"));
+			while let Some(join_result) = join_set.join_next().await {
+				let (index, source, result) = join_result.map_err(|error| error.to_string())?;
+				match result {
+					Ok(page) => {
+						fetched_any_chunk = true;
+						successful_chunks += 1;
+						fetched_raw_posts |= !page.posts.is_empty();
+						chunk_buffers[index].extend(page.posts);
+						next_state[index] = page.after;
+					}
+					Err(err) => {
+						chunk_errors.push(format!("source {source:?}: {err}"));
+					}
 				}
 			}
 		}
@@ -1606,6 +1628,7 @@ mod tests {
 
 		assert!(chunks.len() > 1);
 		assert_eq!(chunks.join("+"), subscriptions.join("+"));
+		assert!(chunks.iter().all(|chunk| chunk.split('+').count() <= super::MAX_SUBREDDITS_PER_LISTING_CHUNK));
 		assert!(chunks
 			.iter()
 			.all(|chunk| { format!("/r/{chunk}/hot.json?raw_json=1").len() + super::AFTER_PATH_HEADROOM <= super::REDDIT_LISTING_PATH_SOFT_LIMIT }));
