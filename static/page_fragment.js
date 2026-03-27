@@ -12,6 +12,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const loadingMessage = container.dataset.loadingMessage || "Loading the page...";
     const errorMessage = container.dataset.errorMessage || "Loading the page is taking longer than expected.";
     const timeoutMs = Number.parseInt(container.dataset.timeoutMs || "15000", 10);
+    const maxAttempts = Number.parseInt(container.dataset.maxAttempts || "3", 10);
+    const retryDelayMs = Number.parseInt(container.dataset.retryDelayMs || "1500", 10);
     const banner = document.querySelector(".feed_status_banner");
 
     const showErrorState = () => {
@@ -32,8 +34,39 @@ document.addEventListener("DOMContentLoaded", () => {
         window.refreshDynamicContent?.(root || document);
     };
 
-    const loadFragment = async () => {
+    const settleBannerState = () => {
+        if (!banner) {
+            return;
+        }
+
+        const activeFeed = document.querySelector("#feed_content[data-feed-session-id]");
+        if (activeFeed) {
+            banner.hidden = false;
+            return;
+        }
+
+        banner.hidden = true;
+        banner.textContent = "";
+        banner.classList.remove("warming");
+    };
+
+    const showRetryState = (attempt) => {
+        if (!banner) {
+            return;
+        }
+
+        banner.hidden = false;
+        banner.classList.add("warming");
+        banner.textContent = attempt < maxAttempts ? `${loadingMessage} Retrying…` : errorMessage;
+    };
+
+    const waitForRetry = () => new Promise((resolve) => {
+        window.setTimeout(resolve, retryDelayMs);
+    });
+
+    const loadFragment = async (attempt = 1) => {
         if (banner) {
+            banner.hidden = false;
             banner.textContent = loadingMessage;
         }
 
@@ -56,7 +89,13 @@ document.addEventListener("DOMContentLoaded", () => {
             const html = await response.text();
             container.outerHTML = html;
             refreshDynamicContent(document);
+            settleBannerState();
         } catch (_) {
+            if (attempt < maxAttempts) {
+                showRetryState(attempt);
+                await waitForRetry();
+                return loadFragment(attempt + 1);
+            }
             showErrorState();
         } finally {
             window.clearTimeout(timeoutId);

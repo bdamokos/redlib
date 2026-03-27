@@ -1,5 +1,6 @@
 (() => {
     const initialize = (root = document) => {
+        window.initializeFeedStatus?.(root);
         window.initializeSubscriptionForms?.(root);
         window.loadAuthorLinks?.(root);
         window.markTruncatedPreviews?.();
