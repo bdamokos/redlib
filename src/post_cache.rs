@@ -346,11 +346,42 @@ fn session_page_from_posts(posts: &[Post], page: usize, per_page: usize, warming
 fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> FeedSessionStatus {
 	let ready_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Ready).count();
 	let failed_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Failed).count();
+	let total_user_sources = session
+		.sources
+		.iter()
+		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name } if name.starts_with("u_")))
+		.count();
+	let ready_user_sources = session
+		.sources
+		.iter()
+		.filter(|entry| entry.state == SessionSourceState::Ready)
+		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name } if name.starts_with("u_")))
+		.count();
 	let current_page_ready = posts.len() >= ((page + 1) * per_page) || session.background_complete;
 	let next_page_ready = posts.len() >= ((page + 2) * per_page);
 	let warming = !session.background_complete;
 	let status_message = if warming {
-		format!("Warmed {} of {} feeds. Loading more in the background.", ready_sources, session.sources.len())
+		if ready_user_sources < total_user_sources {
+			format!(
+				"Loading followed feeds in the background. Warmed {} of {} feeds.",
+				ready_sources,
+				session.sources.len()
+			)
+		} else if !current_page_ready {
+			format!(
+				"Warmed {} of {} feeds. Filling this page with newer posts.",
+				ready_sources,
+				session.sources.len()
+			)
+		} else if next_page_ready {
+			format!("Warmed {} of {} feeds. Next page is ready.", ready_sources, session.sources.len())
+		} else {
+			format!(
+				"Warmed {} of {} feeds. Preparing the next page in the background.",
+				ready_sources,
+				session.sources.len()
+			)
+		}
 	} else {
 		format!("Warmed all {} feeds.", session.sources.len())
 	};
@@ -561,9 +592,12 @@ pub fn cache_stats() -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-	use super::{active_source_keys, sort_sources, FeedSource};
+	use super::{
+		active_source_keys, session_status_from_posts, sort_sources, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState,
+	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
-	use std::collections::VecDeque;
+	use std::collections::{HashSet, VecDeque};
+	use std::time::Instant;
 
 	fn empty_flair() -> Flair {
 		Flair {
@@ -667,5 +701,82 @@ mod tests {
 		assert!(active.contains("subreddit:fresh"));
 		assert!(active.contains("subreddit:recent"));
 		assert!(!active.contains("subreddit:stale"));
+	}
+
+	#[test]
+	fn status_message_mentions_followed_feeds_while_users_are_still_warming() {
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![
+				SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: "u_demo".to_string(),
+					},
+					state: SessionSourceState::Unstarted,
+					posts: Vec::new(),
+					after: String::new(),
+					head_created_ts: None,
+					last_error: None,
+				},
+				SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: "rust".to_string(),
+					},
+					state: SessionSourceState::Ready,
+					posts: vec![test_post("one", "rust", chrono::Utc::now().timestamp() as u64)],
+					after: String::new(),
+					head_created_ts: None,
+					last_error: None,
+				},
+			],
+			background_started: true,
+			background_complete: false,
+			last_updated: Instant::now(),
+		};
+
+		let status = session_status_from_posts(&session, &[], 0, 25);
+
+		assert!(status.status_message.contains("Loading followed feeds in the background."));
+	}
+
+	#[test]
+	fn status_message_mentions_next_page_when_ready() {
+		let post_count = 60;
+		let posts = (0..post_count)
+			.map(|index| test_post(&index.to_string(), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
+			.collect::<Vec<_>>();
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![SessionSourceEntry {
+				source: FeedSource::Subreddit {
+					name: "rust".to_string(),
+				},
+				state: SessionSourceState::Ready,
+				posts: posts.clone(),
+				after: String::new(),
+				head_created_ts: None,
+				last_error: None,
+			}],
+			background_started: true,
+			background_complete: false,
+			last_updated: Instant::now(),
+		};
+
+		let status = session_status_from_posts(&session, &posts, 0, 25);
+
+		assert!(status.next_page_ready);
+		assert!(status.status_message.contains("Next page is ready."));
 	}
 }
