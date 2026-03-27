@@ -13,3 +13,4 @@ docker-compose.yml
 logs/reddit_api/
 target-docker/*
 nginx/
+.playwright-cli/
