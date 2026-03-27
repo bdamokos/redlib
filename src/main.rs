@@ -334,6 +334,8 @@ async fn main() {
 		.get(|r| async move { Ok(redirect(&format!("/user/{}", r.param("name").unwrap_or_default()))) }.boxed());
 	app.at("/u/:name/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/u/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
+	app.at("/post-fragment/u/:name/comments/:id/:title").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/u/:name/comments/:id/:title/:comment_id").get(|r| post::item_fragment(r).boxed());
 
 	app.at("/user/[deleted]").get(|req| error(req, "User has deleted their account").boxed());
 	app.at("/author_links").get(|r| user::author_links(r).boxed());
@@ -345,6 +347,9 @@ async fn main() {
 	app.at("/user/:name/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
+	app.at("/post-fragment/user/:name/comments/:id").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/user/:name/comments/:id/:title").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/user/:name/comments/:id/:title/:comment_id").get(|r| post::item_fragment(r).boxed());
 
 	// Configure settings
 	app.at("/settings").get(|r| settings::get(r).boxed()).post(|r| settings::set(r).boxed());
@@ -377,11 +382,19 @@ async fn main() {
 	app.at("/r/:sub/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/r/:sub/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/r/:sub/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
+	app.at("/post-fragment/r/:sub/comments/:id").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/r/:sub/comments/:id/:title").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/r/:sub/comments/:id/:title/:comment_id").get(|r| post::item_fragment(r).boxed());
 	app.at("/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/comments/:id/comments").get(|r| post::item(r).boxed());
 	app.at("/comments/:id/comments/:comment_id").get(|r| post::item(r).boxed());
 	app.at("/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
+	app.at("/post-fragment/comments/:id").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/comments/:id/comments").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/comments/:id/comments/:comment_id").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/comments/:id/:title").get(|r| post::item_fragment(r).boxed());
+	app.at("/post-fragment/comments/:id/:title/:comment_id").get(|r| post::item_fragment(r).boxed());
 
 	app.at("/r/:sub/duplicates/:id").get(|r| duplicates::item(r).boxed());
 	app.at("/r/:sub/duplicates/:id/:title").get(|r| duplicates::item(r).boxed());

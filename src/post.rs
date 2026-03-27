@@ -21,6 +21,7 @@ use std::sync::LazyLock;
 pub struct PostTemplate {
 	comments: Vec<Comment>,
 	post: Post,
+	post_shell_subreddit: String,
 	sort: String,
 	prefs: Preferences,
 	single_thread: bool,
@@ -28,13 +29,113 @@ pub struct PostTemplate {
 	url: String,
 	url_without_query: String,
 	comment_query: String,
+	shell_mode: bool,
+	fragment_url: String,
+	loading_message: String,
 }
 
 crate::impl_template_str_eq!(PostTemplate);
 
+#[derive(Template)]
+#[template(path = "post_fragment.html")]
+struct PostFragmentTemplate {
+	comments: Vec<Comment>,
+	post: Post,
+	sort: String,
+	prefs: Preferences,
+	single_thread_str: &'static str,
+	url: String,
+	url_without_query: String,
+	comment_query: String,
+}
+
+crate::impl_template_str_eq!(PostFragmentTemplate);
+
 static COMMENT_SEARCH_CAPTURE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\?q=(.*)&type=comment").unwrap());
 
+fn empty_post_for_shell(community: &str, permalink: &str) -> Post {
+	Post {
+		id: String::new(),
+		kind: "t3".to_string(),
+		title: "Loading post...".to_string(),
+		community: community.to_string(),
+		body: String::new(),
+		author: Author {
+			name: String::new(),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+			distinguished: String::new(),
+			external_links: Vec::new(),
+			avg_video_length: None,
+		},
+		permalink: permalink.to_string(),
+		parent_kind: String::new(),
+		link_title: String::new(),
+		link_permalink: String::new(),
+		poll: None,
+		score: ("0".to_string(), "0".to_string()),
+		upvote_ratio: 0,
+		post_type: "self".to_string(),
+		flair: Flair {
+			flair_parts: Vec::new(),
+			text: String::new(),
+			background_color: String::new(),
+			foreground_color: String::new(),
+		},
+		flags: crate::utils::Flags::new(false, false, false),
+		thumbnail: crate::utils::Media::empty(),
+		media: crate::utils::Media::empty(),
+		domain: String::new(),
+		rel_time: String::new(),
+		created: String::new(),
+		created_ts: 0,
+		num_duplicates: 0,
+		comments: ("0".to_string(), "0".to_string()),
+		gallery: Vec::new(),
+		awards: Awards(Vec::new()),
+		nsfw: false,
+		out_url: None,
+		ws_url: String::new(),
+		preview_body: String::new(),
+		collapsed_duplicates: Vec::new(),
+	}
+}
+
+fn post_fragment_path(req: &Request<Body>) -> String {
+	let path = req.uri().path();
+	let query = req.uri().query().unwrap_or_default();
+	if query.is_empty() {
+		format!("/post-fragment{path}")
+	} else {
+		format!("/post-fragment{path}?{query}")
+	}
+}
+
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
+	let post_shell_subreddit = req.param("sub").unwrap_or_default();
+	let url = req.uri().to_string();
+	return Ok(template(&PostTemplate {
+		comments: Vec::new(),
+		post: empty_post_for_shell(&post_shell_subreddit, &url),
+		post_shell_subreddit,
+		sort: String::new(),
+		prefs: Preferences::new(&req),
+		single_thread: req.param("comment_id").is_some(),
+		single_thread_str: if req.param("comment_id").is_some() { "true" } else { "false" },
+		url: url.clone(),
+		url_without_query: url.clone(),
+		comment_query: String::new(),
+		shell_mode: true,
+		fragment_url: post_fragment_path(&req),
+		loading_message: "Loading post and comments...".to_string(),
+	}));
+}
+
+pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
 	let mut path: String = format!("{}.json?{}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default());
 	let sub = req.param("sub").unwrap_or_default();
@@ -93,18 +194,25 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 			};
 
 			// Use the Post and Comment structs to generate a website to show users
-			Ok(template(&PostTemplate {
-				comments,
-				post,
-				url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
-				sort,
-				prefs: Preferences::new(&req),
-				single_thread,
-				single_thread_str: if single_thread { "true" } else { "false" },
-				url: req_url,
-				comment_query: query,
-			}))
-		}
+				let body = PostFragmentTemplate {
+					comments,
+					post,
+					sort,
+					prefs: Preferences::new(&req),
+					single_thread_str: if single_thread { "true" } else { "false" },
+					url: req_url,
+					url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
+					comment_query: query,
+				}
+				.render()
+				.map_err(|error| error.to_string())?;
+				Response::builder()
+					.status(200)
+					.header("content-type", "text/html; charset=utf-8")
+					.header("cache-control", "no-store")
+					.body(Body::from(body))
+					.map_err(|error| error.to_string())
+			}
 		// If the Reddit API returns an error, exit and send error page to user
 		Err(msg) => {
 			if msg == "quarantined" || msg == "gated" {
@@ -114,6 +222,48 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				error(req, &msg).await
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::PostTemplate;
+	use crate::utils::Preferences;
+	use askama::Template;
+
+	fn test_prefs() -> Preferences {
+		Preferences {
+			available_themes: vec!["system".to_string()],
+			layout: "card".to_string(),
+			show_nsfw: "on".to_string(),
+			fixed_navbar: "on".to_string(),
+			disable_visit_reddit_confirmation: "on".to_string(),
+			..Preferences::default()
+		}
+	}
+
+	#[test]
+	fn renders_shell_mode_post_placeholder_with_fragment_url() {
+		let html = PostTemplate {
+			comments: Vec::new(),
+			post: super::empty_post_for_shell("rust", "/r/rust/comments/demo/title"),
+			post_shell_subreddit: "rust".to_string(),
+			sort: String::new(),
+			prefs: test_prefs(),
+			single_thread: false,
+			single_thread_str: "false",
+			url: "/r/rust/comments/demo/title".to_string(),
+			url_without_query: "/r/rust/comments/demo/title".to_string(),
+			comment_query: String::new(),
+			shell_mode: true,
+			fragment_url: "/post-fragment/r/rust/comments/demo/title".to_string(),
+			loading_message: "Loading post and comments...".to_string(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-fragment-url=\"/post-fragment/r/rust/comments/demo/title\""));
+		assert!(html.contains("Loading post and comments..."));
 	}
 }
 
