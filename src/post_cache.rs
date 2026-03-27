@@ -8,8 +8,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 const CACHE_TTL_SECS: u64 = 10_800;
-const FETCH_CONCURRENCY: usize = 5;
-const PER_SOURCE_LIMIT: usize = 100;
+const FETCH_CONCURRENCY: usize = 8;
+const PER_SOURCE_LIMIT: usize = 40;
 const INITIAL_SOURCE_WINDOW: usize = 32;
 const PAGE_FILL_BATCH: usize = 4;
 const MAX_SYNC_FILL_BATCHES: usize = 2;

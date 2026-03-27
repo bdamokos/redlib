@@ -76,6 +76,66 @@ def heavy_subscription_cookie() -> str:
     return "; ".join(parts)
 
 
+def active_subscription_cookie() -> str:
+    subscriptions = [
+        "rust",
+        "programming",
+        "technology",
+        "worldnews",
+        "science",
+        "linux",
+        "opensource",
+        "news",
+        "webdev",
+        "golang",
+        "javascript",
+        "python",
+        "machinelearning",
+        "sysadmin",
+        "devops",
+        "learnprogramming",
+        "privacy",
+        "selfhosted",
+        "futurology",
+        "hardware",
+        "space",
+        "math",
+        "physics",
+        "history",
+        "books",
+        "movies",
+        "music",
+        "television",
+        "games",
+        "gaming",
+        "pcgaming",
+        "dataisbeautiful",
+        "android",
+        "apple",
+        "travel",
+        "food",
+        "photography",
+        "art",
+        "design",
+        "europe",
+    ]
+    return "; ".join(
+        [
+            "front_page=default",
+            "post_sort=new",
+            "subscriptions=" + "+".join(subscriptions),
+        ]
+    )
+
+
+def extract_feed_session_id(body: str, label: str) -> str:
+    return extract(r'data-feed-session-id="([^"]+)"', body, label)
+
+
+def extract_post_sources(body: str) -> set[str]:
+    return set(html.unescape(match) for match in re.findall(r'class="post_subreddit" href="([^"]+)"', body))
+
+
 print(f"Checking shell routes against {BASE_URL}")
 
 front_shell = fetch("/")
@@ -144,6 +204,8 @@ heavy_front_fragment = fetch("/subreddit-fragment/new", cookie=heavy_cookie, tim
 require(r'data-feed-session-id="', heavy_front_fragment, "heavy front fragment session id")
 require(r'id="feed_content"', heavy_front_fragment, "heavy front fragment feed content")
 require(r'accesskey="N"', heavy_front_fragment, "heavy front next page link")
+if 'feed_status_banner' in heavy_front_fragment:
+    fail("heavy front fragment should not inject a duplicate feed status banner")
 
 status_path = extract(r'data-feed-status-url="([^"]+)"', heavy_front_fragment, "heavy feed status url")
 status_body = fetch(status_path, cookie=heavy_cookie, timeout=20)
@@ -153,8 +215,12 @@ require(r'"ready_sources":[0-9]+', status_body, "heavy front status ready source
 reloaded_fragment = fetch("/subreddit-fragment/new", cookie=heavy_cookie, timeout=20)
 require(r'data-feed-session-id="', reloaded_fragment, "heavy front reload session id")
 require(r'id="feed_content"', reloaded_fragment, "heavy front reload feed content")
+if extract_feed_session_id(reloaded_fragment, "heavy reload feed session id") != extract_feed_session_id(
+    heavy_front_fragment, "heavy initial feed session id"
+):
+    fail("heavy front reload did not reuse the existing feed session")
 
-feed_session_id = extract(r'data-feed-session-id="([^"]+)"', heavy_front_fragment, "heavy feed session id")
+feed_session_id = extract_feed_session_id(heavy_front_fragment, "heavy feed session id")
 next_page_fragment = fetch(
     f"/feed-fragment?feed_session={feed_session_id}&cache_page=1&current_url=%2Fnew",
     cookie=heavy_cookie,
@@ -166,6 +232,19 @@ require(r'post_comments', next_page_fragment, "heavy front next page content")
 heavy_sub_fragment = fetch("/subreddit-fragment/r/rust", cookie=heavy_cookie, timeout=20)
 require(r'data-subscription-state="subscribed"', heavy_sub_fragment, "heavy subscribed subreddit state")
 require(r'>Unsubscribe<', heavy_sub_fragment, "heavy subscribed subreddit label")
+
+active_cookie = active_subscription_cookie()
+active_page0 = fetch("/subreddit-fragment/new", cookie=active_cookie, timeout=60)
+active_session_id = extract_feed_session_id(active_page0, "active feed session id")
+active_page1 = fetch(
+    f"/feed-fragment?feed_session={active_session_id}&cache_page=1&current_url=%2Fnew",
+    cookie=active_cookie,
+    timeout=20,
+)
+page0_sources = extract_post_sources(active_page0)
+page1_sources = extract_post_sources(active_page1)
+if not page1_sources.difference(page0_sources):
+    fail("active saved-feed page 1 did not introduce any additional post sources beyond page 0")
 
 print("Shell smoke checks passed.")
 PY
