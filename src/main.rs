@@ -407,6 +407,10 @@ async fn main() {
 	app.at("/r/:sub/duplicates/:id/:title").get(|r| duplicates::item(r).boxed());
 	app.at("/duplicates/:id").get(|r| duplicates::item(r).boxed());
 	app.at("/duplicates/:id/:title").get(|r| duplicates::item(r).boxed());
+	app.at("/duplicates-fragment/r/:sub/duplicates/:id").get(|r| duplicates::item_fragment(r).boxed());
+	app.at("/duplicates-fragment/r/:sub/duplicates/:id/:title").get(|r| duplicates::item_fragment(r).boxed());
+	app.at("/duplicates-fragment/duplicates/:id").get(|r| duplicates::item_fragment(r).boxed());
+	app.at("/duplicates-fragment/duplicates/:id/:title").get(|r| duplicates::item_fragment(r).boxed());
 
 	app.at("/search-fragment").get(|r| search::find_fragment(r).boxed());
 	app.at("/search-fragment/r/:sub/search").get(|r| search::find_fragment(r).boxed());

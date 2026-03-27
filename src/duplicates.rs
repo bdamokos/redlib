@@ -3,7 +3,7 @@
 use crate::client::json;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
-use crate::utils::{self, error, filter_posts, get_filters, nsfw_landing, parse_post, template, Post, Preferences};
+use crate::utils::{self, error, filter_posts, get_filters, nsfw_landing, parse_post, template, Awards, Author, Flair, Post, Preferences};
 
 use askama::Template;
 use hyper::{Body, Request, Response};
@@ -25,6 +25,9 @@ struct DuplicatesParams {
 #[derive(Template)]
 #[template(path = "duplicates.html")]
 pub struct DuplicatesTemplate {
+	shell_mode: bool,
+	fragment_url: String,
+	loading_message: String,
 	/// params contains the relevant request parameters.
 	params: DuplicatesParams,
 
@@ -53,10 +56,111 @@ pub struct DuplicatesTemplate {
 
 crate::impl_template_str_eq!(DuplicatesTemplate);
 
+#[derive(Template)]
+#[template(path = "duplicates_fragment.html")]
+struct DuplicatesFragmentTemplate {
+	params: DuplicatesParams,
+	post: Post,
+	duplicates: Vec<Post>,
+	prefs: Preferences,
+	url: String,
+	num_posts_filtered: u64,
+	all_posts_filtered: bool,
+}
+
+crate::impl_template_str_eq!(DuplicatesFragmentTemplate);
+
+fn empty_post_for_shell(community: &str, permalink: &str) -> Post {
+	Post {
+		id: String::new(),
+		kind: "t3".to_string(),
+		title: "Loading duplicates...".to_string(),
+		community: community.to_string(),
+		body: String::new(),
+		author: Author {
+			name: String::new(),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+			distinguished: String::new(),
+			external_links: Vec::new(),
+			avg_video_length: None,
+		},
+		permalink: permalink.to_string(),
+		parent_kind: String::new(),
+		link_title: String::new(),
+		link_permalink: String::new(),
+		poll: None,
+		score: ("0".to_string(), "0".to_string()),
+		upvote_ratio: 0,
+		post_type: "self".to_string(),
+		flair: Flair {
+			flair_parts: Vec::new(),
+			text: String::new(),
+			background_color: String::new(),
+			foreground_color: String::new(),
+		},
+		flags: crate::utils::Flags::new(false, false, false),
+		thumbnail: crate::utils::Media::empty(),
+		media: crate::utils::Media::empty(),
+		domain: String::new(),
+		rel_time: String::new(),
+		created: String::new(),
+		created_ts: 0,
+		num_duplicates: 0,
+		comments: ("0".to_string(), "0".to_string()),
+		gallery: Vec::new(),
+		awards: Awards(Vec::new()),
+		nsfw: false,
+		out_url: None,
+		ws_url: String::new(),
+		preview_body: String::new(),
+		collapsed_duplicates: Vec::new(),
+	}
+}
+
+fn duplicates_fragment_path(req: &Request<Body>) -> String {
+	let query = req.uri().query().unwrap_or_default();
+	if query.is_empty() {
+		format!("/duplicates-fragment{}", req.uri().path())
+	} else {
+		format!("/duplicates-fragment{}?{query}", req.uri().path())
+	}
+}
+
+fn duplicates_source_path(req: &Request<Body>) -> String {
+	req.uri().path().replacen("/duplicates-fragment", "", 1)
+}
+
 /// Make the GET request to Reddit. It assumes `req` is the appropriate Reddit
 /// REST endpoint for enumerating post duplicates.
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
-	let path: String = format!("{}.json?{}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default());
+	let community = req.param("sub").unwrap_or_default();
+	let url = req.uri().to_string();
+	Ok(template(&DuplicatesTemplate {
+		shell_mode: true,
+		fragment_url: duplicates_fragment_path(&req),
+		loading_message: "Loading duplicates...".to_string(),
+		params: DuplicatesParams {
+			before: String::new(),
+			after: String::new(),
+			sort: String::new(),
+		},
+		post: empty_post_for_shell(&community, &url),
+		duplicates: Vec::new(),
+		prefs: Preferences::new(&req),
+		url,
+		num_posts_filtered: 0,
+		all_posts_filtered: false,
+	}))
+}
+
+pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
+	let source_path = duplicates_source_path(&req);
+	let path: String = format!("{}.json?{}&raw_json=1", source_path, req.uri().query().unwrap_or_default());
 	let sub = req.param("sub").unwrap_or_default();
 	let quarantined = can_access_quarantine(&req, &sub);
 
@@ -201,7 +305,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				}
 			}
 
-			Ok(template(&DuplicatesTemplate {
+			let body = DuplicatesFragmentTemplate {
 				params: DuplicatesParams { before, after, sort },
 				post,
 				duplicates,
@@ -209,7 +313,15 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				url: req_url,
 				num_posts_filtered,
 				all_posts_filtered,
-			}))
+			}
+			.render()
+			.map_err(|error| error.to_string())?;
+			Response::builder()
+				.status(200)
+				.header("content-type", "text/html; charset=utf-8")
+				.header("cache-control", "no-store")
+				.body(Body::from(body))
+				.map_err(|error| error.to_string())
 		}
 
 		// Process error.
@@ -221,6 +333,118 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				error(req, &msg).await
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{duplicates_fragment_path, duplicates_source_path, DuplicatesParams, DuplicatesTemplate};
+	use crate::utils::{Awards, Author, Flair, Post, Preferences};
+	use askama::Template;
+	use hyper::{Body, Request};
+
+	fn test_post() -> Post {
+		Post {
+			id: String::new(),
+			kind: "t3".to_string(),
+			title: "Loading duplicates...".to_string(),
+			community: "rust".to_string(),
+			body: String::new(),
+			author: Author {
+				name: String::new(),
+				flair: Flair {
+					flair_parts: Vec::new(),
+					text: String::new(),
+					background_color: String::new(),
+					foreground_color: String::new(),
+				},
+				distinguished: String::new(),
+				external_links: Vec::new(),
+				avg_video_length: None,
+			},
+			permalink: "/r/rust/duplicates/abc/example".to_string(),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			poll: None,
+			score: ("0".to_string(), "0".to_string()),
+			upvote_ratio: 0,
+			post_type: "self".to_string(),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+			flags: crate::utils::Flags::new(false, false, false),
+			thumbnail: crate::utils::Media::empty(),
+			media: crate::utils::Media::empty(),
+			domain: String::new(),
+			rel_time: String::new(),
+			created: String::new(),
+			created_ts: 0,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
+		}
+	}
+
+	fn test_prefs() -> Preferences {
+		Preferences {
+			available_themes: vec!["system".to_string()],
+			layout: "card".to_string(),
+			fixed_navbar: "on".to_string(),
+			..Preferences::default()
+		}
+	}
+
+	#[test]
+	fn builds_duplicates_fragment_path() {
+		let req = Request::builder()
+			.uri("/r/rust/duplicates/abc/example?sort=new")
+			.body(Body::empty())
+			.unwrap();
+		assert_eq!(duplicates_fragment_path(&req), "/duplicates-fragment/r/rust/duplicates/abc/example?sort=new");
+	}
+
+	#[test]
+	fn duplicates_source_path_removes_fragment_prefix() {
+		let req = Request::builder()
+			.uri("/duplicates-fragment/r/rust/duplicates/abc/example?sort=new")
+			.body(Body::empty())
+			.unwrap();
+		assert_eq!(duplicates_source_path(&req), "/r/rust/duplicates/abc/example");
+	}
+
+	#[test]
+	fn renders_shell_mode_duplicates_placeholder_with_fragment_url() {
+		let html = DuplicatesTemplate {
+			shell_mode: true,
+			fragment_url: "/duplicates-fragment/r/rust/duplicates/abc/example".to_string(),
+			loading_message: "Loading duplicates...".to_string(),
+			params: DuplicatesParams {
+				before: String::new(),
+				after: String::new(),
+				sort: String::new(),
+			},
+			post: test_post(),
+			duplicates: Vec::new(),
+			prefs: test_prefs(),
+			url: "/r/rust/duplicates/abc/example".to_string(),
+			num_posts_filtered: 0,
+			all_posts_filtered: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-fragment-url=\"/duplicates-fragment/r/rust/duplicates/abc/example\""));
+		assert!(html.contains("Loading duplicates..."));
 	}
 }
 
