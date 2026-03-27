@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% import "utils.html" as utils %}
+
+{% block title %}
+	{% if (str_eq(url, "/") || url.starts_with("/?")) && sub.name.contains("+") %}Redlib
+	{% else if !str_eq(sub.name, "") %}{{ sub.name }}
+	{% else %}Redlib{% endif %}
+{% endblock %}
+
+{% block search %}
+	{% call utils::search(["/r/", sub.name.as_str()].concat(), "") %}
+{% endblock %}
+
+{% block subscriptions %}
+	{% call utils::sub_list(sub.name.as_str(), active_flair_filter.as_str()) %}
+{% endblock %}
+
+{% block body %}
+	<div class="feed_status_banner warming">{{ loading_message }}</div>
+	<div id="page_fragment" data-fragment-url="{{ fragment_url }}">
+		<main>
+			<div id="column_one">
+				<center>{{ loading_message }}</center>
+			</div>
+		</main>
+	</div>
+{% endblock %}

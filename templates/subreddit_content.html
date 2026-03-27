@@ -1,0 +1,304 @@
+{% import "utils.html" as utils %}
+
+<main>
+	{% if !is_filtered %}
+	<div id="column_one">
+		<form id="sort">
+			<div id="sort_options">
+				{% for option in sort_options %}
+					<a {% if option.selected %}class="selected"{% endif %} href="{{ option.url }}">{{ option.label }}</a>
+				{% endfor %}
+			</div>
+			{% if str_eq(sort.0, "top") || str_eq(sort.0, "controversial") %}<select id="timeframe" name="t" title="Timeframe">
+				{% call utils::options(sort.1, ["hour", "day", "week", "month", "year", "all"], "day") %}
+			</select>
+			{% if !active_flair_filter.is_empty() %}
+			<input type="hidden" name="flair" value="{{ active_flair_filter }}">
+			{% endif %}
+			<button id="sort_submit" class="submit">
+				<svg width="15" viewBox="0 0 110 100" fill="none" stroke-width="10" stroke-linecap="round">
+					<path d="M20 50 H100" />
+					<path d="M75 15 L100 50 L75 85" />
+					&rarr;
+				</svg>
+			</button>
+			{% endif %}
+		</form>
+
+		{% if sub.name.contains("+") %}
+			<form
+					action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+				method="POST"
+				data-subscription-form
+					data-subscription-target="multireddit:{{ sub.name }}"
+					data-subscription-state="unsubscribed"
+					data-state-on="subscribed"
+					data-state-off="unsubscribed"
+					data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					data-subscribe-label="Subscribe to Multireddit"
+					data-unsubscribe-label="Unsubscribe from Multireddit"
+					data-subscribe-class="subscribe"
+					data-unsubscribe-class="unsubscribe"
+					data-cookie-mode="list"
+					data-cookie-name="subscriptions"
+					data-cookie-values="{{ sub.name }}">
+				<button id="multisub" class="subscribe" title="Subscribe to each sub in this multireddit">Subscribe to Multireddit</button>
+			</form>
+		{% endif %}
+
+			{% if all_posts_hidden_nsfw %}
+			<center>All posts are hidden because they are NSFW. Enable "Show NSFW posts" in settings to view.</center>
+			{% endif %}
+
+		{% if no_posts %}
+		<center>No posts were found.</center>
+		{% endif %}
+
+			{% if all_posts_filtered %}
+				 <center>(All content on this page has been filtered)</center>
+			{% else %}
+			{% if !feed_status_message.is_empty() %}
+			<div class="feed_status_banner{% if feed_warming %} warming{% endif %}">
+				{{ feed_status_message }}
+			</div>
+			{% endif %}
+			<div
+				id="feed_content"
+				{% if !feed_session_id.is_empty() %}
+				data-feed-session-id="{{ feed_session_id }}"
+				data-feed-status-url="{{ feed_status_url }}"
+				data-feed-fragment-url="{{ feed_fragment_url }}"
+				data-feed-warming="{% if feed_warming %}true{% else %}false{% endif %}"
+				{% endif %}>
+				<div id="posts">
+				{% for post in posts %}
+				{% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
+				<hr class="sep" />
+				{% call utils::post_in_list(post, false, "") %}
+				{% endif %}
+				{% endfor %}
+				{% if prefs.use_hls == "on" %}
+				<script src="/hls.min.js"></script>
+				<script src="/playHLSVideo.js"></script>
+				{% endif %}
+				{% if enable_duplicate_collapse %}
+				<script src="/submitted_duplicates.js?v={{ env!("GIT_HASH") }}" defer></script>
+				{% endif %}
+				</div>
+				<footer>
+					{% if !prev_page_url.is_empty() %}
+					<a href="{{ prev_page_url }}" accesskey="P">PREV</a>
+					{% endif %}
+
+					{% if !next_page_url.is_empty() %}
+					<a href="{{ next_page_url }}" accesskey="N">NEXT</a>
+					{% endif %}
+				</footer>
+			</div>
+			{% endif %}
+		</div>
+		{% endif %}
+	{% if is_filtered || (!sub.name.is_empty() && !str_eq(sub.name, "all") && !str_eq(sub.name, "popular") && !sub.name.contains("+")) && !str_eq(prefs.hide_sidebar_and_summary, "on") %}
+	<aside>
+		{% if is_filtered %}
+			<center>(Content from r/{{ sub.name }} has been filtered)</center>
+		{% endif %}
+		{% if !sub.name.is_empty() && !str_eq(sub.name, "all") && !str_eq(sub.name, "popular") && !sub.name.contains("+") %}
+		<details class="panel" id="subreddit" open>
+			<summary id="subreddit_label">Subreddit</summary>
+			{% if sub.wiki %}
+			<div id="top">
+				<div>Posts</div>
+				<a href="/r/{{ sub.name }}/wiki/index">Wiki</a>
+			</div>
+			{% endif %}
+			<div id="sub_meta">
+				<img loading="lazy" id="sub_icon" src="{{ sub.icon }}" alt="Icon for r/{{ sub.name }}">
+				<h1 id="sub_title">{{ sub.title }}</h1>
+				<p id="sub_name">r/{{ sub.name }}</p>
+				<p id="sub_description">{{ sub.description }}</p>
+				<div id="sub_details">
+					<label>Members</label>
+					<label>Active</label>
+					<div title="{{ sub.members.1 }}">{{ sub.members.0 }}</div>
+					<div title="{{ sub.active.1 }}">{{ sub.active.0 }}</div>
+				</div>
+				{% if flair_filters.len() > 0 %}
+				<div id="sub_flairs">
+					<div class="sub_flairs_header">
+						<label>Flairs</label>
+						{% if !active_flair_filter.is_empty() %}
+						<a href="{{ clear_flair_filter_url }}">Clear</a>
+						{% endif %}
+					</div>
+					<div class="sub_flair_list">
+						{% for filter in flair_filters %}
+						<a
+							href="{{ filter.url }}"
+							class="post_flair subreddit_flair_filter{% if filter.active %} active{% endif %}"
+							style="color:{{ filter.flair.foreground_color }}; background:{{ filter.flair.background_color }};"
+							dir="ltr">{% call utils::render_flair(filter.flair.flair_parts) %}</a>
+						{% endfor %}
+					</div>
+				</div>
+				{% endif %}
+				{% if top_users.len() > 0 %}
+				<div id="sub_top_users">
+					<div class="sub_flairs_header">
+						<label>Users</label>
+					</div>
+					<ul class="user_subreddit_list">
+						{% for user in top_users %}
+						<li class="user_subreddit_item">
+							<span class="user_subreddit_link_row">
+								<a class="user_subreddit_link" href="/user/{{ user.name }}">u/{{ user.name }}</a>
+								{% call utils::pending_external_site_icons(user.name) %}
+							</span>
+							<span class="user_subreddit_meta">{{ user.count }}</span>
+						</li>
+						{% endfor %}
+					</ul>
+				</div>
+				{% endif %}
+				<div id="sub_actions">
+					<div id="sub_subscription">
+						{% if prefs.subscriptions.contains(sub.name) %}
+							<form
+								action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+								method="POST"
+								data-subscription-form
+									data-subscription-target="subreddit:{{ sub.name }}"
+									data-subscription-state="subscribed"
+									data-state-on="subscribed"
+									data-state-off="unsubscribed"
+									data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-subscribe-label="Subscribe"
+									data-unsubscribe-label="Unsubscribe"
+									data-subscribe-class="subscribe"
+									data-unsubscribe-class="unsubscribe"
+									data-cookie-mode="list"
+									data-cookie-name="subscriptions"
+									data-cookie-values="{{ sub.name }}">
+								<button class="unsubscribe">Unsubscribe</button>
+							</form>
+						{% else %}
+							<form
+								action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+								method="POST"
+								data-subscription-form
+									data-subscription-target="subreddit:{{ sub.name }}"
+									data-subscription-state="unsubscribed"
+									data-state-on="subscribed"
+									data-state-off="unsubscribed"
+									data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-subscribe-label="Subscribe"
+									data-unsubscribe-label="Unsubscribe"
+									data-subscribe-class="subscribe"
+									data-unsubscribe-class="unsubscribe"
+									data-cookie-mode="list"
+									data-cookie-name="subscriptions"
+									data-cookie-values="{{ sub.name }}">
+								<button class="subscribe">Subscribe</button>
+							</form>
+						{% endif %}
+					</div>
+
+					<div id="sub_filter">
+						{% if prefs.filters.contains(sub.name) %}
+							<form
+								action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+								method="POST"
+								data-subscription-form
+									data-subscription-target="filter:{{ sub.name }}"
+									data-subscription-state="subscribed"
+									data-state-on="subscribed"
+									data-state-off="unsubscribed"
+									data-subscribe-action="/r/{{ sub.name }}/filter?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-unsubscribe-action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-subscribe-label="Filter"
+									data-unsubscribe-label="Unfilter"
+									data-subscribe-class="unsubscribe"
+									data-unsubscribe-class="filter"
+									data-cookie-mode="list"
+									data-cookie-name="filters"
+									data-cookie-values="{{ sub.name }}">
+								<button class="filter">Unfilter</button>
+							</form>
+						{% else %}
+							<form
+								action="/r/{{ sub.name }}/filter?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+								method="POST"
+								data-subscription-form
+									data-subscription-target="filter:{{ sub.name }}"
+									data-subscription-state="unsubscribed"
+									data-state-on="subscribed"
+									data-state-off="unsubscribed"
+									data-subscribe-action="/r/{{ sub.name }}/filter?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-unsubscribe-action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+									data-subscribe-label="Filter"
+									data-unsubscribe-label="Unfilter"
+									data-subscribe-class="unsubscribe"
+									data-unsubscribe-class="filter"
+									data-cookie-mode="list"
+									data-cookie-name="filters"
+									data-cookie-values="{{ sub.name }}">
+								<button class="unsubscribe">Filter</button>
+							</form>
+						{% endif %}
+					</div>
+
+					{% if !active_flair_filter.is_empty() %}
+					<div id="sub_flair_subscription">
+						{% if is_flair_subscribed %}
+						<form
+							action="/r/{{ sub.name }}/flair/unsubscribe?redirect={{ redirect_url }}&flair={{ active_flair_filter_encoded }}&canonical={{ sub.name }}"
+							method="POST"
+							data-subscription-form
+							data-subscription-target="flair:{{ sub.name }}:{{ active_flair_filter }}"
+							data-subscription-state="subscribed"
+							data-state-on="subscribed"
+							data-state-off="unsubscribed"
+							data-subscribe-action="/r/{{ sub.name }}/flair/subscribe?redirect={{ redirect_url }}&flair={{ active_flair_filter_encoded }}&canonical={{ sub.name }}"
+							data-unsubscribe-action="/r/{{ sub.name }}/flair/unsubscribe?redirect={{ redirect_url }}&flair={{ active_flair_filter_encoded }}&canonical={{ sub.name }}"
+							data-subscribe-label="Subscribe to flair"
+							data-unsubscribe-label="Unsubscribe from flair"
+							data-subscribe-class="subscribe"
+							data-unsubscribe-class="unsubscribe"
+							data-cookie-mode="flair"
+							data-cookie-name="flair_subscriptions"
+							data-cookie-values="{{ sub.name }}::{{ active_flair_filter }}">
+							<button class="unsubscribe">Unsubscribe Flair</button>
+						</form>
+						{% else %}
+						<form
+							action="/r/{{ sub.name }}/flair/subscribe?redirect={{ redirect_url }}&flair={{ active_flair_filter_encoded }}&canonical={{ sub.name }}"
+							method="POST"
+							data-subscription-form
+							data-subscription-target="flair:{{ sub.name }}:{{ active_flair_filter }}"
+							data-subscription-state="unsubscribed"
+							data-state-on="subscribed"
+							data-state-off="unsubscribed"
+							data-subscribe-action="/r/{{ sub.name }}/flair/subscribe?redirect={{ redirect_url }}&flair={{ active_flair_filter_encoded }}&canonical={{ sub.name }}"
+							data-unsubscribe-action="/r/{{ sub.name }}/flair/unsubscribe?redirect={{ redirect_url }}&flair={{ active_flair_filter_encoded }}&canonical={{ sub.name }}"
+							data-subscribe-label="Subscribe to flair"
+							data-unsubscribe-label="Unsubscribe from flair"
+							data-subscribe-class="subscribe"
+							data-unsubscribe-class="unsubscribe"
+							data-cookie-mode="flair"
+							data-cookie-name="flair_subscriptions"
+							data-cookie-values="{{ sub.name }}::{{ active_flair_filter }}">
+							<button class="subscribe">Subscribe Flair</button>
+						</form>
+						{% endif %}
+					</div>
+					{% endif %}
+				</div>
+			</div>
+		</details>
+		{% endif %}
+	</aside>
+	{% endif %}
+</main>

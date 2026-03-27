@@ -41,6 +41,7 @@ pub struct SubredditTemplate {
 	sort_options: Vec<SortOption>,
 	flair_filters: Vec<FlairFilterOption>,
 	active_flair_filter: String,
+	active_flair_filter_encoded: String,
 	clear_flair_filter_url: String,
 	prev_page_url: String,
 	next_page_url: String,
@@ -65,6 +66,51 @@ pub struct SubredditTemplate {
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
+
+#[derive(Template)]
+#[template(path = "subreddit_shell.html")]
+pub struct SubredditShellTemplate {
+	sub: Subreddit,
+	active_flair_filter: String,
+	prefs: Preferences,
+	url: String,
+	fragment_url: String,
+	loading_message: String,
+}
+
+crate::impl_template_str_eq!(SubredditShellTemplate);
+
+#[derive(Template)]
+#[template(path = "subreddit_fragment.html")]
+struct SubredditFragmentTemplate {
+	sub: Subreddit,
+	posts: Vec<Post>,
+	top_users: Vec<SubredditUserEntry>,
+	sort: (String, String),
+	sort_options: Vec<SortOption>,
+	flair_filters: Vec<FlairFilterOption>,
+	active_flair_filter: String,
+	active_flair_filter_encoded: String,
+	clear_flair_filter_url: String,
+	prev_page_url: String,
+	next_page_url: String,
+	prefs: Preferences,
+	url: String,
+	redirect_url: String,
+	enable_duplicate_collapse: bool,
+	is_filtered: bool,
+	all_posts_filtered: bool,
+	all_posts_hidden_nsfw: bool,
+	no_posts: bool,
+	is_flair_subscribed: bool,
+	feed_session_id: String,
+	feed_status_url: String,
+	feed_fragment_url: String,
+	feed_status_message: String,
+	feed_warming: bool,
+}
+
+crate::impl_template_str_eq!(SubredditFragmentTemplate);
 
 #[derive(Template)]
 #[template(path = "feed_fragment.html")]
@@ -236,11 +282,32 @@ fn feed_fragment_url(current_url: &str, session_id: &str, page: usize) -> String
 	)
 }
 
+fn subreddit_fragment_path(req: &Request<Body>) -> String {
+	let path = req.uri().path();
+	let query = req.uri().query().unwrap_or_default();
+	let fragment_path = if path == "/" { "/subreddit-fragment".to_string() } else { format!("/subreddit-fragment{path}") };
+	if query.is_empty() {
+		fragment_path
+	} else {
+		format!("{fragment_path}?{query}")
+	}
+}
+
 fn render_feed_fragment(template_data: &FeedFragmentTemplate) -> Result<Response<Body>, String> {
 	let body = template_data.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)
 		.header("content-type", "text/html; charset=utf-8")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())
+}
+
+fn render_subreddit_fragment(template_data: &SubredditFragmentTemplate) -> Result<Response<Body>, String> {
+	let body = template_data.render().map_err(|error| error.to_string())?;
+	Response::builder()
+		.status(200)
+		.header("content-type", "text/html; charset=utf-8")
+		.header("cache-control", "no-store")
 		.body(Body::from(body))
 		.map_err(|error| error.to_string())
 }
@@ -279,6 +346,10 @@ fn build_flair_filters(current_url: &str, active_flair_filter: &str, flairs: Vec
 			flair,
 		})
 		.collect()
+}
+
+fn encode_query_value(value: &str) -> String {
+	form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 fn subreddit_listing_query(query: &str, include_geo_filter: bool) -> String {
@@ -605,6 +676,60 @@ async fn fetch_aggregated_subscription_feed(
 
 // SERVICES
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
+	let prefs = Preferences::new(&req);
+	let subscribed = prefs.subscriptions.join("+");
+	let has_saved_feeds = !saved_feeds(&prefs).is_empty();
+	let front_page = setting(&req, "front_page");
+	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
+	let front_page_is_default = front_page == "default" || front_page.is_empty();
+
+	let sub_name = req.param("sub").unwrap_or(if front_page_is_default {
+		if has_saved_feeds {
+			subscribed.clone()
+		} else {
+			"popular".to_string()
+		}
+	} else {
+		front_page.clone()
+	});
+
+	if (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
+		if !has_saved_feeds {
+			return info(req, "Subscribe to some subreddits! (Default feeds disabled in settings)").await;
+		} else {
+			return info(
+				req,
+				"You have subscribed to some subreddits, but your front page is not set to default. Visit settings and change front page to default.",
+			)
+			.await;
+		}
+	}
+
+	if let Ok(random) = catch_random(&sub_name, "").await {
+		return Ok(random);
+	}
+
+	if req.param("sub").is_some() && sub_name.starts_with("u_") {
+		return Ok(redirect(&["/user/", &sub_name[2..]].concat()));
+	}
+
+	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
+
+	Ok(template(&SubredditShellTemplate {
+		sub: Subreddit {
+			name: sub_name,
+			..Subreddit::default()
+		},
+		active_flair_filter,
+		prefs,
+		url,
+		fragment_url: subreddit_fragment_path(&req),
+		loading_message: "Loading posts...".to_string(),
+	}))
+}
+
+pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
 	let query = req.uri().query().unwrap_or_default().to_string();
 	let prefs = Preferences::new(&req);
@@ -612,7 +737,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let has_saved_feeds = !saved_feeds(&prefs).is_empty();
 	let front_page = setting(&req, "front_page");
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
-	let is_subreddit_route = req.uri().path().starts_with("/r/");
+	let is_subreddit_route = req.uri().path().starts_with("/subreddit-fragment/r/");
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
@@ -668,14 +793,19 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		}
 	};
 
-	let req_url = req.uri().to_string();
+	let fragment_request_url = req.uri().to_string();
+	let req_url = fragment_request_url.replacen("/subreddit-fragment", "", 1);
 	// Return landing page if this post if this is NSFW community but the user
 	// has disabled the display of NSFW content or if the instance is SFW-only.
 	if sub.nsfw && crate::utils::should_be_nsfw_gated(&req, &req_url) {
 		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 	}
 
-	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let url = {
+		let fragment_url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+		let original_url = fragment_url.replacen("/subreddit-fragment", "", 1);
+		if original_url.is_empty() { "/".to_string() } else { original_url }
+	};
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
 	let request_after = param(&format!("?{}", req.uri().query().unwrap_or_default()), "after").unwrap_or_default();
@@ -720,14 +850,15 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 		if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
-			Ok(template(&SubredditTemplate {
+			render_subreddit_fragment(&SubredditFragmentTemplate {
 				sub,
 			posts: Vec::new(),
 			top_users,
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			sort_options,
 			flair_filters,
-			active_flair_filter,
+			active_flair_filter: active_flair_filter.clone(),
+			active_flair_filter_encoded: encode_query_value(&active_flair_filter),
 			clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
@@ -745,7 +876,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				feed_fragment_url: String::new(),
 				feed_status_message: String::new(),
 				feed_warming: false,
-			}))
+			})
 		} else if aggregate_saved_feeds {
 			if sort == "new" {
 				let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
@@ -807,7 +938,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						String::new()
 					};
 
-					return Ok(template(&SubredditTemplate {
+					return render_subreddit_fragment(&SubredditFragmentTemplate {
 						sub,
 						posts: page.posts,
 						top_users,
@@ -815,6 +946,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						sort_options,
 						flair_filters,
 						active_flair_filter: active_flair_filter.clone(),
+						active_flair_filter_encoded: encode_query_value(&active_flair_filter),
 						clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)]),
 						prev_page_url,
 						next_page_url,
@@ -832,7 +964,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
 						feed_status_message: status.status_message,
 						feed_warming: status.warming,
-					}));
+					});
 				}
 			}
 
@@ -866,7 +998,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					warn!("Aggregate front page rendered without posts after partial failures");
 				}
 
-				Ok(template(&SubredditTemplate {
+				render_subreddit_fragment(&SubredditFragmentTemplate {
 					sub,
 					posts: feed.posts,
 					top_users,
@@ -874,6 +1006,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					sort_options,
 					flair_filters,
 					active_flair_filter: active_flair_filter.clone(),
+					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
 					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 					prev_page_url: feed.prev_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
 					next_page_url: feed.next_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
@@ -891,7 +1024,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						feed_fragment_url: String::new(),
 						feed_status_message: String::new(),
 						feed_warming: false,
-					}))
+					})
 				}
 			Err(msg) => error(req, &msg).await,
 		}
@@ -928,7 +1061,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					String::new()
 				};
 
-				return Ok(template(&SubredditTemplate {
+				return render_subreddit_fragment(&SubredditFragmentTemplate {
 					sub,
 					posts,
 					top_users,
@@ -936,6 +1069,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					sort_options,
 					flair_filters,
 					active_flair_filter: active_flair_filter.clone(),
+					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
 					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)]),
 					prev_page_url,
 					next_page_url,
@@ -953,7 +1087,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						feed_fragment_url: String::new(),
 						feed_status_message: String::new(),
 						feed_warming: false,
-					}));
+					});
 			}
 			// Fall through to normal fetch if not cached.
 		}
@@ -975,7 +1109,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				utils::hydrate_post_author_links_from_cache(&mut posts);
 				let timeframe = param(&path, "t").unwrap_or_default();
 				let before = param(&path, "before").unwrap_or_default();
-				Ok(template(&SubredditTemplate {
+				render_subreddit_fragment(&SubredditFragmentTemplate {
 					sub,
 					posts,
 					top_users: if is_single_sub {
@@ -994,6 +1128,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						Vec::new()
 					},
 					active_flair_filter: active_flair_filter.clone(),
+					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
 					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 					prev_page_url: if !before.is_empty() {
 						update_url_query(
@@ -1035,7 +1170,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						feed_fragment_url: String::new(),
 						feed_status_message: String::new(),
 						feed_warming: false,
-					}))
+					})
 				}
 			Err(msg) => match msg.as_str() {
 				"quarantined" | "gated" => Ok(quarantine(&req, sub_name, &msg)),
@@ -1143,6 +1278,7 @@ mod tests {
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
 			clear_flair_filter_url: "/r/rust+programming".to_string(),
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
@@ -1184,6 +1320,7 @@ mod tests {
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
 			clear_flair_filter_url: "/r/rust".to_string(),
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
@@ -1211,6 +1348,26 @@ mod tests {
 	}
 
 	#[test]
+	fn renders_shell_mode_subreddit_placeholder_with_fragment_url() {
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit {
+				name: "rust".to_string(),
+				..Default::default()
+			},
+			active_flair_filter: String::new(),
+			prefs: test_prefs(),
+			url: "/r/rust".to_string(),
+			fragment_url: "/subreddit-fragment/r/rust".to_string(),
+			loading_message: "Loading posts...".to_string(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-fragment-url=\"/subreddit-fragment/r/rust\""));
+		assert!(html.contains("Loading posts..."));
+	}
+
+	#[test]
 	fn does_not_render_sidebar_panel_when_subreddit_sidebar_is_empty() {
 		let html = SubredditTemplate {
 			sub: Subreddit {
@@ -1225,6 +1382,7 @@ mod tests {
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
 			clear_flair_filter_url: "/r/rust".to_string(),
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
