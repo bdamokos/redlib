@@ -1,274 +1,37 @@
-{% extends "base.html" %} {% import "utils.html" as utils %} {% block search %}
-{% call utils::search("".to_owned(), "") %} {% endblock %} {% block title %}{{
-user.name.replace("u/", "") }} (u/{{ user.name }}) - Redlib{% endblock %} {%
-block subscriptions %} {% call utils::sub_list("", "") %} {% endblock %} {% block
-body %}
+{% extends "base.html" %}
+{% import "utils.html" as utils %}
+
+{% block search %}
+{% call utils::search("".to_owned(), "") %}
+{% endblock %}
+
+{% block title %}
+{{ username.replace("u/", "") }} (u/{{ username }}) - Redlib
+{% endblock %}
+
+{% block subscriptions %}
+{% call utils::sub_list("", "") %}
+{% endblock %}
+
+{% block body %}
 <main>
-    {% if !is_filtered %}
-    <div id="column_one">
-        <form id="sort">
-            <div id="listing_options">
-                {% call utils::sort(["/user/", user.name.as_str()].concat(),
-                ["overview", "comments", "submitted"], listing) %}
-            </div>
-            <select id="sort_select" name="sort">
-                {% call utils::options(sort.0, ["hot", "new", "top",
-                "controversial"], "") %}</select
-            >{% if str_eq(sort.0, "top") || str_eq(sort.0, "controversial") %}<select
-                id="timeframe"
-                name="t"
-            >
-                {% call utils::options(sort.1, ["hour", "day", "week", "month",
-                "year", "all"], "all") %}</select
-            >{% endif %}<button id="sort_submit" class="submit">
-                <svg
-                    width="15"
-                    viewBox="0 0 110 100"
-                    fill="none"
-                    stroke-width="10"
-                    stroke-linecap="round"
-                >
-                    <path d="M20 50 H100" />
-                    <path d="M75 15 L100 50 L75 85" />
-                    &rarr;
-                </svg>
-            </button>
-        </form>
-
-        {% if all_posts_hidden_nsfw %}
-        <center>
-            All posts are hidden because they are NSFW. Enable "Show NSFW posts"
-            in settings to view.
-        </center>
-        {% endif %} {% if no_posts %}
-        <center>No posts were found.</center>
-        {% endif %} {% if all_posts_filtered %}
-        <center>(All content on this page has been filtered)</center>
-        {% else %}
-        <div id="posts">
-            {% for post in posts %} {% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
-            <hr class="sep" />
-            {% call utils::post_in_list(post, true, redirect_url.as_str()) %} {% endif %} {% endfor %} {% if prefs.use_hls == "on" %}
-            <script src="/hls.min.js"></script>
-            <script src="/playHLSVideo.js"></script>
-            {% endif %} {% if str_eq(listing, "submitted") || str_eq(listing, "overview") %}
-            <script src="/submitted_duplicates.js?v={{ env!("GIT_HASH") }}" defer></script>
-            {% endif %}
+    {% if shell_mode %}
+    <div class="feed_status_banner warming">{{ loading_message }}</div>
+    <div id="page_fragment" data-fragment-url="{{ fragment_url }}">
+        <div id="column_one">
+            <center>Loading posts and profile details...</center>
         </div>
-        {% endif %}
-
-        <footer>
-            {% if !str_eq(ends.0, "") %}
-            <a
-                href="?sort={{ sort.0 }}&t={{ sort.1 }}&before={{ ends.0 }}"
-                accesskey="P"
-                >PREV</a
-            >
-            {% endif %} {% if !str_eq(ends.1, "") %}
-            <a
-                href="?sort={{ sort.0 }}&t={{ sort.1 }}&after={{ ends.1 }}"
-                accesskey="N"
-                >NEXT</a
-            >
-            {% endif %}
-        </footer>
+        <aside>
+            <details class="panel" id="user" open>
+                <summary id="user_label">User</summary>
+                <div id="user_meta">
+                    <h1 id="user_name">u/{{ username }}</h1>
+                </div>
+            </details>
+        </aside>
     </div>
+    {% else %}
+    {% include "user_fragment.html" %}
     {% endif %}
-    <aside>
-        {% if is_filtered %}
-        <center>(Content from u/{{ user.name }} has been filtered)</center>
-        {% endif %}
-        <details class="panel" id="user" open>
-            <summary id="user_label">User</summary>
-            <div id="user_meta">
-                <img
-                    loading="lazy"
-                    id="user_icon"
-                    src="{{ user.icon }}"
-                    alt="Icon for u/{{ user.name }}"
-                />
-                <h1 id="user_name">u/{{ user.name }}</h1>
-                <div id="user_details">
-                    <div class="user_detail_metric">
-                        <label>Post Karma</label>
-                        <div title="{{ user.post_karma.1 }}">{{ user.post_karma.0 }}</div>
-                    </div>
-                    <div class="user_detail_metric">
-                        <label>Comment Karma</label>
-                        <div title="{{ user.comment_karma.1 }}">{{ user.comment_karma.0 }}</div>
-                    </div>
-                    {% if let Some(avg_video_length) = avg_video_length %}
-                    <div class="user_detail_metric user_detail_metric_full">
-                        <label>Avg video length</label>
-                        <div title="{{ avg_video_length.1 }}">{{ avg_video_length.0 }}</div>
-                        <span class="user_detail_meta">{{ avg_video_length.1 }}</span>
-                    </div>
-                    {% endif %}
-                </div>
-                {% if !user.description.is_empty() || !user.bio_html.is_empty() || user.external_links.len() > 0 %}
-                <div id="user_profile">
-                    {% if !user.description.is_empty() %}
-                    <p id="user_blurb">{{ user.description }}</p>
-                    {% endif %}
-                    {% if !user.bio_html.is_empty() %}
-                    <div id="user_bio">{{ user.bio_html|safe }}</div>
-                    {% endif %}
-                    {% if user.external_links.len() > 0 %}
-                    <div id="user_external_links">
-                        <span class="user_section_label">Links</span>
-                        <div class="user_external_link_list">
-                            {% for link in user.external_links.clone() %}
-                            <a class="user_external_link" href="{{ link.url }}" rel="nofollow noopener noreferrer" title="{{ link.label }}">
-                                <img loading="lazy" src="{{ link.icon_path }}" alt="{{ link.label }}" width="16" height="16" />
-                                <span>{{ link.label }}</span>
-                            </a>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% endif %}
-                </div>
-                {% endif %}
-                {% if user_subreddits.len() > 0 %}
-                <div id="user_subreddits">
-                    <span class="user_section_label">Subreddits</span>
-                    <ul class="user_subreddit_list">
-                        {% for subreddit in user_subreddits %}
-                        <li class="user_subreddit_item">
-                            <a class="user_subreddit_link" href="/r/{{ subreddit.name }}">r/{{ subreddit.name }}</a>
-                            <span class="user_subreddit_meta">{{ subreddit.count }}</span>
-                            {% if !prefs.subscriptions.contains(subreddit.name) %}
-                            <form
-                                class="inline_subscription_form"
-                                action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ subreddit.name }}"
-                                method="POST"
-                                data-subscription-form
-	                                data-subscription-target="subreddit:{{ subreddit.name }}"
-	                                data-subscription-state="unsubscribed"
-	                                data-state-on="subscribed"
-	                                data-state-off="unsubscribed"
-	                                data-subscribe-action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ subreddit.name }}"
-	                                data-unsubscribe-action="/r/{{ subreddit.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ subreddit.name }}"
-	                                data-subscribe-label="Follow"
-	                                data-unsubscribe-label="Unfollow"
-	                                data-subscribe-class="subscribe"
-	                                data-unsubscribe-class="unsubscribe"
-	                                data-cookie-mode="list"
-	                                data-cookie-name="subscriptions"
-	                                data-cookie-values="{{ subreddit.name }}"
-	                            >
-                                <button class="subscribe" type="submit">Follow</button>
-                            </form>
-                            {% endif %}
-                        </li>
-                        {% endfor %}
-                    </ul>
-                </div>
-                {% endif %}
-                <div id="user_actions">
-                    {% let name = ["u_", user.name.as_str()].join("") %}
-                    <div id="user_subscription">
-                        {% if prefs.subscriptions.contains(name) %}
-                        <form
-                            action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ name }}"
-                            method="POST"
-                            data-subscription-form
-	                            data-subscription-target="user:{{ name }}"
-	                            data-subscription-state="subscribed"
-	                            data-state-on="subscribed"
-	                            data-state-off="unsubscribed"
-	                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-subscribe-label="Follow"
-	                            data-unsubscribe-label="Unfollow"
-	                            data-subscribe-class="subscribe"
-	                            data-unsubscribe-class="unsubscribe"
-	                            data-cookie-mode="list"
-	                            data-cookie-name="subscriptions"
-	                            data-cookie-values="{{ name }}"
-	                        >
-                            <button class="unsubscribe">Unfollow</button>
-                        </form>
-                        {% else %}
-                        <form
-                            action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}&canonical={{ name }}"
-                            method="POST"
-                            data-subscription-form
-	                            data-subscription-target="user:{{ name }}"
-	                            data-subscription-state="unsubscribed"
-	                            data-state-on="subscribed"
-	                            data-state-off="unsubscribed"
-	                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-subscribe-label="Follow"
-	                            data-unsubscribe-label="Unfollow"
-	                            data-subscribe-class="subscribe"
-	                            data-unsubscribe-class="unsubscribe"
-	                            data-cookie-mode="list"
-	                            data-cookie-name="subscriptions"
-	                            data-cookie-values="{{ name }}"
-	                        >
-                            <button class="subscribe">Follow</button>
-                        </form>
-                        {% endif %}
-                    </div>
-                    <div id="user_filter">
-                        {% if prefs.filters.contains(name) %}
-	                        <form
-                            action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            method="POST"
-	                            data-subscription-form
-	                            data-subscription-target="filter:{{ name }}"
-	                            data-subscription-state="filtered"
-	                            data-state-on="filtered"
-	                            data-state-off="unfiltered"
-	                            data-subscribe-action="/r/{{ name }}/filter?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-subscribe-label="Filter"
-	                            data-unsubscribe-label="Unfilter"
-	                            data-subscribe-class="filter"
-	                            data-unsubscribe-class="unfilter"
-	                            data-cookie-mode="list"
-	                            data-cookie-name="filters"
-	                            data-cookie-values="{{ name }}"
-	                        >
-                            <button class="unfilter">Unfilter</button>
-                        </form>
-                        {% else %}
-	                        <form
-                            action="/r/{{ name }}/filter?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            method="POST"
-	                            data-subscription-form
-	                            data-subscription-target="filter:{{ name }}"
-	                            data-subscription-state="unfiltered"
-	                            data-state-on="filtered"
-	                            data-state-off="unfiltered"
-	                            data-subscribe-action="/r/{{ name }}/filter?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}&canonical={{ name }}"
-	                            data-subscribe-label="Filter"
-	                            data-unsubscribe-label="Unfilter"
-	                            data-subscribe-class="filter"
-	                            data-unsubscribe-class="unfilter"
-	                            data-cookie-mode="list"
-	                            data-cookie-name="filters"
-	                            data-cookie-values="{{ name }}"
-	                        >
-                            <button class="filter">Filter</button>
-                        </form>
-                        {% endif %}
-                    </div>
-                    {% if crate::utils::enable_rss() %}
-                    <div id="user_rss">
-                        <a
-                            href="/u/{{ user.name }}.rss"
-                            title="RSS feed for u/{{ user.name }}"
-                        >
-                            <button class="subscribe">RSS feed</button>
-                        </a>
-                    </div>
-                    {% endif %}
-                </div>
-            </div>
-        </details>
-    </aside>
 </main>
 {% endblock %}

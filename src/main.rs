@@ -289,6 +289,9 @@ async fn main() {
 		.at("/feed_status.js")
 		.get(|_| resource(include_str!("../static/feed_status.js"), "text/javascript", false).boxed());
 	app
+		.at("/page_fragment.js")
+		.get(|_| resource(include_str!("../static/page_fragment.js"), "text/javascript", false).boxed());
+	app
 		.at("/video_visibility.js")
 		.get(|_| resource(include_str!("../static/video_visibility.js"), "text/javascript", false).boxed());
 	app
@@ -335,6 +338,8 @@ async fn main() {
 	app.at("/user/[deleted]").get(|req| error(req, "User has deleted their account").boxed());
 	app.at("/author_links").get(|r| user::author_links(r).boxed());
 	app.at("/user/:name.rss").get(|r| user::rss(r).boxed());
+	app.at("/user-fragment/:name").get(|r| user::profile_fragment(r).boxed());
+	app.at("/user-fragment/:name/:listing").get(|r| user::profile_fragment(r).boxed());
 	app.at("/user/:name").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/:listing").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/comments/:id").get(|r| post::item(r).boxed());
