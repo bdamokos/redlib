@@ -1,0 +1,45 @@
+{% import "utils.html" as utils %}
+
+{% if !feed_status_message.is_empty() %}
+<div class="feed_status_banner{% if feed_warming %} warming{% endif %}">
+    {{ feed_status_message }}
+</div>
+{% endif %}
+
+{% if all_posts_hidden_nsfw %}
+<center>All posts are hidden because they are NSFW. Enable "Show NSFW posts" in settings to view.</center>
+{% endif %}
+
+{% if no_posts %}
+<center>No posts were found.</center>
+{% endif %}
+
+{% if all_posts_filtered %}
+<center>(All content on this page has been filtered)</center>
+{% else %}
+<div id="posts">
+{% for post in posts %}
+{% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
+<hr class="sep" />
+{% call utils::post_in_list(post, false, "") %}
+{% endif %}
+{% endfor %}
+{% if prefs.use_hls == "on" %}
+<script src="/hls.min.js"></script>
+<script src="/playHLSVideo.js"></script>
+{% endif %}
+{% if enable_duplicate_collapse %}
+<script src="/submitted_duplicates.js?v={{ env!("GIT_HASH") }}" defer></script>
+{% endif %}
+</div>
+{% endif %}
+
+<footer>
+    {% if !prev_page_url.is_empty() %}
+    <a href="{{ prev_page_url }}" accesskey="P">PREV</a>
+    {% endif %}
+
+    {% if !next_page_url.is_empty() %}
+    <a href="{{ next_page_url }}" accesskey="N">NEXT</a>
+    {% endif %}
+</footer>

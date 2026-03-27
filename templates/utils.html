@@ -253,14 +253,19 @@
 			action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}"
 			method="POST"
 			data-subscription-form
-			data-subscription-target="subreddit:{{ post.community }}"
-			data-subscription-state="unsubscribed"
-			data-subscribe-action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}"
-			data-unsubscribe-action="/r/{{ post.community }}/unsubscribe?redirect={{ redirect_url }}"
-			data-subscribe-label="Follow"
-			data-unsubscribe-label="Unfollow"
-			data-subscribe-class="subscribe"
-			data-unsubscribe-class="unsubscribe">
+				data-subscription-target="subreddit:{{ post.community }}"
+				data-subscription-state="unsubscribed"
+				data-state-on="subscribed"
+				data-state-off="unsubscribed"
+				data-subscribe-action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}"
+				data-unsubscribe-action="/r/{{ post.community }}/unsubscribe?redirect={{ redirect_url }}"
+				data-subscribe-label="Follow"
+				data-unsubscribe-label="Unfollow"
+				data-subscribe-class="subscribe"
+				data-unsubscribe-class="unsubscribe"
+				data-cookie-mode="list"
+				data-cookie-name="subscriptions"
+				data-cookie-values="{{ post.community }}">
 			<button class="subscribe" type="submit">Follow</button>
 		</form>
 		{% endif %}
@@ -412,14 +417,19 @@
 						action="/r/{{ duplicate.community }}/subscribe?redirect={{ redirect_url }}"
 						method="POST"
 						data-subscription-form
-						data-subscription-target="subreddit:{{ duplicate.community }}"
-						data-subscription-state="unsubscribed"
-						data-subscribe-action="/r/{{ duplicate.community }}/subscribe?redirect={{ redirect_url }}"
-						data-unsubscribe-action="/r/{{ duplicate.community }}/unsubscribe?redirect={{ redirect_url }}"
-						data-subscribe-label="Follow"
-						data-unsubscribe-label="Unfollow"
-						data-subscribe-class="subscribe"
-						data-unsubscribe-class="unsubscribe">
+							data-subscription-target="subreddit:{{ duplicate.community }}"
+							data-subscription-state="unsubscribed"
+							data-state-on="subscribed"
+							data-state-off="unsubscribed"
+							data-subscribe-action="/r/{{ duplicate.community }}/subscribe?redirect={{ redirect_url }}"
+							data-unsubscribe-action="/r/{{ duplicate.community }}/unsubscribe?redirect={{ redirect_url }}"
+							data-subscribe-label="Follow"
+							data-unsubscribe-label="Unfollow"
+							data-subscribe-class="subscribe"
+							data-unsubscribe-class="unsubscribe"
+							data-cookie-mode="list"
+							data-cookie-name="subscriptions"
+							data-cookie-values="{{ duplicate.community }}">
 						<button class="subscribe" type="submit">Follow</button>
 					</form>
 					{% endif %}

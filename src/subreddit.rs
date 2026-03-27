@@ -2,6 +2,7 @@
 
 use crate::{config, utils};
 // CRATES
+use crate::post_cache::{FeedSessionRequest, FeedSource};
 use crate::utils::{
 	catch_random, clear_sharded_cookie, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect,
 	rewrite_urls, setting, template, val, write_sharded_cookie, FlairSubscription, Post, Preferences, Subreddit,
@@ -22,6 +23,7 @@ use std::sync::LazyLock;
 use url::form_urlencoded;
 
 const FRONT_CURSOR_PARAM: &str = "front_cursor";
+const FEED_SESSION_PARAM: &str = "feed_session";
 const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
@@ -55,9 +57,32 @@ pub struct SubredditTemplate {
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
 	is_flair_subscribed: bool,
+	feed_session_id: String,
+	feed_status_url: String,
+	feed_fragment_url: String,
+	feed_status_message: String,
+	feed_warming: bool,
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
+
+#[derive(Template)]
+#[template(path = "feed_fragment.html")]
+struct FeedFragmentTemplate {
+	posts: Vec<Post>,
+	prev_page_url: String,
+	next_page_url: String,
+	prefs: Preferences,
+	url: String,
+	enable_duplicate_collapse: bool,
+	all_posts_filtered: bool,
+	all_posts_hidden_nsfw: bool,
+	no_posts: bool,
+	feed_status_message: String,
+	feed_warming: bool,
+}
+
+crate::impl_template_str_eq!(FeedFragmentTemplate);
 
 #[derive(PartialEq)]
 struct SubredditUserEntry {
@@ -185,6 +210,37 @@ fn filter_posts_by_flair(posts: &mut Vec<Post>, flair: &str) {
 	posts.retain(|post| post.flair.text.trim() == flair);
 }
 
+fn feed_status_url(current_url: &str, session_id: &str, page: usize) -> String {
+	update_url_query(
+		"/feed-status",
+		&[
+			(FEED_SESSION_PARAM, Some(session_id)),
+			("cache_page", Some(&page.to_string())),
+			("current_url", Some(current_url)),
+		],
+	)
+}
+
+fn feed_fragment_url(current_url: &str, session_id: &str, page: usize) -> String {
+	update_url_query(
+		"/feed-fragment",
+		&[
+			(FEED_SESSION_PARAM, Some(session_id)),
+			("cache_page", Some(&page.to_string())),
+			("current_url", Some(current_url)),
+		],
+	)
+}
+
+fn render_feed_fragment(template_data: &FeedFragmentTemplate) -> Result<Response<Body>, String> {
+	let body = template_data.render().map_err(|error| error.to_string())?;
+	Response::builder()
+		.status(200)
+		.header("content-type", "text/html; charset=utf-8")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())
+}
+
 fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
 	["hot", "new", "top", "rising", "controversial"]
 		.into_iter()
@@ -288,6 +344,23 @@ fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
 	}));
 
 	feeds
+}
+
+fn build_feed_sources(preferences: &Preferences) -> Vec<FeedSource> {
+	let mut sources = preferences
+		.subscriptions
+		.iter()
+		.cloned()
+		.map(|name| FeedSource::Subreddit { name })
+		.collect::<Vec<_>>();
+
+	sources.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| FeedSource::Flair {
+		subreddit: subscription.subreddit,
+		flair: subscription.flair,
+	}));
+
+	crate::post_cache::sort_sources(&mut sources);
+	sources
 }
 
 fn build_aggregate_sources(preferences: &Preferences, sort: &str, reddit_query: &str) -> Vec<AggregateFeedSource> {
@@ -642,9 +715,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			.any(|subscription| subscription.subreddit == sub.name && subscription.flair == active_flair_filter);
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-	if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
-		Ok(template(&SubredditTemplate {
-			sub,
+		if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
+			Ok(template(&SubredditTemplate {
+				sub,
 			posts: Vec::new(),
 			top_users,
 			sort: (sort, param(&path, "t").unwrap_or_default()),
@@ -660,48 +733,79 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 			is_filtered: true,
 			all_posts_filtered: false,
-			all_posts_hidden_nsfw: false,
-			no_posts: false,
-			is_flair_subscribed,
-		}))
-	} else if aggregate_saved_feeds {
-		// EXPERIMENT: For "new" sort, use per-subreddit cache with round-robin merge.
-		// This ensures every subreddit gets equal representation.
-		if sort == "new" {
-			// Always trigger background fetch for subs not yet cached.
-			crate::post_cache::trigger_background_fetch(prefs.subscriptions.clone(), quarantined);
+				all_posts_hidden_nsfw: false,
+				no_posts: false,
+				is_flair_subscribed,
+				feed_session_id: String::new(),
+				feed_status_url: String::new(),
+				feed_fragment_url: String::new(),
+				feed_status_message: String::new(),
+				feed_warming: false,
+			}))
+		} else if aggregate_saved_feeds {
+			if sort == "new" {
+				let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+					.and_then(|p| p.parse::<usize>().ok())
+					.unwrap_or(0);
 
-			let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
-				.and_then(|p| p.parse::<usize>().ok())
-				.unwrap_or(0);
+				let query_fingerprint = listing_query_fingerprint(&query);
+				let feed_session_id = crate::post_cache::ensure_feed_session(
+					FeedSessionRequest {
+						sources: build_feed_sources(&prefs),
+						filters: filters.clone(),
+						quarantine: quarantined,
+						query_fingerprint,
+					},
+					cache_page,
+					crate::post_cache::POSTS_PER_PAGE,
+				)
+				.await;
 
-			if let Some((mut posts, has_next)) =
-				crate::post_cache::build_round_robin_feed(&prefs.subscriptions, cache_page, crate::post_cache::POSTS_PER_PAGE, &filters)
-			{
-				if !posts.is_empty() {
+				if let (Some(mut page), Some(status)) = (
+					crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE),
+					crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE),
+				) {
 					let (cached_subs, cached_posts) = crate::post_cache::cache_stats();
 					info!(
-						"post_cache: serving page {} from cache ({} subs cached, {} total posts)",
-						cache_page, cached_subs, cached_posts
+						"post_cache: serving page {} from session {} ({} sources cached, {} total posts)",
+						cache_page, feed_session_id, cached_subs, cached_posts
 					);
-					let no_posts = posts.is_empty();
-					let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-					utils::hydrate_post_author_links_from_cache(&mut posts);
+					let no_posts = page.posts.is_empty();
+					let all_posts_hidden_nsfw = !no_posts && (page.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+					utils::hydrate_post_author_links_from_cache(&mut page.posts);
 
 					let prev_page_url = if cache_page > 0 {
-						update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)])
+						update_url_query(
+							&url,
+							&[
+								("cache_page", Some(&(cache_page - 1).to_string())),
+								(FEED_SESSION_PARAM, Some(&feed_session_id)),
+								("before", None),
+								("after", None),
+								(FRONT_CURSOR_PARAM, None),
+							],
+						)
 					} else {
 						String::new()
 					};
-					let next_page_url = if has_next {
-						update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)])
+					let next_page_url = if page.has_next {
+						update_url_query(
+							&url,
+							&[
+								("cache_page", Some(&(cache_page + 1).to_string())),
+								(FEED_SESSION_PARAM, Some(&feed_session_id)),
+								("before", None),
+								("after", None),
+								(FRONT_CURSOR_PARAM, None),
+							],
+						)
 					} else {
 						String::new()
 					};
 
 					return Ok(template(&SubredditTemplate {
 						sub,
-						posts,
+						posts: page.posts,
 						top_users,
 						sort: (sort.clone(), timeframe.clone()),
 						sort_options,
@@ -711,7 +815,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						prev_page_url,
 						next_page_url,
 						prefs: Preferences::new(&req),
-						url,
+						url: url.clone(),
 						redirect_url,
 						enable_duplicate_collapse: true,
 						is_filtered: false,
@@ -719,13 +823,16 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 						all_posts_hidden_nsfw,
 						no_posts,
 						is_flair_subscribed,
+						feed_session_id: feed_session_id.clone(),
+						feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
+						feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
+						feed_status_message: status.status_message,
+						feed_warming: status.warming,
 					}));
 				}
 			}
-			// Fall through to legacy aggregate fetch if cache is empty.
-		}
 
-		let query_fingerprint = listing_query_fingerprint(&query);
+			let query_fingerprint = listing_query_fingerprint(&query);
 		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
 			.and_then(|encoded| decode_front_cursor(&encoded))
 			.filter(|cursor| cursor_matches_request(cursor, &aggregate_sources, &sort, &timeframe, &query_fingerprint));
@@ -771,12 +878,17 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					redirect_url,
 					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
-					all_posts_filtered: feed.all_posts_filtered,
-					all_posts_hidden_nsfw,
-					no_posts,
-					is_flair_subscribed,
-				}))
-			}
+						all_posts_filtered: feed.all_posts_filtered,
+						all_posts_hidden_nsfw,
+						no_posts,
+						is_flair_subscribed,
+						feed_session_id: String::new(),
+						feed_status_url: String::new(),
+						feed_fragment_url: String::new(),
+						feed_status_message: String::new(),
+						feed_warming: false,
+					}))
+				}
 			Err(msg) => error(req, &msg).await,
 		}
 	} else {
@@ -828,11 +940,16 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					redirect_url,
 					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
-					all_posts_filtered,
-					all_posts_hidden_nsfw,
-					no_posts,
-					is_flair_subscribed,
-				}));
+						all_posts_filtered,
+						all_posts_hidden_nsfw,
+						no_posts,
+						is_flair_subscribed,
+						feed_session_id: String::new(),
+						feed_status_url: String::new(),
+						feed_fragment_url: String::new(),
+						feed_status_message: String::new(),
+						feed_warming: false,
+					}));
 			}
 			// Fall through to normal fetch if not cached.
 		}
@@ -905,12 +1022,17 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					redirect_url,
 					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
-					all_posts_filtered,
-					all_posts_hidden_nsfw,
-					no_posts,
-					is_flair_subscribed,
-				}))
-			}
+						all_posts_filtered,
+						all_posts_hidden_nsfw,
+						no_posts,
+						is_flair_subscribed,
+						feed_session_id: String::new(),
+						feed_status_url: String::new(),
+						feed_fragment_url: String::new(),
+						feed_status_message: String::new(),
+						feed_warming: false,
+					}))
+				}
 			Err(msg) => match msg.as_str() {
 				"quarantined" | "gated" => Ok(quarantine(&req, sub_name, &msg)),
 				"private" => error(req, &format!("r/{sub_name} is a private community")).await,
@@ -1026,10 +1148,15 @@ mod tests {
 			enable_duplicate_collapse: true,
 			is_filtered: false,
 			all_posts_filtered: false,
-			all_posts_hidden_nsfw: false,
-			no_posts: false,
-			is_flair_subscribed: false,
-		}
+				all_posts_hidden_nsfw: false,
+				no_posts: false,
+				is_flair_subscribed: false,
+				feed_session_id: String::new(),
+				feed_status_url: String::new(),
+				feed_fragment_url: String::new(),
+				feed_status_message: String::new(),
+				feed_warming: false,
+			}
 		.render()
 		.unwrap();
 
@@ -1062,10 +1189,15 @@ mod tests {
 			enable_duplicate_collapse: false,
 			is_filtered: false,
 			all_posts_filtered: false,
-			all_posts_hidden_nsfw: false,
-			no_posts: false,
-			is_flair_subscribed: false,
-		}
+				all_posts_hidden_nsfw: false,
+				no_posts: false,
+				is_flair_subscribed: false,
+				feed_session_id: String::new(),
+				feed_status_url: String::new(),
+				feed_fragment_url: String::new(),
+				feed_status_message: String::new(),
+				feed_warming: false,
+			}
 		.render()
 		.unwrap();
 
@@ -1098,10 +1230,15 @@ mod tests {
 			enable_duplicate_collapse: false,
 			is_filtered: false,
 			all_posts_filtered: false,
-			all_posts_hidden_nsfw: false,
-			no_posts: false,
-			is_flair_subscribed: false,
-		}
+				all_posts_hidden_nsfw: false,
+				no_posts: false,
+				is_flair_subscribed: false,
+				feed_session_id: String::new(),
+				feed_status_url: String::new(),
+				feed_fragment_url: String::new(),
+				feed_status_message: String::new(),
+				feed_warming: false,
+			}
 		.render()
 		.unwrap();
 
@@ -1437,6 +1574,85 @@ async fn resolve_subreddit_display_name(part: &str, display_lookup: &[(String, &
 		Ok(display) => display["data"]["display_name"].as_str().unwrap_or(part).to_string(),
 		Err(_) => part.to_string(),
 	}
+}
+
+pub async fn feed_status_api(req: Request<Body>) -> Result<Response<Body>, String> {
+	let session_id = param(&format!("?{}", req.uri().query().unwrap_or_default()), FEED_SESSION_PARAM).unwrap_or_default();
+	let page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+		.and_then(|value| value.parse::<usize>().ok())
+		.unwrap_or(0);
+
+	let Some(status) = crate::post_cache::feed_status(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
+		return error(req, "Feed session not found or expired").await;
+	};
+
+	let body = serde_json::to_vec(&status).map_err(|error| error.to_string())?;
+	Response::builder()
+		.status(200)
+		.header("content-type", "application/json")
+		.header("cache-control", "no-store")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())
+}
+
+pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
+	let session_id = param(&format!("?{}", req.uri().query().unwrap_or_default()), FEED_SESSION_PARAM).unwrap_or_default();
+	let page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+		.and_then(|value| value.parse::<usize>().ok())
+		.unwrap_or(0);
+	let Some(mut feed_page) = crate::post_cache::feed_page(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
+		return error(req, "Feed session not found or expired").await;
+	};
+	let Some(status) = crate::post_cache::feed_status(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
+		return error(req, "Feed session not found or expired").await;
+	};
+	utils::hydrate_post_author_links_from_cache(&mut feed_page.posts);
+
+	let current_url = param(&format!("?{}", req.uri().query().unwrap_or_default()), "current_url").unwrap_or_else(|| "/".to_string());
+	let prev_page_url = if page > 0 {
+		update_url_query(
+			&current_url,
+			&[
+				("cache_page", Some(&(page - 1).to_string())),
+				(FEED_SESSION_PARAM, Some(&session_id)),
+				("before", None),
+				("after", None),
+				(FRONT_CURSOR_PARAM, None),
+			],
+		)
+	} else {
+		String::new()
+	};
+	let next_page_url = if feed_page.has_next {
+		update_url_query(
+			&current_url,
+			&[
+				("cache_page", Some(&(page + 1).to_string())),
+				(FEED_SESSION_PARAM, Some(&session_id)),
+				("before", None),
+				("after", None),
+				(FRONT_CURSOR_PARAM, None),
+			],
+		)
+	} else {
+		String::new()
+	};
+	let no_posts = feed_page.posts.is_empty();
+	let all_posts_hidden_nsfw = !no_posts && (feed_page.posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+
+	render_feed_fragment(&FeedFragmentTemplate {
+		posts: feed_page.posts,
+		prev_page_url,
+		next_page_url,
+		prefs: Preferences::new(&req),
+		url: current_url,
+		enable_duplicate_collapse: true,
+		all_posts_filtered: false,
+		all_posts_hidden_nsfw,
+		no_posts,
+		feed_status_message: status.status_message,
+		feed_warming: status.warming,
+	})
 }
 
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header

@@ -120,7 +120,7 @@ pub async fn fetch_video_path(video_id: &str) -> Result<String, String> {
 	fetch_media_paths(video_id.to_string()).await.map(|paths| paths.video_path)
 }
 
-#[cached(size = 512, time = 3600, result = true)]
+#[cached(size = 512, time = 10800, result = true)]
 async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String> {
 	match fetch_media_paths_from_api(&video_id).await {
 		Ok(paths) => Ok(paths),
@@ -258,7 +258,7 @@ async fn get_token() -> Result<String, String> {
 
 	let mut cache = REDGIFS_TOKEN.lock().map_err(|_| "Lock error".to_string())?;
 	cache.0 = token.clone();
-	cache.1 = now + 86_000;
+	cache.1 = now + 258_000;
 	Ok(token)
 }
 

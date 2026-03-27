@@ -286,6 +286,9 @@ async fn main() {
 		.at("/subscription.js")
 		.get(|_| resource(include_str!("../static/subscription.js"), "text/javascript", false).boxed());
 	app
+		.at("/feed_status.js")
+		.get(|_| resource(include_str!("../static/feed_status.js"), "text/javascript", false).boxed());
+	app
 		.at("/video_visibility.js")
 		.get(|_| resource(include_str!("../static/video_visibility.js"), "text/javascript", false).boxed());
 	app
@@ -363,6 +366,8 @@ async fn main() {
 	app.at("/r/:sub/flair/unsubscribe").post(|r| subreddit::flair_subscriptions(r).boxed());
 	app.at("/r/:sub/filter").post(|r| subreddit::subscriptions_filters(r).boxed());
 	app.at("/r/:sub/unfilter").post(|r| subreddit::subscriptions_filters(r).boxed());
+	app.at("/feed-status").get(|r| subreddit::feed_status_api(r).boxed());
+	app.at("/feed-fragment").get(|r| subreddit::feed_fragment(r).boxed());
 
 	app.at("/r/:sub/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/r/:sub/comments/:id/:title").get(|r| post::item(r).boxed());

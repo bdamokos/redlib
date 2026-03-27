@@ -949,7 +949,7 @@ pub struct User {
 }
 
 const AUTHOR_LINKS_CACHE_SIZE: usize = 512;
-const AUTHOR_LINKS_CACHE_TTL: StdDuration = StdDuration::from_secs(3600);
+const AUTHOR_LINKS_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
 const SUBREDDIT_FLAIR_CACHE_SIZE: usize = 1000;
 const USER_SUBREDDIT_CACHE_SIZE: usize = 1000;
 const SUBREDDIT_USER_CACHE_SIZE: usize = 1000;
@@ -982,7 +982,7 @@ pub async fn user_profile_details_with_social_links(name: &str, subreddit: &Valu
 	profile
 }
 
-#[cached(size = 512, time = 3600, result = true)]
+#[cached(size = 512, time = 10800, result = true)]
 pub async fn fetch_user_profile_details(name: String) -> Result<UserProfileDetails, String> {
 	let path = format!("/user/{name}/about.json?raw_json=1");
 	let response = json(path, false).await?;
@@ -1125,10 +1125,18 @@ pub fn store_user_subreddits(username: &str, posts: &[Post]) {
 	for post in posts {
 		let subreddit = post.community.trim();
 		if subreddit.is_empty() || subreddit.starts_with("u_") {
-			continue;
+		} else {
+			*entry.subreddits.entry(subreddit.to_string()).or_insert(0) += 1;
 		}
 
-		*entry.subreddits.entry(subreddit.to_string()).or_insert(0) += 1;
+		for duplicate in &post.collapsed_duplicates {
+			let duplicate_subreddit = duplicate.community.trim();
+			if duplicate_subreddit.is_empty() || duplicate_subreddit.starts_with("u_") {
+				continue;
+			}
+
+			*entry.subreddits.entry(duplicate_subreddit.to_string()).or_insert(0) += 1;
+		}
 	}
 
 	while cache.len() > USER_SUBREDDIT_CACHE_SIZE {
@@ -2322,7 +2330,7 @@ fn normalize_external_page_host(url: &str) -> Option<String> {
 	Some(host)
 }
 
-#[cached(size = 1024, time = 3600, result = true)]
+#[cached(size = 1024, time = 10800, result = true)]
 async fn fetch_external_page_html(url: String, redirects_left: usize) -> Result<String, String> {
 	let mut current_url = url;
 	let mut redirects_remaining = redirects_left;
@@ -2465,7 +2473,7 @@ fn is_numeric_identifier(value: &str) -> bool {
 	!value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
-#[cached(size = 2048, time = 3600)]
+#[cached(size = 2048, time = 10800)]
 async fn resolve_fansly_account_id(username: String) -> Option<String> {
 	let username = username.trim();
 	if username.is_empty() {
@@ -2496,7 +2504,7 @@ async fn resolve_fansly_account_id(username: String) -> Option<String> {
 		.map(|id| id.to_string())
 }
 
-#[cached(size = 2048, time = 3600)]
+#[cached(size = 2048, time = 10800)]
 async fn coomer_lookup_exists(url: String) -> bool {
 	let Some(api_url) = coomer_profile_api_url(&url) else {
 		return false;

@@ -22,7 +22,7 @@ const TARGET_POST_COUNT: usize = 25;
 const MAX_DUPLICATE_FILL_REQUESTS: usize = 4;
 const USER_SORT_OPTIONS: [&str; 4] = ["hot", "new", "top", "controversial"];
 const USER_VIDEO_STATS_CACHE_SIZE: usize = 1000;
-const USER_VIDEO_STATS_CACHE_TTL: StdDuration = StdDuration::from_secs(3600);
+const USER_VIDEO_STATS_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
 
 #[derive(Clone)]
 struct CachedUserVideoStats {
@@ -376,7 +376,6 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 		let (mut posts, next_after) = Post::fetch(&request_path, false).await?;
 		fetched_raw_posts |= !posts.is_empty();
 		utils::store_post_flairs(&posts);
-		utils::store_user_subreddits(username, &posts);
 
 		filter_posts(&mut posts, filters);
 		all_posts.extend(posts);
@@ -394,6 +393,10 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 		requests += 1;
 	};
 
+	if should_refill_duplicates {
+		all_posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+	}
+	utils::store_user_subreddits(username, &all_posts);
 	utils::hydrate_post_author_links_from_cache(&mut all_posts);
 	update_user_video_stats(username, &all_posts);
 	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
@@ -801,6 +804,32 @@ mod tests {
 		assert!(html.contains("<span class=\"user_subreddit_meta\">2</span>"));
 		assert!(html.contains("<a class=\"user_subreddit_link\" href=\"/r/other_sub\">r/other_sub</a>"));
 		assert!(html.contains("<span class=\"user_subreddit_meta\">1</span>"));
+	}
+
+	#[test]
+	fn user_subreddit_tallies_include_collapsed_duplicate_communities() {
+		let username = "demo_user_tallies";
+		let mut primary = test_post("one", "Primary", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
+		primary.collapsed_duplicates = vec![CollapsedDuplicate {
+			title: "Duplicate".to_string(),
+			permalink: "/r/other_sub/comments/two/".to_string(),
+			community: "other_sub".to_string(),
+			display_community: "r/other_sub".to_string(),
+			rel_time: "1h ago".to_string(),
+			comments: ("1".to_string(), "1".to_string()),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+		}];
+
+		crate::utils::store_user_subreddits(username, &[primary]);
+		let tallies = crate::utils::cached_user_subreddits(username);
+
+		assert!(tallies.contains(&("demo_sub".to_string(), 1)));
+		assert!(tallies.contains(&("other_sub".to_string(), 1)));
 	}
 
 	#[test]

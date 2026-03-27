@@ -47,57 +47,75 @@
 					action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
 					method="POST"
 					data-subscription-form
-					data-subscription-target="multireddit:{{ sub.name }}"
-					data-subscription-state="unsubscribed"
-					data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
-					data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
-					data-subscribe-label="Subscribe to Multireddit"
-					data-unsubscribe-label="Unsubscribe from Multireddit"
-					data-subscribe-class="subscribe"
-					data-unsubscribe-class="unsubscribe">
+						data-subscription-target="multireddit:{{ sub.name }}"
+						data-subscription-state="unsubscribed"
+						data-state-on="subscribed"
+						data-state-off="unsubscribed"
+						data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+						data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
+						data-subscribe-label="Subscribe to Multireddit"
+						data-unsubscribe-label="Unsubscribe from Multireddit"
+						data-subscribe-class="subscribe"
+						data-unsubscribe-class="unsubscribe"
+						data-cookie-mode="list"
+						data-cookie-name="subscriptions"
+						data-cookie-values="{{ sub.name }}">
 					<button id="multisub" class="subscribe" title="Subscribe to each sub in this multireddit">Subscribe to Multireddit</button>
 				</form>
 			{% endif %}
 
-			{% if all_posts_hidden_nsfw %}
-			<center>All posts are hidden because they are NSFW. Enable "Show NSFW posts" in settings to view.</center>
-			{% endif %}
+				{% if all_posts_hidden_nsfw %}
+				<center>All posts are hidden because they are NSFW. Enable "Show NSFW posts" in settings to view.</center>
+				{% endif %}
 
 			{% if no_posts %}
 			<center>No posts were found.</center>
 			{% endif %}
 
-			{% if all_posts_filtered %}
-				 <center>(All content on this page has been filtered)</center>
-			{% else %}
-			<div id="posts">
-			{% for post in posts %}
-			{% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
-			<hr class="sep" />
-			{% call utils::post_in_list(post, false, "") %}
-			{% endif %}
-			{% endfor %}
-			{% if prefs.use_hls == "on" %}
-			<script src="/hls.min.js"></script>
-			<script src="/playHLSVideo.js"></script>
-			{% endif %}
-			{% if enable_duplicate_collapse %}
-			<script src="/submitted_duplicates.js?v={{ env!("GIT_HASH") }}" defer></script>
-			{% endif %}
+				{% if all_posts_filtered %}
+					 <center>(All content on this page has been filtered)</center>
+				{% else %}
+				{% if !feed_status_message.is_empty() %}
+				<div class="feed_status_banner{% if feed_warming %} warming{% endif %}">
+					{{ feed_status_message }}
+				</div>
+				{% endif %}
+				<div
+					id="feed_content"
+					{% if !feed_session_id.is_empty() %}
+					data-feed-session-id="{{ feed_session_id }}"
+					data-feed-status-url="{{ feed_status_url }}"
+					data-feed-fragment-url="{{ feed_fragment_url }}"
+					data-feed-warming="{% if feed_warming %}true{% else %}false{% endif %}"
+					{% endif %}>
+					<div id="posts">
+					{% for post in posts %}
+					{% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
+					<hr class="sep" />
+					{% call utils::post_in_list(post, false, "") %}
+					{% endif %}
+					{% endfor %}
+					{% if prefs.use_hls == "on" %}
+					<script src="/hls.min.js"></script>
+					<script src="/playHLSVideo.js"></script>
+					{% endif %}
+					{% if enable_duplicate_collapse %}
+					<script src="/submitted_duplicates.js?v={{ env!("GIT_HASH") }}" defer></script>
+					{% endif %}
+					</div>
+					<footer>
+						{% if !prev_page_url.is_empty() %}
+						<a href="{{ prev_page_url }}" accesskey="P">PREV</a>
+						{% endif %}
+
+						{% if !next_page_url.is_empty() %}
+						<a href="{{ next_page_url }}" accesskey="N">NEXT</a>
+						{% endif %}
+					</footer>
+				</div>
+				{% endif %}
 			</div>
 			{% endif %}
-
-			<footer>
-				{% if !prev_page_url.is_empty() %}
-				<a href="{{ prev_page_url }}" accesskey="P">PREV</a>
-				{% endif %}
-
-				{% if !next_page_url.is_empty() %}
-				<a href="{{ next_page_url }}" accesskey="N">NEXT</a>
-				{% endif %}
-			</footer>
-		</div>
-		{% endif %}
 		{% if is_filtered || (!sub.name.is_empty() && !str_eq(sub.name, "all") && !str_eq(sub.name, "popular") && !sub.name.contains("+")) && !str_eq(prefs.hide_sidebar_and_summary, "on") %}
 		<aside>
 			{% if is_filtered %}
@@ -167,14 +185,19 @@
 									action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
 									method="POST"
 									data-subscription-form
-									data-subscription-target="subreddit:{{ sub.name }}"
-									data-subscription-state="subscribed"
-									data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
-									data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
-									data-subscribe-label="Subscribe"
-									data-unsubscribe-label="Unsubscribe"
-									data-subscribe-class="subscribe"
-									data-unsubscribe-class="unsubscribe">
+										data-subscription-target="subreddit:{{ sub.name }}"
+										data-subscription-state="subscribed"
+										data-state-on="subscribed"
+										data-state-off="unsubscribed"
+										data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+										data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
+										data-subscribe-label="Subscribe"
+										data-unsubscribe-label="Unsubscribe"
+										data-subscribe-class="subscribe"
+										data-unsubscribe-class="unsubscribe"
+										data-cookie-mode="list"
+										data-cookie-name="subscriptions"
+										data-cookie-values="{{ sub.name }}">
 									<button class="unsubscribe">Unsubscribe</button>
 								</form>
 							{% else %}
@@ -182,14 +205,19 @@
 									action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
 									method="POST"
 									data-subscription-form
-									data-subscription-target="subreddit:{{ sub.name }}"
-									data-subscription-state="unsubscribed"
-									data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
-									data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
-									data-subscribe-label="Subscribe"
-									data-unsubscribe-label="Unsubscribe"
-									data-subscribe-class="subscribe"
-									data-unsubscribe-class="unsubscribe">
+										data-subscription-target="subreddit:{{ sub.name }}"
+										data-subscription-state="unsubscribed"
+										data-state-on="subscribed"
+										data-state-off="unsubscribed"
+										data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}"
+										data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}"
+										data-subscribe-label="Subscribe"
+										data-unsubscribe-label="Unsubscribe"
+										data-subscribe-class="subscribe"
+										data-unsubscribe-class="unsubscribe"
+										data-cookie-mode="list"
+										data-cookie-name="subscriptions"
+										data-cookie-values="{{ sub.name }}">
 									<button class="subscribe">Subscribe</button>
 								</form>
 							{% endif %}
@@ -201,14 +229,19 @@
 								action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
 								method="POST"
 								data-subscription-form
-								data-subscription-target="{{ crate::utils::flair_subscription_target(sub.name.as_str(), active_flair_filter.as_str()) }}"
-								data-subscription-state="subscribed"
-								data-subscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
-								data-unsubscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
-								data-subscribe-label="Subscribe to Flair"
-								data-unsubscribe-label="Unsubscribe from Flair"
-								data-subscribe-class="subscribe"
-								data-unsubscribe-class="unsubscribe">
+									data-subscription-target="{{ crate::utils::flair_subscription_target(sub.name.as_str(), active_flair_filter.as_str()) }}"
+									data-subscription-state="subscribed"
+									data-state-on="subscribed"
+									data-state-off="unsubscribed"
+									data-subscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+									data-unsubscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+									data-subscribe-label="Subscribe to Flair"
+									data-unsubscribe-label="Unsubscribe from Flair"
+									data-subscribe-class="subscribe"
+									data-unsubscribe-class="unsubscribe"
+									data-cookie-mode="flair"
+									data-cookie-subreddit="{{ sub.name }}"
+									data-cookie-flair="{{ active_flair_filter }}">
 								<button class="unsubscribe">Unsubscribe from Flair</button>
 							</form>
 							{% else %}
@@ -216,14 +249,19 @@
 								action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
 								method="POST"
 								data-subscription-form
-								data-subscription-target="{{ crate::utils::flair_subscription_target(sub.name.as_str(), active_flair_filter.as_str()) }}"
-								data-subscription-state="unsubscribed"
-								data-subscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
-								data-unsubscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
-								data-subscribe-label="Subscribe to Flair"
-								data-unsubscribe-label="Unsubscribe from Flair"
-								data-subscribe-class="subscribe"
-								data-unsubscribe-class="unsubscribe">
+									data-subscription-target="{{ crate::utils::flair_subscription_target(sub.name.as_str(), active_flair_filter.as_str()) }}"
+									data-subscription-state="unsubscribed"
+									data-state-on="subscribed"
+									data-state-off="unsubscribed"
+									data-subscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "subscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+									data-unsubscribe-action="{{ crate::utils::flair_subscription_action_url(sub.name.as_str(), "unsubscribe", active_flair_filter.as_str(), Some(redirect_url.as_str())) }}"
+									data-subscribe-label="Subscribe to Flair"
+									data-unsubscribe-label="Unsubscribe from Flair"
+									data-subscribe-class="subscribe"
+									data-unsubscribe-class="unsubscribe"
+									data-cookie-mode="flair"
+									data-cookie-subreddit="{{ sub.name }}"
+									data-cookie-flair="{{ active_flair_filter }}">
 								<button class="subscribe">Subscribe to Flair</button>
 							</form>
 							{% endif %}
@@ -231,13 +269,45 @@
 						{% endif %}
 						<div id="sub_filter">
 							{% if prefs.filters.contains(sub.name) %}
-								<form action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}" method="POST">
-									<button class="unfilter">Unfilter</button>
+									<form
+										action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}"
+										method="POST"
+										data-subscription-form
+										data-subscription-target="filter:{{ sub.name }}"
+										data-subscription-state="filtered"
+										data-state-on="filtered"
+										data-state-off="unfiltered"
+										data-subscribe-action="/r/{{ sub.name }}/filter?redirect={{ redirect_url }}"
+										data-unsubscribe-action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}"
+										data-subscribe-label="Filter"
+										data-unsubscribe-label="Unfilter"
+										data-subscribe-class="filter"
+										data-unsubscribe-class="unfilter"
+										data-cookie-mode="list"
+										data-cookie-name="filters"
+										data-cookie-values="{{ sub.name }}">
+										<button class="unfilter">Unfilter</button>
+									</form>
+								{% else %}
+								<form
+									action="/r/{{ sub.name }}/filter?redirect={{ redirect_url }}"
+									method="POST"
+									data-subscription-form
+									data-subscription-target="filter:{{ sub.name }}"
+									data-subscription-state="unfiltered"
+									data-state-on="filtered"
+									data-state-off="unfiltered"
+									data-subscribe-action="/r/{{ sub.name }}/filter?redirect={{ redirect_url }}"
+									data-unsubscribe-action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}"
+									data-subscribe-label="Filter"
+									data-unsubscribe-label="Unfilter"
+									data-subscribe-class="filter"
+									data-unsubscribe-class="unfilter"
+									data-cookie-mode="list"
+									data-cookie-name="filters"
+									data-cookie-values="{{ sub.name }}">
+									<button class="filter">Filter</button>
 								</form>
-							{% else %}
-							<form action="/r/{{ sub.name }}/filter?redirect={{ redirect_url }}" method="POST">
-								<button class="filter">Filter</button>
-							</form>
 							{% endif %}
 						</div>
 						{% if crate::utils::enable_rss() %}
