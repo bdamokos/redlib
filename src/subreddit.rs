@@ -82,7 +82,11 @@ struct FeedFragmentTemplate {
 	feed_warming: bool,
 }
 
-crate::impl_template_str_eq!(FeedFragmentTemplate);
+impl FeedFragmentTemplate {
+	pub fn str_eq(&self, x: &str, y: &str) -> bool {
+		x == y
+	}
+}
 
 #[derive(PartialEq)]
 struct SubredditUserEntry {
