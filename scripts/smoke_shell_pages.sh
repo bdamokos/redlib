@@ -3,138 +3,159 @@ set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:18081}"
 
-extract_next_href() {
-    python3 -c 'import html,re,sys; body=sys.stdin.read(); m=re.search(r"href=\"([^\"]+)\" accesskey=\"N\"", body, re.S); print(html.unescape("".join(m.group(1).split())) if m else "")'
-}
+BASE_URL="$BASE_URL" python3 - <<'PY'
+import html
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
 
-extract_fragment_url() {
-    python3 -c 'import html,re,sys; body=sys.stdin.read(); m=re.search(r"data-fragment-url=\"([^\"]+)\"", body); print(html.unescape(m.group(1)) if m else "")'
-}
 
-require_match() {
-    local body="$1"
-    local pattern="$2"
-    local label="$3"
+BASE_URL = os.environ["BASE_URL"].rstrip("/")
 
-    if ! printf '%s' "$body" | rg -q "$pattern"; then
-        printf 'smoke failed: %s\npattern: %s\n' "$label" "$pattern" >&2
-        exit 1
-    fi
-}
 
-fetch() {
-    curl -fsSL --max-time 45 "$1"
-}
+def fail(message: str) -> None:
+    print(f"smoke failed: {message}", file=sys.stderr)
+    raise SystemExit(1)
 
-printf 'Checking shell routes against %s\n' "$BASE_URL"
 
-front_shell="$(fetch "$BASE_URL/")"
-require_match "$front_shell" 'data-fragment-url="/subreddit-fragment"' 'front page shell fragment url'
-require_match "$front_shell" 'Loading posts\.\.\.' 'front page shell loading message'
+def fetch(path: str, *, cookie: str = "", timeout: int = 45) -> str:
+    request = urllib.request.Request(
+        f"{BASE_URL}{path}",
+        headers={"Cookie": cookie} if cookie else {},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace")
+    except urllib.error.URLError as error:
+        fail(f"{path} -> {error}")
 
-sub_shell="$(fetch "$BASE_URL/r/rust")"
-require_match "$sub_shell" 'data-fragment-url="/subreddit-fragment/r/rust"' 'subreddit shell fragment url'
 
-user_shell="$(fetch "$BASE_URL/user/spez")"
-require_match "$user_shell" 'data-fragment-url="/user-fragment/spez"' 'user shell fragment url'
+def require(pattern: str, body: str, label: str) -> None:
+    if not re.search(pattern, body, re.S):
+        fail(f"{label} (pattern: {pattern})")
 
-sub_fragment="$(fetch "$BASE_URL/subreddit-fragment/r/rust")"
-require_match "$sub_fragment" 'id="column_one"' 'subreddit fragment main column'
-require_match "$sub_fragment" 'href="/r/rust/' 'subreddit fragment real links'
 
-first_post_path="$(
-    printf '%s' "$sub_fragment" \
-        | rg -o 'href="/r/rust/comments/[^"]+"' \
-        | head -n 1 \
-        | sed -E 's/^href="([^"]+)"$/\1/'
-)"
+def extract(pattern: str, body: str, label: str) -> str:
+    match = re.search(pattern, body, re.S)
+    if not match:
+        fail(label)
+    return html.unescape(match.group(1))
 
-if [[ -z "$first_post_path" ]]; then
-    printf 'smoke failed: could not extract post link from subreddit fragment\n' >&2
-    exit 1
-fi
 
-post_shell="$(fetch "$BASE_URL$first_post_path")"
-require_match "$post_shell" 'data-fragment-url="/post-fragment/r/rust/comments/' 'post shell fragment url'
+def extract_next(body: str, label: str) -> str:
+    return extract(r'href="([^"]+)" accesskey="N"', body, label)
 
-post_fragment_path="$(
-    printf '%s' "$post_shell" \
-        | rg -o 'data-fragment-url="[^"]+"' \
-        | head -n 1 \
-        | sed -E 's/^data-fragment-url="([^"]+)"$/\1/'
-)"
 
-if [[ -z "$post_fragment_path" ]]; then
-    printf 'smoke failed: could not extract post fragment path from post shell\n' >&2
-    exit 1
-fi
+def heavy_subscription_cookie() -> str:
+    subscriptions = ["rust"] + [f"subreddit{i}" for i in range(1200)]
+    parts = ["front_page=default", "post_sort=new"]
+    current = []
+    current_length = 0
+    chunks = []
 
-post_fragment="$(fetch "$BASE_URL$post_fragment_path")"
-require_match "$post_fragment" 'class="post_page"' 'post fragment content'
+    for subreddit in subscriptions:
+        addition = len(subreddit) + (1 if current else 0)
+        if current and current_length + addition > 3800:
+            chunks.append("+".join(current))
+            current = [subreddit]
+            current_length = len(subreddit)
+        else:
+            current.append(subreddit)
+            current_length += addition
 
-user_fragment="$(fetch "$BASE_URL/user-fragment/spez")"
-require_match "$user_fragment" 'id="column_one"' 'user fragment main column'
-require_match "$user_fragment" 'id="user_actions"' 'user fragment sidebar actions'
+    if current:
+        chunks.append("+".join(current))
 
-front_fragment="$(fetch "$BASE_URL/subreddit-fragment")"
-front_next="$(printf '%s' "$front_fragment" | extract_next_href)"
-if [[ -z "$front_next" ]]; then
-    printf 'smoke failed: could not extract front next page\n' >&2
-    exit 1
-fi
-fetch "$BASE_URL$front_next" >/dev/null
+    for index, chunk in enumerate(chunks):
+        name = "subscriptions" if index == 0 else f"subscriptions{index}"
+        parts.append(f"{name}={chunk}")
 
-sub_next="$(printf '%s' "$sub_fragment" | extract_next_href)"
-if [[ -z "$sub_next" ]]; then
-    printf 'smoke failed: could not extract subreddit next page\n' >&2
-    exit 1
-fi
-fetch "$BASE_URL$sub_next" >/dev/null
+    return "; ".join(parts)
 
-user_next="$(printf '%s' "$user_fragment" | extract_next_href)"
-if [[ -z "$user_next" ]]; then
-    printf 'smoke failed: could not extract user next page\n' >&2
-    exit 1
-fi
-fetch "$BASE_URL/user-fragment/spez$user_next" >/dev/null
 
-search_shell="$(fetch "$BASE_URL/search?q=rust")"
-require_match "$search_shell" 'data-fragment-url="/search-fragment\?q=rust"' 'search shell fragment url'
+print(f"Checking shell routes against {BASE_URL}")
 
-search_fragment="$(fetch "$BASE_URL/search-fragment?q=rust")"
-require_match "$search_fragment" 'id="column_one"' 'search fragment main column'
-search_next="$(printf '%s' "$search_fragment" | extract_next_href)"
-if [[ -z "$search_next" ]]; then
-    printf 'smoke failed: could not extract search next page\n' >&2
-    exit 1
-fi
-fetch "$BASE_URL/search-fragment$search_next" >/dev/null
+front_shell = fetch("/")
+require(r'data-fragment-url="/subreddit-fragment"', front_shell, "front shell fragment url")
 
-duplicates_shell="$(fetch "$BASE_URL/r/rust/duplicates/1s3uoo0/this_week_in_rust_644")"
-duplicates_fragment_path="$(printf '%s' "$duplicates_shell" | extract_fragment_url)"
-if [[ -z "$duplicates_fragment_path" ]]; then
-    printf 'smoke failed: could not extract duplicates fragment path\n' >&2
-    exit 1
-fi
-duplicates_fragment="$(fetch "$BASE_URL$duplicates_fragment_path")"
-require_match "$duplicates_fragment" 'id="column_one"' 'duplicates fragment main column'
+sub_shell = fetch("/r/rust")
+require(r'data-fragment-url="/subreddit-fragment/r/rust"', sub_shell, "subreddit shell fragment url")
 
-wiki_shell="$(fetch "$BASE_URL/r/rust/wiki/install")"
-wiki_fragment_path="$(printf '%s' "$wiki_shell" | extract_fragment_url)"
-if [[ -z "$wiki_fragment_path" ]]; then
-    printf 'smoke failed: could not extract wiki fragment path\n' >&2
-    exit 1
-fi
-wiki_fragment="$(fetch "$BASE_URL$wiki_fragment_path")"
-require_match "$wiki_fragment" 'id="column_one"' 'wiki fragment main column'
+user_shell = fetch("/user/spez")
+require(r'data-fragment-url="/user-fragment/spez"', user_shell, "user shell fragment url")
 
-sidebar_shell="$(fetch "$BASE_URL/r/rust/about/sidebar")"
-sidebar_fragment_path="$(printf '%s' "$sidebar_shell" | extract_fragment_url)"
-if [[ -z "$sidebar_fragment_path" ]]; then
-    printf 'smoke failed: could not extract sidebar fragment path\n' >&2
-    exit 1
-fi
-sidebar_fragment="$(fetch "$BASE_URL$sidebar_fragment_path")"
-require_match "$sidebar_fragment" 'id="column_one"' 'sidebar fragment main column'
+sub_fragment = fetch("/subreddit-fragment/r/rust")
+require(r'id="column_one"', sub_fragment, "subreddit fragment main column")
+first_post_path = extract(r'href="(/r/rust/comments/[^"]+)"', sub_fragment, "subreddit fragment post link")
 
-printf 'Shell smoke checks passed.\n'
+post_shell = fetch(first_post_path)
+require(r'data-fragment-url="/post-fragment/r/rust/comments/', post_shell, "post shell fragment url")
+post_fragment_path = extract(r'data-fragment-url="([^"]+)"', post_shell, "post fragment path")
+post_fragment = fetch(post_fragment_path)
+require(r'class="post_page"', post_fragment, "post fragment content")
+
+user_fragment = fetch("/user-fragment/spez")
+require(r'id="posts"', user_fragment, "user fragment posts")
+require(r'data-subscription-form', user_fragment, "user fragment inline follow forms")
+
+front_fragment = fetch("/subreddit-fragment")
+front_next = extract_next(front_fragment, "front next page")
+fetch(front_next)
+
+sub_next = extract_next(sub_fragment, "subreddit next page")
+fetch(sub_next)
+
+user_next = extract_next(user_fragment, "user next page")
+fetch(f"/user-fragment/spez{user_next}")
+
+search_shell = fetch("/search?q=rust")
+require(r'data-fragment-url="/search-fragment\?q=rust"', search_shell, "search shell fragment url")
+search_fragment = fetch("/search-fragment?q=rust")
+search_next = extract_next(search_fragment, "search next page")
+fetch(f"/search-fragment{search_next}")
+
+duplicates_shell = fetch("/r/rust/duplicates/1s3uoo0/this_week_in_rust_644")
+duplicates_fragment_path = extract(r'data-fragment-url="([^"]+)"', duplicates_shell, "duplicates fragment path")
+duplicates_fragment = fetch(duplicates_fragment_path)
+require(r'id="column_one"', duplicates_fragment, "duplicates fragment content")
+
+wiki_shell = fetch("/r/rust/wiki/install")
+wiki_fragment_path = extract(r'data-fragment-url="([^"]+)"', wiki_shell, "wiki fragment path")
+wiki_fragment = fetch(wiki_fragment_path)
+require(r'id="column_one"', wiki_fragment, "wiki fragment content")
+
+sidebar_shell = fetch("/r/rust/about/sidebar")
+sidebar_fragment_path = extract(r'data-fragment-url="([^"]+)"', sidebar_shell, "sidebar fragment path")
+sidebar_fragment = fetch(sidebar_fragment_path)
+require(r'id="column_one"', sidebar_fragment, "sidebar fragment content")
+
+heavy_cookie = heavy_subscription_cookie()
+heavy_front_shell = fetch("/new", cookie=heavy_cookie, timeout=20)
+require(
+    r'Loading posts from the first 32 feeds\. More feeds will warm in the background\.',
+    heavy_front_shell,
+    "heavy front shell warmup banner",
+)
+
+heavy_front_fragment = fetch("/subreddit-fragment/new", cookie=heavy_cookie, timeout=20)
+require(r'data-feed-session-id="', heavy_front_fragment, "heavy front fragment session id")
+require(r'id="feed_content"', heavy_front_fragment, "heavy front fragment feed content")
+
+status_path = extract(r'data-feed-status-url="([^"]+)"', heavy_front_fragment, "heavy feed status url")
+status_body = fetch(status_path, cookie=heavy_cookie, timeout=20)
+require(r'"warming":(true|false)', status_body, "heavy front status warming field")
+require(r'"ready_sources":[0-9]+', status_body, "heavy front status ready source count")
+
+reloaded_fragment = fetch("/subreddit-fragment/new", cookie=heavy_cookie, timeout=20)
+require(r'data-feed-session-id="', reloaded_fragment, "heavy front reload session id")
+require(r'id="feed_content"', reloaded_fragment, "heavy front reload feed content")
+
+heavy_sub_fragment = fetch("/subreddit-fragment/r/rust", cookie=heavy_cookie, timeout=20)
+require(r'data-subscription-state="subscribed"', heavy_sub_fragment, "heavy subscribed subreddit state")
+require(r'>Unsubscribe<', heavy_sub_fragment, "heavy subscribed subreddit label")
+
+print("Shell smoke checks passed.")
+PY
