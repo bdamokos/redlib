@@ -73,7 +73,7 @@ struct UserSubredditEntry {
 	count: u32,
 }
 
-fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
+pub(crate) fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
 	let mut collapsed: Vec<Post> = Vec::new();
 	let mut seen = HashMap::new();
 
@@ -99,7 +99,7 @@ fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
 	collapsed
 }
 
-fn duplicate_submission_key(post: &Post) -> Option<String> {
+pub(crate) fn duplicate_submission_key(post: &Post) -> Option<String> {
 	match post.post_type.as_str() {
 		"gallery" if !post.gallery.is_empty() => Some(format!(
 			"gallery:{}",
@@ -283,7 +283,7 @@ pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
 	))
 }
 
-fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {
+pub(crate) fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {
 	crate::utils::CollapsedDuplicate {
 		title: post.title,
 		permalink: post.permalink,
@@ -295,7 +295,7 @@ fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {
 	}
 }
 
-fn display_community(community: &str) -> String {
+pub(crate) fn display_community(community: &str) -> String {
 	if community.starts_with("u_") {
 		format!("u/{}", &community[2..])
 	} else {

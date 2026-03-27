@@ -194,7 +194,7 @@ struct CachedSubredditUsers {
 	cached_at: Instant,
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct Poll {
 	pub poll_options: Vec<PollOption>,
 	pub voting_end_timestamp: (String, String),
@@ -222,7 +222,7 @@ impl Poll {
 	}
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct PollOption {
 	pub id: u64,
 	pub text: String,
@@ -252,7 +252,7 @@ impl PollOption {
 }
 
 /// Post flags with NSFW and stickied
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct Flags {
 	pub spoiler: bool,
 	pub nsfw: bool,
@@ -278,7 +278,7 @@ impl Flags {
 	}
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Media {
 	pub url: String,
 	pub preview_url: String,
@@ -491,7 +491,7 @@ pub fn format_video_duration(seconds: i64) -> String {
 	}
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct GalleryMedia {
 	pub url: String,
 	pub preview_url: String,
@@ -571,7 +571,7 @@ pub struct Post {
 	pub collapsed_duplicates: Vec<CollapsedDuplicate>,
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct CollapsedDuplicate {
 	pub title: String,
 	pub permalink: String,
@@ -580,6 +580,44 @@ pub struct CollapsedDuplicate {
 	pub rel_time: String,
 	pub comments: (String, String),
 	pub flair: Flair,
+}
+
+impl Clone for Post {
+	fn clone(&self) -> Self {
+		Self {
+			id: self.id.clone(),
+			kind: self.kind.clone(),
+			title: self.title.clone(),
+			community: self.community.clone(),
+			body: self.body.clone(),
+			author: self.author.clone(),
+			permalink: self.permalink.clone(),
+			parent_kind: self.parent_kind.clone(),
+			link_title: self.link_title.clone(),
+			link_permalink: self.link_permalink.clone(),
+			poll: self.poll.clone(),
+			score: self.score.clone(),
+			upvote_ratio: self.upvote_ratio,
+			post_type: self.post_type.clone(),
+			flair: self.flair.clone(),
+			flags: self.flags.clone(),
+			thumbnail: self.thumbnail.clone(),
+			media: self.media.clone(),
+			domain: self.domain.clone(),
+			rel_time: self.rel_time.clone(),
+			created: self.created.clone(),
+			created_ts: self.created_ts,
+			num_duplicates: self.num_duplicates,
+			comments: self.comments.clone(),
+			gallery: self.gallery.clone(),
+			awards: Awards(self.awards.0.clone()),
+			nsfw: self.nsfw,
+			out_url: self.out_url.clone(),
+			ws_url: self.ws_url.clone(),
+			preview_body: self.preview_body.clone(),
+			collapsed_duplicates: self.collapsed_duplicates.clone(),
+		}
+	}
 }
 
 impl Post {

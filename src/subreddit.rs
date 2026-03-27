@@ -12,7 +12,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cookie::Cookie;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
-use log::warn;
+use log::{info, warn};
 
 use chrono::DateTime;
 use regex::Regex;
@@ -304,10 +304,13 @@ fn build_aggregate_sources(preferences: &Preferences, sort: &str, reddit_query: 
 	sources
 }
 
-fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str) -> String {
+fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str, before: &str) -> String {
 	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(base_query.as_bytes()).into_owned().collect();
 	if !after.is_empty() {
 		query_pairs.push(("after".to_string(), after.to_string()));
+	}
+	if !before.is_empty() {
+		query_pairs.push(("before".to_string(), before.to_string()));
 	}
 
 	let query = form_urlencoded::Serializer::new(String::new())
@@ -344,9 +347,9 @@ fn cursor_matches_request(cursor: &AggregateFrontCursor, sources: &[AggregateFee
 
 async fn fetch_source_listing_page(source: &AggregateFeedSource, sort: &str, reddit_query: &str, after: &str, quarantine: bool) -> Result<ChunkListingPage, String> {
 	let (posts, next_after) = match source {
-		AggregateFeedSource::SubredditChunk { chunk } => Post::fetch(&build_listing_path(chunk, sort, reddit_query, after), quarantine).await?,
+		AggregateFeedSource::SubredditChunk { chunk } => Post::fetch(&build_listing_path(chunk, sort, reddit_query, after, ""), quarantine).await?,
 		AggregateFeedSource::Flair { subreddit, flair } => {
-			let (mut posts, next_after) = Post::fetch(&build_listing_path(subreddit, sort, reddit_query, after), quarantine).await?;
+			let (mut posts, next_after) = Post::fetch(&build_listing_path(subreddit, sort, reddit_query, after, ""), quarantine).await?;
 			filter_posts_by_flair(&mut posts, flair);
 			(posts, next_after)
 		}
@@ -598,10 +601,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
+	let request_after = param(&format!("?{}", req.uri().query().unwrap_or_default()), "after").unwrap_or_default();
+	let request_before = param(&format!("?{}", req.uri().query().unwrap_or_default()), "before").unwrap_or_default();
 	let path = if aggregate_saved_feeds || sub_name.is_empty() {
 		String::new()
 	} else {
-		build_listing_path(&sub_name, &sort, &reddit_query, "")
+		build_listing_path(&sub_name, &sort, &reddit_query, &request_after, &request_before)
 	};
 	let flair_filters = if !sub.name.is_empty() && sub.name != "all" && sub.name != "popular" && !sub.name.contains('+') {
 		build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub.name))
@@ -660,6 +665,66 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			is_flair_subscribed,
 		}))
 	} else if aggregate_saved_feeds {
+		// EXPERIMENT: For "new" sort, use per-subreddit cache with round-robin merge.
+		// This ensures every subreddit gets equal representation.
+		if sort == "new" {
+			// Always trigger background fetch for subs not yet cached.
+			crate::post_cache::trigger_background_fetch(prefs.subscriptions.clone(), quarantined);
+
+			let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+				.and_then(|p| p.parse::<usize>().ok())
+				.unwrap_or(0);
+
+			if let Some((mut posts, has_next)) =
+				crate::post_cache::build_round_robin_feed(&prefs.subscriptions, cache_page, crate::post_cache::POSTS_PER_PAGE, &filters)
+			{
+				if !posts.is_empty() {
+					let (cached_subs, cached_posts) = crate::post_cache::cache_stats();
+					info!(
+						"post_cache: serving page {} from cache ({} subs cached, {} total posts)",
+						cache_page, cached_subs, cached_posts
+					);
+					let no_posts = posts.is_empty();
+					let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+					utils::hydrate_post_author_links_from_cache(&mut posts);
+
+					let prev_page_url = if cache_page > 0 {
+						update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)])
+					} else {
+						String::new()
+					};
+					let next_page_url = if has_next {
+						update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)])
+					} else {
+						String::new()
+					};
+
+					return Ok(template(&SubredditTemplate {
+						sub,
+						posts,
+						top_users,
+						sort: (sort.clone(), timeframe.clone()),
+						sort_options,
+						flair_filters,
+						active_flair_filter: active_flair_filter.clone(),
+						clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)]),
+						prev_page_url,
+						next_page_url,
+						prefs: Preferences::new(&req),
+						url,
+						redirect_url,
+						enable_duplicate_collapse: true,
+						is_filtered: false,
+						all_posts_filtered: false,
+						all_posts_hidden_nsfw,
+						no_posts,
+						is_flair_subscribed,
+					}));
+				}
+			}
+			// Fall through to legacy aggregate fetch if cache is empty.
+		}
+
 		let query_fingerprint = listing_query_fingerprint(&query);
 		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
 			.and_then(|encoded| decode_front_cursor(&encoded))
@@ -715,10 +780,67 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			Err(msg) => error(req, &msg).await,
 		}
 	} else {
+		// EXPERIMENT: For single subreddits with sort=new, try serving from per-sub cache.
+		// This avoids a Reddit API call if we already fetched 100 posts in the background.
+		let is_single_sub = !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+');
+		if is_single_sub && sort == "new" && request_after.is_empty() && request_before.is_empty() {
+			let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+				.and_then(|p| p.parse::<usize>().ok())
+				.unwrap_or(0);
+
+			if let Some((mut posts, after, has_prev, has_next)) =
+				crate::post_cache::get_cached_subreddit_page(&sub_name, cache_page, crate::post_cache::POSTS_PER_PAGE)
+			{
+				info!("post_cache: serving r/{} page {} from cache", sub_name, cache_page);
+				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+				filter_posts_by_flair(&mut posts, &active_flair_filter);
+				let no_posts = posts.is_empty();
+				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+				utils::hydrate_post_author_links_from_cache(&mut posts);
+
+				let prev_page_url = if has_prev {
+					update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None)])
+				} else {
+					String::new()
+				};
+				let next_page_url = if has_next && !after.is_empty() {
+					// Last cached page: link to Reddit's after-based pagination.
+					update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
+				} else if has_next {
+					update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None)])
+				} else {
+					String::new()
+				};
+
+				return Ok(template(&SubredditTemplate {
+					sub,
+					posts,
+					top_users,
+					sort: (sort.clone(), timeframe.clone()),
+					sort_options,
+					flair_filters,
+					active_flair_filter: active_flair_filter.clone(),
+					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)]),
+					prev_page_url,
+					next_page_url,
+					prefs: Preferences::new(&req),
+					url,
+					redirect_url,
+					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+					is_filtered: false,
+					all_posts_filtered,
+					all_posts_hidden_nsfw,
+					no_posts,
+					is_flair_subscribed,
+				}));
+			}
+			// Fall through to normal fetch if not cached.
+		}
+
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
 				utils::store_post_flairs(&posts);
-				if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+				if is_single_sub {
 					utils::store_subreddit_users(&sub_name, &posts);
 				}
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
@@ -731,11 +853,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				}
 				utils::hydrate_post_author_links_from_cache(&mut posts);
 				let timeframe = param(&path, "t").unwrap_or_default();
-				let before = param(&path, "after").unwrap_or_default();
+				let before = param(&path, "before").unwrap_or_default();
 				Ok(template(&SubredditTemplate {
 					sub,
 					posts,
-					top_users: if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+					top_users: if is_single_sub {
 						utils::cached_subreddit_users(&sub_name)
 							.into_iter()
 							.map(|(name, count)| SubredditUserEntry { name, count })
@@ -745,7 +867,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					},
 					sort: (sort.clone(), timeframe.clone()),
 					sort_options,
-					flair_filters: if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+					flair_filters: if is_single_sub {
 						build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub_name))
 					} else {
 						Vec::new()
@@ -1000,6 +1122,22 @@ mod tests {
 		assert_eq!(
 			update_url_query("/r/rust?sort=hot&after=t3_demo", &[("flair", Some("Discussion")), ("after", None)]),
 			"/r/rust?sort=hot&flair=Discussion"
+		);
+	}
+
+	#[test]
+	fn listing_path_includes_requested_after_cursor() {
+		assert_eq!(
+			super::build_listing_path("rust", "hot", "raw_json=1", "t3_after", ""),
+			"/r/rust/hot.json?raw_json=1&after=t3_after"
+		);
+	}
+
+	#[test]
+	fn listing_path_includes_requested_before_cursor() {
+		assert_eq!(
+			super::build_listing_path("rust", "hot", "raw_json=1", "", "t3_before"),
+			"/r/rust/hot.json?raw_json=1&before=t3_before"
 		);
 	}
 
