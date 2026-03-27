@@ -1858,6 +1858,7 @@ pub fn flair_subscription_target(subreddit: &str, flair: &str) -> String {
 pub fn flair_subscription_action_url(subreddit: &str, action: &str, flair: &str, redirect: Option<&str>) -> String {
 	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
 	serializer.append_pair("name", flair);
+	serializer.append_pair("canonical", subreddit);
 	if let Some(redirect) = redirect.filter(|value| !value.is_empty()) {
 		serializer.append_pair("redirect", redirect);
 	}

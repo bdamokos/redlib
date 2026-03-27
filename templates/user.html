@@ -139,15 +139,15 @@ body %}
                             {% if !prefs.subscriptions.contains(subreddit.name) %}
                             <form
                                 class="inline_subscription_form"
-                                action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}"
+                                action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ subreddit.name }}"
                                 method="POST"
                                 data-subscription-form
 	                                data-subscription-target="subreddit:{{ subreddit.name }}"
 	                                data-subscription-state="unsubscribed"
 	                                data-state-on="subscribed"
 	                                data-state-off="unsubscribed"
-	                                data-subscribe-action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}"
-	                                data-unsubscribe-action="/r/{{ subreddit.name }}/unsubscribe?redirect={{ redirect_url }}"
+	                                data-subscribe-action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ subreddit.name }}"
+	                                data-unsubscribe-action="/r/{{ subreddit.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ subreddit.name }}"
 	                                data-subscribe-label="Follow"
 	                                data-unsubscribe-label="Unfollow"
 	                                data-subscribe-class="subscribe"
@@ -169,15 +169,15 @@ body %}
                     <div id="user_subscription">
                         {% if prefs.subscriptions.contains(name) %}
                         <form
-                            action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}"
+                            action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ name }}"
                             method="POST"
                             data-subscription-form
 	                            data-subscription-target="user:{{ name }}"
 	                            data-subscription-state="subscribed"
 	                            data-state-on="subscribed"
 	                            data-state-off="unsubscribed"
-	                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}"
+	                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}&canonical={{ name }}"
+	                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ name }}"
 	                            data-subscribe-label="Follow"
 	                            data-unsubscribe-label="Unfollow"
 	                            data-subscribe-class="subscribe"
@@ -190,15 +190,15 @@ body %}
                         </form>
                         {% else %}
                         <form
-                            action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}"
+                            action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}&canonical={{ name }}"
                             method="POST"
                             data-subscription-form
 	                            data-subscription-target="user:{{ name }}"
 	                            data-subscription-state="unsubscribed"
 	                            data-state-on="subscribed"
 	                            data-state-off="unsubscribed"
-	                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}"
+	                            data-subscribe-action="/r/{{ name }}/subscribe?redirect={{ redirect_url }}&canonical={{ name }}"
+	                            data-unsubscribe-action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ name }}"
 	                            data-subscribe-label="Follow"
 	                            data-unsubscribe-label="Unfollow"
 	                            data-subscribe-class="subscribe"
@@ -214,15 +214,15 @@ body %}
                     <div id="user_filter">
                         {% if prefs.filters.contains(name) %}
 	                        <form
-	                            action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}"
+                            action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}&canonical={{ name }}"
 	                            method="POST"
 	                            data-subscription-form
 	                            data-subscription-target="filter:{{ name }}"
 	                            data-subscription-state="filtered"
 	                            data-state-on="filtered"
 	                            data-state-off="unfiltered"
-	                            data-subscribe-action="/r/{{ name }}/filter?redirect={{ redirect_url }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}"
+	                            data-subscribe-action="/r/{{ name }}/filter?redirect={{ redirect_url }}&canonical={{ name }}"
+	                            data-unsubscribe-action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}&canonical={{ name }}"
 	                            data-subscribe-label="Filter"
 	                            data-unsubscribe-label="Unfilter"
 	                            data-subscribe-class="filter"
@@ -235,15 +235,15 @@ body %}
                         </form>
                         {% else %}
 	                        <form
-	                            action="/r/{{ name }}/filter?redirect={{ redirect_url }}"
+                            action="/r/{{ name }}/filter?redirect={{ redirect_url }}&canonical={{ name }}"
 	                            method="POST"
 	                            data-subscription-form
 	                            data-subscription-target="filter:{{ name }}"
 	                            data-subscription-state="unfiltered"
 	                            data-state-on="filtered"
 	                            data-state-off="unfiltered"
-	                            data-subscribe-action="/r/{{ name }}/filter?redirect={{ redirect_url }}"
-	                            data-unsubscribe-action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}"
+	                            data-subscribe-action="/r/{{ name }}/filter?redirect={{ redirect_url }}&canonical={{ name }}"
+	                            data-unsubscribe-action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}&canonical={{ name }}"
 	                            data-subscribe-label="Filter"
 	                            data-unsubscribe-label="Unfilter"
 	                            data-subscribe-class="filter"

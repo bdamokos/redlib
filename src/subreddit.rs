@@ -1565,19 +1565,30 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 	result
 }
 
-async fn resolve_subreddit_display_name(part: &str, display_lookup: &[(String, &str)]) -> String {
+async fn resolve_subreddit_display_name(part: &str, display_lookup: &[(String, String)]) -> String {
 	if part.starts_with("u_") {
 		return part.to_string();
 	}
 
-	if let Some(&(_, display)) = display_lookup.iter().find(|entry| entry.0 == part.to_lowercase()) {
-		return display.to_string();
+	if let Some((_, display)) = display_lookup.iter().find(|entry| entry.0 == part.to_lowercase()) {
+		return display.clone();
 	}
 
 	match json(format!("/r/{part}/about.json?raw_json=1"), true).await {
 		Ok(display) => display["data"]["display_name"].as_str().unwrap_or(part).to_string(),
 		Err(_) => part.to_string(),
 	}
+}
+
+fn canonical_subreddit_parts(query: &str) -> Option<Vec<String>> {
+	let canonical = param(&format!("?{query}"), "canonical")?.replace(' ', "+");
+	let values = canonical
+		.split('+')
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.map(ToString::to_string)
+		.collect::<Vec<_>>();
+	(!values.is_empty()).then_some(values)
 }
 
 pub async fn feed_status_api(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -1677,29 +1688,34 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	let preferences = Preferences::new(&req);
 	let mut sub_list = preferences.subscriptions;
 	let mut filters = preferences.filters;
+	let canonical_parts = canonical_subreddit_parts(&query);
 
 	// Retrieve list of posts for these subreddits to extract display names
-
-	let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
-	let display_lookup: Vec<(String, &str)> = match &posts {
-		Ok(posts) => posts["data"]["children"]
-			.as_array()
-			.map(|list| {
-				list
-					.iter()
-					.map(|post| {
-						let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
-						(display_name.to_lowercase(), display_name)
-					})
-					.collect::<Vec<_>>()
-			})
-			.unwrap_or_default(),
-		Err(_) => vec![],
+	let display_lookup: Vec<(String, String)> = if canonical_parts.is_some() {
+		Vec::new()
+	} else {
+		let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
+		match &posts {
+			Ok(posts) => posts["data"]["children"]
+				.as_array()
+				.map(|list| {
+					list
+						.iter()
+						.map(|post| {
+							let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
+							(display_name.to_lowercase(), display_name.to_string())
+						})
+						.collect::<Vec<_>>()
+				})
+				.unwrap_or_default(),
+			Err(_) => vec![],
+		}
 	};
 
 	// Find each subreddit name (separated by '+') in sub parameter
-	for part in sub.split('+').filter(|x| x != &"") {
-		let part = resolve_subreddit_display_name(part, &display_lookup).await;
+	let parts = canonical_parts.unwrap_or_else(|| sub.split('+').filter(|x| x != &"").map(ToString::to_string).collect());
+	for part in parts {
+		let part = if display_lookup.is_empty() { part } else { resolve_subreddit_display_name(&part, &display_lookup).await };
 
 		// Modify sub list based on action
 		if action.contains(&"subscribe".to_string()) && !sub_list.iter().any(|sub| sub.eq_ignore_ascii_case(&part)) {
@@ -1759,6 +1775,7 @@ pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, S
 	let action: Vec<String> = req.uri().path().split('/').map(String::from).collect();
 	let query = req.uri().query().unwrap_or_default().to_string();
 	let flair = param(&format!("?{query}"), "name").unwrap_or_default().trim().to_string();
+	let canonical_subreddit = param(&format!("?{query}"), "canonical").unwrap_or_default().replace(' ', "+");
 
 	if sub == "random" || sub == "randnsfw" {
 		return Err("Can't subscribe to random subreddit flair!".to_string());
@@ -1767,23 +1784,27 @@ pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, S
 		return Err("Flair name is required.".to_string());
 	}
 
-	let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
-	let display_lookup: Vec<(String, &str)> = match &posts {
-		Ok(posts) => posts["data"]["children"]
-			.as_array()
-			.map(|list| {
-				list
-					.iter()
-					.map(|post| {
-						let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
-						(display_name.to_lowercase(), display_name)
-					})
-					.collect::<Vec<_>>()
-			})
-			.unwrap_or_default(),
-		Err(_) => vec![],
+	let subreddit = if canonical_subreddit.is_empty() {
+		let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
+		let display_lookup: Vec<(String, String)> = match &posts {
+			Ok(posts) => posts["data"]["children"]
+				.as_array()
+				.map(|list| {
+					list
+						.iter()
+						.map(|post| {
+							let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
+							(display_name.to_lowercase(), display_name.to_string())
+						})
+						.collect::<Vec<_>>()
+				})
+				.unwrap_or_default(),
+			Err(_) => vec![],
+		};
+		resolve_subreddit_display_name(&sub, &display_lookup).await
+	} else {
+		canonical_subreddit
 	};
-	let subreddit = resolve_subreddit_display_name(&sub, &display_lookup).await;
 
 	let mut flair_subscriptions = Preferences::new(&req).flair_subscriptions;
 	let target = FlairSubscription { subreddit, flair: flair.clone() };
