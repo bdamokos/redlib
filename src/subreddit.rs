@@ -72,6 +72,7 @@ pub struct SubredditShellTemplate {
 	active_flair_filter: String,
 	prefs: Preferences,
 	url: String,
+	redirect_url: String,
 	fragment_url: String,
 	loading_message: String,
 }
@@ -731,6 +732,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
 
 	Ok(template(&SubredditShellTemplate {
@@ -741,6 +743,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		active_flair_filter,
 		prefs,
 		url,
+		redirect_url,
 		fragment_url: subreddit_fragment_path(&req),
 		loading_message: "Loading posts...".to_string(),
 	}))
@@ -1358,6 +1361,7 @@ mod tests {
 			active_flair_filter: String::new(),
 			prefs: test_prefs(),
 			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
 		}
@@ -1380,6 +1384,7 @@ mod tests {
 			active_flair_filter: String::new(),
 			prefs: test_prefs(),
 			url: "/".to_string(),
+			redirect_url: String::new(),
 			fragment_url: "/subreddit-fragment".to_string(),
 			loading_message: "Loading posts...".to_string(),
 		}
@@ -1388,6 +1393,30 @@ mod tests {
 
 		assert!(html.contains("action=\"/search\""));
 		assert!(!html.contains("action=\"/r/rust+programming/search\""));
+	}
+
+	#[test]
+	fn subreddit_shell_preserves_subscription_state() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["rust".to_string()];
+
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit {
+				name: "rust".to_string(),
+				..Default::default()
+			},
+			active_flair_filter: String::new(),
+			prefs,
+			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
+			fragment_url: "/subreddit-fragment/r/rust".to_string(),
+			loading_message: "Loading posts...".to_string(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-subscription-state=\"subscribed\""));
+		assert!(html.contains(">Unsubscribe</button>"));
 	}
 
 	#[test]

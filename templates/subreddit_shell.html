@@ -21,6 +21,55 @@
 
 {% block body %}
 	<div class="feed_status_banner warming">{{ loading_message }}</div>
+	{% if !str_eq(sub.name, "") && !sub.name.contains("+") %}
+	<aside id="subreddit_shell_sidebar">
+		<div id="sub_actions">
+			<div id="sub_subscription">
+				{% if prefs.subscriptions.contains(sub.name) %}
+				<form
+					action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					method="POST"
+					data-subscription-form
+					data-subscription-target="subreddit:{{ sub.name }}"
+					data-subscription-state="subscribed"
+					data-state-on="subscribed"
+					data-state-off="unsubscribed"
+					data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					data-subscribe-label="Subscribe"
+					data-unsubscribe-label="Unsubscribe"
+					data-subscribe-class="subscribe"
+					data-unsubscribe-class="unsubscribe"
+					data-cookie-mode="list"
+					data-cookie-name="subscriptions"
+					data-cookie-values="{{ sub.name }}">
+					<button class="unsubscribe">Unsubscribe</button>
+				</form>
+				{% else %}
+				<form
+					action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					method="POST"
+					data-subscription-form
+					data-subscription-target="subreddit:{{ sub.name }}"
+					data-subscription-state="unsubscribed"
+					data-state-on="subscribed"
+					data-state-off="unsubscribed"
+					data-subscribe-action="/r/{{ sub.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					data-unsubscribe-action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
+					data-subscribe-label="Subscribe"
+					data-unsubscribe-label="Unsubscribe"
+					data-subscribe-class="subscribe"
+					data-unsubscribe-class="unsubscribe"
+					data-cookie-mode="list"
+					data-cookie-name="subscriptions"
+					data-cookie-values="{{ sub.name }}">
+					<button class="subscribe">Subscribe</button>
+				</form>
+				{% endif %}
+			</div>
+		</div>
+	</aside>
+	{% endif %}
 	<div
 		id="page_fragment"
 		data-fragment-url="{{ fragment_url }}"
