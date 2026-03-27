@@ -13,7 +13,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 // STRUCTS
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct SearchParams {
 	q: String,
 	sort: String,
@@ -25,7 +25,7 @@ struct SearchParams {
 }
 
 // STRUCTS
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Subreddit {
 	name: String,
 	url: String,
@@ -38,6 +38,9 @@ struct Subreddit {
 #[derive(Template)]
 #[template(path = "search.html")]
 pub struct SearchTemplate {
+	shell_mode: bool,
+	fragment_url: String,
+	loading_message: String,
 	posts: Vec<Post>,
 	subreddits: Vec<Subreddit>,
 	sub: String,
@@ -57,18 +60,138 @@ pub struct SearchTemplate {
 
 crate::impl_template_str_eq!(SearchTemplate);
 
+#[derive(Template)]
+#[template(path = "search_fragment.html")]
+struct SearchFragmentTemplate {
+	posts: Vec<Post>,
+	subreddits: Vec<Subreddit>,
+	sub: String,
+	params: SearchParams,
+	prefs: Preferences,
+	url: String,
+	redirect_url: String,
+	is_filtered: bool,
+	all_posts_filtered: bool,
+	all_posts_hidden_nsfw: bool,
+	no_posts: bool,
+}
+
+crate::impl_template_str_eq!(SearchFragmentTemplate);
+
 /// Regex matched against search queries to determine if they are reddit urls.
 static REDDIT_URL_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^https?://([^\./]+\.)*reddit.com/").unwrap());
 
+fn search_fragment_path(req: &Request<Body>) -> String {
+	let path = req.uri().path();
+	let query = req.uri().query().unwrap_or_default();
+	let fragment_path = if path == "/search" {
+		"/search-fragment".to_string()
+	} else {
+		format!("/search-fragment{}", path)
+	};
+
+	if query.is_empty() {
+		fragment_path
+	} else {
+		format!("{fragment_path}?{query}")
+	}
+}
+
+fn search_source_path(req: &Request<Body>) -> String {
+	let path = req.uri().path();
+	if path == "/search-fragment" {
+		"/search".to_string()
+	} else {
+		path.replacen("/search-fragment", "", 1)
+	}
+}
+
+fn search_current_url(req: &Request<Body>) -> String {
+	let path = search_source_path(req);
+	let query = req.uri().query().unwrap_or_default();
+	if query.is_empty() {
+		path
+	} else {
+		format!("{path}?{query}")
+	}
+}
+
+fn render_search_fragment(template_data: &SearchFragmentTemplate) -> Result<Response<Body>, String> {
+	let body = template_data.render().map_err(|error| error.to_string())?;
+	Response::builder()
+		.status(200)
+		.header("content-type", "text/html; charset=utf-8")
+		.header("cache-control", "no-store")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())
+}
+
+fn search_params_from_request(path: &str, query: &str, after: String, typed: String) -> SearchParams {
+	SearchParams {
+		q: query.replace('"', "&quot;"),
+		sort: param(path, "sort").unwrap_or_else(|| "relevance".to_string()),
+		t: param(path, "t").unwrap_or_default(),
+		before: param(path, "after").unwrap_or_default(),
+		after,
+		restrict_sr: param(path, "restrict_sr").unwrap_or_default(),
+		typed,
+	}
+}
+
 // SERVICES
 pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
+	let uri_path = req.uri().path().replace("+", "%2B");
+	let path = format!("{}.json?{}&raw_json=1", uri_path, req.uri().query().unwrap_or_default());
+	let mut query = param(&path, "q").unwrap_or_default();
+	query = REDDIT_URL_MATCH.replace(&query, "").to_string();
+
+	if query.is_empty() {
+		return Ok(redirect("/"));
+	}
+
+	if query.starts_with("r/") || query.starts_with("user/") {
+		return Ok(redirect(&format!("/{query}")));
+	}
+
+	if query.starts_with("R/") {
+		return Ok(redirect(&format!("/r{}", &query[1..])));
+	}
+
+	if query.starts_with("u/") || query.starts_with("U/") {
+		return Ok(redirect(&format!("/user{}", &query[1..])));
+	}
+
+	let sub = req.param("sub").unwrap_or_default();
+	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
+	let typed = param(&path, "type").unwrap_or_default();
+
+	Ok(template(&SearchTemplate {
+		shell_mode: true,
+		fragment_url: search_fragment_path(&req),
+		loading_message: "Loading search results...".to_string(),
+		posts: Vec::new(),
+		subreddits: Vec::new(),
+		sub,
+		params: search_params_from_request(&path, &query, String::new(), typed),
+		prefs: Preferences::new(&req),
+		url,
+		redirect_url,
+		is_filtered: false,
+		all_posts_filtered: false,
+		all_posts_hidden_nsfw: false,
+		no_posts: false,
+	}))
+}
+
+pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
 	// This ensures that during a search, no NSFW posts are fetched at all
 	let nsfw_results = if setting(&req, "show_nsfw") == "on" && !utils::sfw_only() {
 		"&include_over_18=on"
 	} else {
 		""
 	};
-	let uri_path = req.uri().path().replace("+", "%2B");
+	let uri_path = search_source_path(&req).replace("+", "%2B");
 	let path = format!("{}.json?{}{}&raw_json=1", uri_path, req.uri().query().unwrap_or_default(), nsfw_results);
 	let mut query = param(&path, "q").unwrap_or_default();
 	query = REDDIT_URL_MATCH.replace(&query, "").to_string();
@@ -97,8 +220,6 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let typed = param(&path, "type").unwrap_or_default();
-
-	let sort = param(&path, "sort").unwrap_or_else(|| "relevance".to_string());
 	let filters = get_filters(&req);
 
 	// If search is not restricted to this subreddit, show other subreddits in search results
@@ -110,25 +231,17 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 		Vec::new()
 	};
 
-	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let url = search_current_url(&req);
 	let prefs = Preferences::new(&req);
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if sub.split('+').all(|s| filters.contains(s)) {
-		Ok(template(&SearchTemplate {
+		render_search_fragment(&SearchFragmentTemplate {
 			posts: Vec::new(),
 			subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
 			sub,
-			params: SearchParams {
-				q: query.replace('"', "&quot;"),
-				sort,
-				t: param(&path, "t").unwrap_or_default(),
-				before: param(&path, "after").unwrap_or_default(),
-				after: String::new(),
-				restrict_sr: param(&path, "restrict_sr").unwrap_or_default(),
-				typed,
-			},
+			params: search_params_from_request(&path, &query, String::new(), typed),
 			prefs,
 			url,
 			redirect_url,
@@ -136,7 +249,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
-		}))
+		})
 	} else {
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
@@ -145,19 +258,11 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				utils::hydrate_post_author_links_from_cache(&mut posts);
-				Ok(template(&SearchTemplate {
+				render_search_fragment(&SearchFragmentTemplate {
 					posts,
 					subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
 					sub,
-					params: SearchParams {
-						q: query.replace('"', "&quot;"),
-						sort,
-						t: param(&path, "t").unwrap_or_default(),
-						before: param(&path, "after").unwrap_or_default(),
-						after,
-						restrict_sr: param(&path, "restrict_sr").unwrap_or_default(),
-						typed,
-					},
+					params: search_params_from_request(&path, &query, after, typed),
 					prefs,
 					url,
 					redirect_url,
@@ -165,7 +270,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
-				}))
+				})
 			}
 			Err(msg) => {
 				if msg == "quarantined" || msg == "gated" {
@@ -214,4 +319,108 @@ fn mark_subreddit_subscriptions(subreddits: Vec<Subreddit>, subscriptions: &[Str
 			subreddit
 		})
 		.collect()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{search_current_url, search_fragment_path, search_source_path, SearchFragmentTemplate, SearchParams, SearchTemplate};
+	use crate::utils::Preferences;
+	use askama::Template;
+	use hyper::{Body, Request};
+
+	fn test_prefs() -> Preferences {
+		Preferences {
+			available_themes: vec!["system".to_string()],
+			layout: "card".to_string(),
+			fixed_navbar: "on".to_string(),
+			disable_visit_reddit_confirmation: "on".to_string(),
+			..Preferences::default()
+		}
+	}
+
+	fn test_params() -> SearchParams {
+		SearchParams {
+			q: "rust".to_string(),
+			sort: "relevance".to_string(),
+			t: String::new(),
+			before: String::new(),
+			after: String::new(),
+			restrict_sr: String::new(),
+			typed: String::new(),
+		}
+	}
+
+	#[test]
+	fn builds_search_fragment_path_for_global_search() {
+		let req = Request::builder().uri("/search?q=rust").body(Body::empty()).unwrap();
+		assert_eq!(search_fragment_path(&req), "/search-fragment?q=rust");
+	}
+
+	#[test]
+	fn current_url_strips_search_fragment_prefix() {
+		let req = Request::builder()
+			.uri("/search-fragment/r/rust/search?q=borrow")
+			.body(Body::empty())
+			.unwrap();
+		assert_eq!(search_current_url(&req), "/r/rust/search?q=borrow");
+	}
+
+	#[test]
+	fn search_source_path_restores_global_search_route() {
+		let req = Request::builder()
+			.uri("/search-fragment?q=rust")
+			.body(Body::empty())
+			.unwrap();
+		assert_eq!(search_source_path(&req), "/search");
+	}
+
+	#[test]
+	fn renders_shell_mode_search_placeholder_with_fragment_url() {
+		let html = SearchTemplate {
+			shell_mode: true,
+			fragment_url: "/search-fragment?q=rust".to_string(),
+			loading_message: "Loading search results...".to_string(),
+			posts: Vec::new(),
+			subreddits: Vec::new(),
+			sub: String::new(),
+			params: test_params(),
+			prefs: test_prefs(),
+			url: "/search?q=rust".to_string(),
+			redirect_url: "search%3Fq=rust".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-fragment-url=\"/search-fragment?q=rust\""));
+		assert!(html.contains("Loading search results..."));
+		assert!(html.contains("Loading search results is taking longer than expected."));
+	}
+
+	#[test]
+	fn renders_search_fragment_next_link_without_whitespace() {
+		let html = SearchFragmentTemplate {
+			posts: Vec::new(),
+			subreddits: Vec::new(),
+			sub: String::new(),
+			params: SearchParams {
+				after: "t3_test".to_string(),
+				..test_params()
+			},
+			prefs: test_prefs(),
+			url: "/search?q=rust".to_string(),
+			redirect_url: "search%3Fq=rust".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("href=\"?q=rust&restrict_sr=&sort=relevance&t=&after=t3_test\" accesskey=\"N\""));
+	}
 }
