@@ -105,6 +105,7 @@ struct FeedSession {
 	background_complete: bool,
 	requested_page: usize,
 	last_updated: Instant,
+	revision: u64,
 }
 
 #[derive(Clone)]
@@ -247,6 +248,7 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 		background_complete: false,
 		requested_page: 0,
 		last_updated: Instant::now(),
+		revision: 0,
 	}
 }
 
@@ -446,8 +448,13 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 		next_page_ready,
 		posts_merged: posts.len(),
 		status_message,
-		refresh_token: session.last_updated.elapsed().as_millis() as u64 ^ (posts.len() as u64) ^ (ready_sources as u64),
+		refresh_token: session.revision ^ ((posts.len() as u64) << 16) ^ (ready_sources as u64),
 	}
+}
+
+fn touch_session(session: &mut FeedSession) {
+	session.last_updated = Instant::now();
+	session.revision = session.revision.wrapping_add(1);
 }
 
 fn background_target_posts(session: &FeedSession) -> usize {
@@ -504,7 +511,7 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 		let Some(session) = sessions.get_mut(session_id) else {
 			return;
 		};
-		session.last_updated = Instant::now();
+		touch_session(session);
 		indices
 			.iter()
 			.filter_map(|index| {
@@ -551,7 +558,7 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 					warn!("post_cache: failed to warm {}: {}", source.display_name(), error);
 				}
 			}
-			session.last_updated = Instant::now();
+			touch_session(session);
 		}
 	}
 }
@@ -579,7 +586,7 @@ async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, ma
 
 	let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 	if let Some(session) = sessions.get_mut(session_id) {
-		session.last_updated = Instant::now();
+		touch_session(session);
 	}
 }
 
@@ -599,7 +606,7 @@ async fn warm_session_background(session_id: String) {
 			if let Some(session) = sessions.get_mut(&session_id) {
 				session.background_active = false;
 				session.background_complete = true;
-				session.last_updated = Instant::now();
+				touch_session(session);
 			}
 			info!("post_cache: feed session {session_id} warm complete");
 			return;
@@ -609,7 +616,7 @@ async fn warm_session_background(session_id: String) {
 			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			if let Some(session) = sessions.get_mut(&session_id) {
 				session.background_active = false;
-				session.last_updated = Instant::now();
+				touch_session(session);
 			}
 			info!("post_cache: feed session {session_id} warm paused");
 			return;
@@ -627,8 +634,8 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 		sessions.retain(|_, session| !session_is_expired(session));
 
 		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
-		session.last_updated = Instant::now();
 		session.requested_page = session.requested_page.max(page);
+		touch_session(session);
 	}
 
 	let sync_target = {
@@ -853,6 +860,7 @@ mod tests {
 			background_complete: false,
 			requested_page: 0,
 			last_updated: Instant::now(),
+			revision: 0,
 		};
 
 		let status = session_status_from_posts(&session, &[], 0, 25);
@@ -888,6 +896,7 @@ mod tests {
 			background_complete: false,
 			requested_page: 0,
 			last_updated: Instant::now(),
+			revision: 0,
 		};
 
 		let status = session_status_from_posts(&session, &posts, 0, 25);
@@ -930,6 +939,7 @@ mod tests {
 			background_complete: false,
 			requested_page: 0,
 			last_updated: Instant::now(),
+			revision: 0,
 		};
 
 		assert_eq!(background_target_sources(&session), 82);
@@ -965,6 +975,7 @@ mod tests {
 			background_complete: false,
 			requested_page: 0,
 			last_updated: Instant::now(),
+			revision: 0,
 		};
 
 		assert_eq!(sync_sources_to_request(&session, 0), 0);
@@ -1004,6 +1015,7 @@ mod tests {
 			background_complete: false,
 			requested_page: 0,
 			last_updated: Instant::now(),
+			revision: 0,
 		};
 
 		assert!(!background_target_reached(&session));
@@ -1046,10 +1058,45 @@ mod tests {
 			background_complete: false,
 			requested_page: 0,
 			last_updated: Instant::now(),
+			revision: 0,
 		};
 
 		let merged = merged_posts_for_session(&session);
 		let ids = merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>();
 		assert_eq!(ids, vec!["fresh-post", "stale-post"]);
+	}
+
+	#[test]
+	fn refresh_token_is_stable_without_session_mutation() {
+		let posts = vec![test_post("one", "rust", chrono::Utc::now().timestamp() as u64)];
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![SessionSourceEntry {
+				source: FeedSource::Subreddit {
+					name: "rust".to_string(),
+				},
+				state: SessionSourceState::Ready,
+				posts: posts.clone(),
+				after: String::new(),
+				head_created_ts: posts.first().map(|post| post.created_ts),
+				last_error: None,
+			}],
+			background_active: true,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 42,
+		};
+
+		let first = session_status_from_posts(&session, &posts, 0, 25).refresh_token;
+		let second = session_status_from_posts(&session, &posts, 0, 25).refresh_token;
+
+		assert_eq!(first, second);
 	}
 }
