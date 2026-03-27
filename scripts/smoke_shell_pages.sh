@@ -119,4 +119,22 @@ fi
 duplicates_fragment="$(fetch "$BASE_URL$duplicates_fragment_path")"
 require_match "$duplicates_fragment" 'id="column_one"' 'duplicates fragment main column'
 
+wiki_shell="$(fetch "$BASE_URL/r/rust/wiki/install")"
+wiki_fragment_path="$(printf '%s' "$wiki_shell" | extract_fragment_url)"
+if [[ -z "$wiki_fragment_path" ]]; then
+    printf 'smoke failed: could not extract wiki fragment path\n' >&2
+    exit 1
+fi
+wiki_fragment="$(fetch "$BASE_URL$wiki_fragment_path")"
+require_match "$wiki_fragment" 'id="column_one"' 'wiki fragment main column'
+
+sidebar_shell="$(fetch "$BASE_URL/r/rust/about/sidebar")"
+sidebar_fragment_path="$(printf '%s' "$sidebar_shell" | extract_fragment_url)"
+if [[ -z "$sidebar_fragment_path" ]]; then
+    printf 'smoke failed: could not extract sidebar fragment path\n' >&2
+    exit 1
+fi
+sidebar_fragment="$(fetch "$BASE_URL$sidebar_fragment_path")"
+require_match "$sidebar_fragment" 'id="column_one"' 'sidebar fragment main column'
+
 printf 'Shell smoke checks passed.\n'

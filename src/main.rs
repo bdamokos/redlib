@@ -424,8 +424,11 @@ async fn main() {
 		.get(|r| async move { Ok(redirect(&format!("/r/{}/wiki/{}", r.param("sub").unwrap_or_default(), r.param("wiki").unwrap_or_default()))) }.boxed());
 	app.at("/r/:sub/wiki").get(|r| subreddit::wiki(r).boxed());
 	app.at("/r/:sub/wiki/*page").get(|r| subreddit::wiki(r).boxed());
+	app.at("/wiki-fragment/r/:sub/wiki").get(|r| subreddit::wiki_fragment(r).boxed());
+	app.at("/wiki-fragment/r/:sub/wiki/*page").get(|r| subreddit::wiki_fragment(r).boxed());
 
 	app.at("/r/:sub/about/sidebar").get(|r| subreddit::sidebar(r).boxed());
+	app.at("/wiki-fragment/r/:sub/about/sidebar").get(|r| subreddit::sidebar_fragment(r).boxed());
 
 	app.at("/r/:sub/:sort").get(|r| subreddit::community(r).boxed());
 
@@ -439,6 +442,8 @@ async fn main() {
 		.get(|r| async move { Ok(redirect(&format!("/wiki/{}", r.param("page").unwrap_or_default()))) }.boxed());
 	app.at("/wiki").get(|r| subreddit::wiki(r).boxed());
 	app.at("/wiki/*page").get(|r| subreddit::wiki(r).boxed());
+	app.at("/wiki-fragment/wiki").get(|r| subreddit::wiki_fragment(r).boxed());
+	app.at("/wiki-fragment/wiki/*page").get(|r| subreddit::wiki_fragment(r).boxed());
 
 	// Search all of Reddit
 	app.at("/search").get(|r| search::find(r).boxed());

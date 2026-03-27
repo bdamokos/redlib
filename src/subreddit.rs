@@ -195,9 +195,19 @@ pub struct WikiTemplate {
 	page: String,
 	prefs: Preferences,
 	url: String,
+	shell_mode: bool,
+	fragment_url: String,
+	loading_message: String,
 }
 
 crate::impl_template_str_eq!(WikiTemplate);
+
+#[derive(Template)]
+#[template(path = "wiki_fragment.html")]
+struct WikiFragmentTemplate {
+	sub: String,
+	wiki: String,
+}
 
 #[derive(Template)]
 #[template(path = "wall.html")]
@@ -215,6 +225,19 @@ static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_fil
 
 fn should_enable_duplicate_collapse(sub_name: &str) -> bool {
 	sub_name.is_empty() || sub_name.contains('+') || sub_name == "all" || sub_name == "popular"
+}
+
+fn wiki_fragment_path(req: &Request<Body>) -> String {
+	let query = req.uri().query().unwrap_or_default();
+	if query.is_empty() {
+		format!("/wiki-fragment{}", req.uri().path())
+	} else {
+		format!("/wiki-fragment{}?{query}", req.uri().path())
+	}
+}
+
+fn wiki_source_path(req: &Request<Body>) -> String {
+	req.uri().path().replacen("/wiki-fragment", "", 1)
 }
 
 fn is_async_subscription_request(req: &Request<Body>) -> bool {
@@ -1170,6 +1193,7 @@ mod tests {
 		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
+	use hyper::{Body, Request};
 	use std::collections::{HashSet, VecDeque};
 
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
@@ -1364,6 +1388,34 @@ mod tests {
 
 		assert!(html.contains("action=\"/search\""));
 		assert!(!html.contains("action=\"/r/rust+programming/search\""));
+	}
+
+	#[test]
+	fn builds_wiki_fragment_path() {
+		let req = Request::builder()
+			.uri("/r/rust/wiki/install?view=compact")
+			.body(Body::empty())
+			.unwrap();
+		assert_eq!(super::wiki_fragment_path(&req), "/wiki-fragment/r/rust/wiki/install?view=compact");
+	}
+
+	#[test]
+	fn renders_shell_mode_wiki_placeholder_with_fragment_url() {
+		let html = super::WikiTemplate {
+			sub: "rust".to_string(),
+			wiki: String::new(),
+			page: "install".to_string(),
+			prefs: test_prefs(),
+			url: "/r/rust/wiki/install".to_string(),
+			shell_mode: true,
+			fragment_url: "/wiki-fragment/r/rust/wiki/install".to_string(),
+			loading_message: "Loading wiki page...".to_string(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-fragment-url=\"/wiki-fragment/r/rust/wiki/install\""));
+		assert!(html.contains("Loading wiki page..."));
 	}
 
 	#[test]
@@ -2036,24 +2088,45 @@ pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, S
 
 pub async fn wiki(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sub = req.param("sub").unwrap_or_else(|| "reddit.com".to_string());
+	let url = req.uri().to_string();
+	Ok(template(&WikiTemplate {
+		sub,
+		wiki: String::new(),
+		page: req.param("page").unwrap_or_else(|| "index".to_string()),
+		prefs: Preferences::new(&req),
+		url,
+		shell_mode: true,
+		fragment_url: wiki_fragment_path(&req),
+		loading_message: "Loading wiki page...".to_string(),
+	}))
+}
+
+pub async fn wiki_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
+	let sub = req.param("sub").unwrap_or_else(|| "reddit.com".to_string());
 	let quarantined = can_access_quarantine(&req, &sub);
 	// Handle random subreddits
 	if let Ok(random) = catch_random(&sub, "/wiki").await {
 		return Ok(random);
 	}
 
-	let page = req.param("page").unwrap_or_else(|| "index".to_string());
-	let path: String = format!("/r/{sub}/wiki/{page}.json?raw_json=1");
-	let url = req.uri().to_string();
+	let source_path = wiki_source_path(&req);
+	let path: String = format!("{source_path}.json?raw_json=1");
 
 	match json(path, quarantined).await {
-		Ok(response) => Ok(template(&WikiTemplate {
-			sub,
-			wiki: rewrite_urls(response["data"]["content_html"].as_str().unwrap_or("<h3>Wiki not found</h3>")),
-			page,
-			prefs: Preferences::new(&req),
-			url,
-		})),
+		Ok(response) => {
+			let body = WikiFragmentTemplate {
+				sub,
+				wiki: rewrite_urls(response["data"]["content_html"].as_str().unwrap_or("<h3>Wiki not found</h3>")),
+			}
+			.render()
+			.map_err(|error| error.to_string())?;
+			Response::builder()
+				.status(200)
+				.header("content-type", "text/html; charset=utf-8")
+				.header("cache-control", "no-store")
+				.body(Body::from(body))
+				.map_err(|error| error.to_string())
+		}
 		Err(msg) => {
 			if msg == "quarantined" || msg == "gated" {
 				Ok(quarantine(&req, sub, &msg))
@@ -2066,6 +2139,21 @@ pub async fn wiki(req: Request<Body>) -> Result<Response<Body>, String> {
 
 pub async fn sidebar(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sub = req.param("sub").unwrap_or_else(|| "reddit.com".to_string());
+	let url = req.uri().to_string();
+	Ok(template(&WikiTemplate {
+		sub,
+		wiki: String::new(),
+		page: "Sidebar".to_string(),
+		prefs: Preferences::new(&req),
+		url,
+		shell_mode: true,
+		fragment_url: wiki_fragment_path(&req),
+		loading_message: "Loading sidebar...".to_string(),
+	}))
+}
+
+pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
+	let sub = req.param("sub").unwrap_or_else(|| "reddit.com".to_string());
 	let quarantined = can_access_quarantine(&req, &sub);
 
 	// Handle random subreddits
@@ -2075,23 +2163,28 @@ pub async fn sidebar(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	// Build the Reddit JSON API url
 	let path: String = format!("/r/{sub}/about.json?raw_json=1");
-	let url = req.uri().to_string();
-
 	// Send a request to the url
 	match json(path, quarantined).await {
 		// If success, receive JSON in response
-		Ok(response) => Ok(template(&WikiTemplate {
-			wiki: rewrite_urls(&val(&response, "description_html")),
+		Ok(response) => {
+			let body = WikiFragmentTemplate {
+				wiki: rewrite_urls(&val(&response, "description_html")),
 			// wiki: format!(
 			// 	"{}<hr><h1>Moderators</h1><br><ul>{}</ul>",
 			// 	rewrite_urls(&val(&response, "description_html"),
 			// 	moderators(&sub, quarantined).await.unwrap_or(vec!["Could not fetch moderators".to_string()]).join(""),
 			// ),
-			sub,
-			page: "Sidebar".to_string(),
-			prefs: Preferences::new(&req),
-			url,
-		})),
+				sub,
+			}
+			.render()
+			.map_err(|error| error.to_string())?;
+			Response::builder()
+				.status(200)
+				.header("content-type", "text/html; charset=utf-8")
+				.header("cache-control", "no-store")
+				.body(Body::from(body))
+				.map_err(|error| error.to_string())
+		}
 		Err(msg) => {
 			if msg == "quarantined" || msg == "gated" {
 				Ok(quarantine(&req, sub, &msg))

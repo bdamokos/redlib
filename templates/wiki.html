@@ -15,15 +15,23 @@
 {% endblock %}
 
 {% block body %}
+	{% if shell_mode %}
 	<main>
-		<div class="panel" id="column_one">
-			<div id="top">
-				<a href="/r/{{ sub }}">Posts</a>
-				<div>Wiki</div>
-			</div>
-			<div id="wiki">
-				{{ wiki|safe }}
-			</div>
+		<div class="page_load_banner" data-page-load-banner>
+			<span>{{ loading_message }}</span>
+		</div>
+		<div
+			id="page_fragment"
+			data-fragment-url="{{ fragment_url }}"
+			data-loading-message="{{ loading_message }}"
+			data-timeout-message="{{ loading_message }} is taking longer than expected."
+			aria-busy="true"
+		></div>
+		<div id="page_load_timeout" class="listing_warn" hidden>
+			{{ loading_message }} is taking longer than expected.
 		</div>
 	</main>
+	{% else %}
+	{% include "wiki_fragment.html" %}
+	{% endif %}
 {% endblock %}
