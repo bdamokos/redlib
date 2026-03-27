@@ -12,6 +12,7 @@ const FETCH_CONCURRENCY: usize = 5;
 const PER_SOURCE_LIMIT: usize = 100;
 const INITIAL_SOURCE_WINDOW: usize = 32;
 const PAGE_FILL_BATCH: usize = 4;
+const MAX_SYNC_FILL_BATCHES: usize = 2;
 const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
 const FRESH_RECENT_SECONDS: i64 = 6 * 60 * 60;
 const FRESH_CUTOFF_SECONDS: i64 = 24 * 60 * 60;
@@ -148,6 +149,10 @@ fn source_priority(source: &FeedSource) -> (u8, String, String) {
 
 pub fn sort_sources(sources: &mut [FeedSource]) {
 	sources.sort_by_key(source_priority);
+}
+
+pub const fn initial_source_window() -> usize {
+	INITIAL_SOURCE_WINDOW
 }
 
 pub fn get_cached_subreddit_page(subreddit: &str, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
@@ -419,6 +424,31 @@ fn background_target_posts(session: &FeedSession) -> usize {
 	(session.requested_page + 1 + BACKGROUND_LOOKAHEAD_PAGES) * POSTS_PER_PAGE
 }
 
+fn initial_sync_source_target(page: usize) -> usize {
+	INITIAL_SOURCE_WINDOW + page.saturating_mul(PAGE_FILL_BATCH)
+}
+
+fn max_sync_source_budget(page: usize) -> usize {
+	initial_sync_source_target(page) + (MAX_SYNC_FILL_BATCHES * PAGE_FILL_BATCH)
+}
+
+fn background_target_sources(session: &FeedSession) -> usize {
+	(initial_sync_source_target(session.requested_page) + (BACKGROUND_LOOKAHEAD_PAGES * POSTS_PER_PAGE)).min(session.sources.len())
+}
+
+fn attempted_source_count(session: &FeedSession) -> usize {
+	session.sources.iter().filter(|entry| entry.state != SessionSourceState::Unstarted).count()
+}
+
+fn sync_sources_to_request(session: &FeedSession, page: usize) -> usize {
+	initial_sync_source_target(page).saturating_sub(attempted_source_count(session))
+}
+
+fn background_target_reached(session: &FeedSession) -> bool {
+	merged_posts_for_session(session).len() >= background_target_posts(session)
+		&& attempted_source_count(session) >= background_target_sources(session)
+}
+
 fn session_has_remaining_sources(session: &FeedSession) -> bool {
 	session.sources.iter().any(|entry| entry.state == SessionSourceState::Unstarted)
 }
@@ -496,19 +526,21 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 	}
 }
 
-async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize) {
+async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, max_sources: usize) {
 	loop {
-		let (page_ready, remaining) = {
+		let (page_ready, attempted_sources, remaining) = {
 			let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(session) = sessions.get(session_id) else {
 				return;
 			};
 			let merged = merged_posts_for_session(session);
 			let target = (page + 1) * per_page;
-			(merged.len() >= target, warm_targets(session, PAGE_FILL_BATCH))
+			let attempted_sources = attempted_source_count(session);
+			let remaining_budget = max_sources.saturating_sub(attempted_sources).min(PAGE_FILL_BATCH);
+			(merged.len() >= target, attempted_sources, warm_targets(session, remaining_budget))
 		};
 
-		if page_ready || remaining.is_empty() {
+		if page_ready || attempted_sources >= max_sources || remaining.is_empty() {
 			break;
 		}
 
@@ -528,7 +560,7 @@ async fn warm_session_background(session_id: String) {
 			let Some(session) = sessions.get(&session_id) else {
 				return;
 			};
-			let target_reached = merged_posts_for_session(session).len() >= background_target_posts(session);
+			let target_reached = background_target_reached(session);
 			(warm_targets(session, PAGE_FILL_BATCH), target_reached)
 		};
 
@@ -574,12 +606,11 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 		let Some(session) = sessions.get(&session_id) else {
 			return session_id;
 		};
-		let target_sources = INITIAL_SOURCE_WINDOW.max((page + 1) * PAGE_FILL_BATCH);
-		warm_targets(session, target_sources)
+		warm_targets(session, sync_sources_to_request(session, page))
 	};
 
 	warm_session_indices(&session_id, sync_target).await;
-	warm_session_to_fill(&session_id, page, per_page).await;
+	warm_session_to_fill(&session_id, page, per_page, max_sync_source_budget(page)).await;
 
 	let spawn_background = {
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -593,7 +624,7 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 			false
 		} else if session.background_active {
 			false
-		} else if merged_posts_for_session(session).len() >= background_target_posts(session) {
+		} else if background_target_reached(session) {
 			false
 		} else {
 			session.background_active = true;
@@ -644,7 +675,9 @@ pub fn cache_stats() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_source_keys, session_status_from_posts, sort_sources, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState,
+		active_source_keys, background_target_reached, background_target_sources, initial_sync_source_target, max_sync_source_budget,
+		session_status_from_posts, sort_sources, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry,
+		SessionSourceState,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
 	use std::collections::{HashSet, VecDeque};
@@ -831,5 +864,118 @@ mod tests {
 
 		assert!(status.next_page_ready);
 		assert!(status.status_message.contains("Next page is ready."));
+	}
+
+	#[test]
+	fn caps_sync_fill_budget_close_to_initial_window() {
+		assert_eq!(initial_sync_source_target(0), 32);
+		assert_eq!(max_sync_source_budget(0), 40);
+		assert_eq!(initial_sync_source_target(2), 40);
+		assert_eq!(max_sync_source_budget(2), 48);
+	}
+
+	#[test]
+	fn background_target_prefers_loading_more_sources_for_future_pages() {
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..120)
+				.map(|index| SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: format!("subreddit{index}"),
+					},
+					state: SessionSourceState::Unstarted,
+					posts: Vec::new(),
+					after: String::new(),
+					head_created_ts: None,
+					last_error: None,
+				})
+				.collect(),
+			background_active: true,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+		};
+
+		assert_eq!(background_target_sources(&session), 82);
+	}
+
+	#[test]
+	fn existing_sessions_do_not_request_a_fresh_initial_window_again() {
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..40)
+				.map(|index| SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: format!("subreddit{index}"),
+					},
+					state: if index < 32 {
+						SessionSourceState::Ready
+					} else {
+						SessionSourceState::Unstarted
+					},
+					posts: Vec::new(),
+					after: String::new(),
+					head_created_ts: None,
+					last_error: None,
+				})
+				.collect(),
+			background_active: true,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+		};
+
+		assert_eq!(sync_sources_to_request(&session, 0), 0);
+		assert_eq!(sync_sources_to_request(&session, 1), 4);
+	}
+
+	#[test]
+	fn enough_posts_from_too_few_sources_does_not_stop_background_warming() {
+		let posts = (0..100)
+			.map(|index| test_post(&format!("post-{index}"), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
+			.collect::<Vec<_>>();
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..200)
+				.map(|index| SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: format!("subreddit{index}"),
+					},
+					state: if index < 32 {
+						SessionSourceState::Ready
+					} else {
+						SessionSourceState::Unstarted
+					},
+					posts: if index == 0 { posts.clone() } else { Vec::new() },
+					after: String::new(),
+					head_created_ts: None,
+					last_error: None,
+				})
+				.collect(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+		};
+
+		assert!(!background_target_reached(&session));
 	}
 }

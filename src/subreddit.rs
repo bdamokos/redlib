@@ -722,6 +722,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let front_page = setting(&req, "front_page");
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
+	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
+	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 
 	let sub_name = req.param("sub").unwrap_or(if front_page_is_default {
 		if has_saved_feeds {
@@ -756,6 +758,15 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
+	let aggregate_saved_feeds = req.param("sub").is_none() && front_page_is_default && has_saved_feeds;
+	let loading_message = if aggregate_saved_feeds && sort == "new" {
+		format!(
+			"Loading posts from the first {} feeds. More feeds will warm in the background.",
+			crate::post_cache::initial_source_window()
+		)
+	} else {
+		"Loading posts...".to_string()
+	};
 
 	Ok(template(&SubredditShellTemplate {
 		sub: Subreddit {
@@ -767,7 +778,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		url,
 		redirect_url,
 		fragment_url: subreddit_fragment_path(&req),
-		loading_message: "Loading posts...".to_string(),
+		loading_message,
 	}))
 }
 
@@ -1415,6 +1426,30 @@ mod tests {
 
 		assert!(html.contains("action=\"/search\""));
 		assert!(!html.contains("action=\"/r/rust+programming/search\""));
+	}
+
+	#[test]
+	fn renders_home_new_shell_with_feed_warmup_message() {
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit {
+				name: "rust+programming".to_string(),
+				..Default::default()
+			},
+			active_flair_filter: String::new(),
+			prefs: test_prefs(),
+			url: "/new".to_string(),
+			redirect_url: String::new(),
+			fragment_url: "/subreddit-fragment/new".to_string(),
+			loading_message: format!(
+				"Loading posts from the first {} feeds. More feeds will warm in the background.",
+				crate::post_cache::initial_source_window()
+			),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("first 32 feeds"));
+		assert!(html.contains("feed_status_banner"));
 	}
 
 	#[test]
