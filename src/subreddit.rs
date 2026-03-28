@@ -78,6 +78,7 @@ pub struct SubredditShellTemplate {
 	redirect_url: String,
 	fragment_url: String,
 	loading_message: String,
+	placeholder_message: String,
 }
 
 crate::impl_template_str_eq!(SubredditShellTemplate);
@@ -160,11 +161,20 @@ enum AggregateFeedSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AggregateFrontPageState {
+	source_afters: Vec<String>,
+	#[serde(default)]
+	next_source_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct AggregateFrontCursor {
 	v: u8,
 	sources: Vec<AggregateFeedSource>,
 	source_afters: Vec<String>,
-	prev_stack: Vec<Vec<String>>,
+	#[serde(default)]
+	next_source_index: usize,
+	prev_stack: Vec<AggregateFrontPageState>,
 	#[serde(default)]
 	recent_post_ids: Vec<String>,
 	sort: String,
@@ -536,39 +546,44 @@ fn merge_chunk_posts(
 	recent_post_ids: &HashSet<String>,
 	seen_post_ids: &mut HashSet<String>,
 	any_post_after_filter: &mut bool,
-) {
-	loop {
-		let mut made_progress = false;
-
-		for buffer in chunk_buffers.iter_mut() {
-			let Some(post) = buffer.pop_front() else {
-				continue;
-			};
-			made_progress = true;
-
-			let is_filtered = filters.contains(&post.community) || filters.contains(&format!("u_{}", post.author.name));
-			if is_filtered {
-				continue;
-			}
-
-			*any_post_after_filter = true;
-			if !active_flair_filter.is_empty() && post.flair.text.trim() != active_flair_filter {
-				continue;
-			}
-			if recent_post_ids.contains(&post.id) || !seen_post_ids.insert(post.id.clone()) {
-				continue;
-			}
-
-			merged_posts.push(post);
-			if merged_posts.len() >= TARGET_POST_COUNT {
-				return;
-			}
-		}
-
-		if !made_progress {
-			return;
-		}
+	start_source_index: usize,
+) -> usize {
+	if chunk_buffers.is_empty() {
+		return 0;
 	}
+
+	let mut next_source_index = start_source_index % chunk_buffers.len();
+	let mut cursor = next_source_index;
+	let mut empty_streak = 0usize;
+
+	while empty_streak < chunk_buffers.len() {
+		let Some(post) = chunk_buffers[cursor].pop_front() else {
+			cursor = (cursor + 1) % chunk_buffers.len();
+			empty_streak += 1;
+			continue;
+		};
+
+		empty_streak = 0;
+		next_source_index = (cursor + 1) % chunk_buffers.len();
+
+		let is_filtered = filters.contains(&post.community) || filters.contains(&format!("u_{}", post.author.name));
+		if !is_filtered {
+			*any_post_after_filter = true;
+			if (active_flair_filter.is_empty() || post.flair.text.trim() == active_flair_filter)
+				&& !recent_post_ids.contains(&post.id)
+				&& seen_post_ids.insert(post.id.clone())
+			{
+				merged_posts.push(post);
+				if merged_posts.len() >= TARGET_POST_COUNT {
+					return next_source_index;
+				}
+			}
+		}
+
+		cursor = next_source_index;
+	}
+
+	next_source_index
 }
 
 async fn fetch_aggregated_subscription_feed(
@@ -586,6 +601,7 @@ async fn fetch_aggregated_subscription_feed(
 		.as_ref()
 		.map(|value| value.source_afters.clone())
 		.unwrap_or_else(|| vec![String::new(); sources.len()]);
+	let current_source_index = cursor.as_ref().map(|value| value.next_source_index).unwrap_or(0);
 	let mut next_state = current_state.clone();
 	let mut prev_stack = cursor.as_ref().map(|value| value.prev_stack.clone()).unwrap_or_default();
 	let page_has_cursor = cursor.is_some();
@@ -600,6 +616,7 @@ async fn fetch_aggregated_subscription_feed(
 	let mut any_post_after_filter = false;
 	let mut successful_chunks = 0usize;
 	let mut chunk_errors = Vec::new();
+	let mut next_source_index = current_source_index;
 
 	for round in 0..MAX_AGGREGATE_FILL_ROUNDS {
 		let mut fetched_any_chunk = false;
@@ -645,7 +662,7 @@ async fn fetch_aggregated_subscription_feed(
 			}
 		}
 
-		merge_chunk_posts(
+		next_source_index = merge_chunk_posts(
 			&mut chunk_buffers,
 			&mut merged_posts,
 			filters,
@@ -653,6 +670,7 @@ async fn fetch_aggregated_subscription_feed(
 			&recent_post_ids,
 			&mut seen_post_ids,
 			&mut any_post_after_filter,
+			next_source_index,
 		);
 
 		if merged_posts.len() >= TARGET_POST_COUNT {
@@ -677,11 +695,15 @@ async fn fetch_aggregated_subscription_feed(
 
 	let next_cursor = if next_state.iter().any(|after| !after.is_empty()) {
 		let mut next_prev_stack = prev_stack.clone();
-		next_prev_stack.push(current_state.clone());
+		next_prev_stack.push(AggregateFrontPageState {
+			source_afters: current_state.clone(),
+			next_source_index: current_source_index,
+		});
 		encode_front_cursor(&AggregateFrontCursor {
 			v: 1,
 			sources: sources.to_vec(),
 			source_afters: next_state,
+			next_source_index,
 			prev_stack: next_prev_stack,
 			recent_post_ids: page_post_ids.clone(),
 			sort: sort.to_string(),
@@ -696,7 +718,8 @@ async fn fetch_aggregated_subscription_feed(
 		encode_front_cursor(&AggregateFrontCursor {
 			v: 1,
 			sources: sources.to_vec(),
-			source_afters: previous_state,
+			source_afters: previous_state.source_afters,
+			next_source_index: previous_state.next_source_index,
 			prev_stack,
 			recent_post_ids: Vec::new(),
 			sort: sort.to_string(),
@@ -767,6 +790,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		"Loading posts...".to_string()
 	};
+	let placeholder_message = "Loading posts...".to_string();
 
 	Ok(template(&SubredditShellTemplate {
 		sub: Subreddit {
@@ -779,6 +803,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		redirect_url,
 		fragment_url: subreddit_fragment_path(&req),
 		loading_message,
+		placeholder_message,
 	}))
 }
 
@@ -1226,7 +1251,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 mod tests {
 	use super::{
 		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, should_enable_duplicate_collapse,
-		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, SubredditTemplate, FRONT_CURSOR_PARAM,
+		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate,
+		FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use hyper::{Body, Request};
@@ -1397,6 +1423,7 @@ mod tests {
 			redirect_url: "r/rust".to_string(),
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
+			placeholder_message: "Loading posts...".to_string(),
 		}
 		.render()
 		.unwrap();
@@ -1420,6 +1447,7 @@ mod tests {
 			redirect_url: String::new(),
 			fragment_url: "/subreddit-fragment".to_string(),
 			loading_message: "Loading posts...".to_string(),
+			placeholder_message: "Loading posts...".to_string(),
 		}
 		.render()
 		.unwrap();
@@ -1444,11 +1472,19 @@ mod tests {
 				"Loading posts from the first {} feeds. More feeds will warm in the background.",
 				crate::post_cache::initial_source_window()
 			),
+			placeholder_message: "Loading posts...".to_string(),
 		}
 		.render()
 		.unwrap();
 
-		assert!(html.contains("first 32 feeds"));
+		assert!(html.contains(
+			&format!(
+				"<div class=\"feed_status_banner warming\">Loading posts from the first {} feeds. More feeds will warm in the background.</div>",
+				crate::post_cache::initial_source_window()
+			)
+		));
+		assert!(html.contains("<center>Loading posts...</center>"));
+		assert!(!html.contains("<center>Loading posts from the first"));
 		assert!(html.contains("feed_status_banner"));
 	}
 
@@ -1468,6 +1504,7 @@ mod tests {
 			redirect_url: "r/rust".to_string(),
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
+			placeholder_message: "Loading posts...".to_string(),
 		}
 		.render()
 		.unwrap();
@@ -1681,7 +1718,11 @@ mod tests {
 				},
 			],
 			source_afters: vec!["t3_a".to_string(), String::new()],
-			prev_stack: vec![vec![String::new(), String::new()]],
+			next_source_index: 1,
+			prev_stack: vec![AggregateFrontPageState {
+				source_afters: vec![String::new(), String::new()],
+				next_source_index: 0,
+			}],
 			recent_post_ids: vec!["t3_demo".to_string()],
 			sort: "hot".to_string(),
 			timeframe: String::new(),
@@ -1727,7 +1768,7 @@ mod tests {
 		let mut any_post_after_filter = false;
 		let mut chunk_buffers = [first, second];
 
-		merge_chunk_posts(
+		let next_source_index = merge_chunk_posts(
 			&mut chunk_buffers,
 			&mut merged,
 			&HashSet::new(),
@@ -1735,10 +1776,12 @@ mod tests {
 			&recent_post_ids,
 			&mut seen_post_ids,
 			&mut any_post_after_filter,
+			0,
 		);
 
 		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "3", "2"]);
 		assert!(any_post_after_filter);
+		assert_eq!(next_source_index, 1);
 
 		let mut filtered_merged = Vec::new();
 		let filtered_recent_post_ids = HashSet::new();
@@ -1765,7 +1808,7 @@ mod tests {
 			}]),
 		];
 
-		merge_chunk_posts(
+		let filtered_next_source_index = merge_chunk_posts(
 			&mut filtered_chunk_buffers,
 			&mut filtered_merged,
 			&filters,
@@ -1773,10 +1816,12 @@ mod tests {
 			&filtered_recent_post_ids,
 			&mut filtered_seen_post_ids,
 			&mut filtered_flag,
+			0,
 		);
 
 		assert_eq!(filtered_merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "2"]);
 		assert!(filtered_flag);
+		assert_eq!(filtered_next_source_index, 0);
 	}
 
 	#[test]
@@ -1812,7 +1857,7 @@ mod tests {
 		let mut merged = Vec::new();
 		let mut any_post_after_filter = false;
 
-		merge_chunk_posts(
+		let next_source_index = merge_chunk_posts(
 			&mut chunk_buffers,
 			&mut merged,
 			&HashSet::new(),
@@ -1820,9 +1865,68 @@ mod tests {
 			&recent_post_ids,
 			&mut seen_post_ids,
 			&mut any_post_after_filter,
+			0,
 		);
 
 		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "3"]);
+		assert_eq!(next_source_index, 0);
+	}
+
+	#[test]
+	fn merge_preserves_round_robin_position_across_refills() {
+		let recent_post_ids = HashSet::new();
+		let mut seen_post_ids = HashSet::new();
+		let mut any_post_after_filter = false;
+		let mut first_round_buffers = [
+			VecDeque::from(vec![Post {
+				id: "1".to_string(),
+				community: "user_a".to_string(),
+				..test_post()
+			}]),
+			VecDeque::new(),
+		];
+		let mut merged = Vec::new();
+
+		let next_source_index = merge_chunk_posts(
+			&mut first_round_buffers,
+			&mut merged,
+			&HashSet::new(),
+			"",
+			&recent_post_ids,
+			&mut seen_post_ids,
+			&mut any_post_after_filter,
+			0,
+		);
+
+		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1"]);
+		assert_eq!(next_source_index, 1);
+
+		let mut second_round_buffers = [
+			VecDeque::from(vec![Post {
+				id: "2".to_string(),
+				community: "user_a".to_string(),
+				..test_post()
+			}]),
+			VecDeque::from(vec![Post {
+				id: "3".to_string(),
+				community: "user_b".to_string(),
+				..test_post()
+			}]),
+		];
+
+		let next_source_index = merge_chunk_posts(
+			&mut second_round_buffers,
+			&mut merged,
+			&HashSet::new(),
+			"",
+			&recent_post_ids,
+			&mut seen_post_ids,
+			&mut any_post_after_filter,
+			next_source_index,
+		);
+
+		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "3", "2"]);
+		assert_eq!(next_source_index, 1);
 	}
 }
 
