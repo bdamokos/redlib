@@ -50,6 +50,11 @@ def extract_next(body: str, label: str) -> str:
     return extract(r'href="([^"]+)" accesskey="N"', body, label)
 
 
+def maybe_extract_next(body: str) -> str | None:
+    match = re.search(r'href="([^"]+)" accesskey="N"', body, re.S)
+    return html.unescape(match.group(1)) if match else None
+
+
 def heavy_subscription_cookie() -> str:
     subscriptions = ["rust"] + [f"subreddit{i}" for i in range(1200)]
     parts = ["front_page=default", "post_sort=new"]
@@ -178,8 +183,8 @@ require(r'id="posts"', user_fragment, "user fragment posts")
 require(r'data-subscription-form', user_fragment, "user fragment inline follow forms")
 
 front_fragment = fetch("/subreddit-fragment")
-front_next = extract_next(front_fragment, "front next page")
-fetch(front_next)
+if front_next := maybe_extract_next(front_fragment):
+    fetch(front_next)
 
 sub_next = extract_next(sub_fragment, "subreddit next page")
 fetch(sub_next)
