@@ -744,9 +744,10 @@ pub fn cache_stats() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_source_keys, background_target_reached, background_target_sources, initial_sync_source_target, max_sync_source_budget,
-		merged_posts_for_session, session_status_from_posts, sort_sources, sync_sources_to_request, FeedSession, FeedSessionRequest,
-		FeedSource, SessionSourceEntry, SessionSourceState,
+		active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state,
+		initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, session_status_from_posts,
+		sort_sources, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState,
+		POSTS_PER_PAGE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
 	use std::collections::{HashSet, VecDeque};
@@ -1130,5 +1131,101 @@ mod tests {
 		let second = session_status_from_posts(&session, &posts, 0, 25).refresh_token;
 
 		assert_eq!(first, second);
+	}
+
+	#[test]
+	fn mark_fetching_sources_failed_recovers_stuck_session_entries() {
+		let mut session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![
+				SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: "ready".to_string(),
+					},
+					state: SessionSourceState::Ready,
+					posts: vec![test_post("one", "ready", chrono::Utc::now().timestamp() as u64)],
+					after: String::new(),
+					head_created_ts: None,
+					last_error: None,
+				},
+				SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: "stuck".to_string(),
+					},
+					state: SessionSourceState::Fetching,
+					posts: Vec::new(),
+					after: String::new(),
+					head_created_ts: None,
+					last_error: None,
+				},
+			],
+			background_active: true,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		assert_eq!(count_sources_in_state(&session, SessionSourceState::Fetching), 1);
+		mark_fetching_sources_failed(&mut session);
+
+		assert_eq!(count_sources_in_state(&session, SessionSourceState::Fetching), 0);
+		assert_eq!(count_sources_in_state(&session, SessionSourceState::Failed), 1);
+		assert_eq!(session.sources[1].last_error.as_deref(), Some("task join error"));
+	}
+
+	#[test]
+	fn background_target_waits_for_more_attempted_sources_than_first_page_uses() {
+		let now = chrono::Utc::now().timestamp() as u64;
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..40)
+				.map(|index| SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: format!("subreddit{index}"),
+					},
+					state: if index < 32 {
+						SessionSourceState::Ready
+					} else {
+						SessionSourceState::Unstarted
+					},
+					posts: if index < 32 {
+						vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]
+					} else {
+						Vec::new()
+					},
+					after: String::new(),
+					head_created_ts: if index < 32 { Some(now - index as u64) } else { None },
+					last_error: None,
+				})
+				.collect(),
+			background_active: true,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let first_page_sources = merged_posts_for_session(&session)
+			.into_iter()
+			.take(POSTS_PER_PAGE)
+			.map(|post| post.community)
+			.collect::<HashSet<_>>();
+
+		assert_eq!(first_page_sources.len(), POSTS_PER_PAGE);
+		assert!(attempted_source_count(&session) > first_page_sources.len());
+		assert!(!background_target_reached(&session));
 	}
 }
