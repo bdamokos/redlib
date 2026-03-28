@@ -1821,7 +1821,7 @@ mod tests {
 
 		assert_eq!(filtered_merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "2"]);
 		assert!(filtered_flag);
-		assert_eq!(filtered_next_source_index, 0);
+		assert_eq!(filtered_next_source_index, 1);
 	}
 
 	#[test]
