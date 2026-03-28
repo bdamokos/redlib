@@ -392,6 +392,18 @@ main {
     max-width: 100%;
 }
 
+.feed_status_banner,
+.page_load_banner {
+    box-sizing: border-box;
+    margin: 0 auto 12px;
+    max-width: min(100%, 750px);
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding: 0 12px;
+    text-align: center;
+    width: 100%;
+}
+
 #column_one {
     width: 100%;
     border-radius: 5px;
