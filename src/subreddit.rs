@@ -474,7 +474,7 @@ async fn live_feed_shell_loading_message(req: &Request<Body>, preferences: &Pref
 	let query = req.uri().query().unwrap_or_default().to_string();
 	let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
 	let filters = get_filters(req);
-	let feed_session_id = crate::post_cache::ensure_feed_session(
+	let feed_session_id = crate::post_cache::begin_feed_session(
 		FeedSessionRequest {
 			sources: build_feed_sources(preferences),
 			filters,
@@ -964,100 +964,106 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 			is_filtered: true,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				no_posts: false,
-				is_flair_subscribed,
-				feed_session_id: String::new(),
-				feed_status_url: String::new(),
-				feed_fragment_url: String::new(),
-			})
-		} else if aggregate_saved_feeds {
-			if sort == "new" {
-				let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
-					.and_then(|p| p.parse::<usize>().ok())
-					.unwrap_or(0);
-
-				let query_fingerprint = listing_query_fingerprint(&query);
-				let feed_session_id = crate::post_cache::ensure_feed_session(
-					FeedSessionRequest {
-						sources: build_feed_sources(&prefs),
-						filters: filters.clone(),
-						quarantine: quarantined,
-						query_fingerprint,
-					},
-					cache_page,
-					crate::post_cache::POSTS_PER_PAGE,
-				)
-				.await;
-
-				if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
-					let (cached_subs, cached_posts) = crate::post_cache::cache_stats();
-					info!(
-						"post_cache: serving page {} from session {} ({} sources cached, {} total posts)",
-						cache_page, feed_session_id, cached_subs, cached_posts
-					);
-					let no_posts = page.posts.is_empty();
-					let all_posts_hidden_nsfw = !no_posts && (page.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-					utils::hydrate_post_author_links_from_cache(&mut page.posts);
-
-					let prev_page_url = if cache_page > 0 {
-						update_url_query(
-							&url,
-							&[
-								("cache_page", Some(&(cache_page - 1).to_string())),
-								(FEED_SESSION_PARAM, Some(&feed_session_id)),
-								("before", None),
-								("after", None),
-								(FRONT_CURSOR_PARAM, None),
-							],
-						)
-					} else {
-						String::new()
-					};
-					let next_page_url = if page.has_next {
-						update_url_query(
-							&url,
-							&[
-								("cache_page", Some(&(cache_page + 1).to_string())),
-								(FEED_SESSION_PARAM, Some(&feed_session_id)),
-								("before", None),
-								("after", None),
-								(FRONT_CURSOR_PARAM, None),
-							],
-						)
-					} else {
-						String::new()
-					};
-
-					return render_subreddit_fragment(&SubredditFragmentTemplate {
-						sub,
-						posts: page.posts,
-						top_users,
-						sort: (sort.clone(), timeframe.clone()),
-						sort_options,
-						flair_filters,
-						active_flair_filter: active_flair_filter.clone(),
-						active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-						clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)]),
-						prev_page_url,
-						next_page_url,
-						prefs: Preferences::new(&req),
-						url: url.clone(),
-						redirect_url,
-						enable_duplicate_collapse: true,
-						is_filtered: false,
-						all_posts_filtered: false,
-						all_posts_hidden_nsfw,
-						no_posts,
-						is_flair_subscribed,
-						feed_session_id: feed_session_id.clone(),
-						feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
-						feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
-					});
-				}
-			}
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			is_flair_subscribed,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+		})
+	} else if aggregate_saved_feeds {
+		if sort == "new" {
+			let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+				.and_then(|p| p.parse::<usize>().ok())
+				.unwrap_or(0);
 
 			let query_fingerprint = listing_query_fingerprint(&query);
+			let feed_session_id = crate::post_cache::begin_feed_session(
+				FeedSessionRequest {
+					sources: build_feed_sources(&prefs),
+					filters: filters.clone(),
+					quarantine: quarantined,
+					query_fingerprint,
+				},
+				cache_page,
+				crate::post_cache::POSTS_PER_PAGE,
+			)
+			.await;
+
+			if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
+				let page_ready = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE)
+					.map(|status| status.current_page_ready)
+					.unwrap_or(false);
+				let (cached_subs, cached_posts) = crate::post_cache::cache_stats();
+				info!(
+					"post_cache: serving page {} from session {} ({} sources cached, {} total posts)",
+					cache_page, feed_session_id, cached_subs, cached_posts
+				);
+				let no_posts = page_ready && page.posts.is_empty();
+				let all_posts_hidden_nsfw = !no_posts && (page.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+				utils::hydrate_post_author_links_from_cache(&mut page.posts);
+
+				let prev_page_url = if cache_page > 0 {
+					update_url_query(
+						&url,
+						&[
+							("cache_page", Some(&(cache_page - 1).to_string())),
+							(FEED_SESSION_PARAM, Some(&feed_session_id)),
+							("before", None),
+							("after", None),
+							(FRONT_CURSOR_PARAM, None),
+						],
+					)
+				} else {
+					String::new()
+				};
+				let next_page_url = if page.has_next {
+					update_url_query(
+						&url,
+						&[
+							("cache_page", Some(&(cache_page + 1).to_string())),
+							(FEED_SESSION_PARAM, Some(&feed_session_id)),
+							("before", None),
+							("after", None),
+							(FRONT_CURSOR_PARAM, None),
+						],
+					)
+				} else {
+					String::new()
+				};
+
+				return render_subreddit_fragment(&SubredditFragmentTemplate {
+					sub,
+					posts: page.posts,
+					top_users,
+					sort: (sort.clone(), timeframe.clone()),
+					sort_options,
+					flair_filters,
+					active_flair_filter: active_flair_filter.clone(),
+					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+					clear_flair_filter_url: update_url_query(
+						&url,
+						&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+					),
+					prev_page_url,
+					next_page_url,
+					prefs: Preferences::new(&req),
+					url: url.clone(),
+					redirect_url,
+					enable_duplicate_collapse: true,
+					is_filtered: false,
+					all_posts_filtered: false,
+					all_posts_hidden_nsfw,
+					no_posts,
+					is_flair_subscribed,
+					feed_session_id: feed_session_id.clone(),
+					feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
+					feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
+				});
+			}
+		}
+
+		let query_fingerprint = listing_query_fingerprint(&query);
 		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
 			.and_then(|encoded| decode_front_cursor(&encoded))
 			.filter(|cursor| cursor_matches_request(cursor, &aggregate_sources, &sort, &timeframe, &query_fingerprint));
@@ -2061,6 +2067,9 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
 		.and_then(|value| value.parse::<usize>().ok())
 		.unwrap_or(0);
+	let page_ready = crate::post_cache::feed_status(&session_id, page, crate::post_cache::POSTS_PER_PAGE)
+		.map(|status| status.current_page_ready)
+		.unwrap_or(false);
 	let Some(mut feed_page) = crate::post_cache::feed_page(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
 		return error(req, "Feed session not found or expired").await;
 	};

@@ -737,6 +737,52 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 	session_id
 }
 
+pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
+	let session_id = build_session_id(&request);
+	reconcile_stuck_fetching_sources(&session_id).await;
+
+	{
+		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+		sessions.retain(|_, session| !session_is_expired(session));
+
+		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
+		session.requested_page = session.requested_page.max(page);
+		touch_session(session);
+	}
+
+	let spawn_background = {
+		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(session) = sessions.get_mut(&session_id) else {
+			return session_id;
+		};
+
+		if !session_has_remaining_sources(session) {
+			session.background_complete = true;
+			session.background_active = false;
+			false
+		} else if session.background_active {
+			false
+		} else if background_target_reached(session) {
+			false
+		} else {
+			session.background_complete = false;
+			session.background_active = true;
+			true
+		}
+	};
+
+	if spawn_background {
+		let background_id = session_id.clone();
+		tokio::spawn(async move {
+			warm_session_to_fill(&background_id, page, per_page, max_sync_source_budget(page)).await;
+			warm_session_for_round_robin(&background_id, page, per_page).await;
+			warm_session_background(background_id).await;
+		});
+	}
+
+	session_id
+}
+
 pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedPage> {
 	let sessions = FEED_SESSIONS.lock().ok()?;
 	let session = sessions.get(session_id)?;
