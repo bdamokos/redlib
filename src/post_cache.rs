@@ -528,13 +528,12 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 	for chunk in jobs.chunks(FETCH_CONCURRENCY) {
 		let mut handles = Vec::new();
 		for (index, source, quarantine) in chunk.iter().cloned() {
-			handles.push(tokio::spawn(async move { (index, source.clone(), fetch_source_posts(source, quarantine).await) }));
+			let task_source = source.clone();
+			handles.push((index, source, tokio::spawn(async move { fetch_source_posts(task_source, quarantine).await })));
 		}
 
-		for handle in handles {
-			let Ok((index, source, result)) = handle.await else {
-				continue;
-			};
+		for (index, source, handle) in handles {
+			let result = handle.await;
 			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(session) = sessions.get_mut(session_id) else {
 				continue;
@@ -544,7 +543,7 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 			};
 
 			match result {
-				Ok(cached) => {
+				Ok(Ok(cached)) => {
 					entry.state = SessionSourceState::Ready;
 					entry.posts = cached.posts;
 					entry.after = cached.after;
@@ -552,7 +551,13 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 					entry.last_error = None;
 					log::trace!("post_cache: warmed {}", source.display_name());
 				}
-				Err(error) => {
+				Ok(Err(error)) => {
+					entry.state = SessionSourceState::Failed;
+					entry.last_error = Some(error.clone());
+					warn!("post_cache: failed to warm {}: {}", source.display_name(), error);
+				}
+				Err(join_error) => {
+					let error = format!("task join error: {join_error}");
 					entry.state = SessionSourceState::Failed;
 					entry.last_error = Some(error.clone());
 					warn!("post_cache: failed to warm {}: {}", source.display_name(), error);
@@ -561,6 +566,31 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 			touch_session(session);
 		}
 	}
+}
+
+fn count_sources_in_state(session: &FeedSession, state: SessionSourceState) -> usize {
+	session.sources.iter().filter(|entry| entry.state == state).count()
+}
+
+fn mark_fetching_sources_failed(session: &mut FeedSession) {
+	for entry in &mut session.sources {
+		if entry.state == SessionSourceState::Fetching {
+			entry.state = SessionSourceState::Failed;
+			entry.last_error = Some("task join error".to_string());
+		}
+	}
+}
+
+async fn reconcile_stuck_fetching_sources(session_id: &str) {
+	let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+	let Some(session) = sessions.get_mut(session_id) else {
+		return;
+	};
+	if count_sources_in_state(session, SessionSourceState::Fetching) == 0 {
+		return;
+	}
+	mark_fetching_sources_failed(session);
+	touch_session(session);
 }
 
 async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, max_sources: usize) {
@@ -592,6 +622,7 @@ async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, ma
 
 async fn warm_session_background(session_id: String) {
 	loop {
+		reconcile_stuck_fetching_sources(&session_id).await;
 		let (remaining, target_reached) = {
 			let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(session) = sessions.get(&session_id) else {
@@ -628,6 +659,7 @@ async fn warm_session_background(session_id: String) {
 
 pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
 	let session_id = build_session_id(&request);
+	reconcile_stuck_fetching_sources(&session_id).await;
 
 	{
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());

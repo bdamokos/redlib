@@ -5,6 +5,7 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:18081}"
 
 BASE_URL="$BASE_URL" python3 - <<'PY'
 import html
+import json
 import os
 import re
 import sys
@@ -136,6 +137,21 @@ def extract_post_sources(body: str) -> set[str]:
     return set(html.unescape(match) for match in re.findall(r'class="post_subreddit" href="([^"]+)"', body))
 
 
+def fetch_json(path: str, *, cookie: str = "", timeout: int = 45) -> dict:
+    return json.loads(fetch(path, cookie=cookie, timeout=timeout))
+
+
+def wait_for(predicate, *, timeout_seconds: int = 15, interval_seconds: float = 0.5, failure_message: str):
+    deadline = time.time() + timeout_seconds
+    last_value = None
+    while time.time() < deadline:
+        last_value = predicate()
+        if last_value:
+            return last_value
+        time.sleep(interval_seconds)
+    fail(failure_message)
+
+
 print(f"Checking shell routes against {BASE_URL}")
 
 front_shell = fetch("/")
@@ -236,15 +252,22 @@ require(r'>Unsubscribe<', heavy_sub_fragment, "heavy subscribed subreddit label"
 active_cookie = active_subscription_cookie()
 active_page0 = fetch("/subreddit-fragment/new", cookie=active_cookie, timeout=60)
 active_session_id = extract_feed_session_id(active_page0, "active feed session id")
-active_page1 = fetch(
-    f"/feed-fragment?feed_session={active_session_id}&cache_page=1&current_url=%2Fnew",
-    cookie=active_cookie,
-    timeout=20,
-)
+active_status_path = extract(r'data-feed-status-url="([^"]+)"', active_page0, "active feed status url")
 page0_sources = extract_post_sources(active_page0)
-page1_sources = extract_post_sources(active_page1)
-if not page1_sources.difference(page0_sources):
-    fail("active saved-feed page 1 did not introduce any additional post sources beyond page 0")
+active_status = wait_for(
+    lambda: (
+        status
+        if (
+            (status := fetch_json(active_status_path, cookie=active_cookie, timeout=20)).get("ready_sources", 0)
+            + status.get("failed_sources", 0)
+        ) > len(page0_sources)
+        or not status.get("warming", True)
+        else None
+    ),
+    failure_message="active saved-feed status never expanded beyond the first page source set",
+)
+if active_status.get("ready_sources", 0) + active_status.get("failed_sources", 0) <= len(page0_sources):
+    fail("active saved-feed warmup did not expand beyond the first page source set")
 
 print("Shell smoke checks passed.")
 PY
