@@ -82,9 +82,6 @@ enum SessionSourceState {
 struct SessionSourceEntry {
 	source: FeedSource,
 	state: SessionSourceState,
-	posts: Vec<Post>,
-	after: String,
-	head_created_ts: Option<u64>,
 	last_error: Option<String>,
 }
 
@@ -187,13 +184,19 @@ fn store_source_posts(source: &FeedSource, posts: Vec<Post>, after: String) {
 	}
 }
 
+fn cached_source_posts(source: &FeedSource) -> Option<CachedSourcePosts> {
+	let cache = SOURCE_CACHE.lock().ok()?;
+	let entry = cache.get(&source.cache_key())?;
+	if source_cache_is_expired(entry) {
+		return None;
+	}
+
+	Some(entry.clone())
+}
+
 async fn fetch_source_posts(source: FeedSource, quarantine: bool) -> Result<CachedSourcePosts, String> {
-	if let Ok(cache) = SOURCE_CACHE.lock() {
-		if let Some(entry) = cache.get(&source.cache_key()) {
-			if !source_cache_is_expired(entry) {
-				return Ok(entry.clone());
-			}
-		}
+	if let Some(entry) = cached_source_posts(&source) {
+		return Ok(entry);
 	}
 
 	let (posts, after) = Post::fetch(&source.build_path(), quarantine).await?;
@@ -233,9 +236,6 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 		.map(|source| SessionSourceEntry {
 			source,
 			state: SessionSourceState::Unstarted,
-			posts: Vec::new(),
-			after: String::new(),
-			head_created_ts: None,
 			last_error: None,
 		})
 		.collect();
@@ -255,11 +255,19 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 fn filtered_source_queues(session: &FeedSession) -> Vec<(FeedSource, VecDeque<Post>)> {
 	let mut queues = Vec::new();
 	for entry in &session.sources {
-		if entry.state != SessionSourceState::Ready || entry.posts.is_empty() {
+		if entry.state != SessionSourceState::Ready {
 			continue;
 		}
 
-		let filtered = entry
+		let Some(cached) = cached_source_posts(&entry.source) else {
+			continue;
+		};
+
+		if cached.posts.is_empty() {
+			continue;
+		}
+
+		let filtered = cached
 			.posts
 			.iter()
 			.filter(|post| !session.request.filters.contains(&post.community) && !session.request.filters.contains(&format!("u_{}", post.author.name)))
@@ -533,11 +541,8 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 			};
 
 			match result {
-				Ok(Ok(cached)) => {
+				Ok(Ok(_cached)) => {
 					entry.state = SessionSourceState::Ready;
-					entry.posts = cached.posts;
-					entry.after = cached.after;
-					entry.head_created_ts = entry.posts.first().map(|post| post.created_ts);
 					entry.last_error = None;
 					log::trace!("post_cache: warmed {}", source.display_name());
 				}
@@ -767,11 +772,36 @@ mod tests {
 	use super::{
 		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state,
 		initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, round_robin_source_target, session_status_from_posts,
-		sort_sources, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState, POSTS_PER_PAGE,
+		sort_sources, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState, FEED_SESSIONS,
+		POSTS_PER_PAGE, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
 	use std::collections::{HashSet, VecDeque};
+	use std::sync::{LazyLock, Mutex, MutexGuard};
 	use std::time::Instant;
+
+	static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+	fn test_lock() -> MutexGuard<'static, ()> {
+		TEST_LOCK.lock().unwrap()
+	}
+
+	fn reset_test_caches() {
+		SOURCE_CACHE.lock().unwrap().clear();
+		FEED_SESSIONS.lock().unwrap().clear();
+	}
+
+	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {
+		SessionSourceEntry {
+			source,
+			state,
+			last_error: None,
+		}
+	}
+
+	fn seed_source(source: &FeedSource, posts: Vec<Post>) {
+		store_source_posts(source, posts, String::new());
+	}
 
 	fn empty_flair() -> Flair {
 		Flair {
@@ -826,6 +856,8 @@ mod tests {
 
 	#[test]
 	fn sorts_user_sources_before_subreddits_and_flairs() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let mut sources = vec![
 			FeedSource::Flair {
 				subreddit: "zeta".to_string(),
@@ -844,6 +876,8 @@ mod tests {
 
 	#[test]
 	fn suppresses_clearly_stale_sources_when_fresh_cluster_exists() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
 		let queues = vec![
 			(
@@ -869,6 +903,10 @@ mod tests {
 
 	#[test]
 	fn status_message_mentions_followed_feeds_while_users_are_still_warming() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		seed_source(&rust_source, vec![test_post("one", "rust", chrono::Utc::now().timestamp() as u64)]);
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -878,22 +916,8 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "u_demo".to_string() },
-					state: SessionSourceState::Unstarted,
-					posts: Vec::new(),
-					after: String::new(),
-					head_created_ts: None,
-					last_error: None,
-				},
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "rust".to_string() },
-					state: SessionSourceState::Ready,
-					posts: vec![test_post("one", "rust", chrono::Utc::now().timestamp() as u64)],
-					after: String::new(),
-					head_created_ts: None,
-					last_error: None,
-				},
+				session_entry(FeedSource::Subreddit { name: "u_demo".to_string() }, SessionSourceState::Unstarted),
+				session_entry(rust_source, SessionSourceState::Ready),
 			],
 			background_active: true,
 			background_complete: false,
@@ -909,10 +933,14 @@ mod tests {
 
 	#[test]
 	fn status_message_mentions_next_page_when_ready() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let post_count = 60;
 		let posts = (0..post_count)
 			.map(|index| test_post(&index.to_string(), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
 			.collect::<Vec<_>>();
+		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		seed_source(&rust_source, posts.clone());
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -921,14 +949,7 @@ mod tests {
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
 			},
-			sources: vec![SessionSourceEntry {
-				source: FeedSource::Subreddit { name: "rust".to_string() },
-				state: SessionSourceState::Ready,
-				posts: posts.clone(),
-				after: String::new(),
-				head_created_ts: None,
-				last_error: None,
-			}],
+			sources: vec![session_entry(rust_source, SessionSourceState::Ready)],
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -944,6 +965,8 @@ mod tests {
 
 	#[test]
 	fn caps_sync_fill_budget_close_to_initial_window() {
+		let _guard = test_lock();
+		reset_test_caches();
 		assert_eq!(initial_sync_source_target(0), 32);
 		assert_eq!(max_sync_source_budget(0), 40);
 		assert_eq!(initial_sync_source_target(2), 75);
@@ -952,6 +975,8 @@ mod tests {
 
 	#[test]
 	fn background_target_prefers_loading_more_sources_for_future_pages() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -961,16 +986,7 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: (0..120)
-				.map(|index| SessionSourceEntry {
-					source: FeedSource::Subreddit {
-						name: format!("subreddit{index}"),
-					},
-					state: SessionSourceState::Unstarted,
-					posts: Vec::new(),
-					after: String::new(),
-					head_created_ts: None,
-					last_error: None,
-				})
+				.map(|index| session_entry(FeedSource::Subreddit { name: format!("subreddit{index}") }, SessionSourceState::Unstarted))
 				.collect(),
 			background_active: true,
 			background_complete: false,
@@ -984,6 +1000,8 @@ mod tests {
 
 	#[test]
 	fn existing_sessions_do_not_request_a_fresh_initial_window_again() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -993,15 +1011,13 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: (0..40)
-				.map(|index| SessionSourceEntry {
-					source: FeedSource::Subreddit {
-						name: format!("subreddit{index}"),
-					},
-					state: if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
-					posts: Vec::new(),
-					after: String::new(),
-					head_created_ts: None,
-					last_error: None,
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
+					)
 				})
 				.collect(),
 			background_active: true,
@@ -1017,9 +1033,15 @@ mod tests {
 
 	#[test]
 	fn enough_posts_from_too_few_sources_does_not_stop_background_warming() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let posts = (0..100)
 			.map(|index| test_post(&format!("post-{index}"), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
 			.collect::<Vec<_>>();
+		let hot_source = FeedSource::Subreddit {
+			name: "subreddit0".to_string(),
+		};
+		seed_source(&hot_source, posts);
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -1029,15 +1051,13 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: (0..200)
-				.map(|index| SessionSourceEntry {
-					source: FeedSource::Subreddit {
-						name: format!("subreddit{index}"),
-					},
-					state: if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
-					posts: if index == 0 { posts.clone() } else { Vec::new() },
-					after: String::new(),
-					head_created_ts: None,
-					last_error: None,
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
+					)
 				})
 				.collect(),
 			background_active: false,
@@ -1052,7 +1072,13 @@ mod tests {
 
 	#[test]
 	fn older_sources_reenter_after_fresher_sources_are_exhausted() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
+		let fresh_source = FeedSource::Subreddit { name: "fresh".to_string() };
+		let stale_source = FeedSource::Subreddit { name: "stale".to_string() };
+		seed_source(&fresh_source, vec![test_post("fresh-post", "fresh", now - 60)]);
+		seed_source(&stale_source, vec![test_post("stale-post", "stale", now - 172_800)]);
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -1062,22 +1088,8 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "fresh".to_string() },
-					state: SessionSourceState::Ready,
-					posts: vec![test_post("fresh-post", "fresh", now - 60)],
-					after: String::new(),
-					head_created_ts: Some(now - 60),
-					last_error: None,
-				},
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "stale".to_string() },
-					state: SessionSourceState::Ready,
-					posts: vec![test_post("stale-post", "stale", now - 172_800)],
-					after: String::new(),
-					head_created_ts: Some(now - 172_800),
-					last_error: None,
-				},
+				session_entry(fresh_source, SessionSourceState::Ready),
+				session_entry(stale_source, SessionSourceState::Ready),
 			],
 			background_active: false,
 			background_complete: false,
@@ -1093,7 +1105,11 @@ mod tests {
 
 	#[test]
 	fn refresh_token_is_stable_without_session_mutation() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let posts = vec![test_post("one", "rust", chrono::Utc::now().timestamp() as u64)];
+		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		seed_source(&rust_source, posts.clone());
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -1102,14 +1118,7 @@ mod tests {
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
 			},
-			sources: vec![SessionSourceEntry {
-				source: FeedSource::Subreddit { name: "rust".to_string() },
-				state: SessionSourceState::Ready,
-				posts: posts.clone(),
-				after: String::new(),
-				head_created_ts: posts.first().map(|post| post.created_ts),
-				last_error: None,
-			}],
+			sources: vec![session_entry(rust_source, SessionSourceState::Ready)],
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -1125,6 +1134,10 @@ mod tests {
 
 	#[test]
 	fn mark_fetching_sources_failed_recovers_stuck_session_entries() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let ready_source = FeedSource::Subreddit { name: "ready".to_string() };
+		seed_source(&ready_source, vec![test_post("one", "ready", chrono::Utc::now().timestamp() as u64)]);
 		let mut session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -1134,22 +1147,8 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "ready".to_string() },
-					state: SessionSourceState::Ready,
-					posts: vec![test_post("one", "ready", chrono::Utc::now().timestamp() as u64)],
-					after: String::new(),
-					head_created_ts: None,
-					last_error: None,
-				},
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "stuck".to_string() },
-					state: SessionSourceState::Fetching,
-					posts: Vec::new(),
-					after: String::new(),
-					head_created_ts: None,
-					last_error: None,
-				},
+				session_entry(ready_source, SessionSourceState::Ready),
+				session_entry(FeedSource::Subreddit { name: "stuck".to_string() }, SessionSourceState::Fetching),
 			],
 			background_active: true,
 			background_complete: false,
@@ -1168,7 +1167,18 @@ mod tests {
 
 	#[test]
 	fn background_target_waits_for_more_attempted_sources_than_first_page_uses() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
+		for index in 0..32 {
+			let source = FeedSource::Subreddit {
+				name: format!("subreddit{index}"),
+			};
+			seed_source(
+				&source,
+				vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)],
+			);
+		}
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -1178,19 +1188,13 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: (0..40)
-				.map(|index| SessionSourceEntry {
-					source: FeedSource::Subreddit {
-						name: format!("subreddit{index}"),
-					},
-					state: if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
-					posts: if index < 32 {
-						vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]
-					} else {
-						Vec::new()
-					},
-					after: String::new(),
-					head_created_ts: if index < 32 { Some(now - index as u64) } else { None },
-					last_error: None,
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
+					)
 				})
 				.collect(),
 			background_active: true,
@@ -1213,6 +1217,8 @@ mod tests {
 
 	#[test]
 	fn round_robin_target_scales_with_requested_page_count() {
+		let _guard = test_lock();
+		reset_test_caches();
 		assert_eq!(round_robin_source_target(0, POSTS_PER_PAGE), 32);
 		assert_eq!(round_robin_source_target(1, POSTS_PER_PAGE), 50);
 		assert_eq!(round_robin_source_target(2, POSTS_PER_PAGE), 75);
@@ -1221,7 +1227,15 @@ mod tests {
 
 	#[test]
 	fn active_ready_source_count_ignores_stale_heads() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
+		let fresh_source = FeedSource::Subreddit { name: "fresh".to_string() };
+		let recent_source = FeedSource::Subreddit { name: "recent".to_string() };
+		let stale_source = FeedSource::Subreddit { name: "stale".to_string() };
+		seed_source(&fresh_source, vec![test_post("one", "fresh", now - 60)]);
+		seed_source(&recent_source, vec![test_post("two", "recent", now - 7_200)]);
+		seed_source(&stale_source, vec![test_post("three", "stale", now - 172_800)]);
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -1231,30 +1245,9 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "fresh".to_string() },
-					state: SessionSourceState::Ready,
-					posts: vec![test_post("one", "fresh", now - 60)],
-					after: String::new(),
-					head_created_ts: Some(now - 60),
-					last_error: None,
-				},
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "recent".to_string() },
-					state: SessionSourceState::Ready,
-					posts: vec![test_post("two", "recent", now - 7_200)],
-					after: String::new(),
-					head_created_ts: Some(now - 7_200),
-					last_error: None,
-				},
-				SessionSourceEntry {
-					source: FeedSource::Subreddit { name: "stale".to_string() },
-					state: SessionSourceState::Ready,
-					posts: vec![test_post("three", "stale", now - 172_800)],
-					after: String::new(),
-					head_created_ts: Some(now - 172_800),
-					last_error: None,
-				},
+				session_entry(fresh_source, SessionSourceState::Ready),
+				session_entry(recent_source, SessionSourceState::Ready),
+				session_entry(stale_source, SessionSourceState::Ready),
 			],
 			background_active: false,
 			background_complete: false,
@@ -1268,7 +1261,21 @@ mod tests {
 
 	#[test]
 	fn merged_posts_complete_a_full_first_pass_before_repeating_ready_sources() {
+		let _guard = test_lock();
+		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
+		for index in 0..100 {
+			let source = FeedSource::Subreddit {
+				name: format!("subreddit{index}"),
+			};
+			seed_source(
+				&source,
+				vec![
+					test_post(&format!("post-{index}-a"), &format!("subreddit{index}"), now - index as u64),
+					test_post(&format!("post-{index}-b"), &format!("subreddit{index}"), now - index as u64 - 1),
+				],
+			);
+		}
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -1278,18 +1285,13 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: (0..100)
-				.map(|index| SessionSourceEntry {
-					source: FeedSource::Subreddit {
-						name: format!("subreddit{index}"),
-					},
-					state: SessionSourceState::Ready,
-					posts: vec![
-						test_post(&format!("post-{index}-a"), &format!("subreddit{index}"), now - index as u64),
-						test_post(&format!("post-{index}-b"), &format!("subreddit{index}"), now - index as u64 - 1),
-					],
-					after: String::new(),
-					head_created_ts: Some(now - index as u64),
-					last_error: None,
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						SessionSourceState::Ready,
+					)
 				})
 				.collect(),
 			background_active: false,

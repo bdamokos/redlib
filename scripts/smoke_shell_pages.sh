@@ -223,7 +223,7 @@ require(r'id="column_one"', sidebar_fragment, "sidebar fragment content")
 heavy_cookie = heavy_subscription_cookie()
 heavy_front_shell = fetch("/new", cookie=heavy_cookie, timeout=20)
 require(
-    r'Loading posts from the first 32 feeds\. More feeds will warm in the background\.',
+    r'Warmed [0-9]+ of [0-9]+ feeds\.',
     heavy_front_shell,
     "heavy front shell warmup banner",
 )

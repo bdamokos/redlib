@@ -407,7 +407,7 @@ fn subreddit_listing_query(query: &str, include_geo_filter: bool) -> String {
 fn listing_query_fingerprint(query: &str) -> String {
 	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
 		.into_owned()
-		.filter(|(key, _)| key != FRONT_CURSOR_PARAM && key != "before" && key != "after")
+		.filter(|(key, _)| key != FRONT_CURSOR_PARAM && key != "before" && key != "after" && key != "cache_page" && key != FEED_SESSION_PARAM)
 		.collect();
 	query_pairs.sort();
 
@@ -468,6 +468,25 @@ fn build_feed_sources(preferences: &Preferences) -> Vec<FeedSource> {
 
 	crate::post_cache::sort_sources(&mut sources);
 	sources
+}
+
+async fn live_feed_shell_loading_message(req: &Request<Body>, preferences: &Preferences) -> Option<String> {
+	let query = req.uri().query().unwrap_or_default().to_string();
+	let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
+	let filters = get_filters(req);
+	let feed_session_id = crate::post_cache::ensure_feed_session(
+		FeedSessionRequest {
+			sources: build_feed_sources(preferences),
+			filters,
+			quarantine: true,
+			query_fingerprint: listing_query_fingerprint(&query),
+		},
+		cache_page,
+		crate::post_cache::POSTS_PER_PAGE,
+	)
+	.await;
+
+	crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).map(|status| status.status_message)
 }
 
 fn build_aggregate_sources(preferences: &Preferences, sort: &str, reddit_query: &str) -> Vec<AggregateFeedSource> {
@@ -783,10 +802,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
 	let aggregate_saved_feeds = req.param("sub").is_none() && front_page_is_default && has_saved_feeds;
 	let loading_message = if aggregate_saved_feeds && sort == "new" {
-		format!(
-			"Loading posts from the first {} feeds. More feeds will warm in the background.",
-			crate::post_cache::initial_source_window()
-		)
+		live_feed_shell_loading_message(&req, &prefs)
+			.await
+			.unwrap_or_else(|| "Loading followed feeds in the background.".to_string())
 	} else {
 		"Loading posts...".to_string()
 	};
@@ -1458,6 +1476,7 @@ mod tests {
 
 	#[test]
 	fn renders_home_new_shell_with_feed_warmup_message() {
+		let loading_message = "Loading followed feeds in the background. Warmed 12 of 48 feeds.".to_string();
 		let html = super::SubredditShellTemplate {
 			sub: Subreddit {
 				name: "rust+programming".to_string(),
@@ -1468,23 +1487,15 @@ mod tests {
 			url: "/new".to_string(),
 			redirect_url: String::new(),
 			fragment_url: "/subreddit-fragment/new".to_string(),
-			loading_message: format!(
-				"Loading posts from the first {} feeds. More feeds will warm in the background.",
-				crate::post_cache::initial_source_window()
-			),
+			loading_message: loading_message.clone(),
 			placeholder_message: "Loading posts...".to_string(),
 		}
 		.render()
 		.unwrap();
 
-		assert!(html.contains(
-			&format!(
-				"<div class=\"feed_status_banner warming\">Loading posts from the first {} feeds. More feeds will warm in the background.</div>",
-				crate::post_cache::initial_source_window()
-			)
-		));
+		assert!(html.contains(&format!("<div class=\"feed_status_banner warming\">{loading_message}</div>")));
 		assert!(html.contains("<center>Loading posts...</center>"));
-		assert!(!html.contains("<center>Loading posts from the first"));
+		assert!(!html.contains("<center>Loading followed feeds in the background."));
 		assert!(html.contains("feed_status_banner"));
 	}
 
@@ -1738,8 +1749,8 @@ mod tests {
 	#[test]
 	fn query_fingerprint_ignores_front_cursor_and_page_tokens() {
 		assert_eq!(
-			listing_query_fingerprint("sort=hot&front_cursor=abc&after=t3_a&flair=News"),
-			listing_query_fingerprint("sort=hot&before=t3_b&flair=News")
+			listing_query_fingerprint("sort=hot&front_cursor=abc&after=t3_a&cache_page=1&feed_session=demo&flair=News"),
+			listing_query_fingerprint("sort=hot&before=t3_b&cache_page=7&feed_session=other&flair=News")
 		);
 	}
 
