@@ -2607,7 +2607,7 @@ th {
     
     body.fixed_navbar {
         min-height: calc(100vh - 75px);
-        padding-top: 45px;
+        padding-top: 110px;
         #subreddit { margin: 49px 0 0; }
         #user { margin: 49px 0 20px 0; }
         #settings { margin-top: 48px; }
