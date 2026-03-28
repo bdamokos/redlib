@@ -2111,23 +2111,7 @@ pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, S
 	}
 
 	let subreddit = if canonical_subreddit.is_empty() {
-		let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
-		let display_lookup: Vec<(String, String)> = match &posts {
-			Ok(posts) => posts["data"]["children"]
-				.as_array()
-				.map(|list| {
-					list
-						.iter()
-						.map(|post| {
-							let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
-							(display_name.to_lowercase(), display_name.to_string())
-						})
-						.collect::<Vec<_>>()
-				})
-				.unwrap_or_default(),
-			Err(_) => vec![],
-		};
-		resolve_subreddit_display_name(&sub, &display_lookup).await
+		resolve_subreddit_display_name(&sub, &[]).await
 	} else {
 		canonical_subreddit
 	};
