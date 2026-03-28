@@ -7,6 +7,7 @@
     var pageSessionId = window.crypto.randomUUID();
     var activeHosts = new Map();
     var heartbeatTimer = null;
+    var pendingRenderTimer = null;
 
     function jsonHeaders() {
         return {
@@ -92,6 +93,54 @@
         gallery.hidden = frames.length === 0;
     }
 
+    function preloadFrames(state, frames) {
+        state.preloadedFrames = (frames || []).map(function (frame) {
+            var image = new Image();
+            image.decoding = "async";
+            image.src = frame.image_path;
+            return image;
+        });
+    }
+
+    function shouldRenderHost(host) {
+        var post = host.closest(".post");
+        var target = post || host;
+        var rect = target.getBoundingClientRect();
+        return rect.top <= window.innerHeight;
+    }
+
+    function flushReadyHost(host, state) {
+        if (!state || state.rendered || !state.ready) {
+            return;
+        }
+
+        renderGallery(host, state.frames || []);
+        state.rendered = true;
+        state.preloadedFrames = [];
+    }
+
+    function flushPendingRenders() {
+        pendingRenderTimer = null;
+
+        activeHosts.forEach(function (state, host) {
+            if (!state || !state.ready || state.rendered) {
+                return;
+            }
+
+            if (shouldRenderHost(host)) {
+                flushReadyHost(host, state);
+            }
+        });
+    }
+
+    function schedulePendingRenderCheck() {
+        if (pendingRenderTimer) {
+            return;
+        }
+
+        pendingRenderTimer = window.requestAnimationFrame(flushPendingRenders);
+    }
+
     function setLoadingState(host, state) {
         var loading = host.querySelector(".video_preview_loading");
         if (!loading) {
@@ -149,8 +198,14 @@
 
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
+                    current.frames = payload.frames || [];
+                    preloadFrames(current, current.frames);
                     setLoadingState(host, "ready");
-                    renderGallery(host, payload.frames || []);
+                    if (shouldRenderHost(host)) {
+                        flushReadyHost(host, current);
+                    } else {
+                        schedulePendingRenderCheck();
+                    }
                     return;
                 }
 
@@ -234,8 +289,14 @@
 
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
+                    current.frames = payload.frames || [];
+                    preloadFrames(current, current.frames);
                     setLoadingState(host, "ready");
-                    renderGallery(host, payload.frames || []);
+                    if (shouldRenderHost(host)) {
+                        flushReadyHost(host, current);
+                    } else {
+                        schedulePendingRenderCheck();
+                    }
                     return;
                 }
 
@@ -302,6 +363,9 @@
     window.addEventListener("pagehide", function () {
         releaseAll(true);
     });
+
+    window.addEventListener("scroll", schedulePendingRenderCheck, { passive: true });
+    window.addEventListener("resize", schedulePendingRenderCheck);
 
     window.observeVideoPreviewHosts = observeHosts;
     observeHosts(document);
