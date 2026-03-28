@@ -62,7 +62,15 @@
 
                 const nextPosts = nextRoot.querySelector("#posts");
                 const currentPosts = container.querySelector("#posts");
-                if (nextPosts && currentPosts && nextPosts.innerHTML !== currentPosts.innerHTML) {
+                // Once the user can see posts for the current page, keep that list stable.
+                // We still update the footer/banner so navigation and warmup state stay current.
+                const shouldReplaceVisiblePosts =
+                    nextPosts &&
+                    currentPosts &&
+                    currentPosts.children.length === 0 &&
+                    nextPosts.innerHTML !== currentPosts.innerHTML;
+
+                if (shouldReplaceVisiblePosts) {
                     currentPosts.innerHTML = nextPosts.innerHTML;
                     refreshDynamicContent(currentPosts);
                 }
