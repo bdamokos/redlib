@@ -1265,4 +1265,56 @@ mod tests {
 
 		assert_eq!(active_ready_source_count(&session), 2);
 	}
+
+	#[test]
+	fn merged_posts_complete_a_full_first_pass_before_repeating_ready_sources() {
+		let now = chrono::Utc::now().timestamp() as u64;
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..100)
+				.map(|index| SessionSourceEntry {
+					source: FeedSource::Subreddit {
+						name: format!("subreddit{index}"),
+					},
+					state: SessionSourceState::Ready,
+					posts: vec![
+						test_post(&format!("post-{index}-a"), &format!("subreddit{index}"), now - index as u64),
+						test_post(&format!("post-{index}-b"), &format!("subreddit{index}"), now - index as u64 - 1),
+					],
+					after: String::new(),
+					head_created_ts: Some(now - index as u64),
+					last_error: None,
+				})
+				.collect(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 3,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let merged = merged_posts_for_session(&session);
+		let first_hundred_sources = merged
+			.iter()
+			.take(100)
+			.map(|post| post.community.clone())
+			.collect::<HashSet<_>>();
+
+		assert_eq!(first_hundred_sources.len(), 100);
+
+		let repeated_sources = merged
+			.iter()
+			.skip(100)
+			.take(25)
+			.map(|post| post.community.clone())
+			.collect::<HashSet<_>>();
+
+		assert_eq!(repeated_sources.len(), 25);
+	}
 }
