@@ -1613,6 +1613,14 @@ impl Preferences {
 		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
 	}
 
+	pub fn has_subscription(&self, value: &str) -> bool {
+		self.subscriptions.iter().any(|subscription| subscription.eq_ignore_ascii_case(value))
+	}
+
+	pub fn has_filter(&self, value: &str) -> bool {
+		self.filters.iter().any(|filter| filter.eq_ignore_ascii_case(value))
+	}
+
 	pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
 		let mut bytes = Vec::new();
 		self.serialize_revisioned(&mut bytes).map_err(|e| e.to_string())?;

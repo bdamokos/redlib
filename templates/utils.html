@@ -247,7 +247,7 @@
 			{% let community = format!("r/{}", post.community) -%}
 		{% endif -%}
 		<a class="post_subreddit" href="/{{ community }}">{{ community }}</a>
-		{% if show_subscription_button && !post.community.starts_with("u_") && !prefs.subscriptions.contains(post.community) %}
+		{% if show_subscription_button && !post.community.starts_with("u_") && !prefs.has_subscription(post.community) %}
 		<form
 			class="inline_subscription_form"
 			action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}&canonical={{ post.community }}"
@@ -411,7 +411,7 @@
 				<a href="{{ duplicate.permalink }}">{{ duplicate.title }}</a>
 				<div class="post_duplicates_meta">
 					<a href="/{{ duplicate.display_community }}">{{ duplicate.display_community }}</a>
-					{% if show_subscription_button && !duplicate.community.starts_with("u_") && !prefs.subscriptions.contains(duplicate.community) %}
+					{% if show_subscription_button && !duplicate.community.starts_with("u_") && !prefs.has_subscription(duplicate.community) %}
 					<form
 						class="inline_subscription_form"
 						action="/r/{{ duplicate.community }}/subscribe?redirect={{ redirect_url }}&canonical={{ duplicate.community }}"

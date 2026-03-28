@@ -1104,6 +1104,48 @@ mod tests {
 		assert!(html.contains("avg 1:01"));
 		assert!(html.contains("from 2 seen videos"));
 	}
+
+	#[test]
+	fn renders_user_follow_and_filter_state_case_insensitively() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["u_demouser".to_string(), "demosub".to_string()];
+		prefs.filters = vec!["u_demouser".to_string()];
+
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "DemoUser".to_string(),
+				..Default::default()
+			},
+			username: "DemoUser".to_string(),
+			posts: vec![test_comment("comment_one", "DemoSub", "<div class=\"md\"><p>This is a reply.</p></div>", "t1", "Thread title")],
+			user_subreddits: vec![super::UserSubredditEntry {
+				name: "DemoSub".to_string(),
+				count: 1,
+			}],
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs,
+			url: "/user/DemoUser".to_string(),
+			redirect_url: "user/DemoUser".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			loading_message: String::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("action=\"/r/u_DemoUser/unsubscribe"));
+		assert!(html.contains("<button class=\"unsubscribe\">Unfollow</button>"));
+		assert!(html.contains("action=\"/r/u_DemoUser/unfilter"));
+		assert!(html.contains("<button class=\"unfilter\">Unfilter</button>"));
+		assert!(!html.contains("action=\"/r/DemoSub/subscribe"));
+	}
 }
 
 // FUNCTIONS

@@ -116,7 +116,7 @@
                     <li class="user_subreddit_item">
                         <a class="user_subreddit_link" href="/r/{{ subreddit.name }}">r/{{ subreddit.name }}</a>
                         <span class="user_subreddit_meta">{{ subreddit.count }}</span>
-                        {% if !prefs.subscriptions.contains(subreddit.name) %}
+                        {% if !prefs.has_subscription(subreddit.name) %}
                         <form
                             class="inline_subscription_form"
                             action="/r/{{ subreddit.name }}/subscribe?redirect={{ redirect_url }}&canonical={{ subreddit.name }}"
@@ -146,7 +146,7 @@
             <div id="user_actions">
                 {% let name = ["u_", user.name.as_str()].join("") %}
                 <div id="user_subscription">
-                    {% if prefs.subscriptions.contains(name) %}
+                    {% if prefs.has_subscription(name) %}
                     <form
                         action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ name }}"
                         method="POST"
@@ -189,7 +189,7 @@
                     {% endif %}
                 </div>
                 <div id="user_filter">
-                    {% if prefs.filters.contains(name) %}
+                    {% if prefs.has_filter(name) %}
                     <form
                         action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}&canonical={{ name }}"
                         method="POST"

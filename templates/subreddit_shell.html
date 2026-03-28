@@ -25,7 +25,7 @@
 	<aside id="subreddit_shell_sidebar">
 		<div id="sub_actions">
 			<div id="sub_subscription">
-				{% if prefs.subscriptions.contains(sub.name) %}
+				{% if prefs.has_subscription(sub.name) %}
 				<form
 					action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ sub.name }}"
 					method="POST"
