@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import http.client
 
 
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
@@ -23,15 +24,21 @@ def fail(message: str) -> None:
 
 
 def fetch(path: str, *, cookie: str = "", timeout: int = 45) -> str:
-    request = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        headers={"Cookie": cookie} if cookie else {},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read().decode("utf-8", "replace")
-    except urllib.error.URLError as error:
-        fail(f"{path} -> {error}")
+    last_error = None
+    for attempt in range(10):
+        request = urllib.request.Request(
+            f"{BASE_URL}{path}",
+            headers={"Cookie": cookie} if cookie else {},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, http.client.RemoteDisconnected) as error:
+            last_error = error
+            if attempt == 9:
+                break
+            time.sleep(0.5)
+    fail(f"{path} -> {last_error}")
 
 
 def require(pattern: str, body: str, label: str) -> None:
