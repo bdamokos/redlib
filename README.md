@@ -424,6 +424,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `ROBOTS_DISABLE_INDEXING` | `["on", "off"]` | `off`                  | Disables indexing of the instance by search engines.                                                      |
 | `VIDEO_PREVIEW_ENABLED`   | `["on", "off"]` | `off`                  | Enables server-side asynchronous video preview gallery generation for video posts.                        |
 | `PUSHSHIFT_FRONTEND`      | String          | `undelete.pullpush.io` | Allows the server to set the Pushshift frontend to be used with "removed" links.                          |
+| `RUST_LOG`                | Log filter      | (unset)                | Sets the Rust logger filter for server logs, for example `error`, `warn`, `info`, `debug`, or `trace`.   |
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)
