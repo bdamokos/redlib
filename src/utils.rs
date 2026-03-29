@@ -1218,7 +1218,7 @@ pub fn cached_subreddit_users(subreddit: &str) -> Vec<(String, u32)> {
 	users
 }
 
-#[derive(Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 /// Subreddit struct containing metadata about community
 pub struct Subreddit {
 	pub name: String,

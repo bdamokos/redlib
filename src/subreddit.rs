@@ -18,8 +18,9 @@ use log::{info, warn};
 use chrono::DateTime;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
-use std::sync::LazyLock;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 use tokio::task::JoinSet;
 use url::form_urlencoded;
 
@@ -31,7 +32,22 @@ const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
 const AFTER_PATH_HEADROOM: usize = 128;
 const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 100;
 const AGGREGATE_FETCH_CONCURRENCY: usize = 4;
+const SUBREDDIT_METADATA_CACHE_TTL_SECS: u64 = 10_800;
 static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
+static SUBREDDIT_METADATA_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditMetadata>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static SUBREDDIT_NSFW_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditNsfwStatus>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+struct CachedSubredditMetadata {
+	subreddit: Subreddit,
+	fetched_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct CachedSubredditNsfwStatus {
+	is_nsfw: bool,
+	fetched_at: Instant,
+}
 
 // STRUCTS
 #[derive(Template)]
@@ -241,6 +257,77 @@ fn should_enable_duplicate_collapse(sub_name: &str) -> bool {
 	sub_name.is_empty() || sub_name.contains('+') || sub_name == "all" || sub_name == "popular"
 }
 
+fn placeholder_subreddit(name: &str) -> Subreddit {
+	Subreddit {
+		name: name.to_string(),
+		title: name.to_string(),
+		..Subreddit::default()
+	}
+}
+
+fn cached_subreddit_metadata(sub: &str) -> Option<Subreddit> {
+	let mut cache = SUBREDDIT_METADATA_CACHE.lock().ok()?;
+	let key = sub.to_lowercase();
+	let entry = cache.get(&key)?;
+	if entry.fetched_at.elapsed().as_secs() > SUBREDDIT_METADATA_CACHE_TTL_SECS {
+		cache.remove(&key);
+		return None;
+	}
+
+	Some(entry.subreddit.clone())
+}
+
+fn cached_subreddit_nsfw_status(sub: &str) -> Option<bool> {
+	let mut cache = SUBREDDIT_NSFW_CACHE.lock().ok()?;
+	let key = sub.to_lowercase();
+	let entry = cache.get(&key)?;
+	if entry.fetched_at.elapsed().as_secs() > SUBREDDIT_METADATA_CACHE_TTL_SECS {
+		cache.remove(&key);
+		return None;
+	}
+
+	Some(entry.is_nsfw)
+}
+
+fn store_subreddit_metadata(subreddit: &Subreddit) {
+	if subreddit.name.is_empty() {
+		return;
+	}
+
+	let Ok(mut cache) = SUBREDDIT_METADATA_CACHE.lock() else {
+		return;
+	};
+	cache.insert(
+		subreddit.name.to_lowercase(),
+		CachedSubredditMetadata {
+			subreddit: subreddit.clone(),
+			fetched_at: Instant::now(),
+		},
+	);
+	if let Ok(mut nsfw_cache) = SUBREDDIT_NSFW_CACHE.lock() {
+		nsfw_cache.insert(
+			subreddit.name.to_lowercase(),
+			CachedSubredditNsfwStatus {
+				is_nsfw: subreddit.nsfw,
+				fetched_at: Instant::now(),
+			},
+		);
+	}
+}
+
+fn warm_subreddit_metadata(sub: &str, quarantined: bool) {
+	if sub.is_empty() || cached_subreddit_metadata(sub).is_some() {
+		return;
+	}
+
+	let subreddit_name = sub.to_string();
+	tokio::spawn(async move {
+		if let Ok(subreddit) = subreddit(&subreddit_name, quarantined).await {
+			store_subreddit_metadata(&subreddit);
+		}
+	});
+}
+
 fn wiki_fragment_path(req: &Request<Body>) -> String {
 	let query = req.uri().query().unwrap_or_default();
 	if query.is_empty() {
@@ -316,7 +403,11 @@ fn feed_fragment_url(current_url: &str, session_id: &str, page: usize) -> String
 fn subreddit_fragment_path(req: &Request<Body>) -> String {
 	let path = req.uri().path();
 	let query = req.uri().query().unwrap_or_default();
-	let fragment_path = if path == "/" { "/subreddit-fragment".to_string() } else { format!("/subreddit-fragment{path}") };
+	let fragment_path = if path == "/" {
+		"/subreddit-fragment".to_string()
+	} else {
+		format!("/subreddit-fragment{path}")
+	};
 	if query.is_empty() {
 		fragment_path
 	} else {
@@ -454,12 +545,7 @@ fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
 }
 
 fn build_feed_sources(preferences: &Preferences) -> Vec<FeedSource> {
-	let mut sources = preferences
-		.subscriptions
-		.iter()
-		.cloned()
-		.map(|name| FeedSource::Subreddit { name })
-		.collect::<Vec<_>>();
+	let mut sources = preferences.subscriptions.iter().cloned().map(|name| FeedSource::Subreddit { name }).collect::<Vec<_>>();
 
 	sources.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| FeedSource::Flair {
 		subreddit: subscription.subreddit,
@@ -588,10 +674,7 @@ fn merge_chunk_posts(
 		let is_filtered = filters.contains(&post.community) || filters.contains(&format!("u_{}", post.author.name));
 		if !is_filtered {
 			*any_post_after_filter = true;
-			if (active_flair_filter.is_empty() || post.flair.text.trim() == active_flair_filter)
-				&& !recent_post_ids.contains(&post.id)
-				&& seen_post_ids.insert(post.id.clone())
-			{
+			if (active_flair_filter.is_empty() || post.flair.text.trim() == active_flair_filter) && !recent_post_ids.contains(&post.id) && seen_post_ids.insert(post.id.clone()) {
 				merged_posts.push(post);
 				if merged_posts.len() >= TARGET_POST_COUNT {
 					return next_source_index;
@@ -661,7 +744,13 @@ async fn fetch_aggregated_subscription_feed(
 			for (index, source, request_after) in batch.iter().cloned() {
 				let sort = sort.to_string();
 				let reddit_query = reddit_query.to_string();
-				join_set.spawn(async move { (index, source.clone(), fetch_source_listing_page(&source, &sort, &reddit_query, &request_after, quarantine).await) });
+				join_set.spawn(async move {
+					(
+						index,
+						source.clone(),
+						fetch_source_listing_page(&source, &sort, &reddit_query, &request_after, quarantine).await,
+					)
+				});
 			}
 
 			while let Some(join_result) = join_set.join_next().await {
@@ -877,40 +966,66 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let aggregate_sources = build_aggregate_sources(&prefs, &sort, &reddit_query);
 	let aggregate_saved_feeds = !is_subreddit_route && front_page_is_default && !aggregate_sources.is_empty();
 
-	// Request subreddit metadata
-	let sub = if is_subreddit_route && !sub_name.is_empty() && !sub_name.contains('+') && sub_name != "popular" && sub_name != "all" {
-		subreddit(&sub_name, quarantined).await.unwrap_or_default()
-	} else if aggregate_saved_feeds && !is_subreddit_route {
-		Subreddit::default()
-	} else {
-		Subreddit {
-			name: sub_name.clone(),
-			..Subreddit::default()
-		}
-	};
-
 	let fragment_request_url = req.uri().to_string();
 	let req_url = fragment_request_url.replacen("/subreddit-fragment", "", 1);
-	// Return landing page if this post if this is NSFW community but the user
-	// has disabled the display of NSFW content or if the instance is SFW-only.
-	if sub.nsfw && crate::utils::should_be_nsfw_gated(&req, &req_url) {
-		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
-	}
 
 	let url = {
 		let fragment_url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 		let original_url = fragment_url.replacen("/subreddit-fragment", "", 1);
-		if original_url.is_empty() { "/".to_string() } else { original_url }
+		if original_url.is_empty() {
+			"/".to_string()
+		} else {
+			original_url
+		}
 	};
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
 	let request_after = param(&format!("?{}", req.uri().query().unwrap_or_default()), "after").unwrap_or_default();
 	let request_before = param(&format!("?{}", req.uri().query().unwrap_or_default()), "before").unwrap_or_default();
+	let is_single_sub = !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+');
+	let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+		.and_then(|p| p.parse::<usize>().ok())
+		.unwrap_or(0);
+	let cached_subreddit_page = if is_single_sub && sort == "new" && request_after.is_empty() && request_before.is_empty() {
+		crate::post_cache::get_cached_subreddit_page(&sub_name, cache_page, crate::post_cache::POSTS_PER_PAGE)
+	} else {
+		None
+	};
+	let prefers_cached_subreddit_page = cached_subreddit_page.is_some();
+	if prefers_cached_subreddit_page && crate::utils::should_be_nsfw_gated(&req, &req_url) && cached_subreddit_nsfw_status(&sub_name).is_some_and(|is_nsfw| is_nsfw) {
+		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
+	}
 	let path = if aggregate_saved_feeds || sub_name.is_empty() {
 		String::new()
 	} else {
 		build_listing_path(&sub_name, &sort, &reddit_query, &request_after, &request_before)
 	};
+	let sub = if is_subreddit_route && is_single_sub {
+		if prefers_cached_subreddit_page {
+			if let Some(cached) = cached_subreddit_metadata(&sub_name) {
+				cached
+			} else if cached_subreddit_nsfw_status(&sub_name) == Some(false) {
+				warm_subreddit_metadata(&sub_name, quarantined);
+				placeholder_subreddit(&sub_name)
+			} else if crate::utils::should_be_nsfw_gated(&req, &req_url) {
+				subreddit(&sub_name, quarantined).await.unwrap_or_else(|_| placeholder_subreddit(&sub_name))
+			} else {
+				warm_subreddit_metadata(&sub_name, quarantined);
+				placeholder_subreddit(&sub_name)
+			}
+		} else {
+			subreddit(&sub_name, quarantined).await.unwrap_or_else(|_| placeholder_subreddit(&sub_name))
+		}
+	} else if aggregate_saved_feeds && !is_subreddit_route {
+		Subreddit::default()
+	} else {
+		placeholder_subreddit(&sub_name)
+	};
+	// Return landing page if this post if this is NSFW community but the user
+	// has disabled the display of NSFW content or if the instance is SFW-only.
+	if sub.nsfw && crate::utils::should_be_nsfw_gated(&req, &req_url) {
+		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
+	}
 	let flair_filters = if !sub.name.is_empty() && sub.name != "all" && sub.name != "popular" && !sub.name.contains('+') {
 		build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub.name))
 	} else {
@@ -945,9 +1060,9 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			.any(|subscription| subscription.subreddit == sub.name && subscription.flair == active_flair_filter);
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-		if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
-			render_subreddit_fragment(&SubredditFragmentTemplate {
-				sub,
+	if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
+		render_subreddit_fragment(&SubredditFragmentTemplate {
+			sub,
 			posts: Vec::new(),
 			top_users,
 			sort: (sort, param(&path, "t").unwrap_or_default()),
@@ -1110,78 +1225,71 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					redirect_url,
 					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
-						all_posts_filtered: feed.all_posts_filtered,
-						all_posts_hidden_nsfw,
-						no_posts,
-						is_flair_subscribed,
-						feed_session_id: String::new(),
-						feed_status_url: String::new(),
-						feed_fragment_url: String::new(),
-					})
-				}
+					all_posts_filtered: feed.all_posts_filtered,
+					all_posts_hidden_nsfw,
+					no_posts,
+					is_flair_subscribed,
+					feed_session_id: String::new(),
+					feed_status_url: String::new(),
+					feed_fragment_url: String::new(),
+				})
+			}
 			Err(msg) => error(req, &msg).await,
 		}
 	} else {
-		// EXPERIMENT: For single subreddits with sort=new, try serving from per-sub cache.
-		// This avoids a Reddit API call if we already fetched 100 posts in the background.
-		let is_single_sub = !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+');
-		if is_single_sub && sort == "new" && request_after.is_empty() && request_before.is_empty() {
-			let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
-				.and_then(|p| p.parse::<usize>().ok())
-				.unwrap_or(0);
+		// For single subreddits with sort=new, serve from the per-sub cache before any live Reddit listing fetch.
+		if let Some((mut posts, after, has_prev, has_next)) = cached_subreddit_page {
+			info!("post_cache: serving r/{} page {} from cache", sub_name, cache_page);
+			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+			filter_posts_by_flair(&mut posts, &active_flair_filter);
+			let no_posts = posts.is_empty();
+			let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			utils::hydrate_post_author_links_from_cache(&mut posts);
 
-			if let Some((mut posts, after, has_prev, has_next)) =
-				crate::post_cache::get_cached_subreddit_page(&sub_name, cache_page, crate::post_cache::POSTS_PER_PAGE)
-			{
-				info!("post_cache: serving r/{} page {} from cache", sub_name, cache_page);
-				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
-				filter_posts_by_flair(&mut posts, &active_flair_filter);
-				let no_posts = posts.is_empty();
-				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-				utils::hydrate_post_author_links_from_cache(&mut posts);
+			let prev_page_url = if has_prev {
+				update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None)])
+			} else {
+				String::new()
+			};
+			let next_page_url = if has_next && !after.is_empty() {
+				// Last cached page: link to Reddit's after-based pagination.
+				update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
+			} else if has_next {
+				update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None)])
+			} else {
+				String::new()
+			};
 
-				let prev_page_url = if has_prev {
-					update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None)])
-				} else {
-					String::new()
-				};
-				let next_page_url = if has_next && !after.is_empty() {
-					// Last cached page: link to Reddit's after-based pagination.
-					update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
-				} else if has_next {
-					update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None)])
-				} else {
-					String::new()
-				};
-
-				return render_subreddit_fragment(&SubredditFragmentTemplate {
-					sub,
-					posts,
-					top_users,
-					sort: (sort.clone(), timeframe.clone()),
-					sort_options,
-					flair_filters,
-					active_flair_filter: active_flair_filter.clone(),
-					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)]),
-					prev_page_url,
-					next_page_url,
-					prefs: Preferences::new(&req),
-					url,
-					redirect_url,
-					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
-					is_filtered: false,
-						all_posts_filtered,
-						all_posts_hidden_nsfw,
-						no_posts,
-						is_flair_subscribed,
-						feed_session_id: String::new(),
-						feed_status_url: String::new(),
-						feed_fragment_url: String::new(),
-					});
-			}
-			// Fall through to normal fetch if not cached.
+			return render_subreddit_fragment(&SubredditFragmentTemplate {
+				sub,
+				posts,
+				top_users,
+				sort: (sort.clone(), timeframe.clone()),
+				sort_options,
+				flair_filters,
+				active_flair_filter: active_flair_filter.clone(),
+				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+				clear_flair_filter_url: update_url_query(
+					&url,
+					&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+				),
+				prev_page_url,
+				next_page_url,
+				prefs: Preferences::new(&req),
+				url,
+				redirect_url,
+				enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+				is_filtered: false,
+				all_posts_filtered,
+				all_posts_hidden_nsfw,
+				no_posts,
+				is_flair_subscribed,
+				feed_session_id: String::new(),
+				feed_status_url: String::new(),
+				feed_fragment_url: String::new(),
+			});
 		}
+		// Fall through to normal fetch if not cached.
 
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
@@ -1252,15 +1360,15 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					redirect_url,
 					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
-						all_posts_filtered,
-						all_posts_hidden_nsfw,
-						no_posts,
-						is_flair_subscribed,
-						feed_session_id: String::new(),
-						feed_status_url: String::new(),
-						feed_fragment_url: String::new(),
-					})
-				}
+					all_posts_filtered,
+					all_posts_hidden_nsfw,
+					no_posts,
+					is_flair_subscribed,
+					feed_session_id: String::new(),
+					feed_status_url: String::new(),
+					feed_fragment_url: String::new(),
+				})
+			}
 			Err(msg) => match msg.as_str() {
 				"quarantined" | "gated" => Ok(quarantine(&req, sub_name, &msg)),
 				"private" => error(req, &format!("r/{sub_name} is a private community")).await,
@@ -1275,8 +1383,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 mod tests {
 	use super::{
 		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, should_enable_duplicate_collapse,
-		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate,
-		FRONT_CURSOR_PARAM,
+		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use hyper::{Body, Request};
@@ -1379,13 +1486,13 @@ mod tests {
 			enable_duplicate_collapse: true,
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				no_posts: false,
-				is_flair_subscribed: false,
-				feed_session_id: String::new(),
-				feed_status_url: String::new(),
-				feed_fragment_url: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			is_flair_subscribed: false,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -1419,13 +1526,13 @@ mod tests {
 			enable_duplicate_collapse: false,
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				no_posts: false,
-				is_flair_subscribed: false,
-				feed_session_id: String::new(),
-				feed_status_url: String::new(),
-				feed_fragment_url: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			is_flair_subscribed: false,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -1532,10 +1639,7 @@ mod tests {
 
 	#[test]
 	fn builds_wiki_fragment_path() {
-		let req = Request::builder()
-			.uri("/r/rust/wiki/install?view=compact")
-			.body(Body::empty())
-			.unwrap();
+		let req = Request::builder().uri("/r/rust/wiki/install?view=compact").body(Body::empty()).unwrap();
 		assert_eq!(super::wiki_fragment_path(&req), "/wiki-fragment/r/rust/wiki/install?view=compact");
 	}
 
@@ -1620,13 +1724,13 @@ mod tests {
 			enable_duplicate_collapse: false,
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				no_posts: false,
-				is_flair_subscribed: false,
-				feed_session_id: String::new(),
-				feed_status_url: String::new(),
-				feed_fragment_url: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			is_flair_subscribed: false,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -1750,6 +1854,21 @@ mod tests {
 		let decoded = decode_front_cursor(&encoded).unwrap();
 
 		assert_eq!(decoded, cursor);
+	}
+
+	#[test]
+	fn caches_subreddit_nsfw_status_with_metadata() {
+		super::SUBREDDIT_METADATA_CACHE.lock().unwrap().clear();
+		super::SUBREDDIT_NSFW_CACHE.lock().unwrap().clear();
+
+		super::store_subreddit_metadata(&Subreddit {
+			name: "demo".to_string(),
+			nsfw: true,
+			..Subreddit::default()
+		});
+
+		assert_eq!(super::cached_subreddit_nsfw_status("demo"), Some(true));
+		assert!(super::cached_subreddit_metadata("demo").is_some());
 	}
 
 	#[test]
@@ -2165,7 +2284,11 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	// Find each subreddit name (separated by '+') in sub parameter
 	let parts = canonical_parts.unwrap_or_else(|| sub.split('+').filter(|x| x != &"").map(ToString::to_string).collect());
 	for part in parts {
-		let part = if display_lookup.is_empty() { part } else { resolve_subreddit_display_name(&part, &display_lookup).await };
+		let part = if display_lookup.is_empty() {
+			part
+		} else {
+			resolve_subreddit_display_name(&part, &display_lookup).await
+		};
 
 		// Modify sub list based on action
 		if action.contains(&"subscribe".to_string()) && !sub_list.iter().any(|sub| sub.eq_ignore_ascii_case(&part)) {
@@ -2364,11 +2487,11 @@ pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		Ok(response) => {
 			let body = WikiFragmentTemplate {
 				wiki: rewrite_urls(&val(&response, "description_html")),
-			// wiki: format!(
-			// 	"{}<hr><h1>Moderators</h1><br><ul>{}</ul>",
-			// 	rewrite_urls(&val(&response, "description_html"),
-			// 	moderators(&sub, quarantined).await.unwrap_or(vec!["Could not fetch moderators".to_string()]).join(""),
-			// ),
+				// wiki: format!(
+				// 	"{}<hr><h1>Moderators</h1><br><ul>{}</ul>",
+				// 	rewrite_urls(&val(&response, "description_html"),
+				// 	moderators(&sub, quarantined).await.unwrap_or(vec!["Could not fetch moderators".to_string()]).join(""),
+				// ),
 				sub,
 			}
 			.render()
@@ -2426,6 +2549,10 @@ pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 
 // SUBREDDIT
 async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
+	if let Some(cached) = cached_subreddit_metadata(sub) {
+		return Ok(cached);
+	}
+
 	// Build the Reddit JSON API url
 	let path: String = format!("/r/{sub}/about.json?raw_json=1");
 
@@ -2441,7 +2568,7 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 	let icon = if community_icon.is_empty() { val(&res, "icon_img") } else { community_icon.to_string() };
 	let info = rewrite_urls(&val(&res, "description_html"));
 
-	Ok(Subreddit {
+	let subreddit = Subreddit {
 		name: val(&res, "display_name"),
 		title: val(&res, "title"),
 		description: val(&res, "public_description"),
@@ -2453,7 +2580,9 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 		active: format_num(active),
 		wiki: res["data"]["wiki_enabled"].as_bool().unwrap_or_default(),
 		nsfw: res["data"]["over18"].as_bool().unwrap_or_default(),
-	})
+	};
+	store_subreddit_metadata(&subreddit);
+	Ok(subreddit)
 }
 
 fn subreddit_sidebar_has_content(info: &str) -> bool {
