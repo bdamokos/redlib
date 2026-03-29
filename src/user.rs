@@ -704,13 +704,13 @@ mod tests {
 			},
 		];
 
-			let html = super::UserTemplate {
-				user: crate::utils::User {
-					name: "demo_user".to_string(),
-					..Default::default()
-				},
-				username: "demo_user".to_string(),
-				posts: vec![post],
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![post],
 			user_subreddits: Vec::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -720,13 +720,13 @@ mod tests {
 			redirect_url: "user/demo_user/submitted".to_string(),
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				avg_video_length: None,
-				no_posts: false,
-				shell_mode: false,
-				fragment_url: String::new(),
-				loading_message: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			loading_message: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -748,13 +748,13 @@ mod tests {
 
 	#[test]
 	fn renders_duplicate_script_in_overview_listing() {
-			let html = super::UserTemplate {
-				user: crate::utils::User {
-					name: "demo_user".to_string(),
-					..Default::default()
-				},
-				username: "demo_user".to_string(),
-				posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -764,13 +764,13 @@ mod tests {
 			redirect_url: "user/demo_user".to_string(),
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				avg_video_length: None,
-				no_posts: false,
-				shell_mode: false,
-				fragment_url: String::new(),
-				loading_message: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			loading_message: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -844,13 +844,13 @@ mod tests {
 
 	#[test]
 	fn renders_comment_entries_without_link_thumbnail() {
-			let html = super::UserTemplate {
-				user: crate::utils::User {
-					name: "demo_user".to_string(),
-					..Default::default()
-				},
-				username: "demo_user".to_string(),
-				posts: vec![test_comment(
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![test_comment(
 				"comment_one",
 				"demo_sub",
 				"<div class=\"md\"><p>This is a reply.</p></div>",
@@ -875,13 +875,13 @@ mod tests {
 			redirect_url: "user/demo_user".to_string(),
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				avg_video_length: None,
-				no_posts: false,
-				shell_mode: false,
-				fragment_url: String::new(),
-				loading_message: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			loading_message: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -1000,13 +1000,13 @@ mod tests {
 
 	#[test]
 	fn renders_avg_video_length_in_user_template() {
-			let html = super::UserTemplate {
-				user: crate::utils::User {
-					name: "demo_user".to_string(),
-					..Default::default()
-				},
-				username: "demo_user".to_string(),
-				posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1016,13 +1016,13 @@ mod tests {
 			redirect_url: "user/demo_user".to_string(),
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				avg_video_length: Some(("1:01".to_string(), "from 2 seen videos".to_string())),
-				no_posts: false,
-				shell_mode: false,
-				fragment_url: String::new(),
-				loading_message: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			avg_video_length: Some(("1:01".to_string(), "from 2 seen videos".to_string())),
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			loading_message: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -1033,13 +1033,13 @@ mod tests {
 
 	#[test]
 	fn omits_avg_video_length_when_absent() {
-			let html = super::UserTemplate {
-				user: crate::utils::User {
-					name: "demo_user".to_string(),
-					..Default::default()
-				},
-				username: "demo_user".to_string(),
-				posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1049,13 +1049,13 @@ mod tests {
 			redirect_url: "user/demo_user".to_string(),
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				avg_video_length: None,
-				no_posts: false,
-				shell_mode: false,
-				fragment_url: String::new(),
-				loading_message: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			loading_message: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -1074,13 +1074,13 @@ mod tests {
 		}];
 		post.author.avg_video_length = Some(("1:01".to_string(), "from 2 seen videos".to_string()));
 
-			let html = super::UserTemplate {
-				user: crate::utils::User {
-					name: "demo_user".to_string(),
-					..Default::default()
-				},
-				username: "demo_user".to_string(),
-				posts: vec![post],
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![post],
 			user_subreddits: Vec::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1090,13 +1090,13 @@ mod tests {
 			redirect_url: "user/demo_user".to_string(),
 			is_filtered: false,
 			all_posts_filtered: false,
-				all_posts_hidden_nsfw: false,
-				avg_video_length: None,
-				no_posts: false,
-				shell_mode: false,
-				fragment_url: String::new(),
-				loading_message: String::new(),
-			}
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			loading_message: String::new(),
+		}
 		.render()
 		.unwrap();
 
@@ -1117,7 +1117,13 @@ mod tests {
 				..Default::default()
 			},
 			username: "DemoUser".to_string(),
-			posts: vec![test_comment("comment_one", "DemoSub", "<div class=\"md\"><p>This is a reply.</p></div>", "t1", "Thread title")],
+			posts: vec![test_comment(
+				"comment_one",
+				"DemoSub",
+				"<div class=\"md\"><p>This is a reply.</p></div>",
+				"t1",
+				"Thread title",
+			)],
 			user_subreddits: vec![super::UserSubredditEntry {
 				name: "DemoSub".to_string(),
 				count: 1,

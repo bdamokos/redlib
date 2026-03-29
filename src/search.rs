@@ -358,19 +358,13 @@ mod tests {
 
 	#[test]
 	fn current_url_strips_search_fragment_prefix() {
-		let req = Request::builder()
-			.uri("/search-fragment/r/rust/search?q=borrow")
-			.body(Body::empty())
-			.unwrap();
+		let req = Request::builder().uri("/search-fragment/r/rust/search?q=borrow").body(Body::empty()).unwrap();
 		assert_eq!(search_current_url(&req), "/r/rust/search?q=borrow");
 	}
 
 	#[test]
 	fn search_source_path_restores_global_search_route() {
-		let req = Request::builder()
-			.uri("/search-fragment?q=rust")
-			.body(Body::empty())
-			.unwrap();
+		let req = Request::builder().uri("/search-fragment?q=rust").body(Body::empty()).unwrap();
 		assert_eq!(search_source_path(&req), "/search");
 	}
 

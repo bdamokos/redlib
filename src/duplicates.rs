@@ -3,7 +3,7 @@
 use crate::client::json;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
-use crate::utils::{self, error, filter_posts, get_filters, nsfw_landing, parse_post, template, Awards, Author, Flair, Post, Preferences};
+use crate::utils::{self, error, filter_posts, get_filters, nsfw_landing, parse_post, template, Author, Awards, Flair, Post, Preferences};
 
 use askama::Template;
 use hyper::{Body, Request, Response};
@@ -339,7 +339,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 #[cfg(test)]
 mod tests {
 	use super::{duplicates_fragment_path, duplicates_source_path, DuplicatesParams, DuplicatesTemplate};
-	use crate::utils::{Awards, Author, Flair, Post, Preferences};
+	use crate::utils::{Author, Awards, Flair, Post, Preferences};
 	use askama::Template;
 	use hyper::{Body, Request};
 
@@ -406,10 +406,7 @@ mod tests {
 
 	#[test]
 	fn builds_duplicates_fragment_path() {
-		let req = Request::builder()
-			.uri("/r/rust/duplicates/abc/example?sort=new")
-			.body(Body::empty())
-			.unwrap();
+		let req = Request::builder().uri("/r/rust/duplicates/abc/example?sort=new").body(Body::empty()).unwrap();
 		assert_eq!(duplicates_fragment_path(&req), "/duplicates-fragment/r/rust/duplicates/abc/example?sort=new");
 	}
 

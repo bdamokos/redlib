@@ -1531,7 +1531,6 @@ pub fn write_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, 
 		response.insert_cookie(
 			Cookie::build((cookie_name, chunk.clone()))
 				.path("/")
-				.http_only(true)
 				.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
 				.into(),
 		);
@@ -2951,9 +2950,10 @@ mod tests {
 	use super::{
 		coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions,
 		extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls,
-		user_profile_details, ExternalLink, FlairSubscription, Preferences,
+		user_profile_details, write_sharded_cookie, ExternalLink, FlairSubscription, Preferences,
 	};
 	use futures_lite::future::block_on;
+	use hyper::{Body, Request, Response};
 	use serde_json::json;
 
 	async fn always_exists(_: String) -> bool {
@@ -3282,6 +3282,25 @@ mod tests {
 		let decoded = decode_flair_subscriptions(&encoded).unwrap();
 
 		assert_eq!(decoded, subscriptions);
+	}
+
+	#[test]
+	fn sharded_subscription_cookies_are_readable_by_client_scripts() {
+		let req = Request::builder().body(Body::empty()).unwrap();
+		let mut response = Response::builder().body(Body::empty()).unwrap();
+
+		write_sharded_cookie(&mut response, &req, "subscriptions", "rust+u_spez");
+
+		let set_cookie_headers = response
+			.headers()
+			.get_all("Set-Cookie")
+			.iter()
+			.map(|value| value.to_str().unwrap_or_default().to_string())
+			.collect::<Vec<_>>();
+
+		assert!(!set_cookie_headers.is_empty());
+		assert!(set_cookie_headers.iter().all(|value| !value.contains("HttpOnly")));
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions=rust+u_spez")));
 	}
 }
 

@@ -838,11 +838,7 @@ mod tests {
 	}
 
 	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {
-		SessionSourceEntry {
-			source,
-			state,
-			last_error: None,
-		}
+		SessionSourceEntry { source, state, last_error: None }
 	}
 
 	fn seed_source(source: &FeedSource, posts: Vec<Post>) {
@@ -1032,7 +1028,14 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: (0..120)
-				.map(|index| session_entry(FeedSource::Subreddit { name: format!("subreddit{index}") }, SessionSourceState::Unstarted))
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						SessionSourceState::Unstarted,
+					)
+				})
 				.collect(),
 			background_active: true,
 			background_complete: false,
@@ -1084,9 +1087,7 @@ mod tests {
 		let posts = (0..100)
 			.map(|index| test_post(&format!("post-{index}"), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
 			.collect::<Vec<_>>();
-		let hot_source = FeedSource::Subreddit {
-			name: "subreddit0".to_string(),
-		};
+		let hot_source = FeedSource::Subreddit { name: "subreddit0".to_string() };
 		seed_source(&hot_source, posts);
 		let session = FeedSession {
 			id: "demo".to_string(),
@@ -1220,10 +1221,7 @@ mod tests {
 			let source = FeedSource::Subreddit {
 				name: format!("subreddit{index}"),
 			};
-			seed_source(
-				&source,
-				vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)],
-			);
+			seed_source(&source, vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]);
 		}
 		let session = FeedSession {
 			id: "demo".to_string(),
@@ -1348,20 +1346,11 @@ mod tests {
 		};
 
 		let merged = merged_posts_for_session(&session);
-		let first_hundred_sources = merged
-			.iter()
-			.take(100)
-			.map(|post| post.community.clone())
-			.collect::<HashSet<_>>();
+		let first_hundred_sources = merged.iter().take(100).map(|post| post.community.clone()).collect::<HashSet<_>>();
 
 		assert_eq!(first_hundred_sources.len(), 100);
 
-		let repeated_sources = merged
-			.iter()
-			.skip(100)
-			.take(25)
-			.map(|post| post.community.clone())
-			.collect::<HashSet<_>>();
+		let repeated_sources = merged.iter().skip(100).take(25).map(|post| post.community.clone()).collect::<HashSet<_>>();
 
 		assert_eq!(repeated_sources.len(), 25);
 	}

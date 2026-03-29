@@ -1288,8 +1288,9 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				feed_status_url: String::new(),
 				feed_fragment_url: String::new(),
 			});
+
+			// Fall through to normal fetch if not cached.
 		}
-		// Fall through to normal fetch if not cached.
 
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
@@ -2223,7 +2224,7 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	} else {
 		String::new()
 	};
-	let no_posts = feed_page.posts.is_empty();
+	let no_posts = page_ready && feed_page.posts.is_empty();
 	let all_posts_hidden_nsfw = !no_posts && (feed_page.posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 
 	render_feed_fragment(&FeedFragmentTemplate {

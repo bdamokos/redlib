@@ -15,6 +15,29 @@ document.addEventListener("DOMContentLoaded", () => {
     const maxAttempts = Number.parseInt(container.dataset.maxAttempts || "3", 10);
     const retryDelayMs = Number.parseInt(container.dataset.retryDelayMs || "1500", 10);
     const banner = document.querySelector(".feed_status_banner");
+    const cacheKey = `page-fragment:${fragmentUrl}`;
+
+    const readCachedFragment = () => {
+        try {
+            return window.sessionStorage.getItem(cacheKey);
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const writeCachedFragment = (html) => {
+        try {
+            window.sessionStorage.setItem(cacheKey, html);
+        } catch (_) {
+            // Ignore sessionStorage failures.
+        }
+    };
+
+    const replaceFragment = (html) => {
+        container.outerHTML = html;
+        refreshDynamicContent(document);
+        settleBannerState();
+    };
 
     const showErrorState = () => {
         if (banner) {
@@ -87,9 +110,8 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             const html = await response.text();
-            container.outerHTML = html;
-            refreshDynamicContent(document);
-            settleBannerState();
+            writeCachedFragment(html);
+            replaceFragment(html);
         } catch (_) {
             if (attempt < maxAttempts) {
                 showRetryState(attempt);
@@ -101,6 +123,12 @@ document.addEventListener("DOMContentLoaded", () => {
             window.clearTimeout(timeoutId);
         }
     };
+
+    const cachedHtml = readCachedFragment();
+    if (cachedHtml) {
+        replaceFragment(cachedHtml);
+        return;
+    }
 
     void loadFragment();
 });

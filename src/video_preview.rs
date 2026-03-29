@@ -462,9 +462,7 @@ pub fn preview_timestamps(duration_seconds: i64) -> Vec<i64> {
 	let step = if count > 1 { (end - start) / ((count - 1) as f64) } else { 0.0 };
 	let max_timestamp = (duration_seconds - 1).max(0) as f64;
 
-	(0..count)
-		.map(|index| (start + step * (index as f64)).round().clamp(0.0, max_timestamp) as i64)
-		.collect()
+	(0..count).map(|index| (start + step * (index as f64)).round().clamp(0.0, max_timestamp) as i64).collect()
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -540,24 +538,14 @@ async fn probe_duration_seconds(media_url: &str) -> Option<i64> {
 
 	if !output.status.success() {
 		let stderr = String::from_utf8_lossy(&output.stderr).chars().take(300).collect::<String>();
-		warn!(
-			"ffprobe failed after {:?} for url={}: {}",
-			started_at.elapsed(),
-			media_url,
-			stderr
-		);
+		warn!("ffprobe failed after {:?} for url={}: {}", started_at.elapsed(), media_url, stderr);
 		return None;
 	}
 
 	let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 	let duration = stdout.parse::<f64>().ok()?.round() as i64;
 	if duration > 0 {
-		info!(
-			"ffprobe resolved duration={}s in {:?} for url={}",
-			duration,
-			started_at.elapsed(),
-			media_url
-		);
+		info!("ffprobe resolved duration={}s in {:?} for url={}", duration, started_at.elapsed(), media_url);
 		Some(duration)
 	} else {
 		None

@@ -145,7 +145,11 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
 	let request_path = post_source_path(&req);
-	let reddit_path = if request_path.ends_with('/') { request_path.clone() } else { format!("{request_path}/") };
+	let reddit_path = if request_path.ends_with('/') {
+		request_path.clone()
+	} else {
+		format!("{request_path}/")
+	};
 	let mut path: String = format!("{}.json?{}&raw_json=1", reddit_path, req.uri().query().unwrap_or_default());
 	let sub = req.param("sub").unwrap_or_default();
 	let quarantined = can_access_quarantine(&req, &sub);
@@ -203,25 +207,25 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 			};
 
 			// Use the Post and Comment structs to generate a website to show users
-				let body = PostFragmentTemplate {
-					comments,
-					post,
-					sort,
-					prefs: Preferences::new(&req),
-					single_thread_str: if single_thread { "true" } else { "false" },
-					url: req_url,
-					url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
-					comment_query: query,
-				}
-				.render()
-				.map_err(|error| error.to_string())?;
-				Response::builder()
-					.status(200)
-					.header("content-type", "text/html; charset=utf-8")
-					.header("cache-control", "no-store")
-					.body(Body::from(body))
-					.map_err(|error| error.to_string())
+			let body = PostFragmentTemplate {
+				comments,
+				post,
+				sort,
+				prefs: Preferences::new(&req),
+				single_thread_str: if single_thread { "true" } else { "false" },
+				url: req_url,
+				url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
+				comment_query: query,
 			}
+			.render()
+			.map_err(|error| error.to_string())?;
+			Response::builder()
+				.status(200)
+				.header("content-type", "text/html; charset=utf-8")
+				.header("cache-control", "no-store")
+				.body(Body::from(body))
+				.map_err(|error| error.to_string())
+		}
 		// If the Reddit API returns an error, exit and send error page to user
 		Err(msg) => {
 			if msg == "quarantined" || msg == "gated" {
@@ -280,23 +284,14 @@ mod tests {
 
 	#[test]
 	fn post_fragment_path_trims_trailing_slash() {
-		let request = Request::builder()
-			.uri("/r/rust/comments/demo/title/?sort=new")
-			.body(Body::empty())
-			.unwrap();
+		let request = Request::builder().uri("/r/rust/comments/demo/title/?sort=new").body(Body::empty()).unwrap();
 
-		assert_eq!(
-			post_fragment_path(&request),
-			"/post-fragment/r/rust/comments/demo/title?sort=new"
-		);
+		assert_eq!(post_fragment_path(&request), "/post-fragment/r/rust/comments/demo/title?sort=new");
 	}
 
 	#[test]
 	fn post_source_path_removes_fragment_prefix() {
-		let request = Request::builder()
-			.uri("/post-fragment/r/rust/comments/demo/title")
-			.body(Body::empty())
-			.unwrap();
+		let request = Request::builder().uri("/post-fragment/r/rust/comments/demo/title").body(Body::empty()).unwrap();
 
 		assert_eq!(post_source_path(&request), "/r/rust/comments/demo/title");
 	}
