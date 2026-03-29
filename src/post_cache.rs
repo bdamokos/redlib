@@ -409,6 +409,11 @@ fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per
 	posts.len() >= ((page + 1) * per_page) || session.background_complete || session.frozen_pages.contains_key(&page)
 }
 
+fn sort_page_posts_by_date_desc(mut posts: Vec<Post>) -> Vec<Post> {
+	posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+	posts
+}
+
 fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> FeedSessionStatus {
 	let ready_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Ready).count();
 	let failed_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Failed).count();
@@ -812,14 +817,18 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		if current_page_is_ready(session, &merged_posts, page, per_page) {
 			let start = page * per_page;
 			let end = (start + per_page).min(merged_posts.len());
-			let frozen = if start < merged_posts.len() { merged_posts[start..end].to_vec() } else { Vec::new() };
+			let frozen = if start < merged_posts.len() {
+				sort_page_posts_by_date_desc(merged_posts[start..end].to_vec())
+			} else {
+				Vec::new()
+			};
 			session.frozen_pages.insert(page, frozen.clone());
 			frozen
 		} else {
 			let start = page * per_page;
 			let end = (start + per_page).min(merged_posts.len());
 			if start < merged_posts.len() {
-				merged_posts[start..end].to_vec()
+				sort_page_posts_by_date_desc(merged_posts[start..end].to_vec())
 			} else {
 				Vec::new()
 			}
@@ -1461,7 +1470,7 @@ mod tests {
 
 		let first_page = feed_page("demo", 0, POSTS_PER_PAGE).expect("initial page");
 		let initial_ids = first_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
-		assert_eq!(initial_ids[0], "older-0");
+		assert_eq!(initial_ids[0], "newer-0");
 
 		{
 			let mut sessions = FEED_SESSIONS.lock().unwrap();
@@ -1473,6 +1482,56 @@ mod tests {
 		let refreshed_ids = second_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
 
 		assert_eq!(refreshed_ids, initial_ids);
+	}
+
+	#[test]
+	fn feed_page_sorts_selected_posts_newest_first() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source_a = FeedSource::Subreddit { name: "alpha".to_string() };
+		let source_b = FeedSource::Subreddit { name: "beta".to_string() };
+		seed_source(
+			&source_a,
+			vec![
+				test_post("alpha-1", "alpha", 100),
+				test_post("alpha-2", "alpha", 97),
+			],
+		);
+		seed_source(
+			&source_b,
+			vec![
+				test_post("beta-1", "beta", 99),
+				test_post("beta-2", "beta", 98),
+			],
+		);
+
+		FEED_SESSIONS.lock().unwrap().insert(
+			"demo".to_string(),
+			FeedSession {
+				id: "demo".to_string(),
+				request: FeedSessionRequest {
+					sources: vec![],
+					filters: HashSet::new(),
+					quarantine: false,
+					query_fingerprint: "demo".to_string(),
+				},
+				sources: vec![
+					session_entry(source_a, SessionSourceState::Ready),
+					session_entry(source_b, SessionSourceState::Ready),
+				],
+				frozen_pages: HashMap::new(),
+				background_active: false,
+				background_complete: true,
+				requested_page: 0,
+				last_updated: Instant::now(),
+				revision: 0,
+			},
+		);
+
+		let page = feed_page("demo", 0, 4).expect("page");
+		let ids = page.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>();
+
+		assert_eq!(ids, vec!["alpha-1", "beta-1", "beta-2", "alpha-2"]);
 	}
 
 	#[test]
