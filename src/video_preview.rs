@@ -25,7 +25,7 @@ const DEFAULT_FAILED_RETRY: Duration = Duration::from_secs(120);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_NEAR_TERM_POLL_MS: u64 = 1_500;
 const DEFAULT_BACKPRESSURE_POLL_MS: u64 = 5_000;
-const FRAME_CACHE_SECONDS: u64 = 300;
+const FRAME_CACHE_SECONDS: u64 = 24 * 60 * 60;
 const PREVIEW_MAX_WIDTH: i64 = 640;
 
 type FrameFuture<'a> = Pin<Box<dyn Future<Output = Result<FrameBlob, String>> + Send + 'a>>;
@@ -1266,6 +1266,46 @@ mod tests {
 		req.set_params(params);
 		let response = frame(req).await.unwrap();
 		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn frame_handler_sets_24_hour_cache_header() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		reset_state_for_tests();
+		let job_id = "job".to_string();
+		VIDEO_PREVIEW_JOBS.lock().unwrap().insert(
+			job_id.clone(),
+			JobEntry {
+				key: VideoPreviewJobKey {
+					media_url: "/vid/test".to_string(),
+					poster_url: String::new(),
+					duration_seconds: 30,
+					width: 320,
+					height: 180,
+				},
+				state: VideoPreviewJobState::Pending,
+				queued: false,
+				last_accessed: Instant::now(),
+			},
+		);
+		VIDEO_PREVIEW_FRAMES.lock().unwrap().blobs.insert(
+			frame_cache_key(&job_id, 0),
+			FrameBlob {
+				content_type: "image/jpeg",
+				bytes: b"frame".to_vec(),
+			},
+		);
+
+		let req = Request::builder().uri("/api/video-previews/job/frame/0").body(Body::empty()).unwrap();
+		let mut req = req;
+		let mut params = route_recognizer::Params::new();
+		params.insert("job_id".to_string(), job_id);
+		params.insert("index".to_string(), "0".to_string());
+		req.set_params(params);
+
+		let response = frame(req).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers()["Cache-Control"], "public, max-age=86400");
 	}
 
 	#[tokio::test]
