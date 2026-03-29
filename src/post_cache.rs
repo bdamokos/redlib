@@ -98,6 +98,7 @@ struct FeedSession {
 	id: String,
 	request: FeedSessionRequest,
 	sources: Vec<SessionSourceEntry>,
+	frozen_pages: HashMap<usize, Vec<Post>>,
 	background_active: bool,
 	background_complete: bool,
 	requested_page: usize,
@@ -244,6 +245,7 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 		id,
 		request,
 		sources,
+		frozen_pages: HashMap::new(),
 		background_active: false,
 		background_complete: false,
 		requested_page: 0,
@@ -384,18 +386,8 @@ fn active_source_keys(queues: &[(FeedSource, VecDeque<Post>)], exhausted_sources
 	}
 }
 
-fn session_page_from_posts(posts: &[Post], page: usize, per_page: usize, warming: bool) -> FeedPage {
-	let start = page * per_page;
-	let end = (start + per_page).min(posts.len());
-	let page_posts = if start < posts.len() { posts[start..end].to_vec() } else { Vec::new() };
-	let has_prev = page > 0;
-	let has_next = end < posts.len() || warming;
-
-	FeedPage {
-		posts: page_posts,
-		has_prev,
-		has_next,
-	}
+fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> bool {
+	posts.len() >= ((page + 1) * per_page) || session.background_complete || session.frozen_pages.contains_key(&page)
 }
 
 fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> FeedSessionStatus {
@@ -412,7 +404,7 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 		.filter(|entry| entry.state == SessionSourceState::Ready)
 		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name } if name.starts_with("u_")))
 		.count();
-	let current_page_ready = posts.len() >= ((page + 1) * per_page) || session.background_complete;
+	let current_page_ready = current_page_is_ready(session, posts, page, per_page);
 	let next_page_ready = posts.len() >= ((page + 2) * per_page);
 	let warming = session.background_active;
 	let status_message = if warming {
@@ -784,15 +776,39 @@ pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_pa
 }
 
 pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedPage> {
-	let sessions = FEED_SESSIONS.lock().ok()?;
-	let session = sessions.get(session_id)?;
+	let mut sessions = FEED_SESSIONS.lock().ok()?;
+	let session = sessions.get_mut(session_id)?;
 	if session_is_expired(session) {
 		return None;
 	}
 
-	let posts = merged_posts_for_session(session);
+	let merged_posts = merged_posts_for_session(session);
+	let merged_len = merged_posts.len();
+	let posts = if let Some(frozen_posts) = session.frozen_pages.get(&page) {
+		frozen_posts.clone()
+	} else {
+		if current_page_is_ready(session, &merged_posts, page, per_page) {
+			let start = page * per_page;
+			let end = (start + per_page).min(merged_posts.len());
+			let frozen = if start < merged_posts.len() { merged_posts[start..end].to_vec() } else { Vec::new() };
+			session.frozen_pages.insert(page, frozen.clone());
+			frozen
+		} else {
+			let start = page * per_page;
+			let end = (start + per_page).min(merged_posts.len());
+			if start < merged_posts.len() {
+				merged_posts[start..end].to_vec()
+			} else {
+				Vec::new()
+			}
+		}
+	};
 	let has_more_available = session.background_active || page < session.requested_page || session_has_remaining_sources(session);
-	Some(session_page_from_posts(&posts, page, per_page, has_more_available))
+	Some(FeedPage {
+		posts,
+		has_prev: page > 0,
+		has_next: ((page + 1) * per_page) < merged_len || has_more_available,
+	})
 }
 
 pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<FeedSessionStatus> {
@@ -816,13 +832,13 @@ pub fn cache_stats() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state,
+		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state, feed_page,
 		initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, round_robin_source_target, session_status_from_posts,
 		sort_sources, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState, FEED_SESSIONS,
 		POSTS_PER_PAGE, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
-	use std::collections::{HashSet, VecDeque};
+	use std::collections::{HashMap, HashSet, VecDeque};
 	use std::sync::{LazyLock, Mutex, MutexGuard};
 	use std::time::Instant;
 
@@ -961,6 +977,7 @@ mod tests {
 				session_entry(FeedSource::Subreddit { name: "u_demo".to_string() }, SessionSourceState::Unstarted),
 				session_entry(rust_source, SessionSourceState::Ready),
 			],
+			frozen_pages: HashMap::new(),
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -992,6 +1009,7 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![session_entry(rust_source, SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -1037,6 +1055,7 @@ mod tests {
 					)
 				})
 				.collect(),
+			frozen_pages: HashMap::new(),
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -1069,6 +1088,7 @@ mod tests {
 					)
 				})
 				.collect(),
+			frozen_pages: HashMap::new(),
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -1107,6 +1127,7 @@ mod tests {
 					)
 				})
 				.collect(),
+			frozen_pages: HashMap::new(),
 			background_active: false,
 			background_complete: false,
 			requested_page: 0,
@@ -1138,6 +1159,7 @@ mod tests {
 				session_entry(fresh_source, SessionSourceState::Ready),
 				session_entry(stale_source, SessionSourceState::Ready),
 			],
+			frozen_pages: HashMap::new(),
 			background_active: false,
 			background_complete: false,
 			requested_page: 0,
@@ -1166,6 +1188,7 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![session_entry(rust_source, SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -1197,6 +1220,7 @@ mod tests {
 				session_entry(ready_source, SessionSourceState::Ready),
 				session_entry(FeedSource::Subreddit { name: "stuck".to_string() }, SessionSourceState::Fetching),
 			],
+			frozen_pages: HashMap::new(),
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -1241,6 +1265,7 @@ mod tests {
 					)
 				})
 				.collect(),
+			frozen_pages: HashMap::new(),
 			background_active: true,
 			background_complete: false,
 			requested_page: 0,
@@ -1293,6 +1318,7 @@ mod tests {
 				session_entry(recent_source, SessionSourceState::Ready),
 				session_entry(stale_source, SessionSourceState::Ready),
 			],
+			frozen_pages: HashMap::new(),
 			background_active: false,
 			background_complete: false,
 			requested_page: 0,
@@ -1338,6 +1364,7 @@ mod tests {
 					)
 				})
 				.collect(),
+			frozen_pages: HashMap::new(),
 			background_active: false,
 			background_complete: false,
 			requested_page: 3,
@@ -1353,5 +1380,58 @@ mod tests {
 		let repeated_sources = merged.iter().skip(100).take(25).map(|post| post.community.clone()).collect::<HashSet<_>>();
 
 		assert_eq!(repeated_sources.len(), 25);
+	}
+
+	#[test]
+	fn ready_pages_remain_stable_after_more_sources_finish_warming() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let older_source = FeedSource::Subreddit { name: "older".to_string() };
+		let newer_source = FeedSource::Subreddit { name: "newer".to_string() };
+		let older_posts = (0..30)
+			.map(|index| test_post(&format!("older-{index}"), "older", now - 1_000 - index as u64))
+			.collect::<Vec<_>>();
+		let newer_posts = (0..30).map(|index| test_post(&format!("newer-{index}"), "newer", now - index as u64)).collect::<Vec<_>>();
+		seed_source(&older_source, older_posts);
+		seed_source(&newer_source, newer_posts);
+
+		FEED_SESSIONS.lock().unwrap().insert(
+			"demo".to_string(),
+			FeedSession {
+				id: "demo".to_string(),
+				request: FeedSessionRequest {
+					sources: vec![],
+					filters: HashSet::new(),
+					quarantine: false,
+					query_fingerprint: "demo".to_string(),
+				},
+				sources: vec![
+					session_entry(older_source.clone(), SessionSourceState::Ready),
+					session_entry(newer_source.clone(), SessionSourceState::Unstarted),
+				],
+				frozen_pages: HashMap::new(),
+				background_active: true,
+				background_complete: false,
+				requested_page: 0,
+				last_updated: Instant::now(),
+				revision: 0,
+			},
+		);
+
+		let first_page = feed_page("demo", 0, POSTS_PER_PAGE).expect("initial page");
+		let initial_ids = first_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+		assert_eq!(initial_ids[0], "older-0");
+
+		{
+			let mut sessions = FEED_SESSIONS.lock().unwrap();
+			let session = sessions.get_mut("demo").expect("session");
+			session.sources[1].state = SessionSourceState::Ready;
+		}
+
+		let second_page = feed_page("demo", 0, POSTS_PER_PAGE).expect("stable page");
+		let refreshed_ids = second_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+
+		assert_eq!(refreshed_ids, initial_ids);
 	}
 }

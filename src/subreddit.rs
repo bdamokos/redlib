@@ -91,7 +91,6 @@ pub struct SubredditShellTemplate {
 	active_flair_filter: String,
 	prefs: Preferences,
 	url: String,
-	redirect_url: String,
 	fragment_url: String,
 	loading_message: String,
 	placeholder_message: String,
@@ -887,7 +886,6 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
-	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
 	let aggregate_saved_feeds = req.param("sub").is_none() && front_page_is_default && has_saved_feeds;
 	let loading_message = if aggregate_saved_feeds && sort == "new" {
@@ -907,7 +905,6 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		active_flair_filter,
 		prefs,
 		url,
-		redirect_url,
 		fragment_url: subreddit_fragment_path(&req),
 		loading_message,
 		placeholder_message,
@@ -1552,7 +1549,6 @@ mod tests {
 			active_flair_filter: String::new(),
 			prefs: test_prefs(),
 			url: "/r/rust".to_string(),
-			redirect_url: "r/rust".to_string(),
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1576,7 +1572,6 @@ mod tests {
 			active_flair_filter: String::new(),
 			prefs: test_prefs(),
 			url: "/".to_string(),
-			redirect_url: String::new(),
 			fragment_url: "/subreddit-fragment".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1599,7 +1594,6 @@ mod tests {
 			active_flair_filter: String::new(),
 			prefs: test_prefs(),
 			url: "/new".to_string(),
-			redirect_url: String::new(),
 			fragment_url: "/subreddit-fragment/new".to_string(),
 			loading_message: loading_message.clone(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1614,7 +1608,7 @@ mod tests {
 	}
 
 	#[test]
-	fn subreddit_shell_preserves_subscription_state() {
+	fn subreddit_shell_does_not_render_subscription_controls() {
 		let mut prefs = test_prefs();
 		prefs.subscriptions = vec!["rust".to_string()];
 
@@ -1626,7 +1620,6 @@ mod tests {
 			active_flair_filter: String::new(),
 			prefs,
 			url: "/r/rust".to_string(),
-			redirect_url: "r/rust".to_string(),
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1634,8 +1627,8 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(html.contains("data-subscription-state=\"subscribed\""));
-		assert!(html.contains(">Unsubscribe</button>"));
+		assert!(!html.contains("data-subscription-target=\"subreddit:rust\""));
+		assert!(!html.contains("subreddit_shell_sidebar"));
 	}
 
 	#[test]

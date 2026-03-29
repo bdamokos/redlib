@@ -127,7 +127,6 @@ document.addEventListener("DOMContentLoaded", () => {
     const cachedHtml = readCachedFragment();
     if (cachedHtml) {
         replaceFragment(cachedHtml);
-        return;
     }
 
     void loadFragment();
