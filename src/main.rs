@@ -113,8 +113,8 @@ async fn main() {
 	// Load environment variables
 	_ = dotenvy::dotenv();
 
-	// Initialize logger
-	pretty_env_logger::init();
+	// Initialize logger with timestamps to make upstream pacing visible in logs.
+	pretty_env_logger::init_timed();
 
 	let matches = Command::new("Redlib")
 		.version(env!("CARGO_PKG_VERSION"))

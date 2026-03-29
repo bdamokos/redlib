@@ -104,21 +104,33 @@ impl RedditRateLimitSnapshot {
 		self.status == 429 || self.retry_after_seconds.is_some()
 	}
 
+	fn effective_seconds_remaining(seconds: f32, observed_at: Instant) -> f32 {
+		(seconds - observed_at.elapsed().as_secs_f32()).max(0.0)
+	}
+
+	fn effective_reset_seconds(&self) -> Option<f32> {
+		self.reset_seconds.map(|seconds| Self::effective_seconds_remaining(seconds, self.observed_at))
+	}
+
+	fn effective_retry_after_seconds(&self) -> Option<f32> {
+		self.retry_after_seconds.map(|seconds| Self::effective_seconds_remaining(seconds, self.observed_at))
+	}
+
 	pub fn remaining_requests_per_second(&self) -> Option<f32> {
-		match (self.remaining, self.reset_seconds) {
+		match (self.remaining, self.effective_reset_seconds()) {
 			(Some(remaining), Some(reset_seconds)) if remaining > 0.0 && reset_seconds > 0.0 => Some(remaining / reset_seconds),
 			_ => None,
 		}
 	}
 
 	pub fn suggested_wait_duration(&self) -> Option<Duration> {
-		if let Some(retry_after) = self.retry_after_seconds {
+		if let Some(retry_after) = self.effective_retry_after_seconds() {
 			if retry_after > 0.0 {
 				return Some(Duration::from_secs_f32(retry_after));
 			}
 		}
 
-		match (self.remaining, self.reset_seconds) {
+		match (self.remaining, self.effective_reset_seconds()) {
 			(Some(remaining), Some(reset_seconds)) if remaining <= 0.0 && reset_seconds > 0.0 => Some(Duration::from_secs_f32(reset_seconds)),
 			(Some(remaining), Some(reset_seconds)) if remaining > 0.0 && reset_seconds > 0.0 => {
 				let spacing = reset_seconds / remaining.max(1.0);
@@ -777,10 +789,56 @@ fn test_detects_network_security_block_page() {
 	assert!(!is_network_security_block(hyper::StatusCode::FORBIDDEN, Some("application/json"), "{\"error\":403}",));
 }
 
-#[test]
-fn test_response_preview_truncates_and_escapes_newlines() {
-	assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
-}
+	#[test]
+	fn test_response_preview_truncates_and_escapes_newlines() {
+		assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
+	}
+
+	#[test]
+	fn test_ratelimit_snapshot_wait_counts_down_with_elapsed_time() {
+		let snapshot = RedditRateLimitSnapshot {
+			remaining: Some(0.0),
+			reset_seconds: Some(203.0),
+			used: None,
+			retry_after_seconds: None,
+			status: 429,
+			observed_at: Instant::now() - Duration::from_secs(200),
+		};
+
+		let wait = snapshot.suggested_wait_duration().expect("expected remaining wait");
+		assert!(wait > Duration::from_secs_f32(2.0));
+		assert!(wait <= Duration::from_secs(3));
+	}
+
+	#[test]
+	fn test_ratelimit_snapshot_stops_waiting_after_reset_elapsed() {
+		let snapshot = RedditRateLimitSnapshot {
+			remaining: Some(0.0),
+			reset_seconds: Some(10.0),
+			used: None,
+			retry_after_seconds: None,
+			status: 429,
+			observed_at: Instant::now() - Duration::from_secs(11),
+		};
+
+		assert_eq!(snapshot.suggested_wait_duration(), None);
+	}
+
+	#[test]
+	fn test_retry_after_counts_down_with_elapsed_time() {
+		let snapshot = RedditRateLimitSnapshot {
+			remaining: Some(1.0),
+			reset_seconds: Some(60.0),
+			used: None,
+			retry_after_seconds: Some(10.0),
+			status: 429,
+			observed_at: Instant::now() - Duration::from_secs(7),
+		};
+
+		let wait = snapshot.suggested_wait_duration().expect("expected retry-after wait");
+		assert!(wait > Duration::from_secs_f32(2.0));
+		assert!(wait <= Duration::from_secs(3));
+	}
 
 #[test]
 fn test_detects_uri_too_long_response() {
