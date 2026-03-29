@@ -50,10 +50,14 @@
     {% endif %}
 
     <footer>
-        {% if !str_eq(ends.0, "") %}
+        {% if !str_eq(prev_page_url, "") %}
+        <a href="{{ prev_page_url }}" accesskey="P">PREV</a>
+        {% else if !str_eq(ends.0, "") %}
         <a href="?sort={{ sort.0 }}&t={{ sort.1 }}&before={{ ends.0 }}" accesskey="P">PREV</a>
         {% endif %}
-        {% if !str_eq(ends.1, "") %}
+        {% if !str_eq(next_page_url, "") %}
+        <a href="{{ next_page_url }}" accesskey="N">NEXT</a>
+        {% else if !str_eq(ends.1, "") %}
         <a href="?sort={{ sort.0 }}&t={{ sort.1 }}&after={{ ends.1 }}" accesskey="N">NEXT</a>
         {% endif %}
     </footer>

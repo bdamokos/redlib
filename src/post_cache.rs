@@ -154,9 +154,9 @@ pub const fn initial_source_window() -> usize {
 	INITIAL_SOURCE_WINDOW
 }
 
-pub fn get_cached_subreddit_page(subreddit: &str, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
+pub fn get_cached_source_page(source: &FeedSource, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
 	let cache = SOURCE_CACHE.lock().ok()?;
-	let entry = cache.get(&FeedSource::Subreddit { name: subreddit.to_string() }.cache_key())?;
+	let entry = cache.get(&source.cache_key())?;
 	if source_cache_is_expired(entry) {
 		return None;
 	}
@@ -170,6 +170,10 @@ pub fn get_cached_subreddit_page(subreddit: &str, page: usize, per_page: usize) 
 	let has_prev = page > 0;
 	let after = if end >= entry.posts.len() { entry.after.clone() } else { String::new() };
 	Some((entry.posts[start..end].to_vec(), after, has_prev, has_next))
+}
+
+pub fn get_cached_subreddit_page(subreddit: &str, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
+	get_cached_source_page(&FeedSource::Subreddit { name: subreddit.to_string() }, page, per_page)
 }
 
 fn store_source_posts(source: &FeedSource, posts: Vec<Post>, after: String) {
@@ -833,9 +837,9 @@ pub fn cache_stats() -> (usize, usize) {
 mod tests {
 	use super::{
 		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state, feed_page,
-		initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, round_robin_source_target, session_status_from_posts,
-		sort_sources, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState, FEED_SESSIONS,
-		POSTS_PER_PAGE, SOURCE_CACHE,
+		get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, round_robin_source_target,
+		session_status_from_posts, sort_sources, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState,
+		FEED_SESSIONS, POSTS_PER_PAGE, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
 	use std::collections::{HashMap, HashSet, VecDeque};
@@ -930,6 +934,23 @@ mod tests {
 		assert!(matches!(&sources[0], FeedSource::Subreddit { name } if name == "u_demo"));
 		assert!(matches!(&sources[1], FeedSource::Subreddit { name } if name == "rust"));
 		assert!(matches!(&sources[2], FeedSource::Flair { subreddit, .. } if subreddit == "zeta"));
+	}
+
+	#[test]
+	fn gets_cached_pages_for_user_sources() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let user_source = FeedSource::Subreddit { name: "u_demo".to_string() };
+		let posts = (0..30)
+			.map(|index| test_post(&index.to_string(), "u_demo", chrono::Utc::now().timestamp() as u64 - index as u64))
+			.collect::<Vec<_>>();
+		seed_source(&user_source, posts);
+
+		let cached = get_cached_source_page(&user_source, 0, 25).expect("cached first page");
+
+		assert_eq!(cached.0.len(), 25);
+		assert!(!cached.2);
+		assert!(cached.3);
 	}
 
 	#[test]

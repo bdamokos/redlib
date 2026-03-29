@@ -66,6 +66,8 @@ pub struct UserTemplate {
 	no_posts: bool,
 	shell_mode: bool,
 	fragment_url: String,
+	prev_page_url: String,
+	next_page_url: String,
 	loading_message: String,
 }
 
@@ -88,6 +90,8 @@ struct UserFragmentTemplate {
 	all_posts_hidden_nsfw: bool,
 	avg_video_length: Option<(String, String)>,
 	no_posts: bool,
+	prev_page_url: String,
+	next_page_url: String,
 }
 
 impl UserFragmentTemplate {
@@ -446,6 +450,26 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 	Ok((all_posts, after, all_posts_filtered))
 }
 
+fn cached_user_listing_posts(username: &str, listing: &str, sort: &str, query: &str) -> Option<(Vec<Post>, String, bool, bool)> {
+	if listing != "submitted" || sort != "new" {
+		return None;
+	}
+
+	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
+	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
+	if !request_after.is_empty() || !request_before.is_empty() {
+		return None;
+	}
+
+	let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+
+	crate::post_cache::get_cached_source_page(
+		&crate::post_cache::FeedSource::Subreddit { name: format!("u_{username}") },
+		cache_page,
+		crate::post_cache::POSTS_PER_PAGE,
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::collapse_duplicate_submissions;
@@ -725,6 +749,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: false,
 			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: String::new(),
 		}
 		.render()
@@ -769,6 +795,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: false,
 			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: String::new(),
 		}
 		.render()
@@ -800,6 +828,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: true,
 			fragment_url: "/user-fragment/demo_user".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: "Loading user page...".to_string(),
 		}
 		.render()
@@ -880,6 +910,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: false,
 			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: String::new(),
 		}
 		.render()
@@ -1021,6 +1053,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: false,
 			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: String::new(),
 		}
 		.render()
@@ -1054,6 +1088,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: false,
 			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: String::new(),
 		}
 		.render()
@@ -1095,6 +1131,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: false,
 			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: String::new(),
 		}
 		.render()
@@ -1141,6 +1179,8 @@ mod tests {
 			no_posts: false,
 			shell_mode: false,
 			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 			loading_message: String::new(),
 		}
 		.render()
@@ -1191,6 +1231,8 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		no_posts: false,
 		shell_mode: true,
 		fragment_url: user_fragment_path(&username, &listing, query),
+		prev_page_url: String::new(),
+		next_page_url: String::new(),
 		loading_message: "Loading user page...".to_string(),
 	}))
 }
@@ -1206,6 +1248,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let current_url = if query.is_empty() { url.clone() } else { format!("{url}") };
 	let redirect_url = current_url.trim_start_matches('/').replace('?', "%3F").replace('&', "%26");
 	let sort = param(&path, "sort").unwrap_or_default();
+	let cached_listing_page = cached_user_listing_posts(&username, &listing, &sort, query);
 	let user = user(&username).await.unwrap_or_default();
 	let req_url = req.uri().to_string();
 
@@ -1233,9 +1276,70 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			all_posts_hidden_nsfw: false,
 			avg_video_length: None,
 			no_posts: false,
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
 		}
 	} else {
-		let (posts, after, all_posts_filtered) = fetch_user_listing_posts(&username, &path, &listing, &filters).await?;
+		let (posts, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some((posts, after, has_prev, has_next)) = cached_listing_page {
+			let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+			let prev = if has_prev {
+				let prev_page = cache_page.saturating_sub(1).to_string();
+				let prev_url = format!("/user/{username}/submitted");
+				let prev_query = form_urlencoded::Serializer::new(String::new())
+					.extend_pairs(
+						form_urlencoded::parse(query.as_bytes())
+							.into_owned()
+							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
+					)
+					.append_pair("cache_page", &prev_page)
+					.finish();
+				if prev_query.is_empty() {
+					prev_url
+				} else {
+					format!("{prev_url}?{prev_query}")
+				}
+			} else {
+				String::new()
+			};
+			let next = if has_next && !after.is_empty() {
+				let next_url = format!("/user/{username}/submitted");
+				let next_query = form_urlencoded::Serializer::new(String::new())
+					.extend_pairs(
+						form_urlencoded::parse(query.as_bytes())
+							.into_owned()
+							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
+					)
+					.append_pair("after", &after)
+					.finish();
+				if next_query.is_empty() {
+					next_url
+				} else {
+					format!("{next_url}?{next_query}")
+				}
+			} else if has_next {
+				let next_page = (cache_page + 1).to_string();
+				let next_url = format!("/user/{username}/submitted");
+				let next_query = form_urlencoded::Serializer::new(String::new())
+					.extend_pairs(
+						form_urlencoded::parse(query.as_bytes())
+							.into_owned()
+							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
+					)
+					.append_pair("cache_page", &next_page)
+					.finish();
+				if next_query.is_empty() {
+					next_url
+				} else {
+					format!("{next_url}?{next_query}")
+				}
+			} else {
+				String::new()
+			};
+			(posts, (String::new(), String::new()), prev, next, false)
+		} else {
+			let (posts, after, all_posts_filtered) = fetch_user_listing_posts(&username, &path, &listing, &filters).await?;
+			(posts, (param(&path, "after").unwrap_or_default(), after), String::new(), String::new(), all_posts_filtered)
+		};
 		let no_posts = posts.is_empty();
 		let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 		let avg_video_length = cached_avg_video_length(&username);
@@ -1247,7 +1351,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				.map(|(name, count)| UserSubredditEntry { name, count })
 				.collect(),
 			sort: (sort, param(&path, "t").unwrap_or_default()),
-			ends: (param(&path, "after").unwrap_or_default(), after),
+			ends,
 			listing,
 			prefs: Preferences::new(&req),
 			url,
@@ -1257,6 +1361,8 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			all_posts_hidden_nsfw,
 			avg_video_length,
 			no_posts,
+			prev_page_url,
+			next_page_url,
 		}
 	};
 
