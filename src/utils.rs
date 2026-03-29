@@ -20,6 +20,7 @@ use hyper::header::LOCATION;
 use hyper::{Body, Request, Response, Uri};
 use libflate::deflate::{Decoder, Encoder};
 use log::error;
+use percent_encoding::percent_decode_str;
 use regex::Regex;
 use revision::{revisioned, Revisioned};
 use rust_embed::RustEmbed;
@@ -1499,6 +1500,10 @@ fn chunk_cookie_value(value: &str, max_len: usize) -> Vec<String> {
 	chunks
 }
 
+fn decode_cookie_chunk(value: &str) -> String {
+	percent_decode_str(value).decode_utf8_lossy().into_owned()
+}
+
 pub fn read_sharded_cookie(req: &Request<Body>, base_name: &str) -> String {
 	let mut value = String::new();
 	let mut index = 0usize;
@@ -1510,7 +1515,7 @@ pub fn read_sharded_cookie(req: &Request<Body>, base_name: &str) -> String {
 			break;
 		};
 
-		value.push_str(cookie.value());
+		value.push_str(&decode_cookie_chunk(cookie.value()));
 		index += 1;
 	}
 
@@ -2949,8 +2954,8 @@ impl_template_str_eq!(User);
 mod tests {
 	use super::{
 		coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions,
-		extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration, rewrite_urls,
-		user_profile_details, write_sharded_cookie, ExternalLink, FlairSubscription, Preferences,
+		extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration, read_sharded_cookie,
+		rewrite_urls, user_profile_details, write_sharded_cookie, ExternalLink, FlairSubscription, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
@@ -3301,6 +3306,16 @@ mod tests {
 		assert!(!set_cookie_headers.is_empty());
 		assert!(set_cookie_headers.iter().all(|value| !value.contains("HttpOnly")));
 		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions=rust+u_spez")));
+	}
+
+	#[test]
+	fn read_sharded_cookie_decodes_percent_encoded_chunks() {
+		let req = Request::builder()
+			.header("Cookie", "subscriptions=rust%2Bu_spez; subscriptions1=%2Bprogramming")
+			.body(Body::empty())
+			.unwrap();
+
+		assert_eq!(read_sharded_cookie(&req, "subscriptions"), "rust+u_spez+programming");
 	}
 }
 
