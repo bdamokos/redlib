@@ -258,6 +258,21 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 	}
 }
 
+fn reconcile_session_with_source_cache(session: &mut FeedSession) {
+	let mut changed = false;
+	for entry in &mut session.sources {
+		if cached_source_posts(&entry.source).is_some() && entry.state != SessionSourceState::Ready {
+			entry.state = SessionSourceState::Ready;
+			entry.last_error = None;
+			changed = true;
+		}
+	}
+
+	if changed {
+		touch_session(session);
+	}
+}
+
 fn filtered_source_queues(session: &FeedSession) -> Vec<(FeedSource, VecDeque<Post>)> {
 	let mut queues = Vec::new();
 	for entry in &session.sources {
@@ -688,6 +703,7 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 
 		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
 		session.requested_page = session.requested_page.max(page);
+		reconcile_session_with_source_cache(session);
 		touch_session(session);
 	}
 
@@ -743,6 +759,7 @@ pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_pa
 
 		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
 		session.requested_page = session.requested_page.max(page);
+		reconcile_session_with_source_cache(session);
 		touch_session(session);
 	}
 
@@ -785,6 +802,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	if session_is_expired(session) {
 		return None;
 	}
+	reconcile_session_with_source_cache(session);
 
 	let merged_posts = merged_posts_for_session(session);
 	let merged_len = merged_posts.len();
@@ -816,11 +834,12 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 }
 
 pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<FeedSessionStatus> {
-	let sessions = FEED_SESSIONS.lock().ok()?;
-	let session = sessions.get(session_id)?;
+	let mut sessions = FEED_SESSIONS.lock().ok()?;
+	let session = sessions.get_mut(session_id)?;
 	if session_is_expired(session) {
 		return None;
 	}
+	reconcile_session_with_source_cache(session);
 
 	let posts = merged_posts_for_session(session);
 	Some(session_status_from_posts(session, &posts, page, per_page))
@@ -837,9 +856,9 @@ pub fn cache_stats() -> (usize, usize) {
 mod tests {
 	use super::{
 		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state, feed_page,
-		get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, round_robin_source_target,
-		session_status_from_posts, sort_sources, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState,
-		FEED_SESSIONS, POSTS_PER_PAGE, SOURCE_CACHE,
+		feed_status, get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
+		reconcile_session_with_source_cache, round_robin_source_target, session_status_from_posts, sort_sources, store_source_posts, sync_sources_to_request, FeedSession,
+		FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState, FEED_SESSIONS, POSTS_PER_PAGE, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
 	use std::collections::{HashMap, HashSet, VecDeque};
@@ -1454,5 +1473,81 @@ mod tests {
 		let refreshed_ids = second_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
 
 		assert_eq!(refreshed_ids, initial_ids);
+	}
+
+	#[test]
+	fn reconciles_new_session_sources_from_existing_shared_cache() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let golang_source = FeedSource::Subreddit { name: "golang".to_string() };
+		seed_source(&rust_source, vec![test_post("rust-1", "rust", now)]);
+		seed_source(&golang_source, vec![test_post("go-1", "golang", now - 1)]);
+
+		let mut session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![rust_source.clone(), golang_source.clone()],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![
+				session_entry(rust_source, SessionSourceState::Unstarted),
+				session_entry(golang_source, SessionSourceState::Failed),
+			],
+			frozen_pages: HashMap::new(),
+			background_active: true,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		reconcile_session_with_source_cache(&mut session);
+
+		assert_eq!(count_sources_in_state(&session, SessionSourceState::Ready), 2);
+		assert_eq!(count_sources_in_state(&session, SessionSourceState::Unstarted), 0);
+		assert_eq!(count_sources_in_state(&session, SessionSourceState::Failed), 0);
+	}
+
+	#[test]
+	fn feed_status_counts_cached_sources_for_new_session() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let programming_source = FeedSource::Subreddit { name: "programming".to_string() };
+		seed_source(&rust_source, vec![test_post("rust-1", "rust", now)]);
+		seed_source(&programming_source, vec![test_post("prog-1", "programming", now - 1)]);
+
+		FEED_SESSIONS.lock().unwrap().insert(
+			"demo".to_string(),
+			FeedSession {
+				id: "demo".to_string(),
+				request: FeedSessionRequest {
+					sources: vec![rust_source.clone(), programming_source.clone()],
+					filters: HashSet::new(),
+					quarantine: false,
+					query_fingerprint: "demo".to_string(),
+				},
+				sources: vec![
+					session_entry(rust_source, SessionSourceState::Unstarted),
+					session_entry(programming_source, SessionSourceState::Unstarted),
+				],
+				frozen_pages: HashMap::new(),
+				background_active: true,
+				background_complete: false,
+				requested_page: 0,
+				last_updated: Instant::now(),
+				revision: 0,
+			},
+		);
+
+		let status = feed_status("demo", 0, POSTS_PER_PAGE).expect("session status");
+
+		assert_eq!(status.ready_sources, 2);
+		assert_eq!(status.total_sources, 2);
 	}
 }
