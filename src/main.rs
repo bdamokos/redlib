@@ -15,6 +15,7 @@ use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{config, duplicates, headers, instance_info, post, search, settings, site_icon, subreddit, user, video_preview};
+use url::Url;
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -89,6 +90,53 @@ async fn resource(body: &str, content_type: &str, cache: bool) -> Result<Respons
 	}
 
 	Ok(res)
+}
+
+fn configured_origin(url: &str) -> Option<String> {
+	let parsed = Url::parse(url).ok()?;
+	let host = parsed.host_str()?;
+	let mut origin = format!("{}://{}", parsed.scheme(), host);
+	if let Some(port) = parsed.port() {
+		origin.push(':');
+		origin.push_str(&port.to_string());
+	}
+	Some(origin)
+}
+
+fn content_security_policy() -> String {
+	let mut connect_src = vec!["'self'".to_string()];
+
+	if let Some(origin) = config::get_setting("REDLIB_FULL_URL").and_then(|url| configured_origin(&url)) {
+		if !connect_src.contains(&origin) {
+			connect_src.push(origin);
+		}
+	}
+
+	if let Some(extra_sources) = config::get_setting("REDLIB_CSP_CONNECT_SRC") {
+		for source in extra_sources.split_whitespace() {
+			let source = source.trim();
+			if !source.is_empty() && !connect_src.iter().any(|existing| existing == source) {
+				connect_src.push(source.to_string());
+			}
+		}
+	}
+
+	format!(
+		"default-src 'none'; font-src 'self'; script-src 'self' blob:; manifest-src 'self'; media-src 'self' data: blob: about:; style-src 'self' 'unsafe-inline'; base-uri 'none'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; connect-src {}; worker-src blob:; frame-src https://*.redgifs.com https://*.gfycat.com https://*.imgur.com https://*.redd.it;",
+		connect_src.join(" ")
+	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::configured_origin;
+
+	#[test]
+	fn configured_origin_keeps_scheme_host_and_port() {
+		assert_eq!(configured_origin("https://redlib1.bdamokos.org/path?q=1"), Some("https://redlib1.bdamokos.org".to_string()));
+		assert_eq!(configured_origin("http://127.0.0.1:18081/settings"), Some("http://127.0.0.1:18081".to_string()));
+		assert_eq!(configured_origin("not a url"), None);
+	}
 }
 
 async fn style() -> Result<Response<Body>, String> {
@@ -211,9 +259,11 @@ async fn main() {
 	app.default_headers = headers! {
 		"Referrer-Policy" => "no-referrer",
 		"X-Content-Type-Options" => "nosniff",
-		"X-Frame-Options" => "DENY",
-		"Content-Security-Policy" => "default-src 'none'; font-src 'self'; script-src 'self' blob:; manifest-src 'self'; media-src 'self' data: blob: about:; style-src 'self' 'unsafe-inline'; base-uri 'none'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; connect-src 'self'; worker-src blob:; frame-src https://*.redgifs.com https://*.gfycat.com https://*.imgur.com https://*.redd.it;"
+		"X-Frame-Options" => "DENY"
 	};
+	if let Ok(csp) = HeaderValue::from_str(&content_security_policy()) {
+		app.default_headers.insert("Content-Security-Policy", csp);
+	}
 
 	if let Some(expire_time) = hsts {
 		if let Ok(val) = HeaderValue::from_str(&format!("max-age={expire_time}")) {
