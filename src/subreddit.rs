@@ -30,7 +30,7 @@ const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
 const AFTER_PATH_HEADROOM: usize = 128;
-const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 100;
+const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 20;
 const AGGREGATE_FETCH_CONCURRENCY: usize = 4;
 const SUBREDDIT_METADATA_CACHE_TTL_SECS: u64 = 10_800;
 static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
@@ -544,7 +544,17 @@ fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
 }
 
 fn build_feed_sources(preferences: &Preferences) -> Vec<FeedSource> {
-	let mut sources = preferences.subscriptions.iter().cloned().map(|name| FeedSource::Subreddit { name }).collect::<Vec<_>>();
+	let (user_subscriptions, subreddit_subscriptions): (Vec<_>, Vec<_>) = preferences.subscriptions.iter().cloned().partition(|name| name.starts_with("u_"));
+
+	let mut sources = user_subscriptions.into_iter().map(|name| FeedSource::Subreddit { name }).collect::<Vec<_>>();
+
+	sources.extend(
+		split_subscriptions_for_listing(&subreddit_subscriptions, "new", "limit=40&raw_json=1")
+			.into_iter()
+			.map(|chunk| FeedSource::SubredditBatch {
+				names: chunk.split('+').map(str::to_string).collect(),
+			}),
+	);
 
 	sources.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| FeedSource::Flair {
 		subreddit: subscription.subreddit,
@@ -1819,6 +1829,33 @@ mod tests {
 		assert!(chunks
 			.iter()
 			.all(|chunk| { format!("/r/{chunk}/hot.json?raw_json=1").len() + super::AFTER_PATH_HEADROOM <= super::REDDIT_LISTING_PATH_SOFT_LIMIT }));
+	}
+
+	#[test]
+	fn build_feed_sources_batches_regular_subscriptions_but_keeps_user_and_flair_sources() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = (0..25).map(|idx| format!("subreddit{idx}")).collect();
+		prefs.subscriptions.insert(0, "u_demo".to_string());
+		prefs.flair_subscriptions.push(crate::utils::FlairSubscription {
+			subreddit: "rust".to_string(),
+			flair: "News".to_string(),
+		});
+
+		let sources = super::build_feed_sources(&prefs);
+
+		assert!(matches!(&sources[0], crate::post_cache::FeedSource::Subreddit { name } if name == "u_demo"));
+		assert!(matches!(
+			&sources[1],
+			crate::post_cache::FeedSource::SubredditBatch { names } if names.len() == super::MAX_SUBREDDITS_PER_LISTING_CHUNK
+		));
+		assert!(matches!(
+			&sources[2],
+			crate::post_cache::FeedSource::SubredditBatch { names } if names.len() == 5
+		));
+		assert!(matches!(
+			&sources[3],
+			crate::post_cache::FeedSource::Flair { subreddit, flair } if subreddit == "rust" && flair == "News"
+		));
 	}
 
 	#[test]

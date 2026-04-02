@@ -22,6 +22,7 @@ pub const POSTS_PER_PAGE: usize = 25;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FeedSource {
 	Subreddit { name: String },
+	SubredditBatch { names: Vec<String> },
 	Flair { subreddit: String, flair: String },
 }
 
@@ -29,13 +30,26 @@ impl FeedSource {
 	pub fn display_name(&self) -> String {
 		match self {
 			Self::Subreddit { name } => name.clone(),
+			Self::SubredditBatch { names } => names.join("+"),
 			Self::Flair { subreddit, flair } => format!("{subreddit}#{flair}"),
 		}
+	}
+
+	pub fn feed_count(&self) -> usize {
+		match self {
+			Self::SubredditBatch { names } => names.len(),
+			_ => 1,
+		}
+	}
+
+	fn is_user_source(&self) -> bool {
+		matches!(self, Self::Subreddit { name } if name.starts_with("u_"))
 	}
 
 	fn cache_key(&self) -> String {
 		match self {
 			Self::Subreddit { name } => format!("subreddit:{}", name.to_lowercase()),
+			Self::SubredditBatch { names } => format!("subreddit-batch:{}", names.join("+").to_lowercase()),
 			Self::Flair { subreddit, flair } => format!("flair:{}:{}", subreddit.to_lowercase(), flair.to_lowercase()),
 		}
 	}
@@ -44,6 +58,9 @@ impl FeedSource {
 		match self {
 			Self::Subreddit { name } => {
 				format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", name.replace('+', "%2B"))
+			}
+			Self::SubredditBatch { names } => {
+				format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", names.join("+").replace('+', "%2B"))
 			}
 			Self::Flair { subreddit, .. } => {
 				format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"))
@@ -54,6 +71,7 @@ impl FeedSource {
 	fn filter_posts(&self, mut posts: Vec<Post>) -> Vec<Post> {
 		match self {
 			Self::Subreddit { .. } => posts,
+			Self::SubredditBatch { .. } => posts,
 			Self::Flair { flair, .. } => {
 				let flair = flair.trim().to_string();
 				posts.retain(|post| post.flair.text.trim() == flair);
@@ -142,6 +160,7 @@ fn source_priority(source: &FeedSource) -> (u8, String, String) {
 	match source {
 		FeedSource::Subreddit { name } if name.starts_with("u_") => (0, name.to_lowercase(), String::new()),
 		FeedSource::Subreddit { name } => (1, name.to_lowercase(), String::new()),
+		FeedSource::SubredditBatch { names } => (1, names.join("+").to_lowercase(), String::new()),
 		FeedSource::Flair { subreddit, flair } => (2, subreddit.to_lowercase(), flair.to_lowercase()),
 	}
 }
@@ -415,43 +434,56 @@ fn sort_page_posts_by_date_desc(mut posts: Vec<Post>) -> Vec<Post> {
 }
 
 fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> FeedSessionStatus {
-	let ready_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Ready).count();
-	let failed_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Failed).count();
-	let total_user_sources = session
-		.sources
-		.iter()
-		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name } if name.starts_with("u_")))
-		.count();
-	let ready_user_sources = session
+	let ready_sources = session
 		.sources
 		.iter()
 		.filter(|entry| entry.state == SessionSourceState::Ready)
-		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name } if name.starts_with("u_")))
-		.count();
+		.map(|entry| entry.source.feed_count())
+		.sum();
+	let failed_sources = session
+		.sources
+		.iter()
+		.filter(|entry| entry.state == SessionSourceState::Failed)
+		.map(|entry| entry.source.feed_count())
+		.sum();
+	let total_sources = session.sources.iter().map(|entry| entry.source.feed_count()).sum();
+	let total_user_sources: usize = session
+		.sources
+		.iter()
+		.filter(|entry| entry.source.is_user_source())
+		.map(|entry| entry.source.feed_count())
+		.sum();
+	let ready_user_sources: usize = session
+		.sources
+		.iter()
+		.filter(|entry| entry.state == SessionSourceState::Ready)
+		.filter(|entry| entry.source.is_user_source())
+		.map(|entry| entry.source.feed_count())
+		.sum();
 	let current_page_ready = current_page_is_ready(session, posts, page, per_page);
 	let next_page_ready = posts.len() >= ((page + 2) * per_page);
 	let warming = session.background_active;
 	let status_message = if warming {
 		if ready_user_sources < total_user_sources {
-			format!("Loading followed feeds in the background. Warmed {} of {} feeds.", ready_sources, session.sources.len())
+			format!("Loading followed feeds in the background. Warmed {} of {} feeds.", ready_sources, total_sources)
 		} else if !current_page_ready {
-			format!("Warmed {} of {} feeds. Filling this page with newer posts.", ready_sources, session.sources.len())
+			format!("Warmed {} of {} feeds. Filling this page with newer posts.", ready_sources, total_sources)
 		} else if next_page_ready {
-			format!("Warmed {} of {} feeds. Next page is ready.", ready_sources, session.sources.len())
+			format!("Warmed {} of {} feeds. Next page is ready.", ready_sources, total_sources)
 		} else {
-			format!("Warmed {} of {} feeds. Preparing the next page in the background.", ready_sources, session.sources.len())
+			format!("Warmed {} of {} feeds. Preparing the next page in the background.", ready_sources, total_sources)
 		}
 	} else if session.background_complete {
-		format!("Warmed all {} feeds.", session.sources.len())
+		format!("Warmed all {} feeds.", total_sources)
 	} else if next_page_ready {
-		format!("Warmed {} of {} feeds. More feeds will load as you paginate.", ready_sources, session.sources.len())
+		format!("Warmed {} of {} feeds. More feeds will load as you paginate.", ready_sources, total_sources)
 	} else {
-		format!("Warmed {} of {} feeds for now. More feeds will load as needed.", ready_sources, session.sources.len())
+		format!("Warmed {} of {} feeds for now. More feeds will load as needed.", ready_sources, total_sources)
 	};
 
 	FeedSessionStatus {
 		session_id: session.id.clone(),
-		total_sources: session.sources.len(),
+		total_sources,
 		ready_sources,
 		failed_sources,
 		warming,
@@ -1490,20 +1522,8 @@ mod tests {
 		reset_test_caches();
 		let source_a = FeedSource::Subreddit { name: "alpha".to_string() };
 		let source_b = FeedSource::Subreddit { name: "beta".to_string() };
-		seed_source(
-			&source_a,
-			vec![
-				test_post("alpha-1", "alpha", 100),
-				test_post("alpha-2", "alpha", 97),
-			],
-		);
-		seed_source(
-			&source_b,
-			vec![
-				test_post("beta-1", "beta", 99),
-				test_post("beta-2", "beta", 98),
-			],
-		);
+		seed_source(&source_a, vec![test_post("alpha-1", "alpha", 100), test_post("alpha-2", "alpha", 97)]);
+		seed_source(&source_b, vec![test_post("beta-1", "beta", 99), test_post("beta-2", "beta", 98)]);
 
 		FEED_SESSIONS.lock().unwrap().insert(
 			"demo".to_string(),
@@ -1515,10 +1535,7 @@ mod tests {
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
 				},
-				sources: vec![
-					session_entry(source_a, SessionSourceState::Ready),
-					session_entry(source_b, SessionSourceState::Ready),
-				],
+				sources: vec![session_entry(source_a, SessionSourceState::Ready), session_entry(source_b, SessionSourceState::Ready)],
 				frozen_pages: HashMap::new(),
 				background_active: false,
 				background_complete: true,
@@ -1595,6 +1612,42 @@ mod tests {
 					session_entry(rust_source, SessionSourceState::Unstarted),
 					session_entry(programming_source, SessionSourceState::Unstarted),
 				],
+				frozen_pages: HashMap::new(),
+				background_active: true,
+				background_complete: false,
+				requested_page: 0,
+				last_updated: Instant::now(),
+				revision: 0,
+			},
+		);
+
+		let status = feed_status("demo", 0, POSTS_PER_PAGE).expect("session status");
+
+		assert_eq!(status.ready_sources, 2);
+		assert_eq!(status.total_sources, 2);
+	}
+
+	#[test]
+	fn feed_status_counts_batched_subscriptions_by_underlying_feed_count() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let batch_source = FeedSource::SubredditBatch {
+			names: vec!["rust".to_string(), "programming".to_string()],
+		};
+		seed_source(&batch_source, vec![test_post("rust-1", "rust", now), test_post("prog-1", "programming", now - 1)]);
+
+		FEED_SESSIONS.lock().unwrap().insert(
+			"demo".to_string(),
+			FeedSession {
+				id: "demo".to_string(),
+				request: FeedSessionRequest {
+					sources: vec![batch_source.clone()],
+					filters: HashSet::new(),
+					quarantine: false,
+					query_fingerprint: "demo".to_string(),
+				},
+				sources: vec![session_entry(batch_source, SessionSourceState::Unstarted)],
 				frozen_pages: HashMap::new(),
 				background_active: true,
 				background_complete: false,
