@@ -1124,13 +1124,14 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			.await;
 
 			if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
-				let page_ready = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE)
-					.map(|status| status.current_page_ready)
-					.unwrap_or(false);
-				let (cached_subs, cached_posts) = crate::post_cache::cache_stats();
+				let feed_status = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
+				let page_ready = feed_status.as_ref().map(|status| status.current_page_ready).unwrap_or(false);
+				let ready_sources = feed_status.as_ref().map(|status| status.ready_sources).unwrap_or_default();
+				let daemon_cached_sources = feed_status.as_ref().map(|status| status.daemon_cached_sources).unwrap_or_default();
+				let merged_posts = feed_status.as_ref().map(|status| status.posts_merged).unwrap_or_default();
 				info!(
-					"post_cache: serving page {} from session {} ({} sources cached, {} total posts)",
-					cache_page, feed_session_id, cached_subs, cached_posts
+					"post_cache: serving page {} from session {} ({} session sources ready, {} from daemon cache, {} total posts)",
+					cache_page, feed_session_id, ready_sources, daemon_cached_sources, merged_posts
 				);
 				let no_posts = page_ready && page.posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (page.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");

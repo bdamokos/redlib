@@ -12,6 +12,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 const CACHE_TTL_SECS: u64 = 10_800;
 const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
+const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_ESTIMATED_POST_INTERVAL_SECS: u64 = 21_600;
 const MIN_ESTIMATED_POST_INTERVAL_SECS: u64 = 60;
 const MAX_ESTIMATED_POST_INTERVAL_SECS: u64 = 86_400;
@@ -77,6 +78,7 @@ struct CachedSourcePosts {
 	posts: Vec<Post>,
 	after: String,
 	fetched_at: Instant,
+	refresh_origin: Option<RefreshOrigin>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +88,7 @@ pub struct RememberedSubredditEntry {
 	pub last_refresh_started_at: Option<Instant>,
 	pub last_refresh_succeeded_at: Option<Instant>,
 	pub last_refresh_failed_at: Option<Instant>,
+	pub banned_until: Option<Instant>,
 	pub consecutive_failures: u32,
 	pub estimated_post_interval_secs: u64,
 	pub refresh_in_flight: bool,
@@ -146,6 +149,7 @@ pub struct FeedSessionStatus {
 	pub session_id: String,
 	pub total_sources: usize,
 	pub ready_sources: usize,
+	pub daemon_cached_sources: usize,
 	pub failed_sources: usize,
 	pub warming: bool,
 	pub current_page_ready: bool,
@@ -192,6 +196,7 @@ fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 		last_refresh_started_at: None,
 		last_refresh_succeeded_at: None,
 		last_refresh_failed_at: None,
+		banned_until: None,
 		consecutive_failures: 0,
 		estimated_post_interval_secs: DEFAULT_ESTIMATED_POST_INTERVAL_SECS,
 		refresh_in_flight: false,
@@ -279,6 +284,10 @@ fn effective_freshness_target_secs(entry: &RememberedSubredditEntry) -> u64 {
 	}
 }
 
+fn remembered_entry_refresh_blocked(entry: &RememberedSubredditEntry) -> bool {
+	entry.banned_until.is_some_and(|until| until > Instant::now())
+}
+
 fn refresh_ratio(entry: &RememberedSubredditEntry) -> (u128, u128) {
 	let elapsed = entry.last_refresh_succeeded_at.map(|instant| instant.elapsed().as_secs() as u128).unwrap_or(u128::MAX);
 	(elapsed, effective_freshness_target_secs(entry) as u128)
@@ -343,13 +352,27 @@ pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) {
 	entry.refresh_in_flight = true;
 }
 
+fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) {
+	if let Ok(mut cache) = SOURCE_CACHE.lock() {
+		cache.insert(
+			source.cache_key(),
+			CachedSourcePosts {
+				posts,
+				after,
+				fetched_at: Instant::now(),
+				refresh_origin,
+			},
+		);
+	}
+}
+
 pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) {
 	let Some(normalized) = normalize_plain_subreddit_name(subreddit) else {
 		return;
 	};
 
 	crate::utils::store_post_flairs(&posts);
-	store_source_posts(&FeedSource::Subreddit { name: normalized.clone() }, posts.clone(), after);
+	store_source_posts_with_origin(&FeedSource::Subreddit { name: normalized.clone() }, posts.clone(), after, Some(refresh_origin));
 	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
 		crate::video_preview::prewarm_listing_video_previews(&posts);
 	}
@@ -361,9 +384,15 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 
 	entry.last_refresh_succeeded_at = Some(Instant::now());
 	entry.last_refresh_failed_at = None;
+	entry.banned_until = None;
 	entry.consecutive_failures = 0;
 	entry.estimated_post_interval_secs = estimate_post_interval_secs(&posts, entry.estimated_post_interval_secs);
 	entry.refresh_in_flight = false;
+}
+
+fn refresh_failure_is_banned(error: &str) -> bool {
+	let normalized = error.trim().to_ascii_lowercase();
+	normalized == "banned" || normalized.contains("banned")
 }
 
 pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refresh_origin: RefreshOrigin) {
@@ -371,12 +400,16 @@ pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refr
 		return;
 	};
 
+	let now = Instant::now();
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let Some(entry) = remembered.get_mut(&normalized) else {
 		return;
 	};
 
-	entry.last_refresh_failed_at = Some(Instant::now());
+	entry.last_refresh_failed_at = Some(now);
+	if refresh_failure_is_banned(error) {
+		entry.banned_until = Some(now + Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
+	}
 	entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
 	entry.refresh_in_flight = false;
 	warn!("post_cache: plain subreddit refresh failed for {} via {:?}: {}", entry.name, refresh_origin, error);
@@ -409,7 +442,11 @@ pub fn cleanup_decayed_remembered_subreddits() {
 
 pub fn pick_next_remembered_subreddit_to_refresh() -> Option<String> {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-	let mut entries = remembered.values().filter(|entry| remembered_entry_is_active(entry)).cloned().collect::<Vec<_>>();
+	let mut entries = remembered
+		.values()
+		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked(entry))
+		.cloned()
+		.collect::<Vec<_>>();
 	entries.sort_by(remembered_refresh_priority);
 	entries.into_iter().next().map(|entry| entry.name)
 }
@@ -504,22 +541,23 @@ pub fn get_cached_subreddit_page(subreddit: &str, page: usize, per_page: usize) 
 }
 
 fn store_source_posts(source: &FeedSource, posts: Vec<Post>, after: String) {
-	if let Ok(mut cache) = SOURCE_CACHE.lock() {
-		cache.insert(
-			source.cache_key(),
-			CachedSourcePosts {
-				posts,
-				after,
-				fetched_at: Instant::now(),
-			},
-		);
+	store_source_posts_with_origin(source, posts, after, None);
+}
+
+fn cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
+	let cache = SOURCE_CACHE.lock().ok()?;
+	let entry = cache.get(&source.cache_key())?;
+	if !source_cache_is_servable(source, entry) {
+		return None;
 	}
+
+	entry.refresh_origin
 }
 
 fn cached_source_posts(source: &FeedSource) -> Option<CachedSourcePosts> {
 	let cache = SOURCE_CACHE.lock().ok()?;
 	let entry = cache.get(&source.cache_key())?;
-	if source_cache_is_expired(entry) {
+	if !source_cache_is_servable(source, entry) {
 		return None;
 	}
 
@@ -532,6 +570,16 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 	}
 
 	if let FeedSource::Subreddit { name } = &source {
+		if !matches!(refresh_origin, RefreshOrigin::DirectLiveFetch) {
+			let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+			if remembered
+				.get(&name.to_lowercase())
+				.and_then(|entry| entry.banned_until)
+				.is_some_and(|until| until > Instant::now())
+			{
+				return Err("banned".to_string());
+			}
+		}
 		mark_plain_subreddit_refresh_started(name);
 	}
 
@@ -560,6 +608,10 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		posts,
 		after,
 		fetched_at: Instant::now(),
+		refresh_origin: match source {
+			FeedSource::Subreddit { ref name } if !name.starts_with("u_") => Some(refresh_origin),
+			_ => None,
+		},
 	})
 }
 
@@ -763,6 +815,11 @@ fn sort_page_posts_by_date_desc(mut posts: Vec<Post>) -> Vec<Post> {
 
 fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> FeedSessionStatus {
 	let ready_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Ready).count();
+	let daemon_cached_sources = session
+		.sources
+		.iter()
+		.filter(|entry| cached_source_origin(&entry.source) == Some(RefreshOrigin::Daemon))
+		.count();
 	let failed_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Failed).count();
 	let total_user_sources = session
 		.sources
@@ -778,35 +835,66 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 	let current_page_ready = current_page_is_ready(session, posts, page, per_page);
 	let next_page_ready = posts.len() >= ((page + 2) * per_page);
 	let warming = session.background_active;
+	let daemon_cache_suffix = if daemon_cached_sources > 0 {
+		format!(" ({daemon_cached_sources} from daemon cache)")
+	} else {
+		String::new()
+	};
 	let status_message = if warming {
 		if ready_user_sources < total_user_sources {
-			format!("Loading followed feeds in the background. Warmed {} of {} feeds.", ready_sources, session.sources.len())
+			format!(
+				"Loading followed feeds in the background. Warmed {} of {} feeds{}.",
+				ready_sources,
+				session.sources.len(),
+				daemon_cache_suffix
+			)
 		} else if !current_page_ready {
-			format!("Warmed {} of {} feeds. Filling this page with newer posts.", ready_sources, session.sources.len())
+			format!(
+				"Warmed {} of {} feeds{}. Filling this page with newer posts.",
+				ready_sources,
+				session.sources.len(),
+				daemon_cache_suffix
+			)
 		} else if next_page_ready {
-			format!("Warmed {} of {} feeds. Next page is ready.", ready_sources, session.sources.len())
+			format!("Warmed {} of {} feeds{}. Next page is ready.", ready_sources, session.sources.len(), daemon_cache_suffix)
 		} else {
-			format!("Warmed {} of {} feeds. Preparing the next page in the background.", ready_sources, session.sources.len())
+			format!(
+				"Warmed {} of {} feeds{}. Preparing the next page in the background.",
+				ready_sources,
+				session.sources.len(),
+				daemon_cache_suffix
+			)
 		}
 	} else if session.background_complete {
-		format!("Warmed all {} feeds.", session.sources.len())
+		format!("Warmed all {} feeds{}.", session.sources.len(), daemon_cache_suffix)
 	} else if next_page_ready {
-		format!("Warmed {} of {} feeds. More feeds will load as you paginate.", ready_sources, session.sources.len())
+		format!(
+			"Warmed {} of {} feeds{}. More feeds will load as you paginate.",
+			ready_sources,
+			session.sources.len(),
+			daemon_cache_suffix
+		)
 	} else {
-		format!("Warmed {} of {} feeds for now. More feeds will load as needed.", ready_sources, session.sources.len())
+		format!(
+			"Warmed {} of {} feeds{} for now. More feeds will load as needed.",
+			ready_sources,
+			session.sources.len(),
+			daemon_cache_suffix
+		)
 	};
 
 	FeedSessionStatus {
 		session_id: session.id.clone(),
 		total_sources: session.sources.len(),
 		ready_sources,
+		daemon_cached_sources,
 		failed_sources,
 		warming,
 		current_page_ready,
 		next_page_ready,
 		posts_merged: posts.len(),
 		status_message,
-		refresh_token: session.revision ^ ((posts.len() as u64) << 16) ^ (ready_sources as u64),
+		refresh_token: session.revision ^ ((posts.len() as u64) << 16) ^ (ready_sources as u64) ^ ((daemon_cached_sources as u64) << 8),
 	}
 }
 
@@ -1288,9 +1376,9 @@ mod tests {
 		feed_status, followup_sync_source_budget, get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget,
 		merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh, reconcile_session_with_source_cache,
 		record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, round_robin_source_target,
-		session_status_from_posts, sort_sources, source_cache_is_servable, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource,
-		RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, CACHE_TTL_SECS, FEED_SESSIONS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
-		SOURCE_CACHE,
+		session_status_from_posts, sort_sources, source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, FeedSession,
+		FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, CACHE_TTL_SECS, FEED_SESSIONS,
+		POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use std::cmp::Ordering;
@@ -1325,6 +1413,7 @@ mod tests {
 			last_refresh_started_at: None,
 			last_refresh_succeeded_at: None,
 			last_refresh_failed_at: None,
+			banned_until: None,
 			consecutive_failures: 0,
 			estimated_post_interval_secs: 21_600,
 			refresh_in_flight: false,
@@ -2355,6 +2444,60 @@ mod tests {
 		let status = feed_status("demo", 0, POSTS_PER_PAGE).expect("session status");
 
 		assert_eq!(status.ready_sources, 2);
+		assert_eq!(status.daemon_cached_sources, 0);
 		assert_eq!(status.total_sources, 2);
+	}
+
+	#[test]
+	fn feed_status_counts_daemon_cached_sources_and_servable_remembered_entries() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		remember_subreddit_request("rust");
+		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		store_source_posts_with_origin(&rust_source, vec![test_post("rust-1", "rust", now)], String::new(), Some(RefreshOrigin::Daemon));
+		SOURCE_CACHE.lock().unwrap().get_mut(&rust_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		FEED_SESSIONS.lock().unwrap().insert(
+			"demo".to_string(),
+			FeedSession {
+				id: "demo".to_string(),
+				request: FeedSessionRequest {
+					sources: vec![rust_source.clone()],
+					filters: HashSet::new(),
+					quarantine: false,
+					query_fingerprint: "demo".to_string(),
+				},
+				sources: vec![session_entry(rust_source, SessionSourceState::Unstarted)],
+				frozen_pages: HashMap::new(),
+				background_active: false,
+				background_complete: false,
+				requested_page: 0,
+				last_updated: Instant::now(),
+				revision: 0,
+			},
+		);
+
+		let status = feed_status("demo", 0, POSTS_PER_PAGE).expect("session status");
+		assert_eq!(status.ready_sources, 1);
+		assert_eq!(status.daemon_cached_sources, 1);
+		assert!(status.status_message.contains("1 from daemon cache"));
+		assert_eq!(feed_page("demo", 0, POSTS_PER_PAGE).expect("page").posts.len(), 1);
+	}
+
+	#[test]
+	fn banned_refreshes_are_deprioritized_until_backoff_expires() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("vlogsex");
+		remember_subreddit_request("rust");
+		record_plain_subreddit_refresh_failure("vlogsex", "banned", RefreshOrigin::Daemon);
+
+		assert_eq!(pick_next_remembered_subreddit_to_refresh().as_deref(), Some("rust"));
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("vlogsex").unwrap();
+		assert!(entry.banned_until.is_some_and(|until| until > Instant::now() + Duration::from_secs(24 * 60 * 60)));
 	}
 }
