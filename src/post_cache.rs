@@ -1,13 +1,22 @@
 use crate::user::collapse_duplicate_submissions;
-use crate::utils::Post;
+use crate::utils::{Post, Preferences};
 use log::{info, warn};
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+use tokio::time::{Duration, MissedTickBehavior};
 
 const CACHE_TTL_SECS: u64 = 10_800;
+const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
+const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
+const DEFAULT_ESTIMATED_POST_INTERVAL_SECS: u64 = 21_600;
+const MIN_ESTIMATED_POST_INTERVAL_SECS: u64 = 60;
+const MAX_ESTIMATED_POST_INTERVAL_SECS: u64 = 86_400;
+const MIN_FRESHNESS_TARGET_SECS: u64 = 1_800;
+const MAX_FRESHNESS_TARGET_SECS: u64 = 172_800;
 const FETCH_CONCURRENCY: usize = 8;
 const PER_SOURCE_LIMIT: usize = 40;
 const INITIAL_SOURCE_WINDOW: usize = 32;
@@ -70,6 +79,25 @@ struct CachedSourcePosts {
 	fetched_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+pub struct RememberedSubredditEntry {
+	pub name: String,
+	pub last_requested_at: Instant,
+	pub last_refresh_started_at: Option<Instant>,
+	pub last_refresh_succeeded_at: Option<Instant>,
+	pub last_refresh_failed_at: Option<Instant>,
+	pub consecutive_failures: u32,
+	pub estimated_post_interval_secs: u64,
+	pub refresh_in_flight: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshOrigin {
+	Daemon,
+	FrontPageSession,
+	DirectLiveFetch,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionSourceState {
 	Unstarted,
@@ -129,9 +157,299 @@ pub struct FeedSessionStatus {
 
 static SOURCE_CACHE: LazyLock<Mutex<HashMap<String, CachedSourcePosts>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn source_cache_is_expired(entry: &CachedSourcePosts) -> bool {
 	entry.fetched_at.elapsed().as_secs() > CACHE_TTL_SECS
+}
+
+fn remembered_entry_is_active(entry: &RememberedSubredditEntry) -> bool {
+	entry.last_requested_at.elapsed().as_secs() <= REMEMBERED_SUBREDDIT_TTL_SECS
+}
+
+fn normalize_plain_subreddit_name(subreddit: &str) -> Option<String> {
+	let normalized = subreddit.trim().to_lowercase();
+	(!normalized.is_empty()
+		&& normalized != "popular"
+		&& normalized != "all"
+		&& normalized != "random"
+		&& normalized != "randnsfw"
+		&& !normalized.contains('+')
+		&& !normalized.starts_with("u_"))
+	.then_some(normalized)
+}
+
+fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
+	RememberedSubredditEntry {
+		name,
+		last_requested_at: Instant::now(),
+		last_refresh_started_at: None,
+		last_refresh_succeeded_at: None,
+		last_refresh_failed_at: None,
+		consecutive_failures: 0,
+		estimated_post_interval_secs: DEFAULT_ESTIMATED_POST_INTERVAL_SECS,
+		refresh_in_flight: false,
+	}
+}
+
+pub fn remember_subreddit_request(subreddit: &str) {
+	let Some(normalized) = normalize_plain_subreddit_name(subreddit) else {
+		return;
+	};
+
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let entry = remembered.entry(normalized.clone()).or_insert_with(|| new_remembered_subreddit_entry(normalized));
+	entry.last_requested_at = Instant::now();
+}
+
+pub fn remember_frontpage_subreddits(preferences: &Preferences) {
+	for subreddit in &preferences.subscriptions {
+		remember_subreddit_request(subreddit);
+	}
+
+	for subscription in &preferences.flair_subscriptions {
+		remember_subreddit_request(&subscription.subreddit);
+	}
+}
+
+pub fn is_subreddit_remembered(subreddit: &str) -> bool {
+	let Some(normalized) = normalize_plain_subreddit_name(subreddit) else {
+		return false;
+	};
+
+	REMEMBERED_SUBREDDITS
+		.lock()
+		.unwrap_or_else(|e| e.into_inner())
+		.get(&normalized)
+		.is_some_and(remembered_entry_is_active)
+}
+
+fn source_cache_is_servable(source: &FeedSource, entry: &CachedSourcePosts) -> bool {
+	match source {
+		FeedSource::Subreddit { name } if !name.starts_with("u_") => is_subreddit_remembered(name) || !source_cache_is_expired(entry),
+		_ => !source_cache_is_expired(entry),
+	}
+}
+
+fn median_u64(values: &mut [u64]) -> u64 {
+	values.sort_unstable();
+	let mid = values.len() / 2;
+	if values.len() % 2 == 0 {
+		(values[mid - 1] + values[mid]) / 2
+	} else {
+		values[mid]
+	}
+}
+
+fn estimate_post_interval_secs(posts: &[Post], prior: u64) -> u64 {
+	let mut timestamps = posts.iter().map(|post| post.created_ts).collect::<Vec<_>>();
+	timestamps.sort_unstable_by(|left, right| right.cmp(left));
+
+	let mut deltas = timestamps
+		.windows(2)
+		.filter_map(|window| {
+			let delta = window[0].saturating_sub(window[1]);
+			(delta > 0).then_some(delta)
+		})
+		.collect::<Vec<_>>();
+
+	if deltas.len() < 2 {
+		return prior.clamp(MIN_ESTIMATED_POST_INTERVAL_SECS, MAX_ESTIMATED_POST_INTERVAL_SECS);
+	}
+
+	median_u64(&mut deltas).clamp(MIN_ESTIMATED_POST_INTERVAL_SECS, MAX_ESTIMATED_POST_INTERVAL_SECS)
+}
+
+fn freshness_target_secs(estimated_post_interval_secs: u64) -> u64 {
+	estimated_post_interval_secs.saturating_mul(20).clamp(MIN_FRESHNESS_TARGET_SECS, MAX_FRESHNESS_TARGET_SECS)
+}
+
+fn effective_freshness_target_secs(entry: &RememberedSubredditEntry) -> u64 {
+	let base = freshness_target_secs(entry.estimated_post_interval_secs);
+	if entry.consecutive_failures >= 2 {
+		base.saturating_mul(entry.consecutive_failures.max(1).min(8) as u64)
+	} else {
+		base
+	}
+}
+
+fn refresh_ratio(entry: &RememberedSubredditEntry) -> (u128, u128) {
+	let elapsed = entry.last_refresh_succeeded_at.map(|instant| instant.elapsed().as_secs() as u128).unwrap_or(u128::MAX);
+	(elapsed, effective_freshness_target_secs(entry) as u128)
+}
+
+fn compare_refresh_ratio(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry) -> Ordering {
+	let (left_num, left_den) = refresh_ratio(left);
+	let (right_num, right_den) = refresh_ratio(right);
+	right_num.saturating_mul(left_den).cmp(&left_num.saturating_mul(right_den))
+}
+
+fn remembered_refresh_priority(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry) -> Ordering {
+	let left_never = left.last_refresh_succeeded_at.is_none();
+	let right_never = right.last_refresh_succeeded_at.is_none();
+	match right_never.cmp(&left_never) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	let left_overdue = left
+		.last_refresh_succeeded_at
+		.is_none_or(|instant| instant.elapsed().as_secs() >= effective_freshness_target_secs(left));
+	let right_overdue = right
+		.last_refresh_succeeded_at
+		.is_none_or(|instant| instant.elapsed().as_secs() >= effective_freshness_target_secs(right));
+	match right_overdue.cmp(&left_overdue) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	match compare_refresh_ratio(left, right) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	match right.last_requested_at.cmp(&left.last_requested_at) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	match (left.last_refresh_succeeded_at, right.last_refresh_succeeded_at) {
+		(Some(left_success), Some(right_success)) => match left_success.cmp(&right_success) {
+			Ordering::Equal => {}
+			ordering => return ordering,
+		},
+		_ => {}
+	}
+
+	left.name.cmp(&right.name)
+}
+
+pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) {
+	let Some(normalized) = normalize_plain_subreddit_name(subreddit) else {
+		return;
+	};
+
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let Some(entry) = remembered.get_mut(&normalized) else {
+		return;
+	};
+	entry.last_refresh_started_at = Some(Instant::now());
+	entry.refresh_in_flight = true;
+}
+
+pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after: String, _refresh_origin: RefreshOrigin) {
+	let Some(normalized) = normalize_plain_subreddit_name(subreddit) else {
+		return;
+	};
+
+	crate::utils::store_post_flairs(&posts);
+	store_source_posts(&FeedSource::Subreddit { name: normalized.clone() }, posts.clone(), after);
+
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let Some(entry) = remembered.get_mut(&normalized) else {
+		return;
+	};
+
+	entry.last_refresh_succeeded_at = Some(Instant::now());
+	entry.last_refresh_failed_at = None;
+	entry.consecutive_failures = 0;
+	entry.estimated_post_interval_secs = estimate_post_interval_secs(&posts, entry.estimated_post_interval_secs);
+	entry.refresh_in_flight = false;
+}
+
+pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refresh_origin: RefreshOrigin) {
+	let Some(normalized) = normalize_plain_subreddit_name(subreddit) else {
+		return;
+	};
+
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let Some(entry) = remembered.get_mut(&normalized) else {
+		return;
+	};
+
+	entry.last_refresh_failed_at = Some(Instant::now());
+	entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+	entry.refresh_in_flight = false;
+	warn!("post_cache: plain subreddit refresh failed for {} via {:?}: {}", entry.name, refresh_origin, error);
+}
+
+pub fn cleanup_decayed_remembered_subreddits() {
+	let decayed = {
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		let decayed = remembered
+			.iter()
+			.filter(|(_, entry)| !remembered_entry_is_active(entry))
+			.map(|(name, _)| name.clone())
+			.collect::<Vec<_>>();
+		for subreddit in &decayed {
+			remembered.remove(subreddit);
+		}
+		decayed
+	};
+
+	if decayed.is_empty() {
+		return;
+	}
+
+	let mut cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+	for subreddit in &decayed {
+		cache.remove(&FeedSource::Subreddit { name: subreddit.clone() }.cache_key());
+		crate::subreddit::remove_subreddit_metadata_cache(subreddit);
+	}
+}
+
+pub fn pick_next_remembered_subreddit_to_refresh() -> Option<String> {
+	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let mut entries = remembered.values().filter(|entry| remembered_entry_is_active(entry)).cloned().collect::<Vec<_>>();
+	entries.sort_by(remembered_refresh_priority);
+	entries.into_iter().next().map(|entry| entry.name)
+}
+
+async fn refresh_remembered_subreddit(subreddit: &str) {
+	mark_plain_subreddit_refresh_started(subreddit);
+	let listing_path = format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"));
+	let listing_result = Post::fetch(&listing_path, false).await;
+	let metadata_result = crate::subreddit::refresh_subreddit_metadata(subreddit, false).await;
+
+	match listing_result {
+		Ok((posts, after)) => {
+			publish_plain_subreddit_refresh(subreddit, posts, after, RefreshOrigin::Daemon);
+		}
+		Err(error) => {
+			record_plain_subreddit_refresh_failure(subreddit, &error, RefreshOrigin::Daemon);
+		}
+	}
+
+	if let Err(error) = metadata_result {
+		warn!("post_cache: failed to refresh metadata for {} via {:?}: {}", subreddit, RefreshOrigin::Daemon, error);
+	}
+}
+
+pub fn spawn_remembered_subreddit_daemon() {
+	tokio::spawn(async {
+		let mut interval = tokio::time::interval(Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
+		interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+		interval.tick().await;
+
+		loop {
+			interval.tick().await;
+			cleanup_decayed_remembered_subreddits();
+
+			let Some(subreddit) = pick_next_remembered_subreddit_to_refresh() else {
+				continue;
+			};
+
+			let should_skip = {
+				let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+				remembered.get(&subreddit).is_none_or(|entry| !remembered_entry_is_active(entry) || entry.refresh_in_flight)
+			};
+			if should_skip {
+				continue;
+			}
+
+			refresh_remembered_subreddit(&subreddit).await;
+		}
+	});
 }
 
 fn session_is_expired(entry: &FeedSession) -> bool {
@@ -157,7 +475,7 @@ pub const fn initial_source_window() -> usize {
 pub fn get_cached_source_page(source: &FeedSource, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
 	let cache = SOURCE_CACHE.lock().ok()?;
 	let entry = cache.get(&source.cache_key())?;
-	if source_cache_is_expired(entry) {
+	if !source_cache_is_servable(source, entry) {
 		return None;
 	}
 
@@ -199,15 +517,35 @@ fn cached_source_posts(source: &FeedSource) -> Option<CachedSourcePosts> {
 	Some(entry.clone())
 }
 
-async fn fetch_source_posts(source: FeedSource, quarantine: bool) -> Result<CachedSourcePosts, String> {
+async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin: RefreshOrigin) -> Result<CachedSourcePosts, String> {
 	if let Some(entry) = cached_source_posts(&source) {
 		return Ok(entry);
 	}
 
-	let (posts, after) = Post::fetch(&source.build_path(), quarantine).await?;
+	if let FeedSource::Subreddit { name } = &source {
+		mark_plain_subreddit_refresh_started(name);
+	}
+
+	let (posts, after) = match Post::fetch(&source.build_path(), quarantine).await {
+		Ok(result) => result,
+		Err(error) => {
+			if let FeedSource::Subreddit { name } = &source {
+				record_plain_subreddit_refresh_failure(name, &error, refresh_origin);
+			}
+			return Err(error);
+		}
+	};
 	let posts = source.filter_posts(posts);
-	crate::utils::store_post_flairs(&posts);
-	store_source_posts(&source, posts.clone(), after.clone());
+
+	match &source {
+		FeedSource::Subreddit { name } if !name.starts_with("u_") => {
+			publish_plain_subreddit_refresh(name, posts.clone(), after.clone(), refresh_origin);
+		}
+		_ => {
+			crate::utils::store_post_flairs(&posts);
+			store_source_posts(&source, posts.clone(), after.clone());
+		}
+	}
 
 	Ok(CachedSourcePosts {
 		posts,
@@ -543,7 +881,11 @@ async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
 		let mut handles = Vec::new();
 		for (index, source, quarantine) in chunk.iter().cloned() {
 			let task_source = source.clone();
-			handles.push((index, source, tokio::spawn(async move { fetch_source_posts(task_source, quarantine).await })));
+			handles.push((
+				index,
+				source,
+				tokio::spawn(async move { fetch_source_posts(task_source, quarantine, RefreshOrigin::FrontPageSession).await }),
+			));
 		}
 
 		for (index, source, handle) in handles {
@@ -855,9 +1197,29 @@ pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<Fee
 }
 
 pub fn cache_stats() -> (usize, usize) {
+	fn source_from_cache_key(key: &str) -> Option<FeedSource> {
+		if let Some(name) = key.strip_prefix("subreddit:") {
+			Some(FeedSource::Subreddit { name: name.to_string() })
+		} else if let Some(rest) = key.strip_prefix("flair:") {
+			let mut parts = rest.splitn(2, ':');
+			let subreddit = parts.next().unwrap_or_default().to_string();
+			let flair = parts.next().unwrap_or_default().to_string();
+			Some(FeedSource::Flair { subreddit, flair })
+		} else {
+			None
+		}
+	}
+
 	let cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-	let sources = cache.values().filter(|entry| !source_cache_is_expired(entry)).count();
-	let posts: usize = cache.values().filter(|entry| !source_cache_is_expired(entry)).map(|entry| entry.posts.len()).sum();
+	let sources = cache
+		.iter()
+		.filter(|(key, entry)| source_from_cache_key(key).is_some_and(|source| source_cache_is_servable(&source, entry)))
+		.count();
+	let posts: usize = cache
+		.iter()
+		.filter(|(key, entry)| source_from_cache_key(key).is_some_and(|source| source_cache_is_servable(&source, entry)))
+		.map(|(_, entry)| entry.posts.len())
+		.sum();
 	(sources, posts)
 }
 
@@ -866,13 +1228,16 @@ mod tests {
 	use super::{
 		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state, feed_page,
 		feed_status, get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
-		reconcile_session_with_source_cache, round_robin_source_target, session_status_from_posts, sort_sources, store_source_posts, sync_sources_to_request, FeedSession,
-		FeedSessionRequest, FeedSource, SessionSourceEntry, SessionSourceState, FEED_SESSIONS, POSTS_PER_PAGE, SOURCE_CACHE,
+		pick_next_remembered_subreddit_to_refresh, publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
+		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, round_robin_source_target, session_status_from_posts, sort_sources,
+		source_cache_is_servable, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry,
+		SessionSourceEntry, SessionSourceState, CACHE_TTL_SECS, FEED_SESSIONS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
-	use crate::utils::{Author, Awards, Flags, Flair, Media, Post};
+	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
+	use std::cmp::Ordering;
 	use std::collections::{HashMap, HashSet, VecDeque};
 	use std::sync::{LazyLock, Mutex, MutexGuard};
-	use std::time::Instant;
+	use std::time::{Duration, Instant};
 
 	static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -883,6 +1248,7 @@ mod tests {
 	fn reset_test_caches() {
 		SOURCE_CACHE.lock().unwrap().clear();
 		FEED_SESSIONS.lock().unwrap().clear();
+		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
 	}
 
 	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {
@@ -891,6 +1257,42 @@ mod tests {
 
 	fn seed_source(source: &FeedSource, posts: Vec<Post>) {
 		store_source_posts(source, posts, String::new());
+	}
+
+	fn remembered_entry(name: &str) -> RememberedSubredditEntry {
+		RememberedSubredditEntry {
+			name: name.to_string(),
+			last_requested_at: Instant::now(),
+			last_refresh_started_at: None,
+			last_refresh_succeeded_at: None,
+			last_refresh_failed_at: None,
+			consecutive_failures: 0,
+			estimated_post_interval_secs: 21_600,
+			refresh_in_flight: false,
+		}
+	}
+
+	fn test_prefs_with_saved_feeds() -> Preferences {
+		Preferences {
+			subscriptions: vec![
+				"rust".to_string(),
+				"popular".to_string(),
+				"rust+programming".to_string(),
+				"u_demo".to_string(),
+				String::new(),
+			],
+			flair_subscriptions: vec![
+				FlairSubscription {
+					subreddit: "programming".to_string(),
+					flair: "News".to_string(),
+				},
+				FlairSubscription {
+					subreddit: "all".to_string(),
+					flair: "Ignored".to_string(),
+				},
+			],
+			..Preferences::default()
+		}
 	}
 
 	fn empty_flair() -> Flair {
@@ -962,6 +1364,187 @@ mod tests {
 		assert!(matches!(&sources[0], FeedSource::Subreddit { name } if name == "u_demo"));
 		assert!(matches!(&sources[1], FeedSource::Subreddit { name } if name == "rust"));
 		assert!(matches!(&sources[2], FeedSource::Flair { subreddit, .. } if subreddit == "zeta"));
+	}
+
+	#[test]
+	fn remember_subreddit_request_uses_normalized_plain_names() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("Rust");
+		remember_subreddit_request("popular");
+		remember_subreddit_request("rust+programming");
+		remember_subreddit_request("u_demo");
+		remember_subreddit_request("");
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		assert_eq!(remembered.len(), 1);
+		assert!(remembered.contains_key("rust"));
+	}
+
+	#[test]
+	fn remember_frontpage_subreddits_tracks_subscriptions_and_flair_parents() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_frontpage_subreddits(&test_prefs_with_saved_feeds());
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		assert!(remembered.contains_key("rust"));
+		assert!(remembered.contains_key("programming"));
+		assert_eq!(remembered.len(), 2);
+	}
+
+	#[test]
+	fn remembered_plain_subreddit_cache_remains_servable_beyond_short_ttl() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		remember_subreddit_request("rust");
+		seed_source(&source, vec![test_post("one", "rust", 100)]);
+		SOURCE_CACHE.lock().unwrap().get_mut(&source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		let cache = SOURCE_CACHE.lock().unwrap();
+		let entry = cache.get(&source.cache_key()).unwrap();
+		assert!(source_cache_is_servable(&source, entry));
+		drop(cache);
+		assert!(get_cached_source_page(&source, 0, 25).is_some());
+	}
+
+	#[test]
+	fn non_remembered_plain_subreddit_cache_expires_on_short_ttl() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		seed_source(&source, vec![test_post("one", "rust", 100)]);
+		SOURCE_CACHE.lock().unwrap().get_mut(&source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		let cache = SOURCE_CACHE.lock().unwrap();
+		let entry = cache.get(&source.cache_key()).unwrap();
+		assert!(!source_cache_is_servable(&source, entry));
+		drop(cache);
+		assert!(get_cached_source_page(&source, 0, 25).is_none());
+	}
+
+	#[test]
+	fn flair_and_user_sources_keep_short_ttl_rules() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let flair_source = FeedSource::Flair {
+			subreddit: "rust".to_string(),
+			flair: "News".to_string(),
+		};
+		let user_source = FeedSource::Subreddit { name: "u_demo".to_string() };
+		seed_source(&flair_source, vec![test_post("flair", "rust", 100)]);
+		seed_source(&user_source, vec![test_post("user", "u_demo", 99)]);
+		SOURCE_CACHE.lock().unwrap().get_mut(&flair_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+		SOURCE_CACHE.lock().unwrap().get_mut(&user_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		assert!(get_cached_source_page(&flair_source, 0, 25).is_none());
+		assert!(get_cached_source_page(&user_source, 0, 25).is_none());
+	}
+
+	#[test]
+	fn pick_next_remembered_subreddit_prefers_never_refreshed_then_overdue() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let mut first = remembered_entry("alpha");
+		first.last_requested_at = Instant::now();
+		let mut second = remembered_entry("beta");
+		second.last_requested_at = Instant::now() - Duration::from_secs(60);
+		second.last_refresh_succeeded_at = Some(Instant::now() - Duration::from_secs(10));
+		let mut third = remembered_entry("gamma");
+		third.last_requested_at = Instant::now() - Duration::from_secs(120);
+		third.last_refresh_succeeded_at = Some(Instant::now() - Duration::from_secs(60_000));
+		remembered.insert("alpha".to_string(), first);
+		remembered.insert("beta".to_string(), second);
+		remembered.insert("gamma".to_string(), third);
+		drop(remembered);
+
+		assert_eq!(pick_next_remembered_subreddit_to_refresh().as_deref(), Some("alpha"));
+
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		remembered.get_mut("alpha").unwrap().last_refresh_succeeded_at = Some(Instant::now() - Duration::from_secs(300));
+		drop(remembered);
+
+		assert_eq!(pick_next_remembered_subreddit_to_refresh().as_deref(), Some("gamma"));
+	}
+
+	#[test]
+	fn remembered_refresh_priority_applies_failure_backoff() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let mut steady = remembered_entry("steady");
+		steady.last_refresh_succeeded_at = Some(Instant::now() - Duration::from_secs(50_000));
+		steady.estimated_post_interval_secs = 1_000;
+
+		let mut failing = remembered_entry("failing");
+		failing.last_refresh_succeeded_at = Some(Instant::now() - Duration::from_secs(50_000));
+		failing.estimated_post_interval_secs = 1_000;
+		failing.consecutive_failures = 4;
+
+		assert_eq!(remembered_refresh_priority(&steady, &failing), Ordering::Less);
+	}
+
+	#[test]
+	fn publish_plain_subreddit_refresh_updates_shared_cache_and_stats() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		{
+			let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+			let entry = remembered.get_mut("rust").unwrap();
+			entry.refresh_in_flight = true;
+			entry.consecutive_failures = 3;
+		}
+
+		publish_plain_subreddit_refresh(
+			"rust",
+			vec![
+				test_post("one", "rust", 600),
+				test_post("two", "rust", 480),
+				test_post("three", "rust", 360),
+				test_post("four", "rust", 240),
+			],
+			"t3_after".to_string(),
+			RefreshOrigin::FrontPageSession,
+		);
+
+		assert!(get_cached_source_page(&FeedSource::Subreddit { name: "rust".to_string() }, 0, 25).is_some());
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("rust").unwrap();
+		assert!(entry.last_refresh_succeeded_at.is_some());
+		assert_eq!(entry.consecutive_failures, 0);
+		assert!(!entry.refresh_in_flight);
+		assert_eq!(entry.estimated_post_interval_secs, 120);
+	}
+
+	#[test]
+	fn failure_recording_increments_backoff_and_clears_in_flight() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		{
+			let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+			let entry = remembered.get_mut("rust").unwrap();
+			entry.refresh_in_flight = true;
+		}
+
+		record_plain_subreddit_refresh_failure("rust", "boom", RefreshOrigin::Daemon);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("rust").unwrap();
+		assert_eq!(entry.consecutive_failures, 1);
+		assert!(entry.last_refresh_failed_at.is_some());
+		assert!(!entry.refresh_in_flight);
 	}
 
 	#[test]
@@ -1490,20 +2073,8 @@ mod tests {
 		reset_test_caches();
 		let source_a = FeedSource::Subreddit { name: "alpha".to_string() };
 		let source_b = FeedSource::Subreddit { name: "beta".to_string() };
-		seed_source(
-			&source_a,
-			vec![
-				test_post("alpha-1", "alpha", 100),
-				test_post("alpha-2", "alpha", 97),
-			],
-		);
-		seed_source(
-			&source_b,
-			vec![
-				test_post("beta-1", "beta", 99),
-				test_post("beta-2", "beta", 98),
-			],
-		);
+		seed_source(&source_a, vec![test_post("alpha-1", "alpha", 100), test_post("alpha-2", "alpha", 97)]);
+		seed_source(&source_b, vec![test_post("beta-1", "beta", 99), test_post("beta-2", "beta", 98)]);
 
 		FEED_SESSIONS.lock().unwrap().insert(
 			"demo".to_string(),
@@ -1515,10 +2086,7 @@ mod tests {
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
 				},
-				sources: vec![
-					session_entry(source_a, SessionSourceState::Ready),
-					session_entry(source_b, SessionSourceState::Ready),
-				],
+				sources: vec![session_entry(source_a, SessionSourceState::Ready), session_entry(source_b, SessionSourceState::Ready)],
 				frozen_pages: HashMap::new(),
 				background_active: false,
 				background_complete: true,

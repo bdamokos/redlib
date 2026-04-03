@@ -268,7 +268,7 @@ fn cached_subreddit_metadata(sub: &str) -> Option<Subreddit> {
 	let mut cache = SUBREDDIT_METADATA_CACHE.lock().ok()?;
 	let key = sub.to_lowercase();
 	let entry = cache.get(&key)?;
-	if entry.fetched_at.elapsed().as_secs() > SUBREDDIT_METADATA_CACHE_TTL_SECS {
+	if !crate::post_cache::is_subreddit_remembered(sub) && entry.fetched_at.elapsed().as_secs() > SUBREDDIT_METADATA_CACHE_TTL_SECS {
 		cache.remove(&key);
 		return None;
 	}
@@ -280,7 +280,7 @@ fn cached_subreddit_nsfw_status(sub: &str) -> Option<bool> {
 	let mut cache = SUBREDDIT_NSFW_CACHE.lock().ok()?;
 	let key = sub.to_lowercase();
 	let entry = cache.get(&key)?;
-	if entry.fetched_at.elapsed().as_secs() > SUBREDDIT_METADATA_CACHE_TTL_SECS {
+	if !crate::post_cache::is_subreddit_remembered(sub) && entry.fetched_at.elapsed().as_secs() > SUBREDDIT_METADATA_CACHE_TTL_SECS {
 		cache.remove(&key);
 		return None;
 	}
@@ -311,6 +311,16 @@ fn store_subreddit_metadata(subreddit: &Subreddit) {
 				fetched_at: Instant::now(),
 			},
 		);
+	}
+}
+
+pub(crate) fn remove_subreddit_metadata_cache(sub: &str) {
+	let key = sub.to_lowercase();
+	if let Ok(mut cache) = SUBREDDIT_METADATA_CACHE.lock() {
+		cache.remove(&key);
+	}
+	if let Ok(mut cache) = SUBREDDIT_NSFW_CACHE.lock() {
+		cache.remove(&key);
 	}
 }
 
@@ -980,10 +990,17 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let request_after = param(&format!("?{}", req.uri().query().unwrap_or_default()), "after").unwrap_or_default();
 	let request_before = param(&format!("?{}", req.uri().query().unwrap_or_default()), "before").unwrap_or_default();
 	let is_single_sub = !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+');
+	let uses_remembered_subreddit_cache = is_single_sub && sort == "new";
 	let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
 		.and_then(|p| p.parse::<usize>().ok())
 		.unwrap_or(0);
-	let cached_subreddit_page = if is_single_sub && sort == "new" && request_after.is_empty() && request_before.is_empty() {
+	if uses_remembered_subreddit_cache {
+		crate::post_cache::remember_subreddit_request(&sub_name);
+	}
+	if aggregate_saved_feeds {
+		crate::post_cache::remember_frontpage_subreddits(&prefs);
+	}
+	let cached_subreddit_page = if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
 		crate::post_cache::get_cached_subreddit_page(&sub_name, cache_page, crate::post_cache::POSTS_PER_PAGE)
 	} else {
 		None
@@ -1010,6 +1027,10 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				warm_subreddit_metadata(&sub_name, quarantined);
 				placeholder_subreddit(&sub_name)
 			}
+		} else if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
+			refresh_subreddit_metadata(&sub_name, quarantined)
+				.await
+				.unwrap_or_else(|_| placeholder_subreddit(&sub_name))
 		} else {
 			subreddit(&sub_name, quarantined).await.unwrap_or_else(|_| placeholder_subreddit(&sub_name))
 		}
@@ -1289,9 +1310,17 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			// Fall through to normal fetch if not cached.
 		}
 
+		if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
+			crate::post_cache::mark_plain_subreddit_refresh_started(&sub_name);
+		}
+
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
-				utils::store_post_flairs(&posts);
+				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
+					crate::post_cache::publish_plain_subreddit_refresh(&sub_name, posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+				} else {
+					utils::store_post_flairs(&posts);
+				}
 				if is_single_sub {
 					utils::store_subreddit_users(&sub_name, &posts);
 				}
@@ -1367,12 +1396,17 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					feed_fragment_url: String::new(),
 				})
 			}
-			Err(msg) => match msg.as_str() {
-				"quarantined" | "gated" => Ok(quarantine(&req, sub_name, &msg)),
-				"private" => error(req, &format!("r/{sub_name} is a private community")).await,
-				"banned" => error(req, &format!("r/{sub_name} has been banned from Reddit")).await,
-				_ => error(req, &msg).await,
-			},
+			Err(msg) => {
+				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
+					crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+				}
+				match msg.as_str() {
+					"quarantined" | "gated" => Ok(quarantine(&req, sub_name, &msg)),
+					"private" => error(req, &format!("r/{sub_name} is a private community")).await,
+					"banned" => error(req, &format!("r/{sub_name} has been banned from Reddit")).await,
+					_ => error(req, &msg).await,
+				}
+			}
 		}
 	}
 }
@@ -1386,6 +1420,7 @@ mod tests {
 	use askama::Template;
 	use hyper::{Body, Request};
 	use std::collections::{HashSet, VecDeque};
+	use std::time::Instant;
 
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
 
@@ -1863,6 +1898,50 @@ mod tests {
 
 		assert_eq!(super::cached_subreddit_nsfw_status("demo"), Some(true));
 		assert!(super::cached_subreddit_metadata("demo").is_some());
+	}
+
+	#[test]
+	fn remembered_subreddit_metadata_stays_servable_beyond_short_ttl() {
+		super::SUBREDDIT_METADATA_CACHE.lock().unwrap().clear();
+		super::SUBREDDIT_NSFW_CACHE.lock().unwrap().clear();
+		crate::post_cache::REMEMBERED_SUBREDDITS.lock().unwrap().clear();
+
+		crate::post_cache::remember_subreddit_request("demo");
+		super::store_subreddit_metadata(&Subreddit {
+			name: "demo".to_string(),
+			nsfw: true,
+			..Subreddit::default()
+		});
+		super::SUBREDDIT_METADATA_CACHE.lock().unwrap().get_mut("demo").unwrap().fetched_at =
+			Instant::now() - std::time::Duration::from_secs(super::SUBREDDIT_METADATA_CACHE_TTL_SECS + 60);
+		super::SUBREDDIT_NSFW_CACHE.lock().unwrap().get_mut("demo").unwrap().fetched_at =
+			Instant::now() - std::time::Duration::from_secs(super::SUBREDDIT_METADATA_CACHE_TTL_SECS + 60);
+
+		assert!(super::cached_subreddit_metadata("demo").is_some());
+		assert_eq!(super::cached_subreddit_nsfw_status("demo"), Some(true));
+	}
+
+	#[test]
+	fn cleanup_removes_decayed_metadata_and_plain_cache() {
+		super::SUBREDDIT_METADATA_CACHE.lock().unwrap().clear();
+		super::SUBREDDIT_NSFW_CACHE.lock().unwrap().clear();
+		crate::post_cache::REMEMBERED_SUBREDDITS.lock().unwrap().clear();
+
+		crate::post_cache::remember_subreddit_request("demo");
+		crate::post_cache::publish_plain_subreddit_refresh("demo", vec![test_post()], String::new(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+		super::store_subreddit_metadata(&Subreddit {
+			name: "demo".to_string(),
+			nsfw: false,
+			..Subreddit::default()
+		});
+		crate::post_cache::REMEMBERED_SUBREDDITS.lock().unwrap().get_mut("demo").unwrap().last_requested_at =
+			Instant::now() - std::time::Duration::from_secs(3 * 24 * 60 * 60 + 60);
+
+		crate::post_cache::cleanup_decayed_remembered_subreddits();
+
+		assert!(super::cached_subreddit_metadata("demo").is_none());
+		assert_eq!(super::cached_subreddit_nsfw_status("demo"), None);
+		assert!(crate::post_cache::get_cached_subreddit_page("demo", 0, crate::post_cache::POSTS_PER_PAGE).is_none());
 	}
 
 	#[test]
@@ -2542,11 +2621,7 @@ pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 // }
 
 // SUBREDDIT
-async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
-	if let Some(cached) = cached_subreddit_metadata(sub) {
-		return Ok(cached);
-	}
-
+pub(crate) async fn refresh_subreddit_metadata(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 	// Build the Reddit JSON API url
 	let path: String = format!("/r/{sub}/about.json?raw_json=1");
 
@@ -2568,7 +2643,6 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 		description: val(&res, "public_description"),
 		has_sidebar: subreddit_sidebar_has_content(&info),
 		info,
-		// moderators: moderators_list(sub, quarantined).await.unwrap_or_default(),
 		icon: format_url(&icon),
 		members: format_num(members),
 		active: format_num(active),
@@ -2577,6 +2651,14 @@ async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 	};
 	store_subreddit_metadata(&subreddit);
 	Ok(subreddit)
+}
+
+async fn subreddit(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
+	if let Some(cached) = cached_subreddit_metadata(sub) {
+		return Ok(cached);
+	}
+
+	refresh_subreddit_metadata(sub, quarantined).await
 }
 
 fn subreddit_sidebar_has_content(info: &str) -> bool {
