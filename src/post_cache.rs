@@ -155,6 +155,12 @@ pub struct FeedSessionStatus {
 	pub refresh_token: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionWarmMode {
+	InitialLoad,
+	FollowupCachePreferred { max_sources: usize },
+}
+
 static SOURCE_CACHE: LazyLock<Mutex<HashMap<String, CachedSourcePosts>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -834,6 +840,10 @@ fn sync_sources_to_request(session: &FeedSession, page: usize) -> usize {
 	initial_sync_source_target(page).saturating_sub(attempted_source_count(session))
 }
 
+fn followup_sync_source_budget(session: &FeedSession) -> usize {
+	attempted_source_count(session).saturating_add(PAGE_FILL_BATCH).min(session.sources.len())
+}
+
 fn background_target_reached(session: &FeedSession) -> bool {
 	merged_posts_for_session(session).len() >= background_target_posts(session) && attempted_source_count(session) >= background_target_sources(session)
 }
@@ -1040,56 +1050,105 @@ async fn warm_session_background(session_id: String) {
 	}
 }
 
+fn session_requested_page_ready(session: &FeedSession, page: usize, per_page: usize) -> bool {
+	let merged_posts = merged_posts_for_session(session);
+	current_page_is_ready(session, &merged_posts, page, per_page)
+}
+
+fn plan_session_warm_mode(session: &mut FeedSession, page: usize, per_page: usize, session_is_new: bool) -> Option<SessionWarmMode> {
+	if !session_has_remaining_sources(session) {
+		session.background_complete = true;
+		session.background_active = false;
+		return None;
+	}
+
+	if session.background_active {
+		return None;
+	}
+
+	if session_is_new {
+		if background_target_reached(session) {
+			return None;
+		}
+		session.background_complete = false;
+		session.background_active = true;
+		return Some(SessionWarmMode::InitialLoad);
+	}
+
+	if session_requested_page_ready(session, page, per_page) {
+		session.background_active = false;
+		return None;
+	}
+
+	session.background_complete = false;
+	session.background_active = true;
+	Some(SessionWarmMode::FollowupCachePreferred {
+		max_sources: followup_sync_source_budget(session),
+	})
+}
+
+async fn warm_session_followup_cached(session_id: String, page: usize, per_page: usize, max_sources: usize) {
+	warm_session_to_fill(&session_id, page, per_page, max_sources).await;
+
+	let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+	if let Some(session) = sessions.get_mut(&session_id) {
+		session.background_active = false;
+		if !session_has_remaining_sources(session) {
+			session.background_complete = true;
+		}
+		touch_session(session);
+	}
+}
+
 pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
 	let session_id = build_session_id(&request);
 	reconcile_stuck_fetching_sources(&session_id).await;
 
-	{
+	let session_is_new = {
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 		sessions.retain(|_, session| !session_is_expired(session));
 
+		let session_is_new = !sessions.contains_key(&session_id);
 		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
 		session.requested_page = session.requested_page.max(page);
 		reconcile_session_with_source_cache(session);
 		touch_session(session);
-	}
+		session_is_new
+	};
 
-	let sync_target = {
+	let sync_target = if session_is_new {
 		let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 		let Some(session) = sessions.get(&session_id) else {
 			return session_id;
 		};
 		warm_targets(session, sync_sources_to_request(session, page))
+	} else {
+		Vec::new()
 	};
 
 	warm_session_indices(&session_id, sync_target).await;
-	warm_session_to_fill(&session_id, page, per_page, max_sync_source_budget(page)).await;
-	warm_session_for_round_robin(&session_id, page, per_page).await;
+	if session_is_new {
+		warm_session_to_fill(&session_id, page, per_page, max_sync_source_budget(page)).await;
+		warm_session_for_round_robin(&session_id, page, per_page).await;
+	}
 
-	let spawn_background = {
+	let warm_mode = {
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 		let Some(session) = sessions.get_mut(&session_id) else {
 			return session_id;
 		};
-
-		if !session_has_remaining_sources(session) {
-			session.background_complete = true;
-			session.background_active = false;
-			false
-		} else if session.background_active {
-			false
-		} else if background_target_reached(session) {
-			false
-		} else {
-			session.background_active = true;
-			true
-		}
+		plan_session_warm_mode(session, page, per_page, session_is_new)
 	};
 
-	if spawn_background {
+	if let Some(warm_mode) = warm_mode {
 		let background_id = session_id.clone();
 		tokio::spawn(async move {
-			warm_session_background(background_id).await;
+			match warm_mode {
+				SessionWarmMode::InitialLoad => warm_session_background(background_id).await,
+				SessionWarmMode::FollowupCachePreferred { max_sources } => {
+					warm_session_followup_cached(background_id, page, per_page, max_sources).await;
+				}
+			}
 		});
 	}
 
@@ -1100,43 +1159,39 @@ pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_pa
 	let session_id = build_session_id(&request);
 	reconcile_stuck_fetching_sources(&session_id).await;
 
-	{
+	let session_is_new = {
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 		sessions.retain(|_, session| !session_is_expired(session));
 
+		let session_is_new = !sessions.contains_key(&session_id);
 		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
 		session.requested_page = session.requested_page.max(page);
 		reconcile_session_with_source_cache(session);
 		touch_session(session);
-	}
+		session_is_new
+	};
 
-	let spawn_background = {
+	let warm_mode = {
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 		let Some(session) = sessions.get_mut(&session_id) else {
 			return session_id;
 		};
-
-		if !session_has_remaining_sources(session) {
-			session.background_complete = true;
-			session.background_active = false;
-			false
-		} else if session.background_active {
-			false
-		} else if background_target_reached(session) {
-			false
-		} else {
-			session.background_complete = false;
-			session.background_active = true;
-			true
-		}
+		plan_session_warm_mode(session, page, per_page, session_is_new)
 	};
 
-	if spawn_background {
+	if let Some(warm_mode) = warm_mode {
 		let background_id = session_id.clone();
 		tokio::spawn(async move {
-			warm_session_to_fill(&background_id, page, per_page, max_sync_source_budget(page)).await;
-			warm_session_for_round_robin(&background_id, page, per_page).await;
-			warm_session_background(background_id).await;
+			match warm_mode {
+				SessionWarmMode::InitialLoad => {
+					warm_session_to_fill(&background_id, page, per_page, max_sync_source_budget(page)).await;
+					warm_session_for_round_robin(&background_id, page, per_page).await;
+					warm_session_background(background_id).await;
+				}
+				SessionWarmMode::FollowupCachePreferred { max_sources } => {
+					warm_session_followup_cached(background_id, page, per_page, max_sources).await;
+				}
+			}
 		});
 	}
 
@@ -1227,11 +1282,12 @@ pub fn cache_stats() -> (usize, usize) {
 mod tests {
 	use super::{
 		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state, feed_page,
-		feed_status, get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
-		pick_next_remembered_subreddit_to_refresh, publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
-		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, round_robin_source_target, session_status_from_posts, sort_sources,
-		source_cache_is_servable, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry,
-		SessionSourceEntry, SessionSourceState, CACHE_TTL_SECS, FEED_SESSIONS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		feed_status, followup_sync_source_budget, get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget,
+		merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh, reconcile_session_with_source_cache,
+		record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, round_robin_source_target,
+		session_status_from_posts, sort_sources, source_cache_is_servable, store_source_posts, sync_sources_to_request, FeedSession, FeedSessionRequest, FeedSource,
+		RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, CACHE_TTL_SECS, FEED_SESSIONS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
+		SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use std::cmp::Ordering;
@@ -1730,6 +1786,127 @@ mod tests {
 
 		assert_eq!(sync_sources_to_request(&session, 0), 0);
 		assert_eq!(sync_sources_to_request(&session, 1), 18);
+	}
+
+	#[test]
+	fn followup_cache_preferred_budget_only_adds_one_small_batch() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..32)
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						if index < 12 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
+					)
+				})
+				.collect(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		assert_eq!(followup_sync_source_budget(&session), 16);
+	}
+
+	#[test]
+	fn existing_session_with_ready_requested_page_skips_new_warmup() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		for index in 0..25 {
+			let source = FeedSource::Subreddit {
+				name: format!("subreddit{index}"),
+			};
+			seed_source(&source, vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]);
+		}
+
+		let mut session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..30)
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						if index < 25 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
+					)
+				})
+				.collect(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let warm_mode = plan_session_warm_mode(&mut session, 0, POSTS_PER_PAGE, false);
+
+		assert_eq!(warm_mode, None);
+		assert!(!session.background_active);
+	}
+
+	#[test]
+	fn existing_session_with_unready_page_uses_cache_preferred_followup_mode() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		for index in 0..8 {
+			let source = FeedSource::Subreddit {
+				name: format!("subreddit{index}"),
+			};
+			seed_source(&source, vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]);
+		}
+
+		let mut session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: (0..20)
+				.map(|index| {
+					session_entry(
+						FeedSource::Subreddit {
+							name: format!("subreddit{index}"),
+						},
+						if index < 8 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
+					)
+				})
+				.collect(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let warm_mode = plan_session_warm_mode(&mut session, 0, POSTS_PER_PAGE, false);
+
+		assert_eq!(warm_mode, Some(SessionWarmMode::FollowupCachePreferred { max_sources: 12 }));
+		assert!(session.background_active);
 	}
 
 	#[test]
