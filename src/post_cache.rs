@@ -343,13 +343,16 @@ pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) {
 	entry.refresh_in_flight = true;
 }
 
-pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after: String, _refresh_origin: RefreshOrigin) {
+pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) {
 	let Some(normalized) = normalize_plain_subreddit_name(subreddit) else {
 		return;
 	};
 
 	crate::utils::store_post_flairs(&posts);
 	store_source_posts(&FeedSource::Subreddit { name: normalized.clone() }, posts.clone(), after);
+	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
+		crate::video_preview::prewarm_listing_video_previews(&posts);
+	}
 
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let Some(entry) = remembered.get_mut(&normalized) else {

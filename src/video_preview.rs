@@ -1,5 +1,6 @@
 use crate::config::get_setting;
 use crate::server::RequestExt;
+use crate::utils::Post;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hyper::body::to_bytes;
@@ -22,11 +23,13 @@ const DEFAULT_MAX_QUEUE: usize = 256;
 const DEFAULT_READY_TTL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(25);
 const DEFAULT_FAILED_RETRY: Duration = Duration::from_secs(120);
+const DEFAULT_PREWARM_AUTH_TTL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_NEAR_TERM_POLL_MS: u64 = 1_500;
 const DEFAULT_BACKPRESSURE_POLL_MS: u64 = 5_000;
 const FRAME_CACHE_SECONDS: u64 = 24 * 60 * 60;
 const PREVIEW_MAX_WIDTH: i64 = 640;
+const PREWARM_POST_LIMIT: usize = 5;
 
 type FrameFuture<'a> = Pin<Box<dyn Future<Output = Result<FrameBlob, String>> + Send + 'a>>;
 
@@ -68,6 +71,7 @@ struct JobEntry {
 	state: VideoPreviewJobState,
 	queued: bool,
 	last_accessed: Instant,
+	prewarm_until: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +324,21 @@ pub fn init() {
 	});
 }
 
+pub fn prewarm_listing_video_previews(posts: &[Post]) {
+	if !feature_enabled() {
+		return;
+	}
+
+	init();
+
+	for post in posts.iter().filter_map(video_preview_job_key_from_post).take(PREWARM_POST_LIMIT) {
+		let (job_id, queue_enqueued) = upsert_prewarm_job(post);
+		if queue_enqueued {
+			info!("Queued video preview prewarm job {job_id}");
+		}
+	}
+}
+
 pub async fn lease(req: Request<Body>) -> Result<Response<Body>, String> {
 	if !feature_enabled() {
 		return json_response(
@@ -332,8 +351,8 @@ pub async fn lease(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	let request: LeaseRequest = parse_json_body(req).await?;
 	let key = VideoPreviewJobKey {
-		media_url: absolutize_media_url(&request.media_url, &request.page_origin),
-		poster_url: absolutize_media_url(&request.poster_url, &request.page_origin),
+		media_url: canonicalize_job_url(&request.media_url, &request.page_origin),
+		poster_url: canonicalize_job_url(&request.poster_url, &request.page_origin),
 		duration_seconds: request.duration_seconds,
 		width: request.width,
 		height: request.height,
@@ -473,6 +492,20 @@ fn current_generator() -> Arc<dyn PreviewFrameGenerator> {
 	GENERATOR.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
+fn video_preview_job_key_from_post(post: &Post) -> Option<VideoPreviewJobKey> {
+	if !post.media.video_preview_enabled || post.media.video_preview_job_hint.is_empty() {
+		return None;
+	}
+
+	Some(VideoPreviewJobKey {
+		media_url: canonicalize_job_url(&post.media.video_preview_job_hint, ""),
+		poster_url: canonicalize_job_url(&post.media.poster, ""),
+		duration_seconds: post.media.duration_seconds,
+		width: post.media.width,
+		height: post.media.height,
+	})
+}
+
 fn preferred_image_format() -> PreviewImageFormat {
 	*PREFERRED_IMAGE_FORMAT.get_or_init(detect_preferred_image_format)
 }
@@ -567,6 +600,14 @@ fn job_id_for_key(key: &VideoPreviewJobKey) -> String {
 	URL_SAFE_NO_PAD.encode(key.canonical_string())
 }
 
+fn canonicalize_job_url(value: &str, page_origin: &str) -> String {
+	if value.is_empty() || value.starts_with('/') {
+		value.to_string()
+	} else {
+		absolutize_media_url(value, page_origin)
+	}
+}
+
 fn absolutize_media_url(value: &str, page_origin: &str) -> String {
 	if value.starts_with("http://") || value.starts_with("https://") || value.is_empty() {
 		return value.to_string();
@@ -592,6 +633,41 @@ fn join_base_and_path(base: &str, path: &str) -> String {
 	}
 }
 
+fn upsert_prewarm_job(key: VideoPreviewJobKey) -> (String, bool) {
+	let now = Instant::now();
+	let job_id = job_id_for_key(&key);
+	let mut queue_enqueued = false;
+
+	if let Ok(mut jobs) = VIDEO_PREVIEW_JOBS.lock() {
+		let entry = jobs.entry(job_id.clone()).or_insert_with(|| JobEntry {
+			key: key.clone(),
+			state: VideoPreviewJobState::Pending,
+			queued: false,
+			last_accessed: now,
+			prewarm_until: Some(now + DEFAULT_PREWARM_AUTH_TTL),
+		});
+		entry.key = key;
+		entry.last_accessed = now;
+		entry.prewarm_until = Some(now + DEFAULT_PREWARM_AUTH_TTL);
+
+		match &entry.state {
+			VideoPreviewJobState::Ready { expires_at, .. } if *expires_at > now => {}
+			VideoPreviewJobState::Failed { retry_after, .. } if *retry_after > now => {}
+			VideoPreviewJobState::Running { .. } | VideoPreviewJobState::Pending => {
+				if !entry.queued {
+					queue_enqueued = enqueue_job_locked(&job_id, entry);
+				}
+			}
+			_ => {
+				entry.state = VideoPreviewJobState::Pending;
+				queue_enqueued = enqueue_job_locked(&job_id, entry);
+			}
+		}
+	}
+
+	(job_id, queue_enqueued)
+}
+
 fn upsert_job_and_lease(key: VideoPreviewJobKey, request: &LeaseRequest) -> (String, bool) {
 	let now = Instant::now();
 	let job_id = job_id_for_key(&key);
@@ -603,6 +679,7 @@ fn upsert_job_and_lease(key: VideoPreviewJobKey, request: &LeaseRequest) -> (Str
 			state: VideoPreviewJobState::Pending,
 			queued: false,
 			last_accessed: now,
+			prewarm_until: None,
 		});
 		entry.key = key;
 		entry.last_accessed = now;
@@ -720,6 +797,18 @@ fn snapshot_job(job_id: &str) -> (ApiJobState, Vec<VideoPreviewFrame>, u64) {
 	)
 }
 
+fn has_execution_authorization(job_id: &str) -> bool {
+	let now = Instant::now();
+
+	if let Ok(jobs) = VIDEO_PREVIEW_JOBS.lock() {
+		if jobs.get(job_id).and_then(|job| job.prewarm_until).is_some_and(|until| until > now) {
+			return true;
+		}
+	}
+
+	has_live_lease(job_id)
+}
+
 async fn process_job(job_id: String) {
 	let job_started_at = Instant::now();
 	let mut key = {
@@ -732,7 +821,9 @@ async fn process_job(job_id: String) {
 			return;
 		};
 
-		if !has_live_lease(&job_id) {
+		let now = Instant::now();
+		let has_prewarm_auth = job.prewarm_until.is_some_and(|until| until > now);
+		if !has_prewarm_auth && !has_live_lease(&job_id) {
 			job.queued = false;
 			job.state = VideoPreviewJobState::Pending;
 			return;
@@ -749,7 +840,7 @@ async fn process_job(job_id: String) {
 	};
 
 	if key.duration_seconds <= 0 {
-		let probed_duration_seconds = probe_duration_seconds(&key.media_url).await;
+		let probed_duration_seconds = probe_duration_seconds(&absolutize_media_url(&key.media_url, "")).await;
 		let resolved_duration_seconds = effective_duration_seconds(key.duration_seconds, probed_duration_seconds);
 		if resolved_duration_seconds > 0 && resolved_duration_seconds != key.duration_seconds {
 			key.duration_seconds = resolved_duration_seconds;
@@ -773,14 +864,14 @@ async fn process_job(job_id: String) {
 	let mut produced_frames = Vec::with_capacity(timestamps.len());
 
 	for (index, timestamp_seconds) in timestamps.iter().copied().enumerate() {
-		if !has_live_lease(&job_id) {
+		if !has_execution_authorization(&job_id) {
 			cancel_job(&job_id);
 			info!("Cancelled video preview job {job_id} because its page is no longer live");
 			return;
 		}
 
 		let request = FrameRequest {
-			media_url: key.media_url.clone(),
+			media_url: absolutize_media_url(&key.media_url, ""),
 			timestamp_seconds,
 			width: key.width,
 			height: key.height,
@@ -814,7 +905,7 @@ async fn process_job(job_id: String) {
 		}
 	}
 
-	if !has_live_lease(&job_id) {
+	if !has_execution_authorization(&job_id) {
 		cancel_job(&job_id);
 		info!("Cancelled video preview job {job_id} after generation because its page is no longer live");
 		return;
@@ -912,6 +1003,12 @@ fn sweep_expired_state() {
 		})
 		.collect::<Vec<_>>();
 
+	for job in jobs.values_mut() {
+		if job.prewarm_until.is_some_and(|until| until <= now) {
+			job.prewarm_until = None;
+		}
+	}
+
 	for job_id in expired_job_ids {
 		remove_job_frames_locked(&job_id, &mut jobs, &mut cache);
 		jobs.remove(&job_id);
@@ -994,6 +1091,7 @@ pub(crate) fn reset_state_for_tests() {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::utils::{Author, Awards, Flags, Flair, Media};
 	use hyper::body::to_bytes;
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Mutex;
@@ -1026,6 +1124,67 @@ mod tests {
 					bytes: format!("frame-{}", request.timestamp_seconds).into_bytes(),
 				})
 			})
+		}
+	}
+
+	fn empty_flair() -> Flair {
+		Flair {
+			flair_parts: Vec::new(),
+			text: String::new(),
+			background_color: String::new(),
+			foreground_color: String::new(),
+		}
+	}
+
+	fn preview_enabled_post(id: &str, media_url: &str) -> Post {
+		Post {
+			id: id.to_string(),
+			kind: "t3".to_string(),
+			title: id.to_string(),
+			community: "demo".to_string(),
+			body: String::new(),
+			author: Author {
+				name: "demo".to_string(),
+				flair: empty_flair(),
+				distinguished: String::new(),
+				external_links: Vec::new(),
+				avg_video_length: None,
+			},
+			permalink: format!("/r/demo/comments/{id}/"),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			poll: None,
+			score: ("1".to_string(), "1".to_string()),
+			upvote_ratio: 100,
+			post_type: "video".to_string(),
+			flair: empty_flair(),
+			flags: Flags::new(false, false, false),
+			thumbnail: Media::empty(),
+			media: Media {
+				url: media_url.to_string(),
+				poster: "/thumb/demo".to_string(),
+				width: 320,
+				height: 180,
+				duration_seconds: 30,
+				duration: "0:30".to_string(),
+				video_preview_enabled: true,
+				video_preview_job_hint: media_url.to_string(),
+				..Media::empty()
+			},
+			domain: "v.redd.it".to_string(),
+			rel_time: String::new(),
+			created: String::new(),
+			created_ts: 1,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
 		}
 	}
 
@@ -1123,6 +1282,7 @@ mod tests {
 					},
 					queued: false,
 					last_accessed: now - Duration::from_secs((idx + 1) as u64),
+					prewarm_until: None,
 				},
 			);
 			cache.total_bytes += 10;
@@ -1191,6 +1351,7 @@ mod tests {
 				state: VideoPreviewJobState::Pending,
 				queued: false,
 				last_accessed: Instant::now(),
+				prewarm_until: None,
 			},
 		);
 		let mut job_ids = HashSet::new();
@@ -1234,6 +1395,7 @@ mod tests {
 				state: VideoPreviewJobState::Pending,
 				queued: false,
 				last_accessed: Instant::now(),
+				prewarm_until: None,
 			},
 		);
 		let mut job_ids = HashSet::new();
@@ -1286,6 +1448,7 @@ mod tests {
 				state: VideoPreviewJobState::Pending,
 				queued: false,
 				last_accessed: Instant::now(),
+				prewarm_until: None,
 			},
 		);
 		VIDEO_PREVIEW_FRAMES.lock().unwrap().blobs.insert(
@@ -1346,5 +1509,52 @@ mod tests {
 		let response = release(req).await.unwrap();
 		assert_eq!(response.status(), StatusCode::OK);
 		assert!(VIDEO_PREVIEW_LEASES.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn prewarm_listing_only_queues_first_five_eligible_posts() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		reset_state_for_tests();
+		init();
+
+		let posts = (0..7)
+			.map(|index| preview_enabled_post(&format!("post-{index}"), &format!("/vid/demo/{index}")))
+			.collect::<Vec<_>>();
+
+		prewarm_listing_video_previews(&posts);
+
+		let jobs = VIDEO_PREVIEW_JOBS.lock().unwrap();
+		assert_eq!(jobs.len(), 5);
+		assert!(jobs.values().all(|job| job.prewarm_until.is_some()));
+	}
+
+	#[tokio::test]
+	async fn prewarmed_job_runs_without_live_lease() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		reset_state_for_tests();
+		set_generator(FakeGenerator::successful());
+		let key = VideoPreviewJobKey {
+			media_url: "/vid/test".to_string(),
+			poster_url: String::new(),
+			duration_seconds: 30,
+			width: 320,
+			height: 180,
+		};
+		let job_id = job_id_for_key(&key);
+		VIDEO_PREVIEW_JOBS.lock().unwrap().insert(
+			job_id.clone(),
+			JobEntry {
+				key,
+				state: VideoPreviewJobState::Pending,
+				queued: false,
+				last_accessed: Instant::now(),
+				prewarm_until: Some(Instant::now() + DEFAULT_PREWARM_AUTH_TTL),
+			},
+		);
+
+		process_job(job_id.clone()).await;
+
+		let jobs = VIDEO_PREVIEW_JOBS.lock().unwrap();
+		assert!(matches!(jobs.get(&job_id).map(|job| &job.state), Some(VideoPreviewJobState::Ready { .. })));
 	}
 }
