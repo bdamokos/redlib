@@ -11,9 +11,10 @@ use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 
+use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{io, result::Result};
 
@@ -89,6 +90,12 @@ const URL_PAIRS: [(&str, &str); 2] = [
 	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedditApiRequestOrigin {
+	NonDaemon,
+	Daemon,
+}
+
 #[derive(Clone, Debug)]
 pub struct RedditRateLimitSnapshot {
 	pub remaining: Option<f32>,
@@ -142,6 +149,44 @@ impl RedditRateLimitSnapshot {
 			}
 			_ => None,
 		}
+	}
+}
+
+tokio::task_local! {
+	static REDDIT_API_REQUEST_ORIGIN: RedditApiRequestOrigin;
+}
+
+static LAST_NON_DAEMON_REDDIT_API_CALL_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+fn current_reddit_api_request_origin() -> RedditApiRequestOrigin {
+	REDDIT_API_REQUEST_ORIGIN.try_with(|origin| *origin).unwrap_or(RedditApiRequestOrigin::NonDaemon)
+}
+
+fn record_reddit_api_call_activity() {
+	if current_reddit_api_request_origin() == RedditApiRequestOrigin::Daemon {
+		return;
+	}
+
+	if let Ok(mut last_call_at) = LAST_NON_DAEMON_REDDIT_API_CALL_AT.lock() {
+		*last_call_at = Some(Instant::now());
+	}
+}
+
+pub fn latest_non_daemon_reddit_api_call_at() -> Option<Instant> {
+	LAST_NON_DAEMON_REDDIT_API_CALL_AT.lock().ok().and_then(|last_call_at| *last_call_at)
+}
+
+pub async fn with_daemon_reddit_api_origin<F>(future: F) -> F::Output
+where
+	F: Future,
+{
+	REDDIT_API_REQUEST_ORIGIN.scope(RedditApiRequestOrigin::Daemon, future).await
+}
+
+#[cfg(test)]
+pub(crate) fn set_last_non_daemon_reddit_api_call_at_for_tests(last_call_at: Option<Instant>) {
+	if let Ok(mut stored) = LAST_NON_DAEMON_REDDIT_API_CALL_AT.lock() {
+		*stored = last_call_at;
 	}
 }
 
@@ -347,7 +392,11 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 		.await
 		.map(|mut res| {
 			let content_type = res.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
-			let content_length = res.headers().get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
+			let content_length = res
+				.headers()
+				.get(header::CONTENT_LENGTH)
+				.and_then(|value| value.to_str().ok())
+				.and_then(|value| value.parse::<u64>().ok());
 			let range = req.headers().get("Range").and_then(|value| value.to_str().ok()).map(str::to_owned);
 			let mut rm = |key: &str| res.headers_mut().remove(key);
 
@@ -435,107 +484,110 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 		pace_reddit_request_if_needed().await;
 
 		match builder {
-			Ok(req) => match client.request(req).await {
-				Ok(mut response) => {
-					if let Some(snapshot) = capture_ratelimit_snapshot(&response) {
-						store_ratelimit_snapshot(snapshot);
-					}
+			Ok(req) => {
+				record_reddit_api_call_activity();
+				match client.request(req).await {
+					Ok(mut response) => {
+						if let Some(snapshot) = capture_ratelimit_snapshot(&response) {
+							store_ratelimit_snapshot(snapshot);
+						}
 
-					// Reddit may respond with a 3xx. Decide whether or not to
-					// redirect based on caller params.
-					if response.status().is_redirection() {
-						if !redirect {
-							return Ok(response);
+						// Reddit may respond with a 3xx. Decide whether or not to
+						// redirect based on caller params.
+						if response.status().is_redirection() {
+							if !redirect {
+								return Ok(response);
+							};
+							let location_header = response.headers().get(header::LOCATION);
+							if location_header == Some(&HeaderValue::from_static(ALTERNATIVE_REDDIT_URL_BASE)) {
+								return Err("Reddit response was invalid".to_string());
+							}
+							return request(
+								method,
+								location_header
+									.map(|val| {
+										// We need to make adjustments to the URI
+										// we get back from Reddit. Namely, we
+										// must:
+										//
+										//     1. Remove the authority (e.g.
+										//     https://www.reddit.com) that may be
+										//     present, so that we recurse on the
+										//     path (and query parameters) as
+										//     required.
+										//
+										//     2. Percent-encode the path.
+										let new_path = percent_encode(val.as_bytes(), CONTROLS)
+											.to_string()
+											.trim_start_matches(REDDIT_URL_BASE)
+											.trim_start_matches(ALTERNATIVE_REDDIT_URL_BASE)
+											.to_string();
+										format!("{new_path}{}raw_json=1", if new_path.contains('?') { "&" } else { "?" })
+									})
+									.unwrap_or_default()
+									.to_string(),
+								true,
+								quarantine,
+								base_path,
+								host,
+							)
+							.await;
 						};
-						let location_header = response.headers().get(header::LOCATION);
-						if location_header == Some(&HeaderValue::from_static(ALTERNATIVE_REDDIT_URL_BASE)) {
-							return Err("Reddit response was invalid".to_string());
-						}
-						return request(
-							method,
-							location_header
-								.map(|val| {
-									// We need to make adjustments to the URI
-									// we get back from Reddit. Namely, we
-									// must:
-									//
-									//     1. Remove the authority (e.g.
-									//     https://www.reddit.com) that may be
-									//     present, so that we recurse on the
-									//     path (and query parameters) as
-									//     required.
-									//
-									//     2. Percent-encode the path.
-									let new_path = percent_encode(val.as_bytes(), CONTROLS)
-										.to_string()
-										.trim_start_matches(REDDIT_URL_BASE)
-										.trim_start_matches(ALTERNATIVE_REDDIT_URL_BASE)
-										.to_string();
-									format!("{new_path}{}raw_json=1", if new_path.contains('?') { "&" } else { "?" })
-								})
-								.unwrap_or_default()
-								.to_string(),
-							true,
-							quarantine,
-							base_path,
-							host,
-						)
-						.await;
-					};
 
-					match response.headers().get(header::CONTENT_ENCODING) {
-						// Content not compressed.
-						None => Ok(response),
+						match response.headers().get(header::CONTENT_ENCODING) {
+							// Content not compressed.
+							None => Ok(response),
 
-						// Content encoded (hopefully with gzip).
-						Some(hdr) => {
-							match hdr.to_str() {
-								Ok(val) => match val {
-									"gzip" => {}
-									"identity" => return Ok(response),
-									_ => return Err("Reddit response was encoded with an unsupported compressor".to_string()),
-								},
-								Err(_) => return Err("Reddit response was invalid".to_string()),
+							// Content encoded (hopefully with gzip).
+							Some(hdr) => {
+								match hdr.to_str() {
+									Ok(val) => match val {
+										"gzip" => {}
+										"identity" => return Ok(response),
+										_ => return Err("Reddit response was encoded with an unsupported compressor".to_string()),
+									},
+									Err(_) => return Err("Reddit response was invalid".to_string()),
+								}
+
+								// We get here if the body is gzip-compressed.
+
+								// The body must be something that implements
+								// std::io::Read, hence the conversion to
+								// bytes::buf::Buf and then transformation into a
+								// Reader.
+								let mut decompressed: Vec<u8>;
+								{
+									let mut aggregated_body = match body::aggregate(response.body_mut()).await {
+										Ok(b) => b.reader(),
+										Err(e) => return Err(e.to_string()),
+									};
+
+									let mut decoder = match gzip::Decoder::new(&mut aggregated_body) {
+										Ok(decoder) => decoder,
+										Err(e) => return Err(e.to_string()),
+									};
+
+									decompressed = Vec::<u8>::new();
+									if let Err(e) = io::copy(&mut decoder, &mut decompressed) {
+										return Err(e.to_string());
+									};
+								}
+
+								response.headers_mut().remove(header::CONTENT_ENCODING);
+								response.headers_mut().insert(header::CONTENT_LENGTH, decompressed.len().into());
+								*(response.body_mut()) = Body::from(decompressed);
+
+								Ok(response)
 							}
-
-							// We get here if the body is gzip-compressed.
-
-							// The body must be something that implements
-							// std::io::Read, hence the conversion to
-							// bytes::buf::Buf and then transformation into a
-							// Reader.
-							let mut decompressed: Vec<u8>;
-							{
-								let mut aggregated_body = match body::aggregate(response.body_mut()).await {
-									Ok(b) => b.reader(),
-									Err(e) => return Err(e.to_string()),
-								};
-
-								let mut decoder = match gzip::Decoder::new(&mut aggregated_body) {
-									Ok(decoder) => decoder,
-									Err(e) => return Err(e.to_string()),
-								};
-
-								decompressed = Vec::<u8>::new();
-								if let Err(e) = io::copy(&mut decoder, &mut decompressed) {
-									return Err(e.to_string());
-								};
-							}
-
-							response.headers_mut().remove(header::CONTENT_ENCODING);
-							response.headers_mut().insert(header::CONTENT_LENGTH, decompressed.len().into());
-							*(response.body_mut()) = Body::from(decompressed);
-
-							Ok(response)
 						}
 					}
-				}
-				Err(e) => {
-					dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
+					Err(e) => {
+						dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
 
-					Err(e.to_string())
+						Err(e.to_string())
+					}
 				}
-			},
+			}
 			Err(_) => Err("Post url contains non-ASCII characters".to_string()),
 		}
 	}
@@ -547,10 +599,20 @@ fn debug_logging_enabled() -> bool {
 }
 
 fn download_diagnostics_enabled() -> bool {
-	std::env::var("REDLIB_DOWNLOAD_DIAGNOSTICS").map(|value| value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true")).unwrap_or(false)
+	std::env::var("REDLIB_DOWNLOAD_DIAGNOSTICS")
+		.map(|value| value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
+		.unwrap_or(false)
 }
 
-fn log_download_diagnostics(category: &str, url_or_path: &str, status: hyper::StatusCode, content_type: Option<&str>, content_length: Option<u64>, actual_bytes: Option<usize>, range: Option<&str>) {
+fn log_download_diagnostics(
+	category: &str,
+	url_or_path: &str,
+	status: hyper::StatusCode,
+	content_type: Option<&str>,
+	content_length: Option<u64>,
+	actual_bytes: Option<usize>,
+	range: Option<&str>,
+) {
 	if !download_diagnostics_enabled() {
 		return;
 	}
