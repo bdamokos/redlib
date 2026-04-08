@@ -895,6 +895,9 @@ mod tests {
 		assert!(html.contains("data-error-message=\"Loading the user page is taking longer than expected.\""));
 		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading user page..."));
+		assert!(html.contains("id=\"page_fragment\""));
+		assert!(html.contains("<main>"));
+		assert!(html.contains("<aside>"));
 	}
 
 	#[test]

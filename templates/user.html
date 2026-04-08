@@ -14,7 +14,6 @@
 {% endblock %}
 
 {% block body %}
-<main>
     {% if shell_mode %}
     <div class="feed_status_banner warming">{{ loading_message }}</div>
     <div
@@ -24,13 +23,16 @@
         data-loading-message="{{ loading_message }}"
         data-error-message="Loading the user page is taking longer than expected."
         data-timeout-ms="20000">
-        <div id="column_one">
-            <center>Loading posts...</center>
-        </div>
-        {% include "user_sidebar.html" %}
+        <main>
+            <div id="column_one">
+                <center>Loading posts...</center>
+            </div>
+            {% include "user_sidebar.html" %}
+        </main>
     </div>
     {% else %}
-    {% include "user_fragment.html" %}
+    <main>
+        {% include "user_fragment.html" %}
+    </main>
     {% endif %}
-</main>
 {% endblock %}
