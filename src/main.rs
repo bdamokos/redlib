@@ -331,6 +331,9 @@ async fn main() {
 		.at("/post_preview.js")
 		.get(|_| resource(include_str!("../static/post_preview.js"), "text/javascript", false).boxed());
 	app
+		.at("/browser_session.js")
+		.get(|_| resource(include_str!("../static/browser_session.js"), "text/javascript", false).boxed());
+	app
 		.at("/author_links.js")
 		.get(|_| resource(include_str!("../static/author_links.js"), "text/javascript", false).boxed());
 	app
@@ -358,6 +361,8 @@ async fn main() {
 	app.at("/api/video-previews/lease").post(|r| video_preview::lease(r).boxed());
 	app.at("/api/video-previews/heartbeat").post(|r| video_preview::heartbeat(r).boxed());
 	app.at("/api/video-previews/release").post(|r| video_preview::release(r).boxed());
+	app.at("/api/browser-sessions/heartbeat").post(|r| post_cache::browser_session_heartbeat(r).boxed());
+	app.at("/api/browser-sessions/release").post(|r| post_cache::browser_session_release(r).boxed());
 	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());
 	app.at("/api/video-previews/:job_id/frame/:index").get(|r| video_preview::frame(r).boxed());
 

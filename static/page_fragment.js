@@ -14,6 +14,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const timeoutMs = Number.parseInt(container.dataset.timeoutMs || "15000", 10);
     const maxAttempts = Number.parseInt(container.dataset.maxAttempts || "3", 10);
     const retryDelayMs = Number.parseInt(container.dataset.retryDelayMs || "1500", 10);
+    const replaceSelector = container.dataset.replaceSelector || "";
     const banner = document.querySelector(".feed_status_banner");
     const cacheKey = `page-fragment:${fragmentUrl}`;
 
@@ -34,6 +35,19 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const replaceFragment = (html) => {
+        if (replaceSelector) {
+            const template = document.createElement("template");
+            template.innerHTML = html.trim();
+            const nextNode = template.content.querySelector(replaceSelector);
+            const currentNode = document.querySelector(replaceSelector);
+            if (nextNode && currentNode) {
+                currentNode.replaceWith(nextNode);
+                refreshDynamicContent(document);
+                settleBannerState();
+                return;
+            }
+        }
+
         container.outerHTML = html;
         refreshDynamicContent(document);
         settleBannerState();
@@ -45,11 +59,14 @@ document.addEventListener("DOMContentLoaded", () => {
             banner.classList.remove("warming");
         }
 
-        container.innerHTML = `
-            <div id="column_one">
-                <center>${errorMessage}</center>
-                <center><p><a href="${fragmentUrl}">Try loading the content again</a></p></center>
-            </div>
+        const target = replaceSelector ? document.querySelector(replaceSelector) : container;
+        if (!target) {
+            return;
+        }
+
+        target.innerHTML = `
+            <center>${errorMessage}</center>
+            <center><p><a href="${fragmentUrl}">Try loading the content again</a></p></center>
         `;
     };
 
@@ -87,6 +104,8 @@ document.addEventListener("DOMContentLoaded", () => {
         window.setTimeout(resolve, retryDelayMs);
     });
 
+    const shouldRetryResponse = (status) => status >= 500;
+
     const loadFragment = async (attempt = 1) => {
         if (banner) {
             banner.hidden = false;
@@ -106,6 +125,10 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             if (!response.ok) {
+                if (!shouldRetryResponse(response.status)) {
+                    showErrorState();
+                    return;
+                }
                 throw new Error(`Fragment request failed: ${response.status}`);
             }
 

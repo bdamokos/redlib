@@ -933,7 +933,7 @@ pub struct NSFWLandingTemplate {
 	pub url: String,
 }
 
-#[derive(Default, PartialEq)]
+#[derive(Default, Clone, PartialEq)]
 /// User struct containing metadata about user
 pub struct User {
 	pub name: String,
@@ -951,6 +951,7 @@ pub struct User {
 
 const AUTHOR_LINKS_CACHE_SIZE: usize = 512;
 const AUTHOR_LINKS_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
+const AUTHOR_LINK_PREFETCH_CONCURRENCY: usize = 8;
 const SUBREDDIT_FLAIR_CACHE_SIZE: usize = 1000;
 const USER_SUBREDDIT_CACHE_SIZE: usize = 1000;
 const SUBREDDIT_USER_CACHE_SIZE: usize = 1000;
@@ -1017,6 +1018,31 @@ pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
 	for post in posts.iter_mut() {
 		post.author.external_links = cached_author_external_links(&post.author.name);
 	}
+}
+
+pub async fn prefetch_post_author_links(posts: &[Post]) {
+	let mut authors = posts
+		.iter()
+		.map(|post| post.author.name.trim())
+		.filter(|name| !name.is_empty() && *name != "[deleted]" && cached_author_links(name).is_none())
+		.map(ToString::to_string)
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.collect::<Vec<_>>();
+	authors.sort_unstable();
+
+	let mut pending = JoinSet::new();
+	for author in authors {
+		pending.spawn(async move {
+			let _ = author_external_links(&author).await;
+		});
+
+		if pending.len() >= AUTHOR_LINK_PREFETCH_CONCURRENCY {
+			let _ = pending.join_next().await;
+		}
+	}
+
+	while pending.join_next().await.is_some() {}
 }
 
 pub fn store_subreddit_flairs(subreddit: &str, posts: &[Post]) {

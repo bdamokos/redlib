@@ -24,6 +24,7 @@
 	<div
 		id="page_fragment"
 		data-fragment-url="{{ fragment_url }}"
+		data-replace-selector="#column_one"
 		data-loading-message="{{ loading_message }}"
 		data-error-message="Loading posts is taking longer than expected."
 		data-timeout-ms="20000">
@@ -31,6 +32,7 @@
 			<div id="column_one">
 				<center>{{ placeholder_message }}</center>
 			</div>
+			{% include "subreddit_sidebar.html" %}
 		</main>
 	</div>
 {% endblock %}

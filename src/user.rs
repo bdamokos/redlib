@@ -21,8 +21,16 @@ use url::Url;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_DUPLICATE_FILL_REQUESTS: usize = 4;
 const USER_SORT_OPTIONS: [&str; 4] = ["hot", "new", "top", "controversial"];
+const USER_METADATA_CACHE_SIZE: usize = 1000;
+const USER_METADATA_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
 const USER_VIDEO_STATS_CACHE_SIZE: usize = 1000;
 const USER_VIDEO_STATS_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
+
+#[derive(Clone)]
+struct CachedUserMetadata {
+	user: User,
+	cached_at: Instant,
+}
 
 #[derive(Clone)]
 struct CachedUserVideoStats {
@@ -39,6 +47,7 @@ struct UserVideoStats {
 }
 
 static USER_VIDEO_STATS_CACHE: LazyLock<Mutex<HashMap<String, CachedUserVideoStats>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static USER_METADATA_CACHE: LazyLock<Mutex<HashMap<String, CachedUserMetadata>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // STRUCTS
 #[derive(Template)]
@@ -237,6 +246,53 @@ fn normalize_duplicate_url(url: &str) -> String {
 
 fn normalize_user_video_stats_cache_key(username: &str) -> String {
 	username.trim().to_lowercase()
+}
+
+fn normalize_user_metadata_cache_key(username: &str) -> String {
+	username.trim().to_lowercase()
+}
+
+fn prune_user_metadata_cache(cache: &mut HashMap<String, CachedUserMetadata>) {
+	let now = Instant::now();
+	cache.retain(|_, entry| now.duration_since(entry.cached_at) <= USER_METADATA_CACHE_TTL);
+}
+
+fn cached_user_metadata(username: &str) -> Option<User> {
+	let cache_key = normalize_user_metadata_cache_key(username);
+	if cache_key.is_empty() {
+		return None;
+	}
+
+	let Ok(mut cache) = USER_METADATA_CACHE.lock() else {
+		return None;
+	};
+	prune_user_metadata_cache(&mut cache);
+	cache.get(&cache_key).map(|entry| entry.user.clone())
+}
+
+fn store_user_metadata(username: &str, user: &User) {
+	let cache_key = normalize_user_metadata_cache_key(username);
+	if cache_key.is_empty() {
+		return;
+	}
+
+	let Ok(mut cache) = USER_METADATA_CACHE.lock() else {
+		return;
+	};
+	prune_user_metadata_cache(&mut cache);
+	cache.insert(
+		cache_key,
+		CachedUserMetadata {
+			user: user.clone(),
+			cached_at: Instant::now(),
+		},
+	);
+	while cache.len() > USER_METADATA_CACHE_SIZE {
+		let Some(oldest_key) = cache.iter().min_by_key(|(_, entry)| entry.cached_at).map(|(key, _)| key.clone()) else {
+			break;
+		};
+		cache.remove(&oldest_key);
+	}
 }
 
 fn prune_user_video_stats_cache(cache: &mut HashMap<String, CachedUserVideoStats>) {
@@ -1209,15 +1265,20 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	// Retrieve other variables from Redlib request
 	let sort = param(&path, "sort").unwrap_or_default();
+	let cached_user = cached_user_metadata(&username).unwrap_or_else(|| User {
+		name: username.clone(),
+		..Default::default()
+	});
+	let user_subreddits = utils::cached_user_subreddits(&username)
+		.into_iter()
+		.map(|(name, count)| UserSubredditEntry { name, count })
+		.collect();
 
 	Ok(template(&UserTemplate {
-		user: User {
-			name: username.clone(),
-			..Default::default()
-		},
+		user: cached_user,
 		username: username.clone(),
 		posts: Vec::new(),
-		user_subreddits: Vec::new(),
+		user_subreddits,
 		sort: (sort, param(&path, "t").unwrap_or_default()),
 		ends: (param(&path, "after").unwrap_or_default(), String::new()),
 		listing: listing.clone(),
@@ -1227,7 +1288,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		is_filtered: false,
 		all_posts_filtered: false,
 		all_posts_hidden_nsfw: false,
-		avg_video_length: None,
+		avg_video_length: cached_avg_video_length(&username),
 		no_posts: false,
 		shell_mode: true,
 		fragment_url: user_fragment_path(&username, &listing, query),
@@ -1377,6 +1438,10 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 
 // USER
 async fn user(name: &str) -> Result<User, String> {
+	if let Some(cached) = cached_user_metadata(name) {
+		return Ok(cached);
+	}
+
 	// Build the Reddit JSON API path
 	let path: String = format!("/user/{name}/about.json?raw_json=1");
 
@@ -1392,7 +1457,7 @@ async fn user(name: &str) -> Result<User, String> {
 	let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
 
 	// Parse the JSON output into a User struct
-	Ok(User {
+	let user = User {
 		name: res["data"]["name"].as_str().unwrap_or(name).to_owned(),
 		title: about("title"),
 		icon: format_url(&about("icon_img")),
@@ -1404,7 +1469,9 @@ async fn user(name: &str) -> Result<User, String> {
 		bio_html: profile.bio_html,
 		external_links: utils::external_links_with_coomer_lookups(profile.external_links).await,
 		nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
-	})
+	};
+	store_user_metadata(name, &user);
+	Ok(user)
 }
 
 pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {

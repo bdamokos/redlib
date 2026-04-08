@@ -88,9 +88,16 @@ crate::impl_template_str_eq!(SubredditTemplate);
 #[template(path = "subreddit_shell.html")]
 pub struct SubredditShellTemplate {
 	sub: Subreddit,
+	top_users: Vec<SubredditUserEntry>,
+	flair_filters: Vec<FlairFilterOption>,
 	active_flair_filter: String,
+	active_flair_filter_encoded: String,
+	clear_flair_filter_url: String,
 	prefs: Preferences,
 	url: String,
+	redirect_url: String,
+	is_filtered: bool,
+	is_flair_subscribed: bool,
 	fragment_url: String,
 	loading_message: String,
 	placeholder_message: String,
@@ -898,6 +905,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
 	let aggregate_saved_feeds = req.param("sub").is_none() && front_page_is_default && has_saved_feeds;
+	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let loading_message = if aggregate_saved_feeds && sort == "new" {
 		live_feed_shell_loading_message(&req, &prefs)
 			.await
@@ -906,15 +914,49 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		"Loading posts...".to_string()
 	};
 	let placeholder_message = "Loading posts...".to_string();
+	let cached_sub = if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+		cached_subreddit_metadata(&sub_name).unwrap_or_else(|| placeholder_subreddit(&sub_name))
+	} else {
+		Subreddit {
+			name: sub_name.clone(),
+			..Subreddit::default()
+		}
+	};
+	let flair_filters = if !cached_sub.name.is_empty() && cached_sub.name != "all" && cached_sub.name != "popular" && !cached_sub.name.contains('+') {
+		build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&cached_sub.name))
+	} else {
+		Vec::new()
+	};
+	let top_users = if !cached_sub.name.is_empty() && cached_sub.name != "all" && cached_sub.name != "popular" && !cached_sub.name.contains('+') {
+		utils::cached_subreddit_users(&cached_sub.name)
+			.into_iter()
+			.map(|(name, count)| SubredditUserEntry { name, count })
+			.collect()
+	} else {
+		Vec::new()
+	};
+	let is_flair_subscribed = !active_flair_filter.is_empty()
+		&& !cached_sub.name.is_empty()
+		&& cached_sub.name != "all"
+		&& cached_sub.name != "popular"
+		&& !cached_sub.name.contains('+')
+		&& prefs
+			.flair_subscriptions
+			.iter()
+			.any(|subscription| subscription.subreddit == cached_sub.name && subscription.flair == active_flair_filter);
 
 	Ok(template(&SubredditShellTemplate {
-		sub: Subreddit {
-			name: sub_name,
-			..Subreddit::default()
-		},
-		active_flair_filter,
+		sub: cached_sub,
+		top_users,
+		flair_filters,
+		active_flair_filter: active_flair_filter.clone(),
+		active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+		clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 		prefs,
 		url,
+		redirect_url,
+		is_filtered: false,
+		is_flair_subscribed,
 		fragment_url: subreddit_fragment_path(&req),
 		loading_message,
 		placeholder_message,
@@ -1582,9 +1624,16 @@ mod tests {
 				name: "rust".to_string(),
 				..Default::default()
 			},
+			top_users: Vec::new(),
+			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
 			prefs: test_prefs(),
 			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
+			is_filtered: false,
+			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1605,9 +1654,16 @@ mod tests {
 				name: "rust+programming".to_string(),
 				..Default::default()
 			},
+			top_users: Vec::new(),
+			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
 			prefs: test_prefs(),
 			url: "/".to_string(),
+			redirect_url: String::new(),
+			is_filtered: false,
+			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1627,9 +1683,16 @@ mod tests {
 				name: "rust+programming".to_string(),
 				..Default::default()
 			},
+			top_users: Vec::new(),
+			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
 			prefs: test_prefs(),
 			url: "/new".to_string(),
+			redirect_url: String::new(),
+			is_filtered: false,
+			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/new".to_string(),
 			loading_message: loading_message.clone(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1644,7 +1707,7 @@ mod tests {
 	}
 
 	#[test]
-	fn subreddit_shell_does_not_render_subscription_controls() {
+	fn subreddit_shell_keeps_subscription_controls_available() {
 		let mut prefs = test_prefs();
 		prefs.subscriptions = vec!["rust".to_string()];
 
@@ -1653,9 +1716,16 @@ mod tests {
 				name: "rust".to_string(),
 				..Default::default()
 			},
+			top_users: Vec::new(),
+			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
 			prefs,
 			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
+			is_filtered: false,
+			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
@@ -1663,8 +1733,7 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(!html.contains("data-subscription-target=\"subreddit:rust\""));
-		assert!(!html.contains("subreddit_shell_sidebar"));
+		assert!(html.contains("data-subscription-target=\"subreddit:rust\""));
 	}
 
 	#[test]

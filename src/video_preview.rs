@@ -36,7 +36,6 @@ type FrameFuture<'a> = Pin<Box<dyn Future<Output = Result<FrameBlob, String>> + 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoPreviewJobKey {
 	pub media_url: String,
-	pub poster_url: String,
 	pub duration_seconds: i64,
 	pub width: i64,
 	pub height: i64,
@@ -44,7 +43,7 @@ pub struct VideoPreviewJobKey {
 
 impl VideoPreviewJobKey {
 	fn canonical_string(&self) -> String {
-		format!("{}\n{}\n{}\n{}\n{}", self.media_url, self.poster_url, self.duration_seconds, self.width, self.height)
+		format!("{}\n{}\n{}", self.media_url, self.width, self.height)
 	}
 }
 
@@ -241,7 +240,8 @@ struct LeaseRequest {
 	page_origin: String,
 	post_id: String,
 	media_url: String,
-	poster_url: String,
+	#[serde(rename = "poster_url")]
+	_poster_url: String,
 	duration_seconds: i64,
 	width: i64,
 	height: i64,
@@ -289,6 +289,10 @@ pub fn feature_enabled() -> bool {
 
 pub fn init() {
 	if !feature_enabled() {
+		return;
+	}
+
+	if tokio::runtime::Handle::try_current().is_err() {
 		return;
 	}
 
@@ -352,7 +356,6 @@ pub async fn lease(req: Request<Body>) -> Result<Response<Body>, String> {
 	let request: LeaseRequest = parse_json_body(req).await?;
 	let key = VideoPreviewJobKey {
 		media_url: canonicalize_job_url(&request.media_url, &request.page_origin),
-		poster_url: canonicalize_job_url(&request.poster_url, &request.page_origin),
 		duration_seconds: request.duration_seconds,
 		width: request.width,
 		height: request.height,
@@ -499,7 +502,6 @@ fn video_preview_job_key_from_post(post: &Post) -> Option<VideoPreviewJobKey> {
 
 	Some(VideoPreviewJobKey {
 		media_url: canonicalize_job_url(&post.media.video_preview_job_hint, ""),
-		poster_url: canonicalize_job_url(&post.media.poster, ""),
 		duration_seconds: post.media.duration_seconds,
 		width: post.media.width,
 		height: post.media.height,
@@ -1224,7 +1226,6 @@ mod tests {
 		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		let key = VideoPreviewJobKey {
 			media_url: "/vid/test".to_string(),
-			poster_url: "/thumb/test".to_string(),
 			duration_seconds: 30,
 			width: 320,
 			height: 180,
@@ -1265,7 +1266,6 @@ mod tests {
 				JobEntry {
 					key: VideoPreviewJobKey {
 						media_url: format!("/vid/{idx}"),
-						poster_url: String::new(),
 						duration_seconds: 30,
 						width: 320,
 						height: 180,
@@ -1304,7 +1304,6 @@ mod tests {
 		init();
 		let key = VideoPreviewJobKey {
 			media_url: "/vid/test".to_string(),
-			poster_url: String::new(),
 			duration_seconds: 30,
 			width: 320,
 			height: 180,
@@ -1315,7 +1314,7 @@ mod tests {
 			page_origin: "http://127.0.0.1:18082".to_string(),
 			post_id: "abc".to_string(),
 			media_url: "/vid/test".to_string(),
-			poster_url: String::new(),
+			_poster_url: String::new(),
 			duration_seconds: 30,
 			width: 320,
 			height: 180,
@@ -1338,7 +1337,6 @@ mod tests {
 		set_generator(generator.clone());
 		let key = VideoPreviewJobKey {
 			media_url: "http://example.com/video.mp4".to_string(),
-			poster_url: String::new(),
 			duration_seconds: 30,
 			width: 320,
 			height: 180,
@@ -1382,7 +1380,6 @@ mod tests {
 		}));
 		let key = VideoPreviewJobKey {
 			media_url: "http://example.com/video.mp4".to_string(),
-			poster_url: String::new(),
 			duration_seconds: 30,
 			width: 320,
 			height: 180,
@@ -1440,7 +1437,6 @@ mod tests {
 			JobEntry {
 				key: VideoPreviewJobKey {
 					media_url: "/vid/test".to_string(),
-					poster_url: String::new(),
 					duration_seconds: 30,
 					width: 320,
 					height: 180,
@@ -1535,7 +1531,6 @@ mod tests {
 		set_generator(FakeGenerator::successful());
 		let key = VideoPreviewJobKey {
 			media_url: "/vid/test".to_string(),
-			poster_url: String::new(),
 			duration_seconds: 30,
 			width: 320,
 			height: 180,

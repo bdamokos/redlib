@@ -20,20 +20,14 @@
     <div
         id="page_fragment"
         data-fragment-url="{{ fragment_url }}"
+        data-replace-selector="#column_one"
         data-loading-message="{{ loading_message }}"
         data-error-message="Loading the user page is taking longer than expected."
         data-timeout-ms="20000">
         <div id="column_one">
-            <center>Loading posts and profile details...</center>
+            <center>Loading posts...</center>
         </div>
-        <aside>
-            <details class="panel" id="user" open>
-                <summary id="user_label">User</summary>
-                <div id="user_meta">
-                    <h1 id="user_name">u/{{ username }}</h1>
-                </div>
-            </details>
-        </aside>
+        {% include "user_sidebar.html" %}
     </div>
     {% else %}
     {% include "user_fragment.html" %}

@@ -7,7 +7,7 @@ use hyper::header::HeaderValue;
 use hyper::{body, body::Buf, header, Body, Client, Method, Request, Response, Uri};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use libflate::gzip;
-use log::{error, trace, warn};
+use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 
@@ -346,6 +346,9 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 		.request(stream_request)
 		.await
 		.map(|mut res| {
+			let content_type = res.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
+			let content_length = res.headers().get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
+			let range = req.headers().get("Range").and_then(|value| value.to_str().ok()).map(str::to_owned);
 			let mut rm = |key: &str| res.headers_mut().remove(key);
 
 			rm("access-control-expose-headers");
@@ -360,6 +363,8 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 			rm("x-reddit-video-features");
 			rm("Nel");
 			rm("Report-To");
+
+			log_download_diagnostics("proxy_stream", url, res.status(), content_type.as_deref(), content_length, None, range.as_deref());
 
 			res
 		})
@@ -541,6 +546,27 @@ fn debug_logging_enabled() -> bool {
 	std::env::var("REDLIB_DEBUG_LOGGING").map(|value| value.eq_ignore_ascii_case("true")).unwrap_or(false)
 }
 
+fn download_diagnostics_enabled() -> bool {
+	std::env::var("REDLIB_DOWNLOAD_DIAGNOSTICS").map(|value| value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
+fn log_download_diagnostics(category: &str, url_or_path: &str, status: hyper::StatusCode, content_type: Option<&str>, content_length: Option<u64>, actual_bytes: Option<usize>, range: Option<&str>) {
+	if !download_diagnostics_enabled() {
+		return;
+	}
+
+	info!(
+		"download_diagnostics: category={} target={} status={} content_type={} content_length={:?} actual_bytes={:?} range={}",
+		category,
+		url_or_path,
+		status,
+		content_type.unwrap_or(""),
+		content_length,
+		actual_bytes,
+		range.unwrap_or("")
+	);
+}
+
 fn response_preview(text: &str, max_chars: usize) -> String {
 	let mut preview: String = text.chars().take(max_chars).collect();
 	if text.chars().count() > max_chars {
@@ -607,6 +633,11 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 				store_ratelimit_snapshot(snapshot);
 			}
 			let content_type = response.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
+			let content_length = response
+				.headers()
+				.get(header::CONTENT_LENGTH)
+				.and_then(|value| value.to_str().ok())
+				.and_then(|value| value.parse::<u64>().ok());
 			let debug_headers = if debug_logging_enabled() {
 				Some(
 					response
@@ -638,11 +669,14 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 			match hyper::body::to_bytes(response.into_body()).await {
 				Ok(bytes) => {
 					let text = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
+					let actual_bytes = bytes.len();
 
 					// Save response to debug log if debug logging is enabled
 					if let Some(headers) = debug_headers.as_ref() {
 						persist_debug_response(&path, status, headers, &text);
 					}
+
+					log_download_diagnostics("reddit_json", &path, status, content_type.as_deref(), content_length, Some(actual_bytes), None);
 
 					if status == hyper::StatusCode::TOO_MANY_REQUESTS {
 						return Err("Too many requests.".to_string());
@@ -789,56 +823,56 @@ fn test_detects_network_security_block_page() {
 	assert!(!is_network_security_block(hyper::StatusCode::FORBIDDEN, Some("application/json"), "{\"error\":403}",));
 }
 
-	#[test]
-	fn test_response_preview_truncates_and_escapes_newlines() {
-		assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
-	}
+#[test]
+fn test_response_preview_truncates_and_escapes_newlines() {
+	assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
+}
 
-	#[test]
-	fn test_ratelimit_snapshot_wait_counts_down_with_elapsed_time() {
-		let snapshot = RedditRateLimitSnapshot {
-			remaining: Some(0.0),
-			reset_seconds: Some(203.0),
-			used: None,
-			retry_after_seconds: None,
-			status: 429,
-			observed_at: Instant::now() - Duration::from_secs(200),
-		};
+#[test]
+fn test_ratelimit_snapshot_wait_counts_down_with_elapsed_time() {
+	let snapshot = RedditRateLimitSnapshot {
+		remaining: Some(0.0),
+		reset_seconds: Some(203.0),
+		used: None,
+		retry_after_seconds: None,
+		status: 429,
+		observed_at: Instant::now() - Duration::from_secs(200),
+	};
 
-		let wait = snapshot.suggested_wait_duration().expect("expected remaining wait");
-		assert!(wait > Duration::from_secs_f32(2.0));
-		assert!(wait <= Duration::from_secs(3));
-	}
+	let wait = snapshot.suggested_wait_duration().expect("expected remaining wait");
+	assert!(wait > Duration::from_secs_f32(2.0));
+	assert!(wait <= Duration::from_secs(3));
+}
 
-	#[test]
-	fn test_ratelimit_snapshot_stops_waiting_after_reset_elapsed() {
-		let snapshot = RedditRateLimitSnapshot {
-			remaining: Some(0.0),
-			reset_seconds: Some(10.0),
-			used: None,
-			retry_after_seconds: None,
-			status: 429,
-			observed_at: Instant::now() - Duration::from_secs(11),
-		};
+#[test]
+fn test_ratelimit_snapshot_stops_waiting_after_reset_elapsed() {
+	let snapshot = RedditRateLimitSnapshot {
+		remaining: Some(0.0),
+		reset_seconds: Some(10.0),
+		used: None,
+		retry_after_seconds: None,
+		status: 429,
+		observed_at: Instant::now() - Duration::from_secs(11),
+	};
 
-		assert_eq!(snapshot.suggested_wait_duration(), None);
-	}
+	assert_eq!(snapshot.suggested_wait_duration(), None);
+}
 
-	#[test]
-	fn test_retry_after_counts_down_with_elapsed_time() {
-		let snapshot = RedditRateLimitSnapshot {
-			remaining: Some(1.0),
-			reset_seconds: Some(60.0),
-			used: None,
-			retry_after_seconds: Some(10.0),
-			status: 429,
-			observed_at: Instant::now() - Duration::from_secs(7),
-		};
+#[test]
+fn test_retry_after_counts_down_with_elapsed_time() {
+	let snapshot = RedditRateLimitSnapshot {
+		remaining: Some(1.0),
+		reset_seconds: Some(60.0),
+		used: None,
+		retry_after_seconds: Some(10.0),
+		status: 429,
+		observed_at: Instant::now() - Duration::from_secs(7),
+	};
 
-		let wait = snapshot.suggested_wait_duration().expect("expected retry-after wait");
-		assert!(wait > Duration::from_secs_f32(2.0));
-		assert!(wait <= Duration::from_secs(3));
-	}
+	let wait = snapshot.suggested_wait_duration().expect("expected retry-after wait");
+	assert!(wait > Duration::from_secs_f32(2.0));
+	assert!(wait <= Duration::from_secs(3));
+}
 
 #[test]
 fn test_detects_uri_too_long_response() {

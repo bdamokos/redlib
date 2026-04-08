@@ -1,7 +1,7 @@
 use crate::client::{proxy, CLIENT};
 use cached::proc_macro::cached;
-use hyper::{Body, Request, Response};
-use log::warn;
+use hyper::{Body, Method, Request, Response};
+use log::{info, warn};
 use regex::Regex;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
@@ -17,6 +17,7 @@ pub struct RedgifsMediaPaths {
 	video_path: String,
 	poster_path: String,
 	duration_seconds: i64,
+	has_audio: bool,
 }
 
 pub fn is_redgifs_domain(domain: &str) -> bool {
@@ -108,6 +109,26 @@ pub async fn handler(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 }
 
+fn download_diagnostics_enabled() -> bool {
+	std::env::var("REDLIB_DOWNLOAD_DIAGNOSTICS").map(|value| value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
+fn log_redgifs_download(category: &str, target: &str, status: hyper::StatusCode, content_type: Option<&str>, content_length: Option<u64>, actual_bytes: usize) {
+	if !download_diagnostics_enabled() {
+		return;
+	}
+
+	info!(
+		"download_diagnostics: category={} target={} status={} content_type={} content_length={:?} actual_bytes={}",
+		category,
+		target,
+		status,
+		content_type.unwrap_or(""),
+		content_length,
+		actual_bytes
+	);
+}
+
 pub async fn fetch_poster_path(video_id: &str) -> Result<String, String> {
 	fetch_media_paths(video_id.to_string()).await.map(|paths| paths.poster_path)
 }
@@ -139,29 +160,43 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 	let req = create_request(&api_url, Some(&token))?;
 	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
 	let status = res.status();
+	let content_type = res.headers().get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
+	let content_length = res.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
+	log_redgifs_download("redgifs_api", &api_url, status, content_type.as_deref(), content_length, body_bytes.len());
 	if !status.is_success() {
 		let preview = String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>();
 		return Err(format!("RedGifs API returned HTTP {status}: {preview}"));
 	}
 	let json: Value = serde_json::from_slice(&body_bytes).map_err(|err| err.to_string())?;
 
-	let video_path = json["gif"]["urls"]["hd"]
-		.as_str()
-		.or_else(|| json["gif"]["urls"]["sd"].as_str())
-		.and_then(media_path_from_url)
-		.ok_or_else(|| "No video URL in RedGifs response".to_string())?;
+	let has_audio = json["gif"]["hasAudio"].as_bool().unwrap_or(false);
+	let urls = &json["gif"]["urls"];
+	let selected_video_url = if has_audio {
+		urls["hd"]
+			.as_str()
+			.or_else(|| urls["sd"].as_str())
+			.or_else(|| urls["silent"].as_str())
+	} else {
+		urls["silent"]
+			.as_str()
+			.or_else(|| urls["hd"].as_str())
+			.or_else(|| urls["sd"].as_str())
+	};
+	let video_path = selected_video_url.and_then(media_path_from_url).ok_or_else(|| "No video URL in RedGifs response".to_string())?;
 	let poster_path = json["gif"]["urls"]["poster"]
 		.as_str()
 		.or_else(|| json["gif"]["urls"]["thumbnail"].as_str())
 		.and_then(media_path_from_url)
 		.unwrap_or_default();
 	let duration_seconds = json["gif"]["duration"].as_f64().map(|value| value.round() as i64).unwrap_or_default();
+	info!("Selected RedGifs API media for {}: has_audio={} path={}", video_id, has_audio, video_path);
 
 	Ok(RedgifsMediaPaths {
 		video_path,
 		poster_path,
 		duration_seconds,
+		has_audio,
 	})
 }
 
@@ -170,17 +205,34 @@ async fn fetch_media_paths_from_watch_page(video_id: &str) -> Result<RedgifsMedi
 	let req = create_request(&watch_url, None)?;
 	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
 	let status = res.status();
+	let content_type = res.headers().get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
+	let content_length = res.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
+	log_redgifs_download("redgifs_watch_page", &watch_url, status, content_type.as_deref(), content_length, body_bytes.len());
 	if !status.is_success() {
 		let preview = String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>();
 		return Err(format!("RedGifs watch page returned HTTP {status}: {preview}"));
 	}
 
 	let html = String::from_utf8(body_bytes.to_vec()).map_err(|err| err.to_string())?;
-	parse_watch_page_media_paths(&html)
+	parse_watch_page_media_paths(video_id, &html).await
 }
 
-fn parse_watch_page_media_paths(html: &str) -> Result<RedgifsMediaPaths, String> {
+async fn media_url_exists(url: &str) -> bool {
+	if tokio::runtime::Handle::try_current().is_err() {
+		return false;
+	}
+
+	let Ok(req) = create_request_with_method(Method::HEAD, url, None) else {
+		return false;
+	};
+	let Ok(res) = CLIENT.request(req).await else {
+		return false;
+	};
+	res.status().is_success()
+}
+
+async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<RedgifsMediaPaths, String> {
 	let mut og_video = None;
 	let mut twitter_image = None;
 	let mut og_duration = None;
@@ -223,17 +275,25 @@ fn parse_watch_page_media_paths(html: &str) -> Result<RedgifsMediaPaths, String>
 		}
 	}
 
-	let video_path = og_video
-		.as_deref()
-		.and_then(media_path_from_url)
-		.ok_or_else(|| "No video URL in RedGifs watch page".to_string())?;
+	let og_video = og_video.ok_or_else(|| "No video URL in RedGifs watch page".to_string())?;
+	let mut selected_video_url = og_video.clone();
+	let mut has_audio = false;
+	if let Some(non_silent) = og_video.strip_suffix("-silent.mp4").map(|prefix| format!("{prefix}.mp4")) {
+		if media_url_exists(&non_silent).await {
+			selected_video_url = non_silent;
+			has_audio = true;
+		}
+	}
+	let video_path = media_path_from_url(&selected_video_url).ok_or_else(|| "No video URL in RedGifs watch page".to_string())?;
 	let poster_path = twitter_image.as_deref().and_then(media_path_from_url).unwrap_or_default();
 	let duration_seconds = og_duration.map(|value| value.round() as i64).unwrap_or_default();
+	info!("Selected RedGifs watch-page media for {}: has_audio={} path={}", video_id, has_audio, video_path);
 
 	Ok(RedgifsMediaPaths {
 		video_path,
 		poster_path,
 		duration_seconds,
+		has_audio,
 	})
 }
 
@@ -250,9 +310,14 @@ async fn get_token() -> Result<String, String> {
 		}
 	}
 
-	let req = create_request("https://api.redgifs.com/v2/auth/temporary", None)?;
+	let auth_url = "https://api.redgifs.com/v2/auth/temporary";
+	let req = create_request(auth_url, None)?;
 	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
+	let status = res.status();
+	let content_type = res.headers().get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
+	let content_length = res.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
+	log_redgifs_download("redgifs_auth", auth_url, status, content_type.as_deref(), content_length, body_bytes.len());
 	let json: Value = serde_json::from_slice(&body_bytes).map_err(|err| err.to_string())?;
 	let token = json["token"].as_str().ok_or_else(|| "No token in RedGifs response".to_string())?.to_string();
 
@@ -263,7 +328,13 @@ async fn get_token() -> Result<String, String> {
 }
 
 fn create_request(url: &str, token: Option<&str>) -> Result<Request<Body>, String> {
-	let mut builder = Request::get(url)
+	create_request_with_method(Method::GET, url, token)
+}
+
+fn create_request_with_method(method: Method, url: &str, token: Option<&str>) -> Result<Request<Body>, String> {
+	let mut builder = Request::builder()
+		.method(method)
+		.uri(url)
 		.header("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 		.header("referer", "https://www.redgifs.com/")
 		.header("origin", "https://www.redgifs.com")
@@ -288,6 +359,7 @@ fn validate_video_id(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::{is_valid_media_path, media_path_from_url, parse_watch_page_media_paths, watch_path_from_embed_code, watch_path_from_url};
+	use futures_lite::future::block_on;
 
 	#[test]
 	fn extracts_watch_ids_from_supported_urls() {
@@ -347,11 +419,12 @@ mod tests {
 		"#;
 
 		assert_eq!(
-			parse_watch_page_media_paths(html).unwrap(),
+			block_on(parse_watch_page_media_paths("imperturbablelumpyshihtzu", html)).unwrap(),
 			super::RedgifsMediaPaths {
 				video_path: "/redgifs/ImperturbableLumpyShihtzu-silent.mp4".to_string(),
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				duration_seconds: 31,
+				has_audio: false,
 			}
 		);
 	}
@@ -368,11 +441,12 @@ mod tests {
 		"#;
 
 		assert_eq!(
-			parse_watch_page_media_paths(html).unwrap(),
+			block_on(parse_watch_page_media_paths("imperturbablelumpyshihtzu", html)).unwrap(),
 			super::RedgifsMediaPaths {
 				video_path: "/redgifs/ImperturbableLumpyShihtzu.mp4".to_string(),
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				duration_seconds: 0,
+				has_audio: false,
 			}
 		);
 	}

@@ -1,7 +1,9 @@
 use crate::user::collapse_duplicate_submissions;
 use crate::utils::{Post, Preferences};
+use hyper::body::to_bytes;
+use hyper::{Body, Request, Response, StatusCode};
 use log::{info, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -13,6 +15,9 @@ const CACHE_TTL_SECS: u64 = 10_800;
 const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
 const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
+const PERMANENT_FAILURE_BACKOFF_SECS: u64 = 14 * 24 * 60 * 60;
+const ACTIVE_BROWSER_SESSION_TTL_SECS: u64 = 20;
+const ACTIVE_BROWSER_SESSION_PAUSE_POLL_SECS: u64 = 5;
 const DEFAULT_ESTIMATED_POST_INTERVAL_SECS: u64 = 21_600;
 const MIN_ESTIMATED_POST_INTERVAL_SECS: u64 = 60;
 const MAX_ESTIMATED_POST_INTERVAL_SECS: u64 = 86_400;
@@ -28,6 +33,25 @@ const FRESH_RECENT_SECONDS: i64 = 6 * 60 * 60;
 const FRESH_CUTOFF_SECONDS: i64 = 24 * 60 * 60;
 const MID_CUTOFF_SECONDS: i64 = 48 * 60 * 60;
 pub const POSTS_PER_PAGE: usize = 25;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BrowserSessionHeartbeatRequest {
+	pub session_id: String,
+	pub path: String,
+	pub visible: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BrowserSessionReleaseRequest {
+	pub session_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBrowserSession {
+	path: String,
+	visible: bool,
+	last_seen: Instant,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FeedSource {
@@ -102,6 +126,13 @@ pub enum RefreshOrigin {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RememberedFailureDisposition {
+	Transient,
+	Permanent,
+	Banned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionSourceState {
 	Unstarted,
 	Fetching,
@@ -168,6 +199,7 @@ enum SessionWarmMode {
 static SOURCE_CACHE: LazyLock<Mutex<HashMap<String, CachedSourcePosts>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn source_cache_is_expired(entry: &CachedSourcePosts) -> bool {
 	entry.fetched_at.elapsed().as_secs() > CACHE_TTL_SECS
@@ -201,6 +233,25 @@ fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 		estimated_post_interval_secs: DEFAULT_ESTIMATED_POST_INTERVAL_SECS,
 		refresh_in_flight: false,
 	}
+}
+
+fn prune_active_browser_sessions_locked(sessions: &mut HashMap<String, ActiveBrowserSession>) {
+	let now = Instant::now();
+	sessions.retain(|_, session| {
+		session.visible && now.duration_since(session.last_seen).as_secs() <= ACTIVE_BROWSER_SESSION_TTL_SECS
+	});
+}
+
+fn active_browser_session_paths() -> Vec<String> {
+	let Ok(mut sessions) = ACTIVE_BROWSER_SESSIONS.lock() else {
+		return Vec::new();
+	};
+	prune_active_browser_sessions_locked(&mut sessions);
+	sessions.values().map(|session| session.path.clone()).collect()
+}
+
+pub fn has_active_browser_sessions() -> bool {
+	!active_browser_session_paths().is_empty()
 }
 
 pub fn remember_subreddit_request(subreddit: &str) {
@@ -372,9 +423,15 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	};
 
 	crate::utils::store_post_flairs(&posts);
-	store_source_posts_with_origin(&FeedSource::Subreddit { name: normalized.clone() }, posts.clone(), after, Some(refresh_origin));
+	store_source_posts_with_origin(
+		&FeedSource::Subreddit { name: normalized.clone() },
+		posts.clone(),
+		after.clone(),
+		Some(refresh_origin),
+	);
 	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
 		crate::video_preview::prewarm_listing_video_previews(&posts);
+		spawn_author_link_prefetch(posts.clone());
 	}
 
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
@@ -388,11 +445,31 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	entry.consecutive_failures = 0;
 	entry.estimated_post_interval_secs = estimate_post_interval_secs(&posts, entry.estimated_post_interval_secs);
 	entry.refresh_in_flight = false;
+	info!(
+		"post_cache: plain subreddit refresh succeeded for {} via {:?}: {} posts, after_present={}",
+		entry.name,
+		refresh_origin,
+		posts.len(),
+		!after.is_empty()
+	);
 }
 
-fn refresh_failure_is_banned(error: &str) -> bool {
+fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
 	let normalized = error.trim().to_ascii_lowercase();
-	normalized == "banned" || normalized.contains("banned")
+	if normalized == "banned" || normalized.contains("banned") {
+		RememberedFailureDisposition::Banned
+	} else if normalized == "private"
+		|| normalized.contains("private")
+		|| normalized == "gated"
+		|| normalized.contains("gated")
+		|| normalized.contains("404")
+		|| normalized.contains("not found")
+		|| normalized.contains("no posts found")
+	{
+		RememberedFailureDisposition::Permanent
+	} else {
+		RememberedFailureDisposition::Transient
+	}
 }
 
 pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refresh_origin: RefreshOrigin) {
@@ -407,8 +484,14 @@ pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refr
 	};
 
 	entry.last_refresh_failed_at = Some(now);
-	if refresh_failure_is_banned(error) {
-		entry.banned_until = Some(now + Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
+	match refresh_failure_disposition(error) {
+		RememberedFailureDisposition::Banned => {
+			entry.banned_until = Some(now + Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
+		}
+		RememberedFailureDisposition::Permanent => {
+			entry.banned_until = Some(now + Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
+		}
+		RememberedFailureDisposition::Transient => {}
 	}
 	entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
 	entry.refresh_in_flight = false;
@@ -440,6 +523,64 @@ pub fn cleanup_decayed_remembered_subreddits() {
 	}
 }
 
+async fn parse_json_body<T: serde::de::DeserializeOwned>(req: Request<Body>) -> Result<T, String> {
+	let body = to_bytes(req.into_body()).await.map_err(|err| err.to_string())?;
+	serde_json::from_slice(&body).map_err(|err| err.to_string())
+}
+
+fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> Result<Response<Body>, String> {
+	let body = serde_json::to_vec(payload).map_err(|err| err.to_string())?;
+	Response::builder()
+		.status(status)
+		.header("content-type", "application/json")
+		.header("cache-control", "no-store")
+		.body(Body::from(body))
+		.map_err(|err| err.to_string())
+}
+
+pub async fn browser_session_heartbeat(req: Request<Body>) -> Result<Response<Body>, String> {
+	let request: BrowserSessionHeartbeatRequest = parse_json_body(req).await?;
+	if request.session_id.trim().is_empty() {
+		return json_response(StatusCode::BAD_REQUEST, &serde_json::json!({ "ok": false, "message": "missing session_id" }));
+	}
+
+	if let Ok(mut sessions) = ACTIVE_BROWSER_SESSIONS.lock() {
+		prune_active_browser_sessions_locked(&mut sessions);
+		if request.visible {
+			sessions.insert(
+				request.session_id,
+				ActiveBrowserSession {
+					path: request.path,
+					visible: true,
+					last_seen: Instant::now(),
+				},
+			);
+		} else {
+			sessions.remove(request.session_id.trim());
+		}
+	}
+
+	json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+pub async fn browser_session_release(req: Request<Body>) -> Result<Response<Body>, String> {
+	let request: BrowserSessionReleaseRequest = parse_json_body(req).await?;
+	if let Ok(mut sessions) = ACTIVE_BROWSER_SESSIONS.lock() {
+		sessions.remove(request.session_id.trim());
+	}
+	json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+fn spawn_author_link_prefetch(posts: Vec<Post>) {
+	if tokio::runtime::Handle::try_current().is_err() {
+		return;
+	}
+
+	tokio::spawn(async move {
+		crate::utils::prefetch_post_author_links(&posts).await;
+	});
+}
+
 pub fn pick_next_remembered_subreddit_to_refresh() -> Option<String> {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let mut entries = remembered
@@ -456,18 +597,31 @@ async fn refresh_remembered_subreddit(subreddit: &str) {
 	let listing_path = format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"));
 	let listing_result = Post::fetch(&listing_path, false).await;
 	let metadata_result = crate::subreddit::refresh_subreddit_metadata(subreddit, false).await;
+	let metadata_error = metadata_result.as_ref().err().cloned();
 
 	match listing_result {
 		Ok((posts, after)) => {
 			publish_plain_subreddit_refresh(subreddit, posts, after, RefreshOrigin::Daemon);
 		}
 		Err(error) => {
-			record_plain_subreddit_refresh_failure(subreddit, &error, RefreshOrigin::Daemon);
+			let failure = metadata_error.as_deref().unwrap_or(error.as_str());
+			record_plain_subreddit_refresh_failure(subreddit, failure, RefreshOrigin::Daemon);
 		}
 	}
 
-	if let Err(error) = metadata_result {
-		warn!("post_cache: failed to refresh metadata for {} via {:?}: {}", subreddit, RefreshOrigin::Daemon, error);
+	match metadata_result {
+		Ok(metadata) => {
+			info!(
+				"post_cache: refreshed metadata for {} via {:?}: title={}, nsfw={}",
+				subreddit,
+				RefreshOrigin::Daemon,
+				metadata.title,
+				metadata.nsfw
+			);
+		}
+		Err(error) => {
+			warn!("post_cache: failed to refresh metadata for {} via {:?}: {}", subreddit, RefreshOrigin::Daemon, error);
+		}
 	}
 }
 
@@ -476,10 +630,31 @@ pub fn spawn_remembered_subreddit_daemon() {
 		let mut interval = tokio::time::interval(Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
 		interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 		interval.tick().await;
+		let mut was_paused = false;
 
 		loop {
 			interval.tick().await;
 			cleanup_decayed_remembered_subreddits();
+			loop {
+				let active_paths = active_browser_session_paths();
+				if active_paths.is_empty() {
+					if was_paused {
+						info!("post_cache: remembered subreddit daemon resumed after active browser sessions ended");
+						was_paused = false;
+					}
+					break;
+				}
+				if !was_paused {
+					info!(
+						"post_cache: remembered subreddit daemon paused while {} visible browser session(s) are active: {}",
+						active_paths.len(),
+						active_paths.join(", ")
+					);
+					was_paused = true;
+				}
+				tokio::time::sleep(Duration::from_secs(ACTIVE_BROWSER_SESSION_PAUSE_POLL_SECS)).await;
+				cleanup_decayed_remembered_subreddits();
+			}
 
 			let Some(subreddit) = pick_next_remembered_subreddit_to_refresh() else {
 				continue;
@@ -593,6 +768,11 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		}
 	};
 	let posts = source.filter_posts(posts);
+	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession)
+		&& !matches!(&source, FeedSource::Subreddit { name } if !name.starts_with("u_"))
+	{
+		spawn_author_link_prefetch(posts.clone());
+	}
 
 	match &source {
 		FeedSource::Subreddit { name } if !name.starts_with("u_") => {
@@ -1372,13 +1552,14 @@ pub fn cache_stats() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources, count_sources_in_state, feed_page,
-		feed_status, followup_sync_source_budget, get_cached_source_page, initial_sync_source_target, mark_fetching_sources_failed, max_sync_source_budget,
-		merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh, reconcile_session_with_source_cache,
-		record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, round_robin_source_target,
-		session_status_from_posts, sort_sources, source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, FeedSession,
-		FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, CACHE_TTL_SECS, FEED_SESSIONS,
-		POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		active_browser_session_paths, active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources,
+		count_sources_in_state, feed_page, feed_status, followup_sync_source_budget, get_cached_source_page, has_active_browser_sessions, initial_sync_source_target, mark_fetching_sources_failed,
+		max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh,
+		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request,
+		remembered_refresh_priority, round_robin_source_target, session_status_from_posts, sort_sources, source_cache_is_servable, store_source_posts,
+		store_source_posts_with_origin, sync_sources_to_request, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin,
+		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
+		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use std::cmp::Ordering;
@@ -1396,6 +1577,7 @@ mod tests {
 		SOURCE_CACHE.lock().unwrap().clear();
 		FEED_SESSIONS.lock().unwrap().clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
+		ACTIVE_BROWSER_SESSIONS.lock().unwrap().clear();
 	}
 
 	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {
@@ -1693,6 +1875,98 @@ mod tests {
 		assert_eq!(entry.consecutive_failures, 1);
 		assert!(entry.last_refresh_failed_at.is_some());
 		assert!(!entry.refresh_in_flight);
+	}
+
+	#[test]
+	fn failure_recording_uses_long_backoff_for_permanent_failures() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		record_plain_subreddit_refresh_failure("rust", "404 not found", RefreshOrigin::Daemon);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("rust").unwrap();
+		let banned_until = entry.banned_until.expect("permanent backoff");
+		let remaining = banned_until.saturating_duration_since(Instant::now());
+		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
+		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
+	}
+
+	#[test]
+	fn failure_recording_uses_banned_backoff_for_banned_subreddits() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		record_plain_subreddit_refresh_failure("rust", "banned", RefreshOrigin::Daemon);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("rust").unwrap();
+		let banned_until = entry.banned_until.expect("banned backoff");
+		let remaining = banned_until.saturating_duration_since(Instant::now());
+		assert!(remaining <= Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
+		assert!(remaining > Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS.saturating_sub(5)));
+	}
+
+	#[test]
+	fn active_browser_sessions_expire_after_ttl() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		ACTIVE_BROWSER_SESSIONS.lock().unwrap().insert(
+			"visible".to_string(),
+			ActiveBrowserSession {
+				path: "/r/rust".to_string(),
+				visible: true,
+				last_seen: Instant::now() - Duration::from_secs(ACTIVE_BROWSER_SESSION_TTL_SECS + 1),
+			},
+		);
+
+		assert!(!has_active_browser_sessions());
+		assert!(ACTIVE_BROWSER_SESSIONS.lock().unwrap().is_empty());
+	}
+
+	#[test]
+	fn hidden_browser_sessions_do_not_pause_daemon() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		ACTIVE_BROWSER_SESSIONS.lock().unwrap().insert(
+			"hidden".to_string(),
+			ActiveBrowserSession {
+				path: "/r/rust".to_string(),
+				visible: false,
+				last_seen: Instant::now(),
+			},
+		);
+
+		assert!(!has_active_browser_sessions());
+		assert!(ACTIVE_BROWSER_SESSIONS.lock().unwrap().is_empty());
+	}
+
+	#[test]
+	fn visible_browser_sessions_pause_daemon_until_they_expire() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		ACTIVE_BROWSER_SESSIONS.lock().unwrap().insert(
+			"visible".to_string(),
+			ActiveBrowserSession {
+				path: "/r/rust".to_string(),
+				visible: true,
+				last_seen: Instant::now(),
+			},
+		);
+
+		assert!(has_active_browser_sessions());
+		assert_eq!(active_browser_session_paths(), vec!["/r/rust".to_string()]);
+
+		ACTIVE_BROWSER_SESSIONS.lock().unwrap().get_mut("visible").unwrap().last_seen =
+			Instant::now() - Duration::from_secs(ACTIVE_BROWSER_SESSION_TTL_SECS + 1);
+
+		assert!(!has_active_browser_sessions());
+		assert!(active_browser_session_paths().is_empty());
 	}
 
 	#[test]
