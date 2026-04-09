@@ -590,20 +590,17 @@ async fn refresh_remembered_subreddit(subreddit: &str) {
 	mark_plain_subreddit_refresh_started(subreddit);
 	let listing_path = format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"));
 	let listing_result = Post::fetch(&listing_path, false).await;
-	let metadata_result = crate::subreddit::refresh_subreddit_metadata(subreddit, false).await;
-	let metadata_error = metadata_result.as_ref().err().cloned();
 
 	match listing_result {
 		Ok((posts, after)) => {
 			publish_plain_subreddit_refresh(subreddit, posts, after, RefreshOrigin::Daemon);
 		}
 		Err(error) => {
-			let failure = metadata_error.as_deref().unwrap_or(error.as_str());
-			record_plain_subreddit_refresh_failure(subreddit, failure, RefreshOrigin::Daemon);
+			record_plain_subreddit_refresh_failure(subreddit, &error, RefreshOrigin::Daemon);
 		}
 	}
 
-	match metadata_result {
+	match crate::subreddit::refresh_subreddit_metadata(subreddit, false).await {
 		Ok(metadata) => {
 			info!(
 				"post_cache: refreshed metadata for {} via {:?}: title={}, nsfw={}",
