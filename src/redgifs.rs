@@ -110,7 +110,9 @@ pub async fn handler(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 fn download_diagnostics_enabled() -> bool {
-	std::env::var("REDLIB_DOWNLOAD_DIAGNOSTICS").map(|value| value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true")).unwrap_or(false)
+	std::env::var("REDLIB_DOWNLOAD_DIAGNOSTICS")
+		.map(|value| value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
+		.unwrap_or(false)
 }
 
 fn log_redgifs_download(category: &str, target: &str, status: hyper::StatusCode, content_type: Option<&str>, content_length: Option<u64>, actual_bytes: usize) {
@@ -161,7 +163,11 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
 	let status = res.status();
 	let content_type = res.headers().get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
-	let content_length = res.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
+	let content_length = res
+		.headers()
+		.get("content-length")
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<u64>().ok());
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
 	log_redgifs_download("redgifs_api", &api_url, status, content_type.as_deref(), content_length, body_bytes.len());
 	if !status.is_success() {
@@ -173,17 +179,13 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 	let has_audio = json["gif"]["hasAudio"].as_bool().unwrap_or(false);
 	let urls = &json["gif"]["urls"];
 	let selected_video_url = if has_audio {
-		urls["hd"]
-			.as_str()
-			.or_else(|| urls["sd"].as_str())
-			.or_else(|| urls["silent"].as_str())
+		urls["hd"].as_str().or_else(|| urls["sd"].as_str()).or_else(|| urls["silent"].as_str())
 	} else {
-		urls["silent"]
-			.as_str()
-			.or_else(|| urls["hd"].as_str())
-			.or_else(|| urls["sd"].as_str())
+		urls["silent"].as_str().or_else(|| urls["hd"].as_str()).or_else(|| urls["sd"].as_str())
 	};
-	let video_path = selected_video_url.and_then(media_path_from_url).ok_or_else(|| "No video URL in RedGifs response".to_string())?;
+	let video_path = selected_video_url
+		.and_then(media_path_from_url)
+		.ok_or_else(|| "No video URL in RedGifs response".to_string())?;
 	let poster_path = json["gif"]["urls"]["poster"]
 		.as_str()
 		.or_else(|| json["gif"]["urls"]["thumbnail"].as_str())
@@ -206,7 +208,11 @@ async fn fetch_media_paths_from_watch_page(video_id: &str) -> Result<RedgifsMedi
 	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
 	let status = res.status();
 	let content_type = res.headers().get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
-	let content_length = res.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
+	let content_length = res
+		.headers()
+		.get("content-length")
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<u64>().ok());
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
 	log_redgifs_download("redgifs_watch_page", &watch_url, status, content_type.as_deref(), content_length, body_bytes.len());
 	if !status.is_success() {
@@ -315,7 +321,11 @@ async fn get_token() -> Result<String, String> {
 	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
 	let status = res.status();
 	let content_type = res.headers().get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
-	let content_length = res.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
+	let content_length = res
+		.headers()
+		.get("content-length")
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<u64>().ok());
 	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
 	log_redgifs_download("redgifs_auth", auth_url, status, content_type.as_deref(), content_length, body_bytes.len());
 	let json: Value = serde_json::from_slice(&body_bytes).map_err(|err| err.to_string())?;

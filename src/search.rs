@@ -116,7 +116,8 @@ fn search_current_url(req: &Request<Body>) -> String {
 	}
 }
 
-fn render_search_fragment(template_data: &SearchFragmentTemplate) -> Result<Response<Body>, String> {
+fn render_search_fragment(mut template_data: SearchFragmentTemplate) -> Result<Response<Body>, String> {
+	utils::refresh_post_times(&mut template_data.posts);
 	let body = template_data.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)
@@ -237,7 +238,7 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if sub.split('+').all(|s| filters.contains(s)) {
-		render_search_fragment(&SearchFragmentTemplate {
+		render_search_fragment(SearchFragmentTemplate {
 			posts: Vec::new(),
 			subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
 			sub,
@@ -258,7 +259,7 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				utils::hydrate_post_author_links_from_cache(&mut posts);
-				render_search_fragment(&SearchFragmentTemplate {
+				render_search_fragment(SearchFragmentTemplate {
 					posts,
 					subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
 					sub,

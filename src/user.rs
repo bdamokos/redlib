@@ -378,6 +378,7 @@ pub(crate) fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicat
 		permalink: post.permalink,
 		community: post.community.clone(),
 		display_community: display_community(&post.community),
+		created_ts: post.created_ts,
 		rel_time: post.rel_time,
 		comments: post.comments,
 		flair: post.flair,
@@ -756,6 +757,7 @@ mod tests {
 				permalink: "/r/other_one/comments/one/".to_string(),
 				community: "other_one".to_string(),
 				display_community: "r/other_one".to_string(),
+				created_ts: 0,
 				rel_time: "2h ago".to_string(),
 				comments: ("12".to_string(), "12".to_string()),
 				flair: Flair {
@@ -773,6 +775,7 @@ mod tests {
 				permalink: "/r/other_two/comments/two/".to_string(),
 				community: "other_two".to_string(),
 				display_community: "r/other_two".to_string(),
+				created_ts: 0,
 				rel_time: "3h ago".to_string(),
 				comments: ("1".to_string(), "1".to_string()),
 				flair: Flair {
@@ -995,6 +998,7 @@ mod tests {
 			permalink: "/r/other_sub/comments/two/".to_string(),
 			community: "other_sub".to_string(),
 			display_community: "r/other_sub".to_string(),
+			created_ts: 0,
 			rel_time: "1h ago".to_string(),
 			comments: ("1".to_string(), "1".to_string()),
 			flair: Flair {
@@ -1430,6 +1434,8 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		}
 	};
 
+	let mut fragment = fragment;
+	utils::refresh_post_times(&mut fragment.posts);
 	let body = fragment.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)

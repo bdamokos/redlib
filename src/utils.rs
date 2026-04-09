@@ -578,6 +578,7 @@ pub struct CollapsedDuplicate {
 	pub permalink: String,
 	pub community: String,
 	pub display_community: String,
+	pub created_ts: u64,
 	pub rel_time: String,
 	pub comments: (String, String),
 	pub flair: Flair,
@@ -1701,6 +1702,26 @@ pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, b
 		let la: u64 = posts.len().try_into().unwrap_or(0);
 
 		(lb - la, posts.is_empty())
+	}
+}
+
+pub fn refresh_post_time(post: &mut Post) {
+	if post.created_ts > 0 {
+		let (rel_time, created) = time(post.created_ts as f64);
+		post.rel_time = rel_time;
+		post.created = created;
+	}
+
+	for duplicate in &mut post.collapsed_duplicates {
+		if duplicate.created_ts > 0 {
+			duplicate.rel_time = time(duplicate.created_ts as f64).0;
+		}
+	}
+}
+
+pub fn refresh_post_times(posts: &mut [Post]) {
+	for post in posts {
+		refresh_post_time(post);
 	}
 }
 
@@ -2969,11 +2990,13 @@ mod tests {
 	use super::{
 		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
 		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
-		read_sharded_cookie, rewrite_urls, user_profile_details, write_sharded_cookie, ExternalLink, FlairSubscription, Preferences,
+		read_sharded_cookie, refresh_post_times, rewrite_urls, time, user_profile_details, write_sharded_cookie, Author, Awards, ExternalLink, Flair, FlairSubscription,
+		Flags, Media, Post, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
 	use serde_json::json;
+	use time::OffsetDateTime;
 
 	async fn always_exists(_: String) -> bool {
 		true
@@ -2986,6 +3009,65 @@ mod tests {
 		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
 		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
 		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
+	}
+
+	#[test]
+	fn refresh_post_times_recomputes_stale_relative_labels() {
+		let created_ts = (OffsetDateTime::now_utc().unix_timestamp() - 2 * 60 * 60) as u64;
+		let mut posts = vec![Post {
+			id: "demo".to_string(),
+			kind: "t3".to_string(),
+			title: "Demo".to_string(),
+			community: "demo_sub".to_string(),
+			body: String::new(),
+			author: Author {
+				name: "demo_user".to_string(),
+				flair: Flair {
+					flair_parts: Vec::new(),
+					text: String::new(),
+					background_color: String::new(),
+					foreground_color: String::new(),
+				},
+				distinguished: String::new(),
+				external_links: Vec::new(),
+				avg_video_length: None,
+			},
+			permalink: "/r/demo_sub/comments/demo/".to_string(),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			poll: None,
+			score: ("1".to_string(), "1".to_string()),
+			upvote_ratio: 100,
+			post_type: "self".to_string(),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+			flags: Flags::new(false, false, false),
+			thumbnail: Media::empty(),
+			media: Media::empty(),
+			domain: String::new(),
+			rel_time: "1m ago".to_string(),
+			created: String::new(),
+			created_ts,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
+		}];
+
+		refresh_post_times(&mut posts);
+
+		assert_eq!(posts[0].rel_time, time(created_ts as f64).0);
+		assert_eq!(posts[0].created, time(created_ts as f64).1);
 	}
 
 	#[test]

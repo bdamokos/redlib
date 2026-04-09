@@ -431,7 +431,8 @@ fn subreddit_fragment_path(req: &Request<Body>) -> String {
 	}
 }
 
-fn render_feed_fragment(template_data: &FeedFragmentTemplate) -> Result<Response<Body>, String> {
+fn render_feed_fragment(mut template_data: FeedFragmentTemplate) -> Result<Response<Body>, String> {
+	utils::refresh_post_times(&mut template_data.posts);
 	let body = template_data.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)
@@ -440,7 +441,8 @@ fn render_feed_fragment(template_data: &FeedFragmentTemplate) -> Result<Response
 		.map_err(|error| error.to_string())
 }
 
-fn render_subreddit_fragment(template_data: &SubredditFragmentTemplate) -> Result<Response<Body>, String> {
+fn render_subreddit_fragment(mut template_data: SubredditFragmentTemplate) -> Result<Response<Body>, String> {
+	utils::refresh_post_times(&mut template_data.posts);
 	let body = template_data.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)
@@ -1121,7 +1123,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
-		render_subreddit_fragment(&SubredditFragmentTemplate {
+		render_subreddit_fragment(SubredditFragmentTemplate {
 			sub,
 			posts: Vec::new(),
 			top_users,
@@ -1208,7 +1210,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					String::new()
 				};
 
-				return render_subreddit_fragment(&SubredditFragmentTemplate {
+				return render_subreddit_fragment(SubredditFragmentTemplate {
 					sub,
 					posts: page.posts,
 					top_users,
@@ -1269,7 +1271,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					warn!("Aggregate front page rendered without posts after partial failures");
 				}
 
-				render_subreddit_fragment(&SubredditFragmentTemplate {
+				render_subreddit_fragment(SubredditFragmentTemplate {
 					sub,
 					posts: feed.posts,
 					top_users,
@@ -1321,7 +1323,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				String::new()
 			};
 
-			return render_subreddit_fragment(&SubredditFragmentTemplate {
+			return render_subreddit_fragment(SubredditFragmentTemplate {
 				sub,
 				posts,
 				top_users,
@@ -1378,7 +1380,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				utils::hydrate_post_author_links_from_cache(&mut posts);
 				let timeframe = param(&path, "t").unwrap_or_default();
 				let before = param(&path, "before").unwrap_or_default();
-				render_subreddit_fragment(&SubredditFragmentTemplate {
+				render_subreddit_fragment(SubredditFragmentTemplate {
 					sub,
 					posts,
 					top_users: if is_single_sub {
@@ -2369,7 +2371,7 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let no_posts = page_ready && feed_page.posts.is_empty();
 	let all_posts_hidden_nsfw = !no_posts && (feed_page.posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 
-	render_feed_fragment(&FeedFragmentTemplate {
+	render_feed_fragment(FeedFragmentTemplate {
 		posts: feed_page.posts,
 		prev_page_url,
 		next_page_url,
