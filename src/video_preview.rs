@@ -719,6 +719,10 @@ fn upsert_prewarm_job(key: VideoPreviewJobKey) -> (String, bool) {
 	let mut queue_enqueued = false;
 
 	if let Ok(mut jobs) = VIDEO_PREVIEW_JOBS.lock() {
+		let can_enqueue_new_prewarm = VIDEO_PREVIEW_FRAMES
+			.lock()
+			.ok()
+			.is_none_or(|cache| prewarm_has_ready_capacity_locked(&jobs, &cache));
 		let entry = jobs.entry(job_id.clone()).or_insert_with(|| JobEntry {
 			key: key.clone(),
 			state: VideoPreviewJobState::Pending,
@@ -734,13 +738,15 @@ fn upsert_prewarm_job(key: VideoPreviewJobKey) -> (String, bool) {
 			VideoPreviewJobState::Ready { expires_at, .. } if *expires_at > now => {}
 			VideoPreviewJobState::Failed { retry_after, .. } if *retry_after > now => {}
 			VideoPreviewJobState::Running { .. } | VideoPreviewJobState::Pending => {
-				if !entry.queued {
+				if !entry.queued && can_enqueue_new_prewarm {
 					queue_enqueued = enqueue_job_locked(&job_id, entry);
 				}
 			}
 			_ => {
-				entry.state = VideoPreviewJobState::Pending;
-				queue_enqueued = enqueue_job_locked(&job_id, entry);
+				if can_enqueue_new_prewarm {
+					entry.state = VideoPreviewJobState::Pending;
+					queue_enqueued = enqueue_job_locked(&job_id, entry);
+				}
 			}
 		}
 	}
@@ -1137,6 +1143,10 @@ fn evict_ready_jobs_locked(jobs: &mut HashMap<String, JobEntry>, cache: &mut Fra
 
 fn ready_job_count(jobs: &HashMap<String, JobEntry>) -> usize {
 	jobs.values().filter(|job| matches!(job.state, VideoPreviewJobState::Ready { .. })).count()
+}
+
+fn prewarm_has_ready_capacity_locked(jobs: &HashMap<String, JobEntry>, cache: &FrameCache) -> bool {
+	ready_job_count(jobs) < *MAX_READY_JOBS && cache.total_bytes < *MAX_BYTES
 }
 
 async fn parse_json_body<T: DeserializeOwned>(req: Request<Body>) -> Result<T, String> {
@@ -1608,6 +1618,65 @@ mod tests {
 		let jobs = VIDEO_PREVIEW_JOBS.lock().unwrap();
 		assert_eq!(jobs.len(), 5);
 		assert!(jobs.values().all(|job| job.prewarm_until.is_some()));
+	}
+
+	#[tokio::test]
+	async fn prewarm_listing_does_not_enqueue_when_ready_cache_is_full() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		reset_state_for_tests();
+		init();
+
+		let now = Instant::now();
+		{
+			let mut jobs = VIDEO_PREVIEW_JOBS.lock().unwrap();
+			let mut cache = VIDEO_PREVIEW_FRAMES.lock().unwrap();
+			for idx in 0..*MAX_READY_JOBS {
+				let job_id = format!("ready-{idx}");
+				jobs.insert(
+					job_id.clone(),
+					JobEntry {
+						key: VideoPreviewJobKey {
+							media_url: format!("/vid/{idx}"),
+							duration_seconds: 30,
+							width: 320,
+							height: 180,
+						},
+						state: VideoPreviewJobState::Ready {
+							frames: vec![VideoPreviewFrame {
+								index: 0,
+								timestamp_seconds: 1,
+								image_path: format!("/api/video-previews/{job_id}/frame/0"),
+								width: 320,
+								height: 180,
+							}],
+							expires_at: now + DEFAULT_READY_TTL,
+						},
+						queued: false,
+						last_accessed: now,
+						prewarm_until: None,
+					},
+				);
+				cache.total_bytes += 10;
+				cache.blobs.insert(
+					frame_cache_key(&job_id, 0),
+					FrameBlob {
+						content_type: "image/jpeg",
+						bytes: vec![0; 10],
+					},
+				);
+			}
+		}
+
+		let posts = vec![preview_enabled_post("post-blocked", "/vid/demo/blocked")];
+		prewarm_listing_video_previews(&posts);
+
+		let jobs = VIDEO_PREVIEW_JOBS.lock().unwrap();
+		let blocked_job = jobs
+			.values()
+			.find(|job| job.key.media_url == "/vid/demo/blocked")
+			.expect("expected blocked prewarm job to be tracked");
+		assert!(!blocked_job.queued);
+		assert!(matches!(blocked_job.state, VideoPreviewJobState::Pending));
 	}
 
 	#[tokio::test]
