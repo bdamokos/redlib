@@ -14,8 +14,6 @@ use tokio::time::{Duration, MissedTickBehavior};
 const CACHE_TTL_SECS: u64 = 10_800;
 const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
-const REMEMBERED_SUBREDDIT_DAEMON_PAUSE_AFTER_NON_DAEMON_API_SECS: u64 = 2 * 60;
-const REMEMBERED_SUBREDDIT_DAEMON_PAUSE_POLL_SECS: u64 = 5;
 const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
 const PERMANENT_FAILURE_BACKOFF_SECS: u64 = 14 * 24 * 60 * 60;
 const ACTIVE_BROWSER_SESSION_TTL_SECS: u64 = 20;
@@ -616,46 +614,15 @@ async fn refresh_remembered_subreddit(subreddit: &str) {
 	}
 }
 
-fn remembered_subreddit_daemon_pause_remaining() -> Option<Duration> {
-	let last_non_daemon_call = crate::client::latest_non_daemon_reddit_api_call_at()?;
-	let pause_window = Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_PAUSE_AFTER_NON_DAEMON_API_SECS);
-	let elapsed = last_non_daemon_call.elapsed();
-	if elapsed < pause_window {
-		Some(pause_window - elapsed)
-	} else {
-		None
-	}
-}
-
 pub fn spawn_remembered_subreddit_daemon() {
 	tokio::spawn(async {
 		let mut interval = tokio::time::interval(Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
 		interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 		interval.tick().await;
-		let mut was_paused = false;
 
 		loop {
 			interval.tick().await;
 			cleanup_decayed_remembered_subreddits();
-			loop {
-				let Some(pause_remaining) = remembered_subreddit_daemon_pause_remaining() else {
-					if was_paused {
-						info!("post_cache: remembered subreddit daemon resumed after 2 minutes without non-daemon Reddit API activity");
-						was_paused = false;
-					}
-					break;
-				};
-
-				if !was_paused {
-					info!(
-						"post_cache: remembered subreddit daemon paused for 2 minutes after a non-daemon Reddit API call ({}s remaining)",
-						pause_remaining.as_secs().max(1)
-					);
-					was_paused = true;
-				}
-				tokio::time::sleep(pause_remaining.min(Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_PAUSE_POLL_SECS))).await;
-				cleanup_decayed_remembered_subreddits();
-			}
 
 			let Some(subreddit) = pick_next_remembered_subreddit_to_refresh() else {
 				continue;
@@ -669,7 +636,7 @@ pub fn spawn_remembered_subreddit_daemon() {
 				continue;
 			}
 
-			crate::client::with_daemon_reddit_api_origin(refresh_remembered_subreddit(&subreddit)).await;
+			refresh_remembered_subreddit(&subreddit).await;
 		}
 	});
 }
@@ -1555,11 +1522,10 @@ mod tests {
 		count_sources_in_state, feed_page, feed_status, followup_sync_source_budget, get_cached_source_page, has_active_browser_sessions, initial_sync_source_target,
 		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
 		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request,
-		remembered_refresh_priority, remembered_subreddit_daemon_pause_remaining, round_robin_source_target, session_status_from_posts, sort_sources, source_cache_is_servable,
-		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin,
-		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
-		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_PAUSE_AFTER_NON_DAEMON_API_SECS,
-		SOURCE_CACHE,
+		remembered_refresh_priority, round_robin_source_target, session_status_from_posts, sort_sources, source_cache_is_servable, store_source_posts,
+		store_source_posts_with_origin, sync_sources_to_request, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry,
+		SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS,
+		FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use std::cmp::Ordering;
@@ -1578,7 +1544,6 @@ mod tests {
 		FEED_SESSIONS.lock().unwrap().clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap().clear();
-		crate::client::set_last_non_daemon_reddit_api_call_at_for_tests(None);
 	}
 
 	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {
@@ -1967,31 +1932,6 @@ mod tests {
 
 		assert!(!has_active_browser_sessions());
 		assert!(active_browser_session_paths().is_empty());
-	}
-
-	#[test]
-	fn recent_non_daemon_api_activity_pauses_remembered_subreddit_daemon() {
-		let _guard = test_lock();
-		reset_test_caches();
-
-		crate::client::set_last_non_daemon_reddit_api_call_at_for_tests(Some(Instant::now()));
-
-		let remaining = remembered_subreddit_daemon_pause_remaining().expect("pause remaining");
-		assert!(remaining <= Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_PAUSE_AFTER_NON_DAEMON_API_SECS));
-		assert!(remaining > Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_PAUSE_AFTER_NON_DAEMON_API_SECS.saturating_sub(5)));
-	}
-
-	#[test]
-	fn daemon_resumes_after_non_daemon_api_quiet_period_expires() {
-		let _guard = test_lock();
-		reset_test_caches();
-
-		let expired_call_at = Instant::now()
-			.checked_sub(Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_PAUSE_AFTER_NON_DAEMON_API_SECS + 1))
-			.expect("expired instant");
-		crate::client::set_last_non_daemon_reddit_api_call_at_for_tests(Some(expired_call_at));
-
-		assert!(remembered_subreddit_daemon_pause_remaining().is_none());
 	}
 
 	#[test]

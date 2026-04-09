@@ -11,10 +11,9 @@ use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 
-use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use std::{io, result::Result};
 
@@ -90,12 +89,6 @@ const URL_PAIRS: [(&str, &str); 2] = [
 	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RedditApiRequestOrigin {
-	NonDaemon,
-	Daemon,
-}
-
 #[derive(Clone, Debug)]
 pub struct RedditRateLimitSnapshot {
 	pub remaining: Option<f32>,
@@ -149,44 +142,6 @@ impl RedditRateLimitSnapshot {
 			}
 			_ => None,
 		}
-	}
-}
-
-tokio::task_local! {
-	static REDDIT_API_REQUEST_ORIGIN: RedditApiRequestOrigin;
-}
-
-static LAST_NON_DAEMON_REDDIT_API_CALL_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
-
-fn current_reddit_api_request_origin() -> RedditApiRequestOrigin {
-	REDDIT_API_REQUEST_ORIGIN.try_with(|origin| *origin).unwrap_or(RedditApiRequestOrigin::NonDaemon)
-}
-
-fn record_reddit_api_call_activity() {
-	if current_reddit_api_request_origin() == RedditApiRequestOrigin::Daemon {
-		return;
-	}
-
-	if let Ok(mut last_call_at) = LAST_NON_DAEMON_REDDIT_API_CALL_AT.lock() {
-		*last_call_at = Some(Instant::now());
-	}
-}
-
-pub fn latest_non_daemon_reddit_api_call_at() -> Option<Instant> {
-	LAST_NON_DAEMON_REDDIT_API_CALL_AT.lock().ok().and_then(|last_call_at| *last_call_at)
-}
-
-pub async fn with_daemon_reddit_api_origin<F>(future: F) -> F::Output
-where
-	F: Future,
-{
-	REDDIT_API_REQUEST_ORIGIN.scope(RedditApiRequestOrigin::Daemon, future).await
-}
-
-#[cfg(test)]
-pub(crate) fn set_last_non_daemon_reddit_api_call_at_for_tests(last_call_at: Option<Instant>) {
-	if let Ok(mut stored) = LAST_NON_DAEMON_REDDIT_API_CALL_AT.lock() {
-		*stored = last_call_at;
 	}
 }
 
@@ -485,7 +440,6 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 
 		match builder {
 			Ok(req) => {
-				record_reddit_api_call_activity();
 				match client.request(req).await {
 					Ok(mut response) => {
 						if let Some(snapshot) = capture_ratelimit_snapshot(&response) {
