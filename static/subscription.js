@@ -1,5 +1,6 @@
 (() => {
     const nativeSubmit = HTMLFormElement.prototype.submit;
+    const maxCookieShards = 16;
     const oneYearFromNow = () => new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString();
     const getForms = () => Array.from(document.querySelectorAll("form[data-subscription-form]"));
 
@@ -44,14 +45,9 @@
         const chunkSize = 3800;
         const chunks = value ? value.match(new RegExp(`.{1,${chunkSize}}`, "g")) || [] : [];
         if (chunks.length === 0) {
-            let staleIndex = 0;
-            while (true) {
+            for (let staleIndex = 0; staleIndex < maxCookieShards; staleIndex += 1) {
                 const staleName = staleIndex === 0 ? baseName : `${baseName}${staleIndex}`;
-                if (!readCookie(staleName)) {
-                    break;
-                }
                 removeCookie(staleName);
-                staleIndex += 1;
             }
             return;
         }
@@ -61,14 +57,9 @@
             document.cookie = `${cookieName}=${encodeURIComponent(chunk)}; expires=${oneYearFromNow()}; path=/; SameSite=Lax`;
         });
 
-        let staleIndex = chunks.length;
-        while (true) {
+        for (let staleIndex = chunks.length; staleIndex < maxCookieShards; staleIndex += 1) {
             const staleName = staleIndex === 0 ? baseName : `${baseName}${staleIndex}`;
-            if (!readCookie(staleName)) {
-                break;
-            }
             removeCookie(staleName);
-            staleIndex += 1;
         }
     };
 
@@ -162,6 +153,25 @@
             if (button) {
                 button.disabled = pending;
             }
+        }
+    };
+
+    const removeSettingsFeedItem = (form) => {
+        const removeWhenState = form.dataset.removeWhenState;
+        if (!removeWhenState || form.dataset.subscriptionState !== removeWhenState) {
+            return;
+        }
+
+        const item = form.closest("[data-settings-feed-item]");
+        if (!item) {
+            return;
+        }
+
+        const group = item.closest("[data-settings-feed-group]");
+        item.remove();
+
+        if (group && !group.querySelector("[data-settings-feed-item]")) {
+            group.remove();
         }
     };
 
@@ -301,6 +311,7 @@
             }
 
             setPending(target, false);
+            removeSettingsFeedItem(form);
         });
     };
 

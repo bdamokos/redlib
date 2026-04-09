@@ -193,15 +193,32 @@
 		</div>
 	</form>
 	{% if prefs.subscriptions.len() > 0 %}
-	<div class="prefs" id="settings_subs">
+	<div class="prefs" id="settings_subs" data-settings-feed-group>
 		<legend>Subscribed Feeds</legend>
 		{% for sub in prefs.subscriptions %}
-		<div>
+		<div data-settings-feed-item>
 			{% let feed -%}
 			{% if sub.starts_with("u_") -%}{% let feed = format!("u/{}", &sub[2..]) -%}{% else -%}{% let feed =
 			format!("r/{}", sub) -%}{% endif -%}
 			<a href="/{{ feed }}">{{ feed }}</a>
-			<form action="/r/{{ sub }}/unsubscribe/?redirect=settings" method="POST">
+			<form
+				action="/r/{{ sub }}/unsubscribe/?redirect=settings&canonical={{ sub }}"
+				method="POST"
+				data-subscription-form
+				data-subscription-target="settings-subscription:{{ sub }}"
+				data-subscription-state="subscribed"
+				data-state-on="subscribed"
+				data-state-off="unsubscribed"
+				data-subscribe-action="/r/{{ sub }}/subscribe/?redirect=settings&canonical={{ sub }}"
+				data-unsubscribe-action="/r/{{ sub }}/unsubscribe/?redirect=settings&canonical={{ sub }}"
+				data-subscribe-label="Subscribe"
+				data-unsubscribe-label="Unsubscribe"
+				data-subscribe-class="subscribe"
+				data-unsubscribe-class="unsubscribe"
+				data-cookie-mode="list"
+				data-cookie-name="subscriptions"
+				data-cookie-values="{{ sub }}"
+				data-remove-when-state="unsubscribed">
 				<button class="unsubscribe">Unsubscribe</button>
 			</form>
 		</div>
@@ -209,12 +226,30 @@
 	</div>
 	{% endif %}
 	{% if !prefs.flair_subscriptions.is_empty() %}
-	<div class="prefs" id="settings_flair_subs">
+	<div class="prefs" id="settings_flair_subs" data-settings-feed-group>
 		<legend>Subscribed Flair Feeds</legend>
 		{% for subscription in prefs.flair_subscriptions %}
-		<div>
+		<div data-settings-feed-item>
 			<a href="{{ crate::utils::flair_feed_url(subscription.subreddit.as_str(), subscription.flair.as_str()) }}">r/{{ subscription.subreddit }} [{{ subscription.flair }}]</a>
-			<form action="{{ crate::utils::flair_subscription_action_url(subscription.subreddit.as_str(), "unsubscribe", subscription.flair.as_str(), Some("settings")) }}" method="POST">
+			<form
+				action="{{ crate::utils::flair_subscription_action_url(subscription.subreddit.as_str(), "unsubscribe", subscription.flair.as_str(), Some("settings")) }}"
+				method="POST"
+				data-subscription-form
+				data-subscription-target="settings-flair:{{ subscription.subreddit }}:{{ subscription.flair }}"
+				data-subscription-state="subscribed"
+				data-state-on="subscribed"
+				data-state-off="unsubscribed"
+				data-subscribe-action="{{ crate::utils::flair_subscription_action_url(subscription.subreddit.as_str(), "subscribe", subscription.flair.as_str(), Some("settings")) }}"
+				data-unsubscribe-action="{{ crate::utils::flair_subscription_action_url(subscription.subreddit.as_str(), "unsubscribe", subscription.flair.as_str(), Some("settings")) }}"
+				data-subscribe-label="Subscribe Flair"
+				data-unsubscribe-label="Unsubscribe Flair"
+				data-subscribe-class="subscribe"
+				data-unsubscribe-class="unsubscribe"
+				data-cookie-mode="flair"
+				data-cookie-name="flair_subscriptions"
+				data-cookie-subreddit="{{ subscription.subreddit }}"
+				data-cookie-flair="{{ subscription.flair }}"
+				data-remove-when-state="unsubscribed">
 				<button class="unsubscribe">Unsubscribe</button>
 			</form>
 		</div>
@@ -222,15 +257,32 @@
 	</div>
 	{% endif %}
 	{% if !prefs.filters.is_empty() %}
-	<div class="prefs" id="settings_filters">
+	<div class="prefs" id="settings_filters" data-settings-feed-group>
 		<legend>Filtered Feeds</legend>
 		{% for sub in prefs.filters %}
-		<div>
+		<div data-settings-feed-item>
 			{% let feed -%}
 			{% if sub.starts_with("u_") -%}{% let feed = format!("u/{}", &sub[2..]) -%}{% else -%}{% let feed =
 			format!("r/{}", sub) -%}{% endif -%}
 			<a href="/{{ feed }}">{{ feed }}</a>
-			<form action="/r/{{ sub }}/unfilter/?redirect=settings" method="POST">
+			<form
+				action="/r/{{ sub }}/unfilter/?redirect=settings&canonical={{ sub }}"
+				method="POST"
+				data-subscription-form
+				data-subscription-target="settings-filter:{{ sub }}"
+				data-subscription-state="filtered"
+				data-state-on="filtered"
+				data-state-off="unfiltered"
+				data-subscribe-action="/r/{{ sub }}/filter/?redirect=settings&canonical={{ sub }}"
+				data-unsubscribe-action="/r/{{ sub }}/unfilter/?redirect=settings&canonical={{ sub }}"
+				data-subscribe-label="Filter"
+				data-unsubscribe-label="Unfilter"
+				data-subscribe-class="filter"
+				data-unsubscribe-class="unfilter"
+				data-cookie-mode="list"
+				data-cookie-name="filters"
+				data-cookie-values="{{ sub }}"
+				data-remove-when-state="unfiltered">
 				<button class="unfilter">Unfilter</button>
 			</form>
 		</div>

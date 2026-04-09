@@ -168,7 +168,8 @@
 						data-unsubscribe-class="unsubscribe"
 						data-cookie-mode="flair"
 						data-cookie-name="flair_subscriptions"
-						data-cookie-values="{{ sub.name }}::{{ active_flair_filter }}">
+						data-cookie-subreddit="{{ sub.name }}"
+						data-cookie-flair="{{ active_flair_filter }}">
 						<button class="unsubscribe">Unsubscribe Flair</button>
 					</form>
 					{% else %}
@@ -188,7 +189,8 @@
 						data-unsubscribe-class="unsubscribe"
 						data-cookie-mode="flair"
 						data-cookie-name="flair_subscriptions"
-						data-cookie-values="{{ sub.name }}::{{ active_flair_filter }}">
+						data-cookie-subreddit="{{ sub.name }}"
+						data-cookie-flair="{{ active_flair_filter }}">
 						<button class="subscribe">Subscribe Flair</button>
 					</form>
 					{% endif %}

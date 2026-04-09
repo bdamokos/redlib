@@ -1530,6 +1530,8 @@ fn decode_cookie_chunk(value: &str) -> String {
 	percent_decode_str(value).decode_utf8_lossy().into_owned()
 }
 
+const MAX_COOKIE_SHARDS: usize = 16;
+
 pub fn read_sharded_cookie(req: &Request<Body>, base_name: &str) -> String {
 	let mut value = String::new();
 	let mut index = 0usize;
@@ -1567,30 +1569,16 @@ pub fn write_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, 
 		);
 	}
 
-	let mut stale_index = chunks.len();
-	loop {
+	for stale_index in chunks.len()..MAX_COOKIE_SHARDS {
 		let cookie_name = if stale_index == 0 { base_name.to_string() } else { format!("{base_name}{stale_index}") };
-
-		if req.cookie(&cookie_name).is_none() {
-			break;
-		}
-
 		response.remove_cookie(cookie_name);
-		stale_index += 1;
 	}
 }
 
-pub fn clear_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, base_name: &str) {
-	let mut index = 0usize;
-	loop {
+pub fn clear_sharded_cookie(response: &mut Response<Body>, _req: &Request<Body>, base_name: &str) {
+	for index in 0..MAX_COOKIE_SHARDS {
 		let cookie_name = if index == 0 { base_name.to_string() } else { format!("{base_name}{index}") };
-
-		if req.cookie(&cookie_name).is_none() {
-			break;
-		}
-
 		response.remove_cookie(cookie_name);
-		index += 1;
 	}
 }
 
@@ -2979,9 +2967,9 @@ impl_template_str_eq!(User);
 #[cfg(test)]
 mod tests {
 	use super::{
-		coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions,
-		extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration, read_sharded_cookie,
-		rewrite_urls, user_profile_details, write_sharded_cookie, ExternalLink, FlairSubscription, Preferences,
+		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
+		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
+		read_sharded_cookie, rewrite_urls, user_profile_details, write_sharded_cookie, ExternalLink, FlairSubscription, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
@@ -3330,8 +3318,11 @@ mod tests {
 			.collect::<Vec<_>>();
 
 		assert!(!set_cookie_headers.is_empty());
-		assert!(set_cookie_headers.iter().all(|value| !value.contains("HttpOnly")));
 		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions=rust+u_spez")));
+		assert!(set_cookie_headers
+			.iter()
+			.filter(|value| value.starts_with("subscriptions=rust+u_spez"))
+			.all(|value| !value.contains("HttpOnly")));
 	}
 
 	#[test]
@@ -3342,6 +3333,44 @@ mod tests {
 			.unwrap();
 
 		assert_eq!(read_sharded_cookie(&req, "subscriptions"), "rust+u_spez+programming");
+	}
+
+	#[test]
+	fn write_sharded_cookie_expires_stale_suffixes_even_if_request_cannot_see_them() {
+		let req = Request::builder().body(Body::empty()).unwrap();
+		let mut response = Response::builder().body(Body::empty()).unwrap();
+
+		write_sharded_cookie(&mut response, &req, "subscriptions", "rust");
+
+		let set_cookie_headers = response
+			.headers()
+			.get_all("Set-Cookie")
+			.iter()
+			.map(|value| value.to_str().unwrap_or_default().to_string())
+			.collect::<Vec<_>>();
+
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions=rust")));
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions1=")));
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions15=")));
+	}
+
+	#[test]
+	fn clear_sharded_cookie_expires_all_shard_slots() {
+		let req = Request::builder().body(Body::empty()).unwrap();
+		let mut response = Response::builder().body(Body::empty()).unwrap();
+
+		clear_sharded_cookie(&mut response, &req, "subscriptions");
+
+		let set_cookie_headers = response
+			.headers()
+			.get_all("Set-Cookie")
+			.iter()
+			.map(|value| value.to_str().unwrap_or_default().to_string())
+			.collect::<Vec<_>>();
+
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions=")));
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions1=")));
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions15=")));
 	}
 }
 
