@@ -1,18 +1,23 @@
+use crate::client::{CLIENT, OAUTH_CLIENT};
 use crate::config::get_setting;
 use crate::server::RequestExt;
 use crate::utils::Post;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hyper::body::to_bytes;
-use hyper::{Body, Request, Response, StatusCode};
+use hyper::body::HttpBody as _;
+use hyper::{Body, Request, Response, StatusCode, Uri};
 use log::{info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 
@@ -20,7 +25,9 @@ const DEFAULT_MAX_CONCURRENT: usize = 3;
 const DEFAULT_MAX_READY_JOBS: usize = 128;
 const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_MAX_QUEUE: usize = 256;
-const DEFAULT_READY_TTL: Duration = Duration::from_secs(30 * 60);
+// Keep preview outputs alive for as long as remembered daemon-cached feeds can
+// remain active, otherwise the same previews are regenerated repeatedly.
+const DEFAULT_READY_TTL: Duration = Duration::from_secs(crate::post_cache::REMEMBERED_SUBREDDIT_TTL_SECS);
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(25);
 const DEFAULT_FAILED_RETRY: Duration = Duration::from_secs(120);
 const DEFAULT_PREWARM_AUTH_TTL: Duration = Duration::from_secs(15 * 60);
@@ -97,6 +104,32 @@ impl FrameBlob {
 struct FrameCache {
 	blobs: HashMap<String, FrameBlob>,
 	total_bytes: usize,
+}
+
+struct MaterializedMediaInput {
+	input_path: String,
+	temp_path: Option<PathBuf>,
+}
+
+impl MaterializedMediaInput {
+	fn passthrough(path: String) -> Self {
+		Self {
+			input_path: path,
+			temp_path: None,
+		}
+	}
+
+	fn input_path(&self) -> &str {
+		&self.input_path
+	}
+}
+
+impl Drop for MaterializedMediaInput {
+	fn drop(&mut self) {
+		if let Some(path) = self.temp_path.take() {
+			let _ = std::fs::remove_file(path);
+		}
+	}
 }
 
 pub trait PreviewFrameGenerator: Send + Sync {
@@ -587,6 +620,51 @@ async fn probe_duration_seconds(media_url: &str) -> Option<i64> {
 	}
 }
 
+fn build_preview_download_request(url: &str) -> Result<Request<Body>, String> {
+	let uri = url.parse::<Uri>().map_err(|_| format!("Couldn't parse media URL: {url}"))?;
+	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
+	Request::get(uri)
+		.header("User-Agent", user_agent)
+		.body(Body::empty())
+		.map_err(|_| format!("Couldn't build media download request for {url}"))
+}
+
+async fn materialize_media_input(media_url: &str) -> Result<MaterializedMediaInput, String> {
+	let resolved_url = absolutize_media_url(media_url, "");
+	if resolved_url.is_empty() || !(resolved_url.starts_with("http://") || resolved_url.starts_with("https://")) {
+		return Ok(MaterializedMediaInput::passthrough(resolved_url));
+	}
+
+	let temp_path = std::env::temp_dir().join(format!("redlib-video-preview-{}-{}.media", std::process::id(), fastrand::u64(..)));
+	let request = build_preview_download_request(&resolved_url)?;
+	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+	let status = response.status();
+	if !status.is_success() {
+		return Err(format!("media download returned HTTP {status} for {resolved_url}"));
+	}
+
+	let mut file = File::create(&temp_path).await.map_err(|err| err.to_string())?;
+	let mut body = response.into_body();
+	let mut total_bytes = 0usize;
+	while let Some(chunk) = body.data().await {
+		let chunk = chunk.map_err(|err| err.to_string())?;
+		file.write_all(&chunk).await.map_err(|err| err.to_string())?;
+		total_bytes += chunk.len();
+	}
+	file.flush().await.map_err(|err| err.to_string())?;
+
+	if total_bytes == 0 {
+		return Err(format!("downloaded empty media for {resolved_url}"));
+	}
+
+	info!("Materialized video preview media {} into {} ({} bytes)", resolved_url, temp_path.display(), total_bytes);
+
+	Ok(MaterializedMediaInput {
+		input_path: temp_path.to_string_lossy().into_owned(),
+		temp_path: Some(temp_path),
+	})
+}
+
 #[cfg(test)]
 fn set_generator(generator: Arc<dyn PreviewFrameGenerator>) {
 	if let Ok(mut state) = GENERATOR.lock() {
@@ -841,8 +919,16 @@ async fn process_job(job_id: String) {
 		job.key.clone()
 	};
 
+	let materialized_media = match materialize_media_input(&key.media_url).await {
+		Ok(media) => media,
+		Err(err) => {
+			fail_job(&job_id, err);
+			return;
+		}
+	};
+
 	if key.duration_seconds <= 0 {
-		let probed_duration_seconds = probe_duration_seconds(&absolutize_media_url(&key.media_url, "")).await;
+		let probed_duration_seconds = probe_duration_seconds(materialized_media.input_path()).await;
 		let resolved_duration_seconds = effective_duration_seconds(key.duration_seconds, probed_duration_seconds);
 		if resolved_duration_seconds > 0 && resolved_duration_seconds != key.duration_seconds {
 			key.duration_seconds = resolved_duration_seconds;
@@ -873,7 +959,7 @@ async fn process_job(job_id: String) {
 		}
 
 		let request = FrameRequest {
-			media_url: absolutize_media_url(&key.media_url, ""),
+			media_url: materialized_media.input_path().to_string(),
 			timestamp_seconds,
 			width: key.width,
 			height: key.height,

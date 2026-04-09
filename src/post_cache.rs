@@ -11,8 +11,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use tokio::time::{Duration, MissedTickBehavior};
 
-const CACHE_TTL_SECS: u64 = 10_800;
-const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
+pub(crate) const CACHE_TTL_SECS: u64 = 10_800;
+pub(crate) const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
 const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
 const PERMANENT_FAILURE_BACKOFF_SECS: u64 = 14 * 24 * 60 * 60;
