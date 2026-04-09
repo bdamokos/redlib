@@ -515,6 +515,29 @@ pub fn cleanup_decayed_remembered_subreddits() {
 	}
 }
 
+fn remembered_subreddit_daemon_counts() -> (usize, usize, usize, usize) {
+	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let total = remembered.len();
+	let mut active = 0;
+	let mut eligible = 0;
+	let mut blocked_or_in_flight = 0;
+
+	for entry in remembered.values() {
+		if !remembered_entry_is_active(entry) {
+			continue;
+		}
+
+		active += 1;
+		if entry.refresh_in_flight || remembered_entry_refresh_blocked(entry) {
+			blocked_or_in_flight += 1;
+		} else {
+			eligible += 1;
+		}
+	}
+
+	(total, active, eligible, blocked_or_in_flight)
+}
+
 async fn parse_json_body<T: serde::de::DeserializeOwned>(req: Request<Body>) -> Result<T, String> {
 	let body = to_bytes(req.into_body()).await.map_err(|err| err.to_string())?;
 	serde_json::from_slice(&body).map_err(|err| err.to_string())
@@ -618,13 +641,20 @@ pub fn spawn_remembered_subreddit_daemon() {
 	tokio::spawn(async {
 		let mut interval = tokio::time::interval(Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
 		interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+		info!("post_cache: remembered subreddit daemon started (interval={}s)", REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS);
 		interval.tick().await;
 
 		loop {
 			interval.tick().await;
 			cleanup_decayed_remembered_subreddits();
+			let (total, active, eligible, blocked_or_in_flight) = remembered_subreddit_daemon_counts();
+			info!(
+				"post_cache: remembered subreddit daemon tick (total={}, active={}, eligible={}, blocked_or_in_flight={})",
+				total, active, eligible, blocked_or_in_flight
+			);
 
 			let Some(subreddit) = pick_next_remembered_subreddit_to_refresh() else {
+				info!("post_cache: remembered subreddit daemon idle: no eligible subreddit to refresh");
 				continue;
 			};
 
@@ -633,9 +663,11 @@ pub fn spawn_remembered_subreddit_daemon() {
 				remembered.get(&subreddit).is_none_or(|entry| !remembered_entry_is_active(entry) || entry.refresh_in_flight)
 			};
 			if should_skip {
+				info!("post_cache: remembered subreddit daemon skipped refresh for {} because it is no longer eligible", subreddit);
 				continue;
 			}
 
+			info!("post_cache: remembered subreddit daemon refreshing {}", subreddit);
 			refresh_remembered_subreddit(&subreddit).await;
 		}
 	});
