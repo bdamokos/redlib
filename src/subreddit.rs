@@ -272,6 +272,26 @@ pub struct CacheStatusTemplate {
 
 crate::impl_template_str_eq!(CacheStatusTemplate);
 
+impl CacheStatusTemplate {
+	fn human_duration(&self, seconds: &&u64) -> String {
+		let seconds = **seconds;
+		let days = seconds / 86_400;
+		let hours = (seconds % 86_400) / 3_600;
+		let minutes = (seconds % 3_600) / 60;
+		let secs = seconds % 60;
+
+		if days > 0 {
+			format!("{days}d {hours}h")
+		} else if hours > 0 {
+			format!("{hours}h {minutes}m")
+		} else if minutes > 0 {
+			format!("{minutes}m {secs}s")
+		} else {
+			format!("{secs}s")
+		}
+	}
+}
+
 static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
 
 fn should_enable_duplicate_collapse(sub_name: &str) -> bool {
