@@ -18,6 +18,7 @@ use redlib::{config, duplicates, headers, instance_info, post, post_cache, searc
 use url::Url;
 
 use redlib::client::OAUTH_CLIENT;
+use redlib::oauth::spawn_oauth_maintenance;
 
 // Create Services
 
@@ -244,15 +245,16 @@ async fn main() {
 	// Force evaluation of statics. In instance_info case, we need to evaluate
 	// the timestamp so deploy date is accurate - in config case, we need to
 	// evaluate the configuration to avoid paying penalty at first request -
-	// in OAUTH case, we need to retrieve the token to avoid paying penalty
-	// at first request
+	// in OAUTH case, we only need the shared holder ready; background
+	// maintenance handles initial acquisition and refreshes.
 
 	info!("Evaluating config.");
 	LazyLock::force(&config::CONFIG);
 	info!("Evaluating instance info.");
 	LazyLock::force(&instance_info::INSTANCE_INFO);
-	info!("Creating OAUTH client.");
+	info!("Initializing OAUTH client state.");
 	LazyLock::force(&OAUTH_CLIENT);
+	spawn_oauth_maintenance();
 	video_preview::init();
 	post_cache::spawn_remembered_subreddit_daemon();
 
@@ -436,6 +438,8 @@ async fn main() {
 	app.at("/r/:sub/filter").post(|r| subreddit::subscriptions_filters(r).boxed());
 	app.at("/r/:sub/unfilter").post(|r| subreddit::subscriptions_filters(r).boxed());
 	app.at("/feed-status").get(|r| subreddit::feed_status_api(r).boxed());
+	app.at("/cache-status").get(|r| subreddit::cache_status_page(r).boxed());
+	app.at("/cache-status.json").get(|r| subreddit::cache_status_api(r).boxed());
 	app.at("/feed-fragment").get(|r| subreddit::feed_fragment(r).boxed());
 	app.at("/subreddit-fragment").get(|r| subreddit::community_fragment(r).boxed());
 	app.at("/subreddit-fragment/:sort").get(|r| subreddit::community_fragment(r).boxed());

@@ -1,3 +1,4 @@
+use crate::oauth::oauth_is_available;
 use crate::user::collapse_duplicate_submissions;
 use crate::utils::{Post, Preferences};
 use hyper::body::to_bytes;
@@ -13,7 +14,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 
 pub(crate) const CACHE_TTL_SECS: u64 = 10_800;
 pub(crate) const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
-const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
+pub(crate) const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
 const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
 const PERMANENT_FAILURE_BACKOFF_SECS: u64 = 14 * 24 * 60 * 60;
 const ACTIVE_BROWSER_SESSION_TTL_SECS: u64 = 20;
@@ -139,6 +140,49 @@ enum SessionSourceState {
 	Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheServeMode {
+	Normal,
+	AllowStaleOnOauthOutage,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheStatusSummary {
+	pub sources_total: usize,
+	pub cached_sources: usize,
+	pub daemon_managed_sources: usize,
+	pub scheduled_sources: usize,
+	pub in_flight_sources: usize,
+	pub blocked_sources: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheStatusSource {
+	pub source_key: String,
+	pub display_name: String,
+	pub source_type: String,
+	pub daemon_managed: bool,
+	pub cached: bool,
+	pub cached_posts: usize,
+	pub cached_age_secs: Option<u64>,
+	pub cache_expires_in_secs: Option<u64>,
+	pub last_refresh_origin: Option<String>,
+	pub last_refresh_succeeded_secs_ago: Option<u64>,
+	pub last_refresh_failed_secs_ago: Option<u64>,
+	pub refresh_frequency_secs: Option<u64>,
+	pub schedule_state: String,
+	pub predicted_next_fetch_in_secs: Option<u64>,
+	pub blocked_until_secs: Option<u64>,
+	pub consecutive_failures: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheStatusResponse {
+	pub generated_at_unix: u64,
+	pub summary: CacheStatusSummary,
+	pub sources: Vec<CacheStatusSource>,
+}
+
 #[derive(Clone)]
 struct SessionSourceEntry {
 	source: FeedSource,
@@ -199,6 +243,7 @@ static SOURCE_CACHE: LazyLock<Mutex<HashMap<String, CachedSourcePosts>>> = LazyL
 static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
 fn source_cache_is_expired(entry: &CachedSourcePosts) -> bool {
 	entry.fetched_at.elapsed().as_secs() > CACHE_TTL_SECS
@@ -283,11 +328,19 @@ pub fn is_subreddit_remembered(subreddit: &str) -> bool {
 		.is_some_and(remembered_entry_is_active)
 }
 
-fn source_cache_is_servable(source: &FeedSource, entry: &CachedSourcePosts) -> bool {
+fn source_cache_is_servable_with_mode(source: &FeedSource, entry: &CachedSourcePosts, mode: CacheServeMode) -> bool {
+	if matches!(mode, CacheServeMode::AllowStaleOnOauthOutage) && !oauth_is_available() {
+		return true;
+	}
+
 	match source {
 		FeedSource::Subreddit { name } if !name.starts_with("u_") => is_subreddit_remembered(name) || !source_cache_is_expired(entry),
 		_ => !source_cache_is_expired(entry),
 	}
+}
+
+fn source_cache_is_servable(source: &FeedSource, entry: &CachedSourcePosts) -> bool {
+	source_cache_is_servable_with_mode(source, entry, CacheServeMode::Normal)
 }
 
 fn median_u64(values: &mut [u64]) -> u64 {
@@ -642,10 +695,16 @@ pub fn spawn_remembered_subreddit_daemon() {
 		let mut interval = tokio::time::interval(Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
 		interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 		info!("post_cache: remembered subreddit daemon started (interval={}s)", REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS);
+		if let Ok(mut next_tick) = REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT.lock() {
+			*next_tick = Some(Instant::now() + Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
+		}
 		interval.tick().await;
 
 		loop {
 			interval.tick().await;
+			if let Ok(mut next_tick) = REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT.lock() {
+				*next_tick = Some(Instant::now() + Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
+			}
 			cleanup_decayed_remembered_subreddits();
 			let (total, active, eligible, blocked_or_in_flight) = remembered_subreddit_daemon_counts();
 			info!(
@@ -693,10 +752,10 @@ pub const fn initial_source_window() -> usize {
 	INITIAL_SOURCE_WINDOW
 }
 
-pub fn get_cached_source_page(source: &FeedSource, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
+pub fn get_cached_source_page_with_mode(source: &FeedSource, page: usize, per_page: usize, mode: CacheServeMode) -> Option<(Vec<Post>, String, bool, bool)> {
 	let cache = SOURCE_CACHE.lock().ok()?;
 	let entry = cache.get(&source.cache_key())?;
-	if !source_cache_is_servable(source, entry) {
+	if !source_cache_is_servable_with_mode(source, entry, mode) {
 		return None;
 	}
 
@@ -711,32 +770,48 @@ pub fn get_cached_source_page(source: &FeedSource, page: usize, per_page: usize)
 	Some((entry.posts[start..end].to_vec(), after, has_prev, has_next))
 }
 
+pub fn get_cached_source_page(source: &FeedSource, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
+	get_cached_source_page_with_mode(source, page, per_page, CacheServeMode::Normal)
+}
+
+pub fn get_cached_subreddit_page_with_mode(subreddit: &str, page: usize, per_page: usize, mode: CacheServeMode) -> Option<(Vec<Post>, String, bool, bool)> {
+	get_cached_source_page_with_mode(&FeedSource::Subreddit { name: subreddit.to_string() }, page, per_page, mode)
+}
+
 pub fn get_cached_subreddit_page(subreddit: &str, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
-	get_cached_source_page(&FeedSource::Subreddit { name: subreddit.to_string() }, page, per_page)
+	get_cached_subreddit_page_with_mode(subreddit, page, per_page, CacheServeMode::Normal)
 }
 
 fn store_source_posts(source: &FeedSource, posts: Vec<Post>, after: String) {
 	store_source_posts_with_origin(source, posts, after, None);
 }
 
-fn cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
+fn cached_source_origin_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<RefreshOrigin> {
 	let cache = SOURCE_CACHE.lock().ok()?;
 	let entry = cache.get(&source.cache_key())?;
-	if !source_cache_is_servable(source, entry) {
+	if !source_cache_is_servable_with_mode(source, entry, mode) {
 		return None;
 	}
 
 	entry.refresh_origin
 }
 
-fn cached_source_posts(source: &FeedSource) -> Option<CachedSourcePosts> {
+fn cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
+	cached_source_origin_with_mode(source, CacheServeMode::Normal)
+}
+
+fn cached_source_posts_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<CachedSourcePosts> {
 	let cache = SOURCE_CACHE.lock().ok()?;
 	let entry = cache.get(&source.cache_key())?;
-	if !source_cache_is_servable(source, entry) {
+	if !source_cache_is_servable_with_mode(source, entry, mode) {
 		return None;
 	}
 
 	Some(entry.clone())
+}
+
+fn cached_source_posts(source: &FeedSource) -> Option<CachedSourcePosts> {
+	cached_source_posts_with_mode(source, CacheServeMode::Normal)
 }
 
 async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin: RefreshOrigin) -> Result<CachedSourcePosts, String> {
@@ -761,6 +836,12 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 	let (posts, after) = match Post::fetch(&source.build_path(), quarantine).await {
 		Ok(result) => result,
 		Err(error) => {
+			if error.contains("oauth_unavailable") {
+				if let Some(entry) = cached_source_posts_with_mode(&source, CacheServeMode::AllowStaleOnOauthOutage) {
+					warn!("post_cache: serving stale cached source {} because OAuth is unavailable", source.display_name());
+					return Ok(entry);
+				}
+			}
 			if let FeedSource::Subreddit { name } = &source {
 				record_plain_subreddit_refresh_failure(name, &error, refresh_origin);
 			}
@@ -1545,6 +1626,161 @@ pub fn cache_stats() -> (usize, usize) {
 		.map(|(_, entry)| entry.posts.len())
 		.sum();
 	(sources, posts)
+}
+
+fn visible_sources_from_preferences(preferences: &Preferences) -> Vec<FeedSource> {
+	let mut seen = HashSet::new();
+	let mut sources = Vec::new();
+
+	for subreddit in &preferences.subscriptions {
+		let normalized = subreddit.trim();
+		if normalized.is_empty() {
+			continue;
+		}
+		let source = FeedSource::Subreddit { name: normalized.to_string() };
+		if seen.insert(source.cache_key()) {
+			sources.push(source);
+		}
+	}
+
+	for subscription in &preferences.flair_subscriptions {
+		if subscription.subreddit.trim().is_empty() || subscription.flair.trim().is_empty() {
+			continue;
+		}
+		let source = FeedSource::Flair {
+			subreddit: subscription.subreddit.clone(),
+			flair: subscription.flair.clone(),
+		};
+		if seen.insert(source.cache_key()) {
+			sources.push(source);
+		}
+	}
+
+	sort_sources(&mut sources);
+	sources
+}
+
+fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
+	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let mut entries = remembered
+		.values()
+		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked(entry) && !entry.refresh_in_flight)
+		.cloned()
+		.collect::<Vec<_>>();
+	entries.sort_by(remembered_refresh_priority);
+
+	let seconds_until_tick = REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT
+		.lock()
+		.ok()
+		.and_then(|next_tick| *next_tick)
+		.map(|next_tick| next_tick.saturating_duration_since(Instant::now()).as_secs())
+		.unwrap_or(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS);
+
+	let positions = entries.into_iter().enumerate().map(|(index, entry)| (entry.name, index)).collect::<HashMap<_, _>>();
+
+	(seconds_until_tick, positions)
+}
+
+pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusResponse {
+	let now = Instant::now();
+	let generated_at_unix = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|duration| duration.as_secs())
+		.unwrap_or_default();
+	let visible_sources = visible_sources_from_preferences(preferences);
+	let (seconds_until_tick, queue_positions) = daemon_next_fetch_map();
+	let cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+
+	let mut sources = Vec::with_capacity(visible_sources.len());
+	for source in visible_sources {
+		let cache_key = source.cache_key();
+		let cache_entry = cache.get(&cache_key);
+		let remembered_entry = match &source {
+			FeedSource::Subreddit { name } if !name.starts_with("u_") => remembered.get(&name.to_lowercase()),
+			_ => None,
+		};
+		let daemon_managed = matches!(&source, FeedSource::Subreddit { name } if !name.starts_with("u_"));
+		let cached = cache_entry.is_some();
+		let cached_posts = cache_entry.map(|entry| entry.posts.len()).unwrap_or_default();
+		let cached_age_secs = cache_entry.map(|entry| entry.fetched_at.elapsed().as_secs());
+		let cache_expires_in_secs = if let Some(entry) = remembered_entry.filter(|entry| remembered_entry_is_active(entry)) {
+			Some(REMEMBERED_SUBREDDIT_TTL_SECS.saturating_sub(entry.last_requested_at.elapsed().as_secs()))
+		} else {
+			cache_entry.map(|entry| CACHE_TTL_SECS.saturating_sub(entry.fetched_at.elapsed().as_secs()))
+		};
+		let blocked_until_secs = remembered_entry
+			.and_then(|entry| entry.banned_until)
+			.map(|until| until.saturating_duration_since(now).as_secs())
+			.filter(|seconds| *seconds > 0);
+		let predicted_next_fetch_in_secs = if let Some(entry) = remembered_entry {
+			if entry.refresh_in_flight {
+				Some(0)
+			} else if let Some(blocked) = blocked_until_secs {
+				Some(blocked)
+			} else {
+				queue_positions
+					.get(&entry.name)
+					.map(|position| seconds_until_tick + (*position as u64 * REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS))
+			}
+		} else {
+			None
+		};
+		let schedule_state = if let Some(entry) = remembered_entry {
+			if entry.refresh_in_flight {
+				"in_flight"
+			} else if blocked_until_secs.is_some() {
+				"blocked"
+			} else if queue_positions.contains_key(&entry.name) {
+				"scheduled"
+			} else {
+				"idle"
+			}
+		} else if daemon_managed {
+			"not_cached"
+		} else {
+			"session_only"
+		};
+
+		sources.push(CacheStatusSource {
+			source_key: cache_key,
+			display_name: source.display_name(),
+			source_type: match source {
+				FeedSource::Subreddit { .. } => "subreddit".to_string(),
+				FeedSource::Flair { .. } => "flair".to_string(),
+			},
+			daemon_managed,
+			cached,
+			cached_posts,
+			cached_age_secs,
+			cache_expires_in_secs,
+			last_refresh_origin: cache_entry.and_then(|entry| entry.refresh_origin).map(|origin| format!("{origin:?}").to_lowercase()),
+			last_refresh_succeeded_secs_ago: remembered_entry
+				.and_then(|entry| entry.last_refresh_succeeded_at)
+				.map(|instant| instant.elapsed().as_secs()),
+			last_refresh_failed_secs_ago: remembered_entry.and_then(|entry| entry.last_refresh_failed_at).map(|instant| instant.elapsed().as_secs()),
+			refresh_frequency_secs: remembered_entry.map(effective_freshness_target_secs),
+			schedule_state: schedule_state.to_string(),
+			predicted_next_fetch_in_secs,
+			blocked_until_secs,
+			consecutive_failures: remembered_entry.map(|entry| entry.consecutive_failures).unwrap_or_default(),
+		});
+	}
+
+	let summary = CacheStatusSummary {
+		sources_total: sources.len(),
+		cached_sources: sources.iter().filter(|source| source.cached).count(),
+		daemon_managed_sources: sources.iter().filter(|source| source.daemon_managed).count(),
+		scheduled_sources: sources.iter().filter(|source| source.schedule_state == "scheduled").count(),
+		in_flight_sources: sources.iter().filter(|source| source.schedule_state == "in_flight").count(),
+		blocked_sources: sources.iter().filter(|source| source.schedule_state == "blocked").count(),
+	};
+
+	CacheStatusResponse {
+		generated_at_unix,
+		summary,
+		sources,
+	}
 }
 
 #[cfg(test)]

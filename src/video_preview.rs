@@ -1,23 +1,19 @@
-use crate::client::{CLIENT, OAUTH_CLIENT};
+use crate::client::OAUTH_CLIENT;
 use crate::config::get_setting;
 use crate::server::RequestExt;
 use crate::utils::Post;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hyper::body::to_bytes;
-use hyper::body::HttpBody as _;
-use hyper::{Body, Request, Response, StatusCode, Uri};
+use hyper::{Body, Request, Response, StatusCode};
 use log::{info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 
@@ -108,27 +104,15 @@ struct FrameCache {
 
 struct MaterializedMediaInput {
 	input_path: String,
-	temp_path: Option<PathBuf>,
 }
 
 impl MaterializedMediaInput {
 	fn passthrough(path: String) -> Self {
-		Self {
-			input_path: path,
-			temp_path: None,
-		}
+		Self { input_path: path }
 	}
 
 	fn input_path(&self) -> &str {
 		&self.input_path
-	}
-}
-
-impl Drop for MaterializedMediaInput {
-	fn drop(&mut self) {
-		if let Some(path) = self.temp_path.take() {
-			let _ = std::fs::remove_file(path);
-		}
 	}
 }
 
@@ -182,13 +166,16 @@ impl PreviewFrameGenerator for FfmpegFrameGenerator {
 				image_format.codec_name()
 			);
 			let scale_filter = format!("scale='min({PREVIEW_MAX_WIDTH},iw)':-2");
-			let output = Command::new("ffmpeg")
+			let mut command = Command::new("ffmpeg");
+			command
 				.arg("-hide_banner")
 				.arg("-loglevel")
 				.arg("error")
 				.arg("-nostdin")
 				.arg("-ss")
-				.arg(request.timestamp_seconds.to_string())
+				.arg(request.timestamp_seconds.to_string());
+			append_media_access_args(&mut command, &request.media_url);
+			let output = command
 				.arg("-i")
 				.arg(&request.media_url)
 				.arg("-frames:v")
@@ -589,13 +576,16 @@ fn effective_duration_seconds(metadata_duration_seconds: i64, probed_duration_se
 
 async fn probe_duration_seconds(media_url: &str) -> Option<i64> {
 	let started_at = Instant::now();
-	let output = Command::new("ffprobe")
+	let mut command = Command::new("ffprobe");
+	command
 		.arg("-v")
 		.arg("error")
 		.arg("-show_entries")
 		.arg("format=duration")
 		.arg("-of")
-		.arg("default=noprint_wrappers=1:nokey=1")
+		.arg("default=noprint_wrappers=1:nokey=1");
+	append_media_access_args(&mut command, media_url);
+	let output = command
 		.arg(media_url)
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
@@ -620,49 +610,37 @@ async fn probe_duration_seconds(media_url: &str) -> Option<i64> {
 	}
 }
 
-fn build_preview_download_request(url: &str) -> Result<Request<Body>, String> {
-	let uri = url.parse::<Uri>().map_err(|_| format!("Couldn't parse media URL: {url}"))?;
+fn ffmpeg_http_headers() -> Option<String> {
+	let client = OAUTH_CLIENT.load_full();
+	let mut headers = Vec::new();
+	for key in ["x-reddit-loid", "x-reddit-session"] {
+		if let Some(value) = client.headers_map.get(key) {
+			headers.push(format!("{key}: {value}\r\n"));
+		}
+	}
+
+	if headers.is_empty() {
+		None
+	} else {
+		Some(headers.concat())
+	}
+}
+
+fn append_media_access_args(command: &mut Command, media_url: &str) {
+	if !(media_url.starts_with("http://") || media_url.starts_with("https://")) {
+		return;
+	}
+
 	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
-	Request::get(uri)
-		.header("User-Agent", user_agent)
-		.body(Body::empty())
-		.map_err(|_| format!("Couldn't build media download request for {url}"))
+	command.arg("-user_agent").arg(user_agent);
+	if let Some(headers) = ffmpeg_http_headers() {
+		command.arg("-headers").arg(headers);
+	}
 }
 
 async fn materialize_media_input(media_url: &str) -> Result<MaterializedMediaInput, String> {
 	let resolved_url = absolutize_media_url(media_url, "");
-	if resolved_url.is_empty() || !(resolved_url.starts_with("http://") || resolved_url.starts_with("https://")) {
-		return Ok(MaterializedMediaInput::passthrough(resolved_url));
-	}
-
-	let temp_path = std::env::temp_dir().join(format!("redlib-video-preview-{}-{}.media", std::process::id(), fastrand::u64(..)));
-	let request = build_preview_download_request(&resolved_url)?;
-	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
-	let status = response.status();
-	if !status.is_success() {
-		return Err(format!("media download returned HTTP {status} for {resolved_url}"));
-	}
-
-	let mut file = File::create(&temp_path).await.map_err(|err| err.to_string())?;
-	let mut body = response.into_body();
-	let mut total_bytes = 0usize;
-	while let Some(chunk) = body.data().await {
-		let chunk = chunk.map_err(|err| err.to_string())?;
-		file.write_all(&chunk).await.map_err(|err| err.to_string())?;
-		total_bytes += chunk.len();
-	}
-	file.flush().await.map_err(|err| err.to_string())?;
-
-	if total_bytes == 0 {
-		return Err(format!("downloaded empty media for {resolved_url}"));
-	}
-
-	info!("Materialized video preview media {} into {} ({} bytes)", resolved_url, temp_path.display(), total_bytes);
-
-	Ok(MaterializedMediaInput {
-		input_path: temp_path.to_string_lossy().into_owned(),
-		temp_path: Some(temp_path),
-	})
+	Ok(MaterializedMediaInput::passthrough(resolved_url))
 }
 
 #[cfg(test)]
@@ -719,10 +697,7 @@ fn upsert_prewarm_job(key: VideoPreviewJobKey) -> (String, bool) {
 	let mut queue_enqueued = false;
 
 	if let Ok(mut jobs) = VIDEO_PREVIEW_JOBS.lock() {
-		let can_enqueue_new_prewarm = VIDEO_PREVIEW_FRAMES
-			.lock()
-			.ok()
-			.is_none_or(|cache| prewarm_has_ready_capacity_locked(&jobs, &cache));
+		let can_enqueue_new_prewarm = VIDEO_PREVIEW_FRAMES.lock().ok().is_none_or(|cache| prewarm_has_ready_capacity_locked(&jobs, &cache));
 		let entry = jobs.entry(job_id.clone()).or_insert_with(|| JobEntry {
 			key: key.clone(),
 			state: VideoPreviewJobState::Pending,

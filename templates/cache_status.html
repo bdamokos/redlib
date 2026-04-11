@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block title %}Cache Status{% endblock %}
+
+{% block body %}
+<main class="cache_status_page">
+	<h1>Cache Status</h1>
+	<p>This page only shows cached and scheduled sources derived from your saved subscriptions and flair subscriptions.</p>
+	<p>Generated at Unix time {{ generated_at_unix }}.</p>
+
+	<div class="panel">
+		<p>Visible sources: {{ summary.sources_total }}</p>
+		<p>Cached now: {{ summary.cached_sources }}</p>
+		<p>Daemon-managed: {{ summary.daemon_managed_sources }}</p>
+		<p>Scheduled: {{ summary.scheduled_sources }}</p>
+		<p>In flight: {{ summary.in_flight_sources }}</p>
+		<p>Blocked: {{ summary.blocked_sources }}</p>
+	</div>
+
+	{% if sources.is_empty() %}
+	<p>No saved subscriptions or flair subscriptions are available for this client.</p>
+	{% else %}
+	<table>
+		<thead>
+			<tr>
+				<th>Source</th>
+				<th>Type</th>
+				<th>Cached</th>
+				<th>Posts</th>
+				<th>Cache Expires In</th>
+				<th>Last Fetched</th>
+				<th>Refresh Frequency</th>
+				<th>Schedule State</th>
+				<th>Next Fetch</th>
+				<th>Failures</th>
+			</tr>
+		</thead>
+		<tbody>
+			{% for source in sources %}
+			<tr>
+				<td>{{ source.display_name }}</td>
+				<td>{{ source.source_type }}</td>
+				<td>{% if source.cached %}yes{% else %}no{% endif %}</td>
+				<td>{{ source.cached_posts }}</td>
+				<td>{% match source.cache_expires_in_secs %}{% when Some with (seconds) %}{{ seconds }}s{% when None %}-{% endmatch %}</td>
+				<td>{% match source.cached_age_secs %}{% when Some with (seconds) %}{{ seconds }}s ago{% when None %}-{% endmatch %}</td>
+				<td>{% match source.refresh_frequency_secs %}{% when Some with (seconds) %}{{ seconds }}s{% when None %}-{% endmatch %}</td>
+				<td>{{ source.schedule_state }}</td>
+				<td>{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}{{ seconds }}s{% when None %}-{% endmatch %}</td>
+				<td>{{ source.consecutive_failures }}</td>
+			</tr>
+			{% endfor %}
+		</tbody>
+	</table>
+	{% endif %}
+</main>
+{% endblock %}

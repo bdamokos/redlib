@@ -2990,8 +2990,8 @@ mod tests {
 	use super::{
 		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
 		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
-		read_sharded_cookie, refresh_post_times, rewrite_urls, time, user_profile_details, write_sharded_cookie, Author, Awards, ExternalLink, Flair, FlairSubscription,
-		Flags, Media, Post, Preferences,
+		read_sharded_cookie, refresh_post_times, rewrite_urls, time, user_profile_details, write_sharded_cookie, Author, Awards, ExternalLink, Flags, Flair, FlairSubscription,
+		Media, Post, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};

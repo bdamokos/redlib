@@ -33,6 +33,7 @@ const AFTER_PATH_HEADROOM: usize = 128;
 const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 100;
 const AGGREGATE_FETCH_CONCURRENCY: usize = 4;
 const SUBREDDIT_METADATA_CACHE_TTL_SECS: u64 = 10_800;
+const OAUTH_CACHE_NOTICE: &str = "Showing cached posts because live Reddit authentication is temporarily unavailable. Content may be stale.";
 static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
 static SUBREDDIT_METADATA_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditMetadata>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SUBREDDIT_NSFW_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditNsfwStatus>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -76,6 +77,7 @@ pub struct SubredditTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	cache_notice: String,
 	is_flair_subscribed: bool,
 	feed_session_id: String,
 	feed_status_url: String,
@@ -127,6 +129,7 @@ struct SubredditFragmentTemplate {
 	all_posts_filtered: bool,
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	cache_notice: String,
 	is_flair_subscribed: bool,
 	feed_session_id: String,
 	feed_status_url: String,
@@ -256,6 +259,18 @@ pub struct WallTemplate {
 }
 
 crate::impl_template_str_eq!(WallTemplate);
+
+#[derive(Template)]
+#[template(path = "cache_status.html")]
+pub struct CacheStatusTemplate {
+	prefs: Preferences,
+	url: String,
+	generated_at_unix: u64,
+	summary: crate::post_cache::CacheStatusSummary,
+	sources: Vec<crate::post_cache::CacheStatusSource>,
+}
+
+crate::impl_template_str_eq!(CacheStatusTemplate);
 
 static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
 
@@ -1143,6 +1158,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			cache_notice: String::new(),
 			is_flair_subscribed,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -1233,6 +1249,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					all_posts_filtered: false,
 					all_posts_hidden_nsfw,
 					no_posts,
+					cache_notice: String::new(),
 					is_flair_subscribed,
 					feed_session_id: feed_session_id.clone(),
 					feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
@@ -1291,6 +1308,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					all_posts_filtered: feed.all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					cache_notice: String::new(),
 					is_flair_subscribed,
 					feed_session_id: String::new(),
 					feed_status_url: String::new(),
@@ -1346,6 +1364,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				all_posts_filtered,
 				all_posts_hidden_nsfw,
 				no_posts,
+				cache_notice: String::new(),
 				is_flair_subscribed,
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
@@ -1435,6 +1454,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					cache_notice: String::new(),
 					is_flair_subscribed,
 					feed_session_id: String::new(),
 					feed_status_url: String::new(),
@@ -1444,6 +1464,63 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			Err(msg) => {
 				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
 					crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					if msg.contains("oauth_unavailable") {
+						if let Some((mut posts, after, has_prev, has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(
+							&sub_name,
+							cache_page,
+							crate::post_cache::POSTS_PER_PAGE,
+							crate::post_cache::CacheServeMode::AllowStaleOnOauthOutage,
+						) {
+							let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+							filter_posts_by_flair(&mut posts, &active_flair_filter);
+							let no_posts = posts.is_empty();
+							let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+							utils::hydrate_post_author_links_from_cache(&mut posts);
+
+							let prev_page_url = if has_prev {
+								update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None)])
+							} else {
+								String::new()
+							};
+							let next_page_url = if has_next && !after.is_empty() {
+								update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
+							} else if has_next {
+								update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None)])
+							} else {
+								String::new()
+							};
+
+							return render_subreddit_fragment(SubredditFragmentTemplate {
+								sub,
+								posts,
+								top_users,
+								sort: (sort.clone(), timeframe.clone()),
+								sort_options,
+								flair_filters,
+								active_flair_filter: active_flair_filter.clone(),
+								active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+								clear_flair_filter_url: update_url_query(
+									&url,
+									&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+								),
+								prev_page_url,
+								next_page_url,
+								prefs: Preferences::new(&req),
+								url,
+								redirect_url,
+								enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+								is_filtered: false,
+								all_posts_filtered,
+								all_posts_hidden_nsfw,
+								no_posts,
+								cache_notice: OAUTH_CACHE_NOTICE.to_string(),
+								is_flair_subscribed,
+								feed_session_id: String::new(),
+								feed_status_url: String::new(),
+								feed_fragment_url: String::new(),
+							});
+						}
+					}
 				}
 				match msg.as_str() {
 					"quarantined" | "gated" => Ok(quarantine(&req, sub_name, &msg)),
@@ -1566,6 +1643,7 @@ mod tests {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			cache_notice: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -1606,6 +1684,7 @@ mod tests {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			cache_notice: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -1788,6 +1867,7 @@ mod tests {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			cache_notice: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: "demo".to_string(),
 			feed_status_url: "/feed-status?feed_session=demo".to_string(),
@@ -1827,6 +1907,7 @@ mod tests {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			cache_notice: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -2317,6 +2398,30 @@ pub async fn feed_status_api(req: Request<Body>) -> Result<Response<Body>, Strin
 		return error(req, "Feed session not found or expired").await;
 	};
 
+	let body = serde_json::to_vec(&status).map_err(|error| error.to_string())?;
+	Response::builder()
+		.status(200)
+		.header("content-type", "application/json")
+		.header("cache-control", "no-store")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())
+}
+
+pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, String> {
+	let prefs = Preferences::new(&req);
+	let status = crate::post_cache::cache_status_for_preferences(&prefs);
+	Ok(template(&CacheStatusTemplate {
+		prefs,
+		url: req.uri().path().to_string(),
+		generated_at_unix: status.generated_at_unix,
+		summary: status.summary,
+		sources: status.sources,
+	}))
+}
+
+pub async fn cache_status_api(req: Request<Body>) -> Result<Response<Body>, String> {
+	let prefs = Preferences::new(&req);
+	let status = crate::post_cache::cache_status_for_preferences(&prefs);
 	let body = serde_json::to_vec(&status).map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)

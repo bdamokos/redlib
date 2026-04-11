@@ -115,6 +115,9 @@ pub struct Config {
 
 	#[serde(rename = "REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS")]
 	pub(crate) default_remove_default_feeds: Option<String>,
+
+	#[serde(rename = "REDLIB_REDDIT_TRANSPORT")]
+	pub(crate) reddit_transport: Option<String>,
 }
 
 impl Config {
@@ -165,6 +168,7 @@ impl Config {
 			full_url: parse("REDLIB_FULL_URL"),
 			csp_connect_src: parse("REDLIB_CSP_CONNECT_SRC"),
 			default_remove_default_feeds: parse("REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS"),
+			reddit_transport: parse("REDLIB_REDDIT_TRANSPORT"),
 		}
 	}
 }
@@ -197,6 +201,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_FULL_URL" => config.full_url.clone(),
 		"REDLIB_CSP_CONNECT_SRC" => config.csp_connect_src.clone(),
 		"REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS" => config.default_remove_default_feeds.clone(),
+		"REDLIB_REDDIT_TRANSPORT" => config.reddit_transport.clone(),
 		_ => None,
 	}
 }

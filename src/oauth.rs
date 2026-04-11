@@ -1,28 +1,74 @@
-use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
+use std::{
+	collections::HashMap,
+	fmt,
+	sync::{atomic::Ordering, LazyLock, Mutex},
+	time::{Duration, SystemTime},
+};
 
 use crate::{
-	client::{CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
+	client::{send_reddit_transport_request, RedditTransport, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
 use base64::{engine::general_purpose, Engine as _};
-use hyper::{client, Body, Method, Request};
+use hyper::{Body, Method, StatusCode};
 use log::{error, info, trace, warn};
 use serde_json::json;
 use tegen::tegen::TextGenerator;
-use tokio::time::{error::Elapsed, timeout};
+use tokio::time::timeout;
 
 const REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
+const REDDIT_GENERIC_WEB_OAUTH_HEADER: &str = "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=";
 
 const AUTH_ENDPOINT: &str = "https://www.reddit.com";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const OAUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const OAUTH_REFRESH_HEADROOM_SECS: u64 = 120;
+const OAUTH_MIN_REFRESH_WAIT_SECS: u64 = 30;
+
+const GENERIC_WEB_USER_AGENTS: &[&str] = &[
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0",
+	"Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+];
+
+#[derive(Debug, Clone, Default)]
+pub struct OAuthStatusSnapshot {
+	pub available: bool,
+	pub last_error: Option<String>,
+	pub last_attempt_at: Option<SystemTime>,
+	pub last_success_at: Option<SystemTime>,
+	pub active_backend: Option<String>,
+	pub active_transport: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OAuthStatus {
+	available: bool,
+	last_error: Option<String>,
+	last_attempt_at: Option<SystemTime>,
+	last_success_at: Option<SystemTime>,
+	active_backend: Option<String>,
+	active_transport: Option<String>,
+}
+
+static OAUTH_STATUS: LazyLock<Mutex<OAuthStatus>> = LazyLock::new(|| {
+	Mutex::new(OAuthStatus {
+		available: false,
+		last_error: Some("OAuth initialization pending".to_string()),
+		last_attempt_at: None,
+		last_success_at: None,
+		active_backend: None,
+		active_transport: None,
+	})
+});
 
 // Response from OAuth backend authentication
 #[derive(Debug, Clone)]
 pub struct OauthResponse {
 	pub token: String,
 	pub expires_in: u64,
-	pub additional_headers: HashMap<String, String>,
+	pub transport: RedditTransport,
 }
 
 // Trait for OAuth backend implementations
@@ -37,6 +83,30 @@ trait OauthBackend: Send + Sync {
 pub(crate) enum OauthBackendImpl {
 	MobileSpoof(MobileSpoofAuth),
 	GenericWeb(GenericWebAuth),
+}
+
+impl OauthBackendImpl {
+	fn name(&self) -> &'static str {
+		match self {
+			OauthBackendImpl::MobileSpoof(_) => "mobile_spoof",
+			OauthBackendImpl::GenericWeb(_) => "generic_web",
+		}
+	}
+
+	fn fresh_generic_web() -> Self {
+		OauthBackendImpl::GenericWeb(GenericWebAuth::new())
+	}
+
+	fn fresh_mobile_spoof() -> Self {
+		OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new())
+	}
+
+	fn alternate_fresh(&self) -> Self {
+		match self {
+			OauthBackendImpl::GenericWeb(_) => Self::fresh_mobile_spoof(),
+			OauthBackendImpl::MobileSpoof(_) => Self::fresh_generic_web(),
+		}
+	}
 }
 
 impl OauthBackend for OauthBackendImpl {
@@ -62,91 +132,95 @@ impl OauthBackend for OauthBackendImpl {
 	}
 }
 
-// Spoofed client for Android devices
 #[derive(Debug, Clone)]
 pub struct Oauth {
 	pub(crate) headers_map: HashMap<String, String>,
 	expires_in: u64,
 	pub(crate) backend: OauthBackendImpl,
+	available: bool,
+	transport: RedditTransport,
 }
 
 impl Oauth {
-	/// Create a new OAuth client
-	pub(crate) async fn new() -> Self {
-		// Prefer the generic web flow first. It is less brittle when Reddit
-		// tightens checks on the mobile-spoof path, and we still retain the
-		// mobile backend as a fallback.
-		let mut failure_count = 0;
-		let mut backend = OauthBackendImpl::GenericWeb(GenericWebAuth::new());
-
-		loop {
-			let attempt = Self::new_with_timeout_with_backend(backend.clone()).await;
-			match attempt {
-				Ok(Ok(oauth)) => {
-					info!("[✅] Successfully created OAuth client");
-					return oauth;
-				}
-				Ok(Err(e)) => {
-					error!(
-						"[⛔] Failed to create OAuth client: {}. Retrying in 5 seconds...",
-						match e {
-							AuthError::Hyper(error) => error.to_string(),
-							AuthError::SerdeDeserialize(error) => error.to_string(),
-							AuthError::Field((value, error)) => format!("{error}\n{value}"),
-						}
-					);
-				}
-				Err(_) => {
-					error!("[⛔] Failed to create OAuth client before timeout. Retrying in 5 seconds...");
+	pub(crate) async fn try_new() -> Result<Self, AuthError> {
+		let mut primary_error = None;
+		for backend in [OauthBackendImpl::fresh_generic_web(), OauthBackendImpl::fresh_mobile_spoof()] {
+			match Self::try_new_with_backend(backend.clone()).await {
+				Ok(oauth) => return Ok(oauth),
+				Err(error) => {
+					warn!("[⛔] Failed to create OAuth client using {}: {}", backend.name(), error);
+					primary_error = Some(error);
 				}
 			}
-
-			failure_count += 1;
-
-			// Switch to MobileSpoof after repeated GenericWeb failures.
-			if matches!(backend, OauthBackendImpl::GenericWeb(_)) && failure_count >= 5 {
-				warn!("[🔄] GenericWebAuth failed 5 times. Falling back to MobileSpoofAuth...");
-				backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
-			}
-
-			// Crash after 10 total failures
-			if failure_count >= 10 {
-				error!("[⛔] Failed to create OAuth client (generic + mobile)");
-				std::process::exit(1);
-			}
-
-			tokio::time::sleep(OAUTH_TIMEOUT).await;
 		}
+
+		Err(primary_error.unwrap_or_else(|| AuthError::Message("no OAuth backends available".to_string())))
 	}
 
-	async fn new_with_timeout_with_backend(mut backend: OauthBackendImpl) -> Result<Result<Self, AuthError>, Elapsed> {
-		timeout(OAUTH_TIMEOUT, async move {
-			let response = backend.authenticate().await?;
+	pub(crate) async fn try_new_with_backend(mut backend: OauthBackendImpl) -> Result<Self, AuthError> {
+		let response = timeout(OAUTH_TIMEOUT, backend.authenticate()).await.map_err(|_| AuthError::Timeout)??;
 
-			// Build headers_map from backend headers + Authorization header
-			let mut headers_map = backend.get_headers();
-			headers_map.insert("Authorization".to_owned(), format!("Bearer {}", response.token));
-			headers_map.extend(response.additional_headers);
+		let mut headers_map = backend.get_headers();
+		headers_map.insert("Authorization".to_owned(), format!("Bearer {}", response.token));
 
-			Ok(Self {
-				headers_map,
-				expires_in: response.expires_in,
-				backend,
-			})
+		Ok(Self {
+			headers_map,
+			expires_in: response.expires_in,
+			backend,
+			available: true,
+			transport: response.transport,
 		})
-		.await
+	}
+
+	pub(crate) fn unavailable(_reason: &str) -> Self {
+		Self {
+			headers_map: HashMap::new(),
+			expires_in: OAUTH_RETRY_INTERVAL.as_secs(),
+			backend: OauthBackendImpl::GenericWeb(GenericWebAuth::placeholder()),
+			available: false,
+			transport: RedditTransport::Hyper,
+		}
 	}
 
 	pub fn user_agent(&self) -> &str {
 		self.backend.user_agent()
 	}
+
+	pub fn is_available(&self) -> bool {
+		self.available
+	}
+
+	pub(crate) fn expires_in(&self) -> u64 {
+		self.expires_in
+	}
+
+	fn transport_name(&self) -> &'static str {
+		match self.transport {
+			RedditTransport::Wreq => "wreq",
+			RedditTransport::Hyper => "hyper",
+		}
+	}
 }
 
 #[derive(Debug)]
-enum AuthError {
+pub(crate) enum AuthError {
 	Hyper(hyper::Error),
 	SerdeDeserialize(serde_json::Error),
 	Field((serde_json::Value, &'static str)),
+	Timeout,
+	Message(String),
+}
+
+impl fmt::Display for AuthError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			AuthError::Hyper(error) => write!(f, "{error}"),
+			AuthError::SerdeDeserialize(error) => write!(f, "{error}"),
+			AuthError::Field((value, field)) => write!(f, "{field}: {value}"),
+			AuthError::Timeout => write!(f, "timed out while creating OAuth client"),
+			AuthError::Message(message) => write!(f, "{message}"),
+		}
+	}
 }
 
 impl From<hyper::Error> for AuthError {
@@ -161,26 +235,102 @@ impl From<serde_json::Error> for AuthError {
 	}
 }
 
-pub async fn token_daemon() {
-	// Monitor for refreshing token
-	loop {
-		// Get expiry time - be sure to not hold the read lock
-		let expires_in = { OAUTH_CLIENT.load_full().expires_in };
+pub fn oauth_status_snapshot() -> OAuthStatusSnapshot {
+	OAUTH_STATUS
+		.lock()
+		.map(|status| OAuthStatusSnapshot {
+			available: status.available,
+			last_error: status.last_error.clone(),
+			last_attempt_at: status.last_attempt_at,
+			last_success_at: status.last_success_at,
+			active_backend: status.active_backend.clone(),
+			active_transport: status.active_transport.clone(),
+		})
+		.unwrap_or_default()
+}
 
-		// sleep for the expiry time minus 2 minutes
-		let duration = Duration::from_secs(expires_in - 120);
+pub fn oauth_is_available() -> bool {
+	oauth_status_snapshot().available
+}
 
-		info!("[⏳] Waiting for {duration:?} seconds before refreshing OAuth token...");
+fn update_oauth_status<F>(mutator: F)
+where
+	F: FnOnce(&mut OAuthStatus),
+{
+	if let Ok(mut status) = OAUTH_STATUS.lock() {
+		mutator(&mut status);
+	}
+}
 
-		tokio::time::sleep(duration).await;
+fn mark_oauth_attempt(backend: &str) {
+	update_oauth_status(|status| {
+		status.last_attempt_at = Some(SystemTime::now());
+		status.active_backend = Some(backend.to_string());
+	});
+}
 
-		info!("[⌛] {duration:?} Elapsed! Refreshing OAuth token...");
+fn mark_oauth_success(oauth: &Oauth) {
+	update_oauth_status(|status| {
+		status.available = true;
+		status.last_error = None;
+		status.last_success_at = Some(SystemTime::now());
+		status.active_backend = Some(oauth.backend.name().to_string());
+		status.active_transport = Some(oauth.transport_name().to_string());
+	});
+}
 
-		// Refresh token - in its own scope
-		{
-			force_refresh_token().await;
+fn mark_oauth_failure(backend: &str, error: &str, available: bool) {
+	update_oauth_status(|status| {
+		status.available = available;
+		status.last_error = Some(error.to_string());
+		status.active_backend = Some(backend.to_string());
+		status.active_transport = Some("hyper".to_string());
+	});
+}
+
+async fn try_refresh_from_existing(current: &Oauth) -> Result<Oauth, AuthError> {
+	let mut errors = Vec::new();
+
+	mark_oauth_attempt(current.backend.name());
+	match Oauth::try_new_with_backend(current.backend.clone()).await {
+		Ok(oauth) => return Ok(oauth),
+		Err(error) => errors.push(format!("{}: {}", current.backend.name(), error)),
+	}
+
+	let fallback = current.backend.alternate_fresh();
+	mark_oauth_attempt(fallback.name());
+	match Oauth::try_new_with_backend(fallback.clone()).await {
+		Ok(oauth) => Ok(oauth),
+		Err(error) => {
+			errors.push(format!("{}: {}", fallback.name(), error));
+			Err(AuthError::Message(errors.join("; ")))
 		}
 	}
+}
+
+fn oauth_maintenance_delay(current: &Oauth) -> Duration {
+	if !current.is_available() {
+		return OAUTH_RETRY_INTERVAL + Duration::from_secs(fastrand::u64(0..=5));
+	}
+
+	let refresh_secs = current.expires_in().saturating_sub(OAUTH_REFRESH_HEADROOM_SECS).max(OAUTH_MIN_REFRESH_WAIT_SECS);
+	Duration::from_secs(refresh_secs)
+}
+
+pub fn spawn_oauth_maintenance() {
+	tokio::spawn(async {
+		force_refresh_token().await;
+
+		loop {
+			let wait_duration = {
+				let current = OAUTH_CLIENT.load_full();
+				oauth_maintenance_delay(&current)
+			};
+			trace!("Next OAuth maintenance run in {:?}", wait_duration);
+			tokio::time::sleep(wait_duration).await;
+			force_refresh_token().await;
+		}
+	});
 }
 
 pub async fn force_refresh_token() {
@@ -190,9 +340,35 @@ pub async fn force_refresh_token() {
 	}
 
 	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
-	let new_client = Oauth::new().await;
-	OAUTH_CLIENT.swap(new_client.into());
-	OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+
+	let previous = OAUTH_CLIENT.load_full();
+	let refresh_result = if previous.is_available() {
+		try_refresh_from_existing(&previous).await
+	} else {
+		mark_oauth_attempt("generic_web");
+		Oauth::try_new().await
+	};
+
+	match refresh_result {
+		Ok(new_client) => {
+			info!("[✅] Successfully created OAuth client using {}", new_client.backend.name());
+			mark_oauth_success(&new_client);
+			OAUTH_CLIENT.swap(new_client.into());
+			OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+		}
+		Err(error) => {
+			let error_message = error.to_string();
+			error!("[⛔] Failed to refresh OAuth client: {error_message}");
+			if previous.is_available() {
+				mark_oauth_failure(previous.backend.name(), &error_message, true);
+				warn!("Keeping previous OAuth client while background refresh retries continue");
+			} else {
+				mark_oauth_failure(previous.backend.name(), &error_message, false);
+				OAUTH_CLIENT.swap(Oauth::unavailable(&error_message).into());
+			}
+		}
+	}
+
 	OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 }
 
@@ -202,255 +378,19 @@ struct Device {
 	initial_headers: HashMap<String, String>,
 	headers: HashMap<String, String>,
 	user_agent: String,
-}
-
-// MobileSpoofAuth backend - spoofs an Android mobile device
-#[derive(Debug, Clone)]
-pub struct MobileSpoofAuth {
-	device: Device,
-	additional_headers: HashMap<String, String>,
-}
-
-impl MobileSpoofAuth {
-	fn new() -> Self {
-		Self {
-			device: Device::new(),
-			additional_headers: HashMap::new(),
-		}
-	}
-}
-
-impl OauthBackend for MobileSpoofAuth {
-	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
-		// Construct URL for OAuth token
-		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
-		let mut builder = Request::builder().method(Method::POST).uri(&url);
-
-		// Add headers from spoofed client
-		for (key, value) in &self.device.initial_headers {
-			builder = builder.header(key, value);
-		}
-		// Set up HTTP Basic Auth - basically just the const OAuth ID's with no password,
-		// Base64-encoded. https://en.wikipedia.org/wiki/Basic_access_authentication
-		// This could be constant, but I don't think it's worth it. OAuth ID's can change
-		// over time and we want to be flexible.
-		let auth = general_purpose::STANDARD.encode(format!("{}:", self.device.oauth_id));
-		builder = builder.header("Authorization", format!("Basic {auth}"));
-
-		// Set JSON body. I couldn't tell you what this means. But that's what the client sends
-		let json = json!({
-				"scopes": ["*","email", "pii"]
-		});
-		let body = Body::from(json.to_string());
-
-		// Build request
-		let request = builder.body(body).unwrap();
-
-		trace!("Sending token request...\n\n{request:?}");
-
-		// Send request
-		let client: &std::sync::LazyLock<client::Client<_, Body>> = &CLIENT;
-		let resp = client.request(request).await?;
-
-		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
-		trace!("OAuth headers: {:#?}", resp.headers());
-
-		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
-		// Technically it's not needed, but it's easy for Reddit API to check for this.
-		// It's some kind of header that uniquely identifies the device.
-		// Not worried about the privacy implications, since this is randomly changed
-		// and really only as privacy-concerning as the OAuth token itself.
-		if let Some(header) = resp.headers().get("x-reddit-loid") {
-			self.additional_headers.insert("x-reddit-loid".to_owned(), header.to_str().unwrap().to_string());
-		}
-
-		// Same with x-reddit-session
-		if let Some(header) = resp.headers().get("x-reddit-session") {
-			self.additional_headers.insert("x-reddit-session".to_owned(), header.to_str().unwrap().to_string());
-		}
-
-		trace!("Serializing response...");
-
-		// Serialize response
-		let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
-		let json: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(AuthError::SerdeDeserialize)?;
-
-		trace!("Accessing relevant fields...");
-
-		// Save token and expiry
-		let token = json
-			.get("access_token")
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token")))?
-			.as_str()
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token: as_str")))?
-			.to_string();
-		let expires_in = json
-			.get("expires_in")
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in")))?
-			.as_u64()
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in: as_u64")))?;
-
-		info!("[✅] Success - Retrieved token \"{}...\", expires in {}", &token[..32], expires_in);
-
-		Ok(OauthResponse {
-			token,
-			expires_in,
-			additional_headers: self.additional_headers.clone(),
-		})
-	}
-
-	fn user_agent(&self) -> &str {
-		&self.device.user_agent
-	}
-
-	fn get_headers(&self) -> HashMap<String, String> {
-		let mut headers = self.device.headers.clone();
-		headers.extend(self.additional_headers.clone());
-		headers
-	}
-}
-
-// GenericWebAuth backend - simple web-based authentication
-#[derive(Debug, Clone)]
-pub struct GenericWebAuth {
-	device_id: String,
-	user_agent: String,
-	additional_headers: HashMap<String, String>,
-}
-
-impl GenericWebAuth {
-	fn new() -> Self {
-		// Generate random 20-character alphanumeric device_id
-		let device_id: String = (0..20)
-			.map(|_| {
-				let idx = fastrand::usize(..62);
-				let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-				chars[idx] as char
-			})
-			.collect();
-
-		info!("[🔄] Using GenericWebAuth with device_id: \"{device_id}\"");
-
-		Self {
-			device_id,
-			user_agent: fake_user_agent::get_rua().to_owned(),
-			additional_headers: HashMap::new(),
-		}
-	}
-}
-
-impl OauthBackend for GenericWebAuth {
-	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
-		// Construct URL for OAuth token
-		let url = "https://www.reddit.com/api/v1/access_token";
-		let mut builder = Request::builder().method(Method::POST).uri(url);
-
-		// Add minimal headers
-		builder = builder.header("Host", "www.reddit.com");
-		builder = builder.header("User-Agent", &self.user_agent);
-		builder = builder.header("Accept", "*/*");
-		builder = builder.header("Accept-Language", "en-US,en;q=0.5");
-		// builder = builder.header("Accept-Encoding", "gzip, deflate, br, zstd");
-		builder = builder.header("Authorization", "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=");
-		builder = builder.header("Content-Type", "application/x-www-form-urlencoded");
-		builder = builder.header("Sec-GPC", "1");
-		builder = builder.header("Connection", "keep-alive");
-
-		// Set up form body
-		let body_str = format!("grant_type=https%3A%2F%2Foauth.reddit.com%2Fgrants%2Finstalled_client&device_id={}", self.device_id);
-		let body = Body::from(body_str);
-
-		// Build request
-		let request = builder.body(body).unwrap();
-
-		trace!("Sending GenericWebAuth token request...\n\n{request:?}");
-
-		// Send request
-		let client: &std::sync::LazyLock<client::Client<_, Body>> = &CLIENT;
-		let resp = client.request(request).await?;
-
-		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
-		trace!("GenericWebAuth headers: {:#?}", resp.headers());
-
-		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
-		// Technically it's not needed, but it's easy for Reddit API to check for this.
-		// It's some kind of header that uniquely identifies the device.
-		// Not worried about the privacy implications, since this is randomly changed
-		// and really only as privacy-concerning as the OAuth token itself.
-		if let Some(header) = resp.headers().get("x-reddit-loid") {
-			self.additional_headers.insert("x-reddit-loid".to_owned(), header.to_str().unwrap().to_string());
-		}
-
-		// Same with x-reddit-session
-		if let Some(header) = resp.headers().get("x-reddit-session") {
-			self.additional_headers.insert("x-reddit-session".to_owned(), header.to_str().unwrap().to_string());
-		}
-
-		trace!("Serializing GenericWebAuth response...");
-
-		// Serialize response
-		let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
-		let json: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(AuthError::SerdeDeserialize)?;
-
-		trace!("Accessing relevant fields...");
-
-		// Parse response - access_token, token_type, device_id, expires_in, scope
-		let token = json
-			.get("access_token")
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token")))?
-			.as_str()
-			.ok_or_else(|| AuthError::Field((json.clone(), "access_token: as_str")))?
-			.to_string();
-		let expires_in = json
-			.get("expires_in")
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in")))?
-			.as_u64()
-			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in: as_u64")))?;
-
-		info!(
-			"[✅] GenericWebAuth success - Retrieved token \"{}...\", expires in {}",
-			&token[..32.min(token.len())],
-			expires_in
-		);
-
-		// Insert a few necessary headers
-		self.additional_headers.insert("Origin".to_owned(), "https://www.reddit.com".to_owned());
-		self.additional_headers.insert("User-Agent".to_owned(), self.user_agent.to_owned());
-
-		Ok(OauthResponse {
-			token,
-			expires_in,
-			additional_headers: self.additional_headers.clone(),
-		})
-	}
-
-	fn user_agent(&self) -> &str {
-		&self.user_agent
-	}
-
-	fn get_headers(&self) -> HashMap<String, String> {
-		self.additional_headers.clone()
-	}
+	loid: Option<String>,
+	session: Option<String>,
 }
 
 impl Device {
 	fn android() -> Self {
-		// Generate uuid
 		let uuid = uuid::Uuid::new_v4().to_string();
-
-		// Generate random user-agent
 		let android_app_version = choose(ANDROID_APP_VERSION_LIST).to_string();
 		let android_version = fastrand::u8(9..=14);
-
 		let android_user_agent = format!("Reddit/{android_app_version}/Android {android_version}");
-
-		let qos = fastrand::u32(1000..=100_000);
-		let qos: f32 = qos as f32 / 1000.0;
-		let qos = format!("{qos:.3}");
-
+		let qos = format!("{:.3}", fastrand::u32(1000..=100_000) as f32 / 1000.0);
 		let codecs = TextGenerator::new().generate("available-codecs=video/avc, video/hevc{, video/x-vnd.on2.vp9|}");
 
-		// Android device headers
 		let headers: HashMap<String, String> = HashMap::from([
 			("User-Agent".into(), android_user_agent.clone()),
 			("x-reddit-retry".into(), "algo=no-retries".into()),
@@ -469,21 +409,230 @@ impl Device {
 			headers: headers.clone(),
 			initial_headers: headers,
 			user_agent: android_user_agent,
+			loid: None,
+			session: None,
 		}
 	}
+
 	fn new() -> Self {
-		// See https://github.com/redlib-org/redlib/issues/8
 		Self::android()
 	}
+
+	fn update_persisted_headers(&mut self, headers: &hyper::HeaderMap) {
+		if let Some(header) = headers.get("x-reddit-loid").and_then(|header| header.to_str().ok()) {
+			self.loid = Some(header.to_string());
+		}
+		if let Some(header) = headers.get("x-reddit-session").and_then(|header| header.to_str().ok()) {
+			self.session = Some(header.to_string());
+		}
+	}
+
+	fn merged_headers(&self) -> HashMap<String, String> {
+		let mut headers = self.headers.clone();
+		if let Some(loid) = &self.loid {
+			headers.insert("x-reddit-loid".to_owned(), loid.clone());
+		}
+		if let Some(session) = &self.session {
+			headers.insert("x-reddit-session".to_owned(), session.clone());
+		}
+		headers
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct MobileSpoofAuth {
+	device: Device,
+}
+
+impl MobileSpoofAuth {
+	fn new() -> Self {
+		Self { device: Device::new() }
+	}
+}
+
+impl OauthBackend for MobileSpoofAuth {
+	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
+		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
+		let auth = general_purpose::STANDARD.encode(format!("{}:", self.device.oauth_id));
+		let json = json!({
+			"scopes": ["*","email", "pii"]
+		});
+		let mut headers = self.device.initial_headers.iter().map(|(key, value)| (key.clone(), value.clone())).collect::<Vec<_>>();
+		if let Some(loid) = &self.device.loid {
+			headers.push(("x-reddit-loid".to_string(), loid.clone()));
+		}
+		if let Some(session) = &self.device.session {
+			headers.push(("x-reddit-session".to_string(), session.clone()));
+		}
+		headers.push(("Authorization".to_string(), format!("Basic {auth}")));
+
+		trace!("Sending MobileSpoofAuth token request to {url}");
+
+		let (response, transport) = send_reddit_transport_request(&Method::POST, &url, &headers, json.to_string().into_bytes())
+			.await
+			.map_err(AuthError::Message)?;
+
+		trace!(
+			"Received mobile auth response with status {} and length {:?}",
+			response.status(),
+			response.headers().get("content-length")
+		);
+		self.device.update_persisted_headers(response.headers());
+
+		parse_oauth_response(response, transport).await
+	}
+
+	fn user_agent(&self) -> &str {
+		&self.device.user_agent
+	}
+
+	fn get_headers(&self) -> HashMap<String, String> {
+		self.device.merged_headers()
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct GenericWebAuth {
+	device_id: String,
+	user_agent: String,
+	loid: Option<String>,
+	session: Option<String>,
+}
+
+impl GenericWebAuth {
+	fn new() -> Self {
+		let device_id: String = (0..20)
+			.map(|_| {
+				let idx = fastrand::usize(..62);
+				let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+				chars[idx] as char
+			})
+			.collect();
+		let user_agent = choose(GENERIC_WEB_USER_AGENTS).to_string();
+
+		info!("[🔄] Using GenericWebAuth with device_id: \"{device_id}\" and user agent: {user_agent}");
+
+		Self {
+			device_id,
+			user_agent,
+			loid: None,
+			session: None,
+		}
+	}
+
+	fn placeholder() -> Self {
+		Self {
+			device_id: "redlib-placeholder-device".to_string(),
+			user_agent: GENERIC_WEB_USER_AGENTS[0].to_string(),
+			loid: None,
+			session: None,
+		}
+	}
+}
+
+impl OauthBackend for GenericWebAuth {
+	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
+		let url = "https://www.reddit.com/api/v1/access_token";
+		let body = format!("grant_type=https%3A%2F%2Foauth.reddit.com%2Fgrants%2Finstalled_client&device_id={}", self.device_id);
+		let mut headers = vec![
+			("Host".to_string(), "www.reddit.com".to_string()),
+			("User-Agent".to_string(), self.user_agent.clone()),
+			("Accept".to_string(), "*/*".to_string()),
+			("Accept-Language".to_string(), "en-US,en;q=0.5".to_string()),
+			("Authorization".to_string(), REDDIT_GENERIC_WEB_OAUTH_HEADER.to_string()),
+			("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()),
+			("Sec-GPC".to_string(), "1".to_string()),
+			("Connection".to_string(), "keep-alive".to_string()),
+		];
+		if let Some(loid) = &self.loid {
+			headers.push(("x-reddit-loid".to_string(), loid.clone()));
+		}
+		if let Some(session) = &self.session {
+			headers.push(("x-reddit-session".to_string(), session.clone()));
+		}
+
+		trace!("Sending GenericWebAuth token request to {url}");
+
+		let (response, transport) = send_reddit_transport_request(&Method::POST, url, &headers, body.into_bytes())
+			.await
+			.map_err(AuthError::Message)?;
+
+		trace!(
+			"Received generic web auth response with status {} and length {:?}",
+			response.status(),
+			response.headers().get("content-length")
+		);
+		if let Some(header) = response.headers().get("x-reddit-loid").and_then(|header| header.to_str().ok()) {
+			self.loid = Some(header.to_string());
+		}
+		if let Some(header) = response.headers().get("x-reddit-session").and_then(|header| header.to_str().ok()) {
+			self.session = Some(header.to_string());
+		}
+
+		parse_oauth_response(response, transport).await
+	}
+
+	fn user_agent(&self) -> &str {
+		&self.user_agent
+	}
+
+	fn get_headers(&self) -> HashMap<String, String> {
+		let mut headers = HashMap::from([
+			("Origin".to_owned(), "https://www.reddit.com".to_owned()),
+			("User-Agent".to_owned(), self.user_agent.clone()),
+		]);
+		if let Some(loid) = &self.loid {
+			headers.insert("x-reddit-loid".to_owned(), loid.clone());
+		}
+		if let Some(session) = &self.session {
+			headers.insert("x-reddit-session".to_owned(), session.clone());
+		}
+		headers
+	}
+}
+
+async fn parse_oauth_response(response: hyper::Response<Body>, transport: RedditTransport) -> Result<OauthResponse, AuthError> {
+	let status = response.status();
+	let body_bytes = hyper::body::to_bytes(response.into_body()).await?;
+	if status == StatusCode::TOO_MANY_REQUESTS {
+		return Err(AuthError::Message("rate limited while creating OAuth client".to_string()));
+	}
+
+	let json: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(AuthError::SerdeDeserialize)?;
+	if !status.is_success() {
+		return Err(AuthError::Message(format!("OAuth endpoint returned {status}: {json}")));
+	}
+
+	let token = json
+		.get("access_token")
+		.ok_or_else(|| AuthError::Field((json.clone(), "access_token")))?
+		.as_str()
+		.ok_or_else(|| AuthError::Field((json.clone(), "access_token: as_str")))?
+		.to_string();
+	let expires_in = json
+		.get("expires_in")
+		.ok_or_else(|| AuthError::Field((json.clone(), "expires_in")))?
+		.as_u64()
+		.ok_or_else(|| AuthError::Field((json.clone(), "expires_in: as_u64")))?;
+
+	info!("[✅] Retrieved OAuth token \"{}...\", expires in {} seconds", &token[..32.min(token.len())], expires_in);
+
+	Ok(OauthResponse { token, expires_in, transport })
 }
 
 fn choose<T: Copy>(list: &[T]) -> T {
 	*fastrand::choose_multiple(list.iter(), 1)[0]
 }
 
+#[cfg(test)]
+async fn ensure_oauth_client_available() {
+	if !oauth_is_available() {
+		force_refresh_token().await;
+	}
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mobile_spoof_backend() {
-	// Test MobileSpoofAuth backend specifically
 	let mut backend = MobileSpoofAuth::new();
 	let response = backend.authenticate().await;
 	assert!(response.is_ok());
@@ -496,7 +645,6 @@ async fn test_mobile_spoof_backend() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_generic_web_backend() {
-	// Test GenericWebAuth backend specifically
 	let mut backend = GenericWebAuth::new();
 	let response = backend.authenticate().await;
 	assert!(response.is_ok());
@@ -508,7 +656,7 @@ async fn test_generic_web_backend() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_oauth_client() {
-	// Integration test - tests the overall Oauth client
+	ensure_oauth_client_available().await;
 	assert!(OAUTH_CLIENT.load_full().headers_map.contains_key("Authorization"));
 }
 
@@ -519,6 +667,7 @@ async fn test_oauth_client_refresh() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_oauth_token_exists() {
+	ensure_oauth_client_available().await;
 	let client = OAUTH_CLIENT.load_full();
 	let auth_header = client.headers_map.get("Authorization").unwrap();
 	assert!(auth_header.starts_with("Bearer "));
@@ -526,6 +675,7 @@ async fn test_oauth_token_exists() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_oauth_headers_len() {
+	ensure_oauth_client_available().await;
 	assert!(OAUTH_CLIENT.load_full().headers_map.len() >= 3);
 }
 
@@ -536,7 +686,6 @@ fn test_creating_device() {
 
 #[test]
 fn test_creating_backends() {
-	// Test that both backends can be created
 	MobileSpoofAuth::new();
 	GenericWebAuth::new();
 }
