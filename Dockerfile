@@ -6,6 +6,9 @@ ARG GIT_HASH=dev
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
+    cmake \
+    clang \
+    perl \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
