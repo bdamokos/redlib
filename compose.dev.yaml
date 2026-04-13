@@ -23,6 +23,9 @@ services:
     env_file: .env
     environment:
       REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT: "${REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT:-3}"
+      REDLIB_CACHE_DIR: "${REDLIB_CACHE_DIR:-/var/lib/redlib/cache}"
+    volumes:
+      - redlib-cache:/var/lib/redlib/cache
     networks:
       - redlib
     healthcheck:
@@ -32,3 +35,7 @@ services:
 
 networks:
   redlib:
+
+volumes:
+  redlib-cache:
+    name: redlib-cache

@@ -3,6 +3,7 @@
 // CRATES
 use crate::client::json;
 use crate::config::get_setting;
+use crate::instance_scrape;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
 use crate::utils::{
@@ -22,6 +23,7 @@ pub struct PostTemplate {
 	comments: Vec<Comment>,
 	post: Post,
 	post_shell_subreddit: String,
+	fallback_notice: String,
 	sort: String,
 	prefs: Preferences,
 	single_thread: bool,
@@ -41,6 +43,7 @@ crate::impl_template_str_eq!(PostTemplate);
 struct PostFragmentTemplate {
 	comments: Vec<Comment>,
 	post: Post,
+	fallback_notice: String,
 	sort: String,
 	prefs: Preferences,
 	single_thread_str: &'static str,
@@ -129,6 +132,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 		comments: Vec::new(),
 		post: empty_post_for_shell(&post_shell_subreddit, &url),
 		post_shell_subreddit,
+		fallback_notice: String::new(),
 		sort: String::new(),
 		prefs: Preferences::new(&req),
 		single_thread: req.param("comment_id").is_some(),
@@ -175,6 +179,13 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 
 	let single_thread = req.param("comment_id").is_some();
 	let highlighted_comment = &req.param("comment_id").unwrap_or_default();
+	let query_body = match COMMENT_SEARCH_CAPTURE.captures(&url) {
+		Some(captures) => captures.get(1).unwrap().as_str().replace("%20", " ").replace('+', " "),
+		None => String::new(),
+	};
+	let query_string = format!("q={query_body}&type=comment");
+	let form = url::form_urlencoded::parse(query_string.as_bytes()).collect::<HashMap<_, _>>();
+	let comment_query = form.get("q").unwrap().clone().to_string();
 
 	// Send a request to the url, receive JSON in response
 	match json(path, quarantined).await {
@@ -192,30 +203,30 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 			}
 
-			let query_body = match COMMENT_SEARCH_CAPTURE.captures(&url) {
-				Some(captures) => captures.get(1).unwrap().as_str().replace("%20", " ").replace('+', " "),
-				None => String::new(),
-			};
-
-			let query_string = format!("q={query_body}&type=comment");
-			let form = url::form_urlencoded::parse(query_string.as_bytes()).collect::<HashMap<_, _>>();
-			let query = form.get("q").unwrap().clone().to_string();
-
-			let comments = match query.as_str() {
+			let comments = match comment_query.as_str() {
 				"" => parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &req),
-				_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &query, &req),
+				_ => query_comments(
+					&response[1],
+					&post.permalink,
+					&post.author.name,
+					highlighted_comment,
+					&get_filters(&req),
+					&comment_query,
+					&req,
+				),
 			};
 
 			// Use the Post and Comment structs to generate a website to show users
 			let body = PostFragmentTemplate {
 				comments,
 				post,
+				fallback_notice: String::new(),
 				sort,
 				prefs: Preferences::new(&req),
 				single_thread_str: if single_thread { "true" } else { "false" },
 				url: req_url,
-				url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
-				comment_query: query,
+				url_without_query: url.clone().trim_end_matches(&format!("?q={comment_query}&type=comment")).to_string(),
+				comment_query,
 			}
 			.render()
 			.map_err(|error| error.to_string())?;
@@ -228,6 +239,34 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		}
 		// If the Reddit API returns an error, exit and send error page to user
 		Err(msg) => {
+			if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) {
+				match instance_scrape::scrape_post_page(&url, highlighted_comment).await {
+					Ok(mut scraped) => {
+						let prefs = Preferences::new(&req);
+						instance_scrape::apply_comment_prefs(&mut scraped.comments, &prefs);
+						let body = PostFragmentTemplate {
+							comments: scraped.comments,
+							post: scraped.post,
+							fallback_notice: instance_scrape::scrape_notice().to_string(),
+							sort,
+							prefs,
+							single_thread_str: if single_thread { "true" } else { "false" },
+							url: req.uri().to_string(),
+							url_without_query: url.clone().trim_end_matches(&format!("?q={comment_query}&type=comment")).to_string(),
+							comment_query,
+						}
+						.render()
+						.map_err(|error| error.to_string())?;
+						return Response::builder()
+							.status(200)
+							.header("content-type", "text/html; charset=utf-8")
+							.header("cache-control", "no-store")
+							.body(Body::from(body))
+							.map_err(|error| error.to_string());
+					}
+					Err(_) => {}
+				}
+			}
 			if msg == "quarantined" || msg == "gated" {
 				let sub = req.param("sub").unwrap_or_default();
 				Ok(quarantine(&req, sub, &msg))
@@ -262,6 +301,7 @@ mod tests {
 			comments: Vec::new(),
 			post: super::empty_post_for_shell("rust", "/r/rust/comments/demo/title"),
 			post_shell_subreddit: "rust".to_string(),
+			fallback_notice: String::new(),
 			sort: String::new(),
 			prefs: test_prefs(),
 			single_thread: false,

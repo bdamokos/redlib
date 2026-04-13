@@ -1,7 +1,8 @@
 #![allow(clippy::cmp_owned)]
 
-use crate::{config, utils};
+use crate::{config, instance_scrape, utils};
 // CRATES
+use crate::cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditMetadataEntry, PersistedSubredditNsfwEntry};
 use crate::post_cache::{FeedSessionRequest, FeedSource};
 use crate::utils::{
 	catch_random, clear_sharded_cookie, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect,
@@ -354,6 +355,7 @@ fn store_subreddit_metadata(subreddit: &Subreddit) {
 			},
 		);
 	}
+	crate::cache_persistence::mark_dirty();
 }
 
 pub(crate) fn remove_subreddit_metadata_cache(sub: &str) {
@@ -363,6 +365,97 @@ pub(crate) fn remove_subreddit_metadata_cache(sub: &str) {
 	}
 	if let Ok(mut cache) = SUBREDDIT_NSFW_CACHE.lock() {
 		cache.remove(&key);
+	}
+	crate::cache_persistence::mark_dirty();
+}
+
+pub(crate) fn cache_subreddit_metadata(subreddit: &Subreddit) {
+	store_subreddit_metadata(subreddit);
+}
+
+pub(crate) fn snapshot_persisted_metadata(now_unix: u64) -> Vec<PersistedSubredditMetadataEntry> {
+	let Ok(cache) = SUBREDDIT_METADATA_CACHE.lock() else {
+		return Vec::new();
+	};
+
+	cache
+		.values()
+		.filter(|entry| !entry.subreddit.name.is_empty())
+		.map(|entry| PersistedSubredditMetadataEntry {
+			subreddit: crate::cache_persistence::PersistedSubreddit::from_runtime(&entry.subreddit),
+			fetched_at_unix: instant_to_unix(entry.fetched_at, now_unix),
+		})
+		.collect()
+}
+
+pub(crate) fn snapshot_persisted_nsfw(now_unix: u64) -> Vec<PersistedSubredditNsfwEntry> {
+	let Ok(cache) = SUBREDDIT_NSFW_CACHE.lock() else {
+		return Vec::new();
+	};
+
+	cache
+		.iter()
+		.map(|(subreddit, entry)| PersistedSubredditNsfwEntry {
+			subreddit: subreddit.clone(),
+			is_nsfw: entry.is_nsfw,
+			fetched_at_unix: instant_to_unix(entry.fetched_at, now_unix),
+		})
+		.collect()
+}
+
+pub(crate) fn restore_persisted_state(
+	metadata_entries: Vec<PersistedSubredditMetadataEntry>,
+	nsfw_entries: Vec<PersistedSubredditNsfwEntry>,
+	_saved_at_unix: u64,
+	now_unix: u64,
+) {
+	let restored_metadata = metadata_entries
+		.into_iter()
+		.filter_map(|entry| {
+			let subreddit = entry.subreddit.into_runtime();
+			if subreddit.name.is_empty() {
+				return None;
+			}
+			let age_secs = now_unix.saturating_sub(entry.fetched_at_unix);
+			if !crate::post_cache::is_subreddit_remembered(&subreddit.name) && age_secs > SUBREDDIT_METADATA_CACHE_TTL_SECS {
+				return None;
+			}
+			Some((
+				subreddit.name.to_lowercase(),
+				CachedSubredditMetadata {
+					subreddit,
+					fetched_at: unix_to_instant(entry.fetched_at_unix, now_unix),
+				},
+			))
+		})
+		.collect::<HashMap<_, _>>();
+
+	let restored_nsfw = nsfw_entries
+		.into_iter()
+		.filter_map(|entry| {
+			let subreddit = entry.subreddit.trim().to_lowercase();
+			if subreddit.is_empty() {
+				return None;
+			}
+			let age_secs = now_unix.saturating_sub(entry.fetched_at_unix);
+			if !crate::post_cache::is_subreddit_remembered(&subreddit) && age_secs > SUBREDDIT_METADATA_CACHE_TTL_SECS {
+				return None;
+			}
+			Some((
+				subreddit,
+				CachedSubredditNsfwStatus {
+					is_nsfw: entry.is_nsfw,
+					fetched_at: unix_to_instant(entry.fetched_at_unix, now_unix),
+				},
+			))
+		})
+		.collect::<HashMap<_, _>>();
+
+	if let Ok(mut cache) = SUBREDDIT_METADATA_CACHE.lock() {
+		cache.extend(restored_metadata);
+	}
+	if let Ok(mut cache) = SUBREDDIT_NSFW_CACHE.lock() {
+		cache.extend(restored_nsfw);
 	}
 }
 
@@ -485,6 +578,83 @@ fn render_subreddit_fragment(mut template_data: SubredditFragmentTemplate) -> Re
 		.header("cache-control", "no-store")
 		.body(Body::from(body))
 		.map_err(|error| error.to_string())
+}
+
+fn render_scraped_subreddit_fragment(
+	req: &Request<Body>,
+	scraped: instance_scrape::ScrapedSubredditPage,
+	sub_name: &str,
+	sort: &str,
+	timeframe: &str,
+	sort_options: Vec<SortOption>,
+	active_flair_filter: &str,
+	url: &str,
+	redirect_url: &str,
+	filters: &HashSet<String>,
+	request_before: &str,
+	is_flair_subscribed: bool,
+	cacheable_first_page: bool,
+) -> Result<Response<Body>, String> {
+	cache_subreddit_metadata(&scraped.subreddit);
+	if cacheable_first_page {
+		crate::post_cache::publish_plain_subreddit_refresh(sub_name, scraped.posts.clone(), scraped.after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+	} else {
+		utils::store_post_flairs(&scraped.posts);
+		utils::store_subreddit_users(sub_name, &scraped.posts);
+	}
+
+	let mut posts = scraped.posts;
+	let (_, all_posts_filtered) = filter_posts(&mut posts, filters);
+	filter_posts_by_flair(&mut posts, active_flair_filter);
+	if sort == "new" {
+		posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+		posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+	}
+	let no_posts = posts.is_empty();
+	let prefs = Preferences::new(req);
+	let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(req, "show_nsfw") != "on");
+	utils::hydrate_post_author_links_from_cache(&mut posts);
+
+	render_subreddit_fragment(SubredditFragmentTemplate {
+		sub: scraped.subreddit,
+		posts,
+		top_users: utils::cached_subreddit_users(sub_name)
+			.into_iter()
+			.map(|(name, count)| SubredditUserEntry { name, count })
+			.collect(),
+		sort: (sort.to_string(), timeframe.to_string()),
+		sort_options,
+		flair_filters: build_flair_filters(url, active_flair_filter, utils::cached_subreddit_flairs(sub_name)),
+		active_flair_filter: active_flair_filter.to_string(),
+		active_flair_filter_encoded: encode_query_value(active_flair_filter),
+		clear_flair_filter_url: update_url_query(url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+		prev_page_url: if !request_before.is_empty() {
+			update_url_query(url, &[("sort", Some(sort)), ("t", Some(timeframe)), ("before", Some(request_before)), ("after", None)])
+		} else {
+			String::new()
+		},
+		next_page_url: if !scraped.after.is_empty() {
+			update_url_query(
+				url,
+				&[("sort", Some(sort)), ("t", Some(timeframe)), ("before", None), ("after", Some(scraped.after.as_str()))],
+			)
+		} else {
+			String::new()
+		},
+		prefs,
+		url: url.to_string(),
+		redirect_url: redirect_url.to_string(),
+		enable_duplicate_collapse: should_enable_duplicate_collapse(sub_name),
+		is_filtered: false,
+		all_posts_filtered,
+		all_posts_hidden_nsfw,
+		no_posts,
+		cache_notice: instance_scrape::scrape_notice().to_string(),
+		is_flair_subscribed,
+		feed_session_id: String::new(),
+		feed_status_url: String::new(),
+		feed_fragment_url: String::new(),
+	})
 }
 
 fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
@@ -1093,6 +1263,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	} else {
 		build_listing_path(&sub_name, &sort, &reddit_query, &request_after, &request_before)
 	};
+	let mut metadata_error: Option<String> = None;
 	let sub = if is_subreddit_route && is_single_sub {
 		if prefers_cached_subreddit_page {
 			if let Some(cached) = cached_subreddit_metadata(&sub_name) {
@@ -1101,17 +1272,33 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				warm_subreddit_metadata(&sub_name, quarantined);
 				placeholder_subreddit(&sub_name)
 			} else if crate::utils::should_be_nsfw_gated(&req, &req_url) {
-				subreddit(&sub_name, quarantined).await.unwrap_or_else(|_| placeholder_subreddit(&sub_name))
+				match subreddit(&sub_name, quarantined).await {
+					Ok(subreddit) => subreddit,
+					Err(error) => {
+						metadata_error = Some(error);
+						placeholder_subreddit(&sub_name)
+					}
+				}
 			} else {
 				warm_subreddit_metadata(&sub_name, quarantined);
 				placeholder_subreddit(&sub_name)
 			}
 		} else if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-			refresh_subreddit_metadata(&sub_name, quarantined)
-				.await
-				.unwrap_or_else(|_| placeholder_subreddit(&sub_name))
+			match refresh_subreddit_metadata(&sub_name, quarantined).await {
+				Ok(subreddit) => subreddit,
+				Err(error) => {
+					metadata_error = Some(error);
+					placeholder_subreddit(&sub_name)
+				}
+			}
 		} else {
-			subreddit(&sub_name, quarantined).await.unwrap_or_else(|_| placeholder_subreddit(&sub_name))
+			match subreddit(&sub_name, quarantined).await {
+				Ok(subreddit) => subreddit,
+				Err(error) => {
+					metadata_error = Some(error);
+					placeholder_subreddit(&sub_name)
+				}
+			}
 		}
 	} else if aggregate_saved_feeds && !is_subreddit_route {
 		Subreddit::default()
@@ -1155,6 +1342,31 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			.flair_subscriptions
 			.iter()
 			.any(|subscription| subscription.subreddit == sub.name && subscription.flair == active_flair_filter);
+	let scrape_cacheable_first_page = is_subreddit_route && is_single_sub && uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty();
+
+	if is_subreddit_route
+		&& is_single_sub
+		&& instance_scrape::instance_scrape_enabled()
+		&& metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback)
+	{
+		if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
+			return render_scraped_subreddit_fragment(
+				&req,
+				scraped,
+				&sub_name,
+				&sort,
+				&timeframe,
+				sort_options,
+				&active_flair_filter,
+				&url,
+				&redirect_url,
+				&filters,
+				&request_before,
+				is_flair_subscribed,
+				scrape_cacheable_first_page,
+			);
+		}
+	}
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
@@ -1540,6 +1752,25 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								feed_fragment_url: String::new(),
 							});
 						}
+					}
+				}
+				if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) {
+					if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
+						return render_scraped_subreddit_fragment(
+							&req,
+							scraped,
+							&sub_name,
+							&sort,
+							&timeframe,
+							sort_options,
+							&active_flair_filter,
+							&url,
+							&redirect_url,
+							&filters,
+							&request_before,
+							is_flair_subscribed,
+							scrape_cacheable_first_page,
+						);
 					}
 				}
 				match msg.as_str() {

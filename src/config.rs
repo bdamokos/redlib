@@ -118,6 +118,18 @@ pub struct Config {
 
 	#[serde(rename = "REDLIB_REDDIT_TRANSPORT")]
 	pub(crate) reddit_transport: Option<String>,
+
+	#[serde(rename = "REDLIB_CACHE_DIR")]
+	pub(crate) cache_dir: Option<String>,
+
+	#[serde(rename = "REDLIB_INSTANCE_SCRAPE_ENABLED")]
+	pub(crate) instance_scrape_enabled: Option<String>,
+
+	#[serde(rename = "REDLIB_INSTANCE_SCRAPE_SOURCES")]
+	pub(crate) instance_scrape_sources: Option<String>,
+
+	#[serde(rename = "REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS")]
+	pub(crate) instance_scrape_timeout_secs: Option<String>,
 }
 
 impl Config {
@@ -169,6 +181,10 @@ impl Config {
 			csp_connect_src: parse("REDLIB_CSP_CONNECT_SRC"),
 			default_remove_default_feeds: parse("REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS"),
 			reddit_transport: parse("REDLIB_REDDIT_TRANSPORT"),
+			cache_dir: parse("REDLIB_CACHE_DIR"),
+			instance_scrape_enabled: parse("REDLIB_INSTANCE_SCRAPE_ENABLED"),
+			instance_scrape_sources: parse("REDLIB_INSTANCE_SCRAPE_SOURCES"),
+			instance_scrape_timeout_secs: parse("REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS"),
 		}
 	}
 }
@@ -202,6 +218,10 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_CSP_CONNECT_SRC" => config.csp_connect_src.clone(),
 		"REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS" => config.default_remove_default_feeds.clone(),
 		"REDLIB_REDDIT_TRANSPORT" => config.reddit_transport.clone(),
+		"REDLIB_CACHE_DIR" => config.cache_dir.clone(),
+		"REDLIB_INSTANCE_SCRAPE_ENABLED" => config.instance_scrape_enabled.clone(),
+		"REDLIB_INSTANCE_SCRAPE_SOURCES" => config.instance_scrape_sources.clone(),
+		"REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS" => config.instance_scrape_timeout_secs.clone(),
 		_ => None,
 	}
 }

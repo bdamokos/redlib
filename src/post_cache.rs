@@ -1,3 +1,6 @@
+use crate::cache_persistence::{
+	instant_to_unix, option_instant_to_unix, option_unix_to_instant, unix_to_instant, PersistedRefreshOrigin, PersistedRememberedSubredditEntry, PersistedSourceCacheEntry,
+};
 use crate::oauth::oauth_is_available;
 use crate::user::collapse_duplicate_submissions;
 use crate::utils::{Post, Preferences};
@@ -265,6 +268,10 @@ fn normalize_plain_subreddit_name(subreddit: &str) -> Option<String> {
 	.then_some(normalized)
 }
 
+fn is_plain_subreddit_source(source: &FeedSource) -> bool {
+	matches!(source, FeedSource::Subreddit { name } if normalize_plain_subreddit_name(name).is_some())
+}
+
 fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 	RememberedSubredditEntry {
 		name,
@@ -304,6 +311,7 @@ pub fn remember_subreddit_request(subreddit: &str) {
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let entry = remembered.entry(normalized.clone()).or_insert_with(|| new_remembered_subreddit_entry(normalized));
 	entry.last_requested_at = Instant::now();
+	crate::cache_persistence::mark_dirty();
 }
 
 pub fn remember_frontpage_subreddits(preferences: &Preferences) {
@@ -451,6 +459,7 @@ pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) {
 	};
 	entry.last_refresh_started_at = Some(Instant::now());
 	entry.refresh_in_flight = true;
+	crate::cache_persistence::mark_dirty();
 }
 
 fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) {
@@ -464,6 +473,9 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 				refresh_origin,
 			},
 		);
+	}
+	if is_plain_subreddit_source(source) {
+		crate::cache_persistence::mark_dirty();
 	}
 }
 
@@ -497,6 +509,7 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 		posts.len(),
 		!after.is_empty()
 	);
+	crate::cache_persistence::mark_dirty();
 }
 
 fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
@@ -541,6 +554,7 @@ pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refr
 	entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
 	entry.refresh_in_flight = false;
 	warn!("post_cache: plain subreddit refresh failed for {} via {:?}: {}", entry.name, refresh_origin, error);
+	crate::cache_persistence::mark_dirty();
 }
 
 pub fn cleanup_decayed_remembered_subreddits() {
@@ -565,6 +579,113 @@ pub fn cleanup_decayed_remembered_subreddits() {
 	for subreddit in &decayed {
 		cache.remove(&FeedSource::Subreddit { name: subreddit.clone() }.cache_key());
 		crate::subreddit::remove_subreddit_metadata_cache(subreddit);
+	}
+	crate::cache_persistence::mark_dirty();
+}
+
+pub(crate) fn store_source_posts_for_cache(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) {
+	store_source_posts_with_origin(source, posts, after, refresh_origin);
+}
+
+pub(crate) fn snapshot_persisted_source_entries(now_unix: u64) -> Vec<PersistedSourceCacheEntry> {
+	let Ok(cache) = SOURCE_CACHE.lock() else {
+		return Vec::new();
+	};
+
+	cache
+		.iter()
+		.filter_map(|(key, entry)| {
+			let subreddit = key.strip_prefix("subreddit:")?.to_string();
+			normalize_plain_subreddit_name(&subreddit)?;
+			Some(PersistedSourceCacheEntry {
+				subreddit,
+				posts: entry.posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
+				after: entry.after.clone(),
+				fetched_at_unix: instant_to_unix(entry.fetched_at, now_unix),
+				refresh_origin: entry.refresh_origin.map(PersistedRefreshOrigin::from_runtime),
+			})
+		})
+		.collect()
+}
+
+pub(crate) fn snapshot_persisted_remembered_subreddits(now_unix: u64) -> Vec<PersistedRememberedSubredditEntry> {
+	let Ok(remembered) = REMEMBERED_SUBREDDITS.lock() else {
+		return Vec::new();
+	};
+
+	remembered
+		.values()
+		.filter(|entry| normalize_plain_subreddit_name(&entry.name).is_some())
+		.map(|entry| PersistedRememberedSubredditEntry {
+			name: entry.name.clone(),
+			last_requested_at_unix: instant_to_unix(entry.last_requested_at, now_unix),
+			last_refresh_started_at_unix: option_instant_to_unix(entry.last_refresh_started_at, now_unix),
+			last_refresh_succeeded_at_unix: option_instant_to_unix(entry.last_refresh_succeeded_at, now_unix),
+			last_refresh_failed_at_unix: option_instant_to_unix(entry.last_refresh_failed_at, now_unix),
+			banned_until_unix: option_instant_to_unix(entry.banned_until, now_unix),
+			consecutive_failures: entry.consecutive_failures,
+			estimated_post_interval_secs: entry.estimated_post_interval_secs,
+			refresh_in_flight: entry.refresh_in_flight,
+		})
+		.collect()
+}
+
+pub(crate) fn restore_persisted_state(
+	source_entries: Vec<PersistedSourceCacheEntry>,
+	remembered_entries: Vec<PersistedRememberedSubredditEntry>,
+	_saved_at_unix: u64,
+	now_unix: u64,
+) {
+	let restored_remembered = remembered_entries
+		.into_iter()
+		.filter_map(|entry| {
+			let normalized = normalize_plain_subreddit_name(&entry.name)?;
+			let age_secs = now_unix.saturating_sub(entry.last_requested_at_unix);
+			(age_secs <= REMEMBERED_SUBREDDIT_TTL_SECS).then_some((
+				normalized,
+				RememberedSubredditEntry {
+					name: entry.name,
+					last_requested_at: unix_to_instant(entry.last_requested_at_unix, now_unix),
+					last_refresh_started_at: option_unix_to_instant(entry.last_refresh_started_at_unix, now_unix),
+					last_refresh_succeeded_at: option_unix_to_instant(entry.last_refresh_succeeded_at_unix, now_unix),
+					last_refresh_failed_at: option_unix_to_instant(entry.last_refresh_failed_at_unix, now_unix),
+					banned_until: option_unix_to_instant(entry.banned_until_unix, now_unix),
+					consecutive_failures: entry.consecutive_failures,
+					estimated_post_interval_secs: entry.estimated_post_interval_secs,
+					refresh_in_flight: false,
+				},
+			))
+		})
+		.collect::<HashMap<_, _>>();
+
+	if let Ok(mut remembered) = REMEMBERED_SUBREDDITS.lock() {
+		remembered.extend(restored_remembered.clone());
+	}
+
+	let restored_sources = source_entries
+		.into_iter()
+		.filter_map(|entry| {
+			let subreddit = normalize_plain_subreddit_name(&entry.subreddit)?;
+			let age_secs = now_unix.saturating_sub(entry.fetched_at_unix);
+			let remember_kept = restored_remembered.get(&subreddit).is_some();
+			if age_secs > CACHE_TTL_SECS && !remember_kept {
+				return None;
+			}
+
+			Some((
+				FeedSource::Subreddit { name: subreddit }.cache_key(),
+				CachedSourcePosts {
+					posts: entry.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect(),
+					after: entry.after,
+					fetched_at: unix_to_instant(entry.fetched_at_unix, now_unix),
+					refresh_origin: entry.refresh_origin.map(PersistedRefreshOrigin::into_runtime),
+				},
+			))
+		})
+		.collect::<HashMap<_, _>>();
+
+	if let Ok(mut cache) = SOURCE_CACHE.lock() {
+		cache.extend(restored_sources);
 	}
 }
 
@@ -1790,10 +1911,11 @@ mod tests {
 		count_sources_in_state, feed_page, feed_status, followup_sync_source_budget, get_cached_source_page, has_active_browser_sessions, initial_sync_source_target,
 		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
 		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request,
-		remembered_refresh_priority, round_robin_source_target, session_status_from_posts, sort_sources, source_cache_is_servable, store_source_posts,
-		store_source_posts_with_origin, sync_sources_to_request, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry,
-		SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS,
-		FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		remembered_refresh_priority, restore_persisted_state, round_robin_source_target, session_status_from_posts, snapshot_persisted_remembered_subreddits,
+		snapshot_persisted_source_entries, sort_sources, source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request,
+		ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
+		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE,
+		REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use std::cmp::Ordering;
@@ -3006,5 +3128,33 @@ mod tests {
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		let entry = remembered.get("vlogsex").unwrap();
 		assert!(entry.banned_until.is_some_and(|until| until > Instant::now() + Duration::from_secs(24 * 60 * 60)));
+	}
+
+	#[test]
+	fn persisted_restore_respects_remembered_retention_rules() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let stale_source = FeedSource::Subreddit { name: "rust".to_string() };
+		store_source_posts_with_origin(&stale_source, vec![test_post("one", "rust", 100)], "after".to_string(), None);
+		SOURCE_CACHE.lock().unwrap().get_mut(&stale_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		let stale_snapshot = snapshot_persisted_source_entries(1_000_000);
+		SOURCE_CACHE.lock().unwrap().clear();
+		restore_persisted_state(stale_snapshot, Vec::new(), 1_000_000, 1_000_000);
+		assert!(SOURCE_CACHE.lock().unwrap().is_empty());
+
+		remember_subreddit_request("remembered");
+		let remembered_source = FeedSource::Subreddit { name: "remembered".to_string() };
+		store_source_posts_with_origin(&remembered_source, vec![test_post("two", "remembered", 200)], "after".to_string(), None);
+		SOURCE_CACHE.lock().unwrap().get_mut(&remembered_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		let remembered_snapshot = snapshot_persisted_source_entries(1_000_100);
+		let remembered_state = snapshot_persisted_remembered_subreddits(1_000_100);
+		SOURCE_CACHE.lock().unwrap().clear();
+		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
+		restore_persisted_state(remembered_snapshot, remembered_state, 1_000_100, 1_000_100);
+		assert!(SOURCE_CACHE.lock().unwrap().contains_key(&remembered_source.cache_key()));
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().contains_key("remembered"));
 	}
 }

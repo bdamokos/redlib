@@ -2,6 +2,7 @@
 
 // CRATES
 use crate::client::json;
+use crate::instance_scrape;
 use crate::redgifs;
 use crate::server::RequestExt;
 use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
@@ -57,6 +58,7 @@ pub struct UserTemplate {
 	username: String,
 	posts: Vec<Post>,
 	user_subreddits: Vec<UserSubredditEntry>,
+	fallback_notice: String,
 	sort: (String, String),
 	ends: (String, String),
 	/// "overview", "comments", or "submitted"
@@ -88,6 +90,7 @@ struct UserFragmentTemplate {
 	user: User,
 	posts: Vec<Post>,
 	user_subreddits: Vec<UserSubredditEntry>,
+	fallback_notice: String,
 	sort: (String, String),
 	ends: (String, String),
 	listing: String,
@@ -270,7 +273,7 @@ fn cached_user_metadata(username: &str) -> Option<User> {
 	cache.get(&cache_key).map(|entry| entry.user.clone())
 }
 
-fn store_user_metadata(username: &str, user: &User) {
+pub(crate) fn store_user_metadata(username: &str, user: &User) {
 	let cache_key = normalize_user_metadata_cache_key(username);
 	if cache_key.is_empty() {
 		return;
@@ -795,6 +798,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![post],
 			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "submitted".to_string(),
@@ -841,6 +845,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -874,6 +879,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: Vec::new(),
 			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -959,6 +965,7 @@ mod tests {
 					count: 1,
 				},
 			],
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -1103,6 +1110,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -1138,6 +1146,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -1181,6 +1190,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![post],
 			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -1229,6 +1239,7 @@ mod tests {
 				name: "DemoSub".to_string(),
 				count: 1,
 			}],
+			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing: "overview".to_string(),
@@ -1286,6 +1297,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		username: username.clone(),
 		posts: Vec::new(),
 		user_subreddits,
+		fallback_notice: String::new(),
 		sort: (sort, param(&path, "t").unwrap_or_default()),
 		ends: (param(&path, "after").unwrap_or_default(), String::new()),
 		listing: listing.clone(),
@@ -1317,7 +1329,10 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let redirect_url = current_url.trim_start_matches('/').replace('?', "%3F").replace('&', "%26");
 	let sort = param(&path, "sort").unwrap_or_default();
 	let cached_listing_page = cached_user_listing_posts(&username, &listing, &sort, query);
-	let user = user(&username).await.unwrap_or_default();
+	let user_result = user(&username).await;
+	let metadata_error = user_result.as_ref().err().cloned();
+	let metadata_rate_limited = metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback);
+	let user = user_result.unwrap_or_default();
 	let req_url = req.uri().to_string();
 
 	if user.nsfw && crate::utils::should_be_nsfw_gated(&req, &req_url) {
@@ -1333,6 +1348,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				.into_iter()
 				.map(|(name, count)| UserSubredditEntry { name, count })
 				.collect(),
+			fallback_notice: String::new(),
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			ends: (param(&path, "after").unwrap_or_default(), String::new()),
 			listing,
@@ -1348,7 +1364,31 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			next_page_url: String::new(),
 		}
 	} else {
-		let (posts, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some((posts, after, has_prev, has_next)) = cached_listing_page {
+		let cacheable_submitted_first_page = listing == "submitted"
+			&& sort == "new"
+			&& param(&format!("?{query}"), "after").unwrap_or_default().is_empty()
+			&& param(&format!("?{query}"), "before").unwrap_or_default().is_empty();
+		let mut fallback_notice = String::new();
+		let maybe_scraped = if instance_scrape::instance_scrape_enabled() && metadata_rate_limited {
+			instance_scrape::scrape_user_page(&current_url).await.ok()
+		} else {
+			None
+		};
+		let (fragment_user, posts, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some(scraped) = maybe_scraped {
+			store_user_metadata(&username, &scraped.user);
+			utils::store_post_flairs(&scraped.posts);
+			utils::store_user_subreddits(&username, &scraped.posts);
+			if cacheable_submitted_first_page {
+				crate::post_cache::store_source_posts_for_cache(
+					&crate::post_cache::FeedSource::Subreddit { name: format!("u_{username}") },
+					scraped.posts.clone(),
+					scraped.after.clone(),
+					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+				);
+			}
+			fallback_notice = instance_scrape::scrape_notice().to_string();
+			(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
+		} else if let Some((posts, after, has_prev, has_next)) = cached_listing_page {
 			let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
 			let prev = if has_prev {
 				let prev_page = cache_page.saturating_sub(1).to_string();
@@ -1403,21 +1443,47 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			} else {
 				String::new()
 			};
-			(posts, (String::new(), String::new()), prev, next, false)
+			(user.clone(), posts, (String::new(), String::new()), prev, next, false)
 		} else {
-			let (posts, after, all_posts_filtered) = fetch_user_listing_posts(&username, &path, &listing, &filters).await?;
-			(posts, (param(&path, "after").unwrap_or_default(), after), String::new(), String::new(), all_posts_filtered)
+			match fetch_user_listing_posts(&username, &path, &listing, &filters).await {
+				Ok((posts, after, all_posts_filtered)) => (
+					user.clone(),
+					posts,
+					(param(&path, "after").unwrap_or_default(), after),
+					String::new(),
+					String::new(),
+					all_posts_filtered,
+				),
+				Err(msg) if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) => {
+					let scraped = instance_scrape::scrape_user_page(&current_url).await.map_err(|_| msg.clone())?;
+					store_user_metadata(&username, &scraped.user);
+					utils::store_post_flairs(&scraped.posts);
+					utils::store_user_subreddits(&username, &scraped.posts);
+					if cacheable_submitted_first_page {
+						crate::post_cache::store_source_posts_for_cache(
+							&crate::post_cache::FeedSource::Subreddit { name: format!("u_{username}") },
+							scraped.posts.clone(),
+							scraped.after.clone(),
+							Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+						);
+					}
+					fallback_notice = instance_scrape::scrape_notice().to_string();
+					(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
+				}
+				Err(msg) => return Err(msg),
+			}
 		};
 		let no_posts = posts.is_empty();
 		let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 		let avg_video_length = cached_avg_video_length(&username);
 		UserFragmentTemplate {
-			user,
+			user: fragment_user,
 			posts,
 			user_subreddits: utils::cached_user_subreddits(&username)
 				.into_iter()
 				.map(|(name, count)| UserSubredditEntry { name, count })
 				.collect(),
+			fallback_notice,
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			ends,
 			listing,

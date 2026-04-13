@@ -29,6 +29,9 @@
     {% if no_posts %}
     <center>No posts were found.</center>
     {% endif %}
+    {% if !fallback_notice.is_empty() %}
+    <center>{{ fallback_notice }}</center>
+    {% endif %}
     {% if all_posts_filtered %}
     <center>(All content on this page has been filtered)</center>
     {% else %}

@@ -50,7 +50,9 @@ COPY --from=builder /tmp/redlib /usr/local/bin/redlib
 COPY --from=builder /usr/src/redlib/templates /templates
 COPY --from=builder /usr/src/redlib/static /static
 
-RUN useradd -r -s /bin/false redlib
+RUN useradd -r -s /bin/false redlib && \
+    mkdir -p /var/lib/redlib/cache && \
+    chown -R redlib:redlib /var/lib/redlib
 USER redlib
 
 # Set environment variables
@@ -65,6 +67,7 @@ ENV REDLIB_DEFAULT_USE_HLS=off
 ENV REDLIB_DEFAULT_HIDE_HLS_NOTIFICATION=off
 ENV REDLIB_DEFAULT_AUTOPLAY_VIDEOS=off
 ENV REDLIB_BANNER_TEXT=Redlib
+ENV REDLIB_CACHE_DIR=/var/lib/redlib/cache
 
 # Tell Docker to expose port 8080
 EXPOSE 8080

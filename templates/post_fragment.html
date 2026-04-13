@@ -1,6 +1,9 @@
 {% import "utils.html" as utils %}
 
 <div id="column_one" class="post_page">
+    {% if !fallback_notice.is_empty() %}
+    <center>{{ fallback_notice }}</center>
+    {% endif %}
     {% call utils::post(post) %}
 
     <div id="commentQueryForms">

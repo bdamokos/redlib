@@ -77,6 +77,18 @@
     "REDLIB_ENABLE_RSS": {
       "required": false
     },
+    "REDLIB_CACHE_DIR": {
+      "required": false
+    },
+    "REDLIB_INSTANCE_SCRAPE_ENABLED": {
+      "required": false
+    },
+    "REDLIB_INSTANCE_SCRAPE_SOURCES": {
+      "required": false
+    },
+    "REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS": {
+      "required": false
+    },
     "REDLIB_FULL_URL": {
       "required": false
     },

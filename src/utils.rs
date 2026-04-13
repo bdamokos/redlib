@@ -6,6 +6,7 @@ use crate::config::{self, get_setting};
 // CRATES
 //
 use crate::{
+	cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditFlairsEntry, PersistedSubredditUsersEntry},
 	client::{json, latest_ratelimit_snapshot, CLIENT, OAUTH_CLIENT},
 	redgifs,
 	server::{RequestExt, ResponseExt},
@@ -1084,6 +1085,7 @@ pub fn store_subreddit_flairs(subreddit: &str, posts: &[Post]) {
 		};
 		cache.remove(&oldest_key);
 	}
+	crate::cache_persistence::mark_dirty();
 }
 
 pub fn store_post_flairs(posts: &[Post]) {
@@ -1113,6 +1115,7 @@ pub fn store_post_flairs(posts: &[Post]) {
 			cache.remove(&oldest_key);
 		}
 	}
+	crate::cache_persistence::mark_dirty();
 }
 
 pub fn cached_subreddit_flairs(subreddit: &str) -> Vec<Flair> {
@@ -1225,6 +1228,7 @@ pub fn store_subreddit_users(subreddit: &str, posts: &[Post]) {
 		};
 		cache.remove(&oldest_key);
 	}
+	crate::cache_persistence::mark_dirty();
 }
 
 pub fn cached_subreddit_users(subreddit: &str) -> Vec<(String, u32)> {
@@ -1244,6 +1248,95 @@ pub fn cached_subreddit_users(subreddit: &str) -> Vec<(String, u32)> {
 	let mut users = entry.users.iter().map(|(name, count)| (name.clone(), *count)).collect::<Vec<_>>();
 	users.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())).then_with(|| a.0.cmp(&b.0)));
 	users
+}
+
+pub(crate) fn snapshot_persisted_subreddit_flairs(now_unix: u64) -> Vec<PersistedSubredditFlairsEntry> {
+	let Ok(cache) = SUBREDDIT_FLAIR_CACHE.lock() else {
+		return Vec::new();
+	};
+
+	cache
+		.iter()
+		.filter(|(subreddit, _)| !subreddit.trim().is_empty())
+		.map(|(subreddit, entry)| {
+			let mut flairs = entry.flairs.values().map(crate::cache_persistence::PersistedFlair::from_runtime).collect::<Vec<_>>();
+			flairs.sort_by(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase()).then_with(|| a.text.cmp(&b.text)));
+			PersistedSubredditFlairsEntry {
+				subreddit: subreddit.clone(),
+				flairs,
+				cached_at_unix: instant_to_unix(entry.cached_at, now_unix),
+			}
+		})
+		.collect()
+}
+
+pub(crate) fn snapshot_persisted_subreddit_users(now_unix: u64) -> Vec<PersistedSubredditUsersEntry> {
+	let Ok(cache) = SUBREDDIT_USER_CACHE.lock() else {
+		return Vec::new();
+	};
+
+	cache
+		.iter()
+		.filter(|(subreddit, _)| !subreddit.trim().is_empty())
+		.map(|(subreddit, entry)| {
+			let mut users = entry.users.iter().map(|(name, count)| (name.clone(), *count)).collect::<Vec<_>>();
+			users.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())).then_with(|| a.0.cmp(&b.0)));
+			PersistedSubredditUsersEntry {
+				subreddit: subreddit.clone(),
+				users,
+				cached_at_unix: instant_to_unix(entry.cached_at, now_unix),
+			}
+		})
+		.collect()
+}
+
+pub(crate) fn restore_persisted_state(flair_entries: Vec<PersistedSubredditFlairsEntry>, user_entries: Vec<PersistedSubredditUsersEntry>, _saved_at_unix: u64, now_unix: u64) {
+	let restored_flairs = flair_entries
+		.into_iter()
+		.filter_map(|entry| {
+			let subreddit = entry.subreddit.trim().to_string();
+			if subreddit.is_empty() {
+				return None;
+			}
+			Some((
+				subreddit,
+				CachedSubredditFlairs {
+					flairs: entry
+						.flairs
+						.into_iter()
+						.map(crate::cache_persistence::PersistedFlair::into_runtime)
+						.filter(|flair| !flair.text.trim().is_empty())
+						.map(|flair| (flair.text.clone(), flair))
+						.collect(),
+					cached_at: unix_to_instant(entry.cached_at_unix, now_unix),
+				},
+			))
+		})
+		.collect::<HashMap<_, _>>();
+
+	let restored_users = user_entries
+		.into_iter()
+		.filter_map(|entry| {
+			let subreddit = entry.subreddit.trim().to_string();
+			if subreddit.is_empty() {
+				return None;
+			}
+			Some((
+				subreddit,
+				CachedSubredditUsers {
+					users: entry.users.into_iter().collect(),
+					cached_at: unix_to_instant(entry.cached_at_unix, now_unix),
+				},
+			))
+		})
+		.collect::<HashMap<_, _>>();
+
+	if let Ok(mut cache) = SUBREDDIT_FLAIR_CACHE.lock() {
+		cache.extend(restored_flairs);
+	}
+	if let Ok(mut cache) = SUBREDDIT_USER_CACHE.lock() {
+		cache.extend(restored_users);
+	}
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1272,7 +1365,7 @@ pub struct Params {
 	pub before: Option<String>,
 }
 
-#[derive(Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[revisioned(revision = 4)]
 pub struct Preferences {
 	#[revision(start = 1)]

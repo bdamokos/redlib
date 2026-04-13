@@ -14,7 +14,7 @@ use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
-use redlib::{config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, user, video_preview};
+use redlib::{cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, user, video_preview};
 use url::Url;
 
 use redlib::client::OAUTH_CLIENT;
@@ -256,6 +256,7 @@ async fn main() {
 	LazyLock::force(&OAUTH_CLIENT);
 	spawn_oauth_maintenance();
 	video_preview::init();
+	cache_persistence::init();
 	post_cache::spawn_remembered_subreddit_daemon();
 
 	// Define default headers (added to all responses)

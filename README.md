@@ -199,6 +199,22 @@ Stream logs from the Redlib container:
 docker logs -f redlib
 ```
 
+The maintained compose files in this repository mount a named Docker volume called `redlib-cache` at `/var/lib/redlib/cache`. That volume persists the remembered plain-subreddit cache across image rebuilds and container recreation.
+
+To clear the persisted cache volume on demand:
+
+```bash
+./scripts/purge_cache_volume.sh compose.dev.yaml
+```
+
+Equivalent manual commands:
+
+```bash
+docker compose -f compose.dev.yaml stop redlib
+docker run --rm -v redlib-cache:/cache alpine:3.22 sh -c 'rm -rf /cache/* /cache/.[!.]* /cache/..?*'
+docker compose -f compose.dev.yaml up -d redlib
+```
+
 ### Docker CLI
 
 Deploy Redlib:
@@ -427,7 +443,14 @@ Assign a default value for each instance-specific setting by passing environment
 | `RUST_LOG`                | Log filter      | (unset)                | Sets the Rust logger filter for server logs, for example `error`, `warn`, `info`, `debug`, or `trace`.   |
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
-| `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)
+| `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS).                                                     |
+| `CACHE_DIR`               | String          | `/var/lib/redlib/cache`| Directory used for persisted subreddit cache snapshots.                                                    |
+| `INSTANCE_SCRAPE_ENABLED` | `["on", "off"]` | `off`                  | Enables direct-request fallback scraping from public stock Redlib instances when Reddit rate limits apply. |
+| `INSTANCE_SCRAPE_SOURCES` | CSV of origins  | (empty)                | Optional override list of Redlib origins. If unset, Redlib uses the public `redlib-instances` JSON catalog and refreshes health every 3 days. |
+| `INSTANCE_SCRAPE_TIMEOUT_SECS` | Integer     | `6`                    | Per-request timeout for external Redlib scrape fallback and instance-health probes.                        |
+
+> [!WARNING]
+> When `REDLIB_INSTANCE_SCRAPE_ENABLED=on`, direct subreddit, user, and post page requests that hit a Reddit rate limit may be fetched from a public Redlib instance instead. That leaks the requested path to the selected external instance. Front-page warming, remembered-subreddit background refreshes, and other background cache traffic do not use this fallback.
 ## Default user settings
 
 Assign a default value for each user-modifiable setting by passing environment variables to Redlib in the format `REDLIB_DEFAULT_{Y}`. Replace `{Y}` with the setting name (see list below) in capital letters.
