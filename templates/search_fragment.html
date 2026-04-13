@@ -1,6 +1,10 @@
 {% import "utils.html" as utils %}
 
 <div id="column_one">
+	{% if !fallback_notice.is_empty() %}
+	<center>{{ fallback_notice }}</center>
+	{% endif %}
+
 	<form id="search_sort">
 		<div class="search_widget_divider_box">
 			<input id="search" type="text" name="q" placeholder="Search" value="{{ params.q|safe }}" title="Search redlib">

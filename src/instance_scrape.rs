@@ -67,6 +67,11 @@ static SEL_COMMENT_SCORE: LazyLock<Selector> = LazyLock::new(|| Selector::parse(
 static SEL_COMMENT_BODY: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".comment_body").unwrap());
 static SEL_REPLIES: LazyLock<Selector> = LazyLock::new(|| Selector::parse("blockquote.replies").unwrap());
 static SEL_COMMENT_COUNT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("#comment_count").unwrap());
+static SEL_SEARCH_SUBREDDIT_CARD: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a.search_subreddit").unwrap());
+static SEL_SEARCH_SUBREDDIT_NAME: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".search_subreddit_name").unwrap());
+static SEL_SEARCH_SUBREDDIT_MEMBERS: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".search_subreddit_members").unwrap());
+static SEL_SEARCH_SUBREDDIT_DESCRIPTION: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".search_subreddit_description").unwrap());
+static SEL_SEARCH_SUBREDDIT_ICON: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".search_subreddit_left img").unwrap());
 
 #[derive(Clone)]
 struct InstanceHealthCache {
@@ -101,6 +106,20 @@ pub(crate) struct ScrapedPostPage {
 	pub comments: Vec<Comment>,
 }
 
+pub(crate) struct ScrapedSearchSubreddit {
+	pub name: String,
+	pub url: String,
+	pub icon: String,
+	pub description: String,
+	pub subscribers: (String, String),
+}
+
+pub(crate) struct ScrapedSearchPage {
+	pub posts: Vec<Post>,
+	pub subreddits: Vec<ScrapedSearchSubreddit>,
+	pub after: String,
+}
+
 pub(crate) fn scrape_notice() -> &'static str {
 	SCRAPE_NOTICE
 }
@@ -113,10 +132,11 @@ pub(crate) fn instance_scrape_enabled() -> bool {
 
 pub(crate) fn should_attempt_scrape_fallback(error: &str) -> bool {
 	let message = error.to_ascii_lowercase();
-	message.contains("too many requests")
-		|| message.contains("rate limit")
-		|| message.contains("ratelimit")
-		|| latest_ratelimit_snapshot().is_some_and(|snapshot| snapshot.is_rate_limited())
+	message.contains("too many requests") || message.contains("rate limit") || message.contains("ratelimit") || reddit_rate_limited_now()
+}
+
+pub(crate) fn reddit_rate_limited_now() -> bool {
+	latest_ratelimit_snapshot().is_some_and(|snapshot| snapshot.is_rate_limited())
 }
 
 pub(crate) fn apply_comment_prefs(comments: &mut [Comment], prefs: &Preferences) {
@@ -139,6 +159,11 @@ pub(crate) async fn scrape_user_page(path_and_query: &str) -> Result<ScrapedUser
 pub(crate) async fn scrape_post_page(path_and_query: &str, highlighted_comment_id: &str) -> Result<ScrapedPostPage, String> {
 	let html = fetch_page_html(path_and_query).await?;
 	parse_post_page(&html, highlighted_comment_id)
+}
+
+pub(crate) async fn scrape_search_page(path_and_query: &str) -> Result<ScrapedSearchPage, String> {
+	let html = fetch_page_html(path_and_query).await?;
+	parse_search_page(&html)
 }
 
 fn request_timeout() -> Duration {
@@ -481,11 +506,42 @@ fn parse_post_page(document: &str, highlighted_comment_id: &str) -> Result<Scrap
 	Ok(ScrapedPostPage { post, comments })
 }
 
+fn parse_search_page(document: &str) -> Result<ScrapedSearchPage, String> {
+	let parsed = Html::parse_document(document);
+	let mut posts = Vec::new();
+	if let Some(column_one) = parsed.select(&SEL_COLUMN_ONE).next() {
+		for child in column_one.children().filter_map(ElementRef::wrap) {
+			if has_class(&child, "post") {
+				if let Some(post) = parse_post_card(child, ListingContext::Search) {
+					posts.push(post);
+				}
+			}
+		}
+	}
+
+	let subreddits = parsed
+		.select(&SEL_SEARCH_SUBREDDIT_CARD)
+		.filter(|element| element.value().attr("id").unwrap_or_default() != "more_subreddits")
+		.filter_map(parse_search_subreddit_card)
+		.collect::<Vec<_>>();
+
+	if posts.is_empty() && subreddits.is_empty() {
+		return Err("scraped search page did not contain posts or subreddit results".to_string());
+	}
+
+	Ok(ScrapedSearchPage {
+		posts,
+		subreddits,
+		after: next_after_token(&parsed).unwrap_or_default(),
+	})
+}
+
 #[derive(Clone, Copy)]
 enum ListingContext {
 	Subreddit,
 	User,
 	PostPage,
+	Search,
 }
 
 fn parse_post_card(element: ElementRef<'_>, context: ListingContext) -> Option<Post> {
@@ -612,6 +668,39 @@ fn parse_post_card(element: ElementRef<'_>, context: ListingContext) -> Option<P
 		ws_url: String::new(),
 		preview_body: if matches!(context, ListingContext::PostPage) { String::new() } else { preview_html },
 		collapsed_duplicates: Vec::new(),
+	})
+}
+
+fn parse_search_subreddit_card(element: ElementRef<'_>) -> Option<ScrapedSearchSubreddit> {
+	let name = normalize_resource_name(&element.select(&SEL_SEARCH_SUBREDDIT_NAME).next().map(text_contents).unwrap_or_default());
+	if name.is_empty() {
+		return None;
+	}
+
+	let url = element.value().attr("href").unwrap_or_default().to_string();
+	let icon = element
+		.select(&SEL_SEARCH_SUBREDDIT_ICON)
+		.next()
+		.and_then(|image| image.value().attr("src"))
+		.unwrap_or_default()
+		.to_string();
+	let description = element.select(&SEL_SEARCH_SUBREDDIT_DESCRIPTION).next().map(text_contents).unwrap_or_default();
+	let subscribers = element
+		.select(&SEL_SEARCH_SUBREDDIT_MEMBERS)
+		.next()
+		.map(|members| {
+			let display = text_contents(members);
+			let raw = members.value().attr("title").unwrap_or(&display).to_string();
+			(if display.is_empty() { raw.clone() } else { display }, if raw.is_empty() { "0".to_string() } else { raw })
+		})
+		.unwrap_or_else(|| ("0".to_string(), "0".to_string()));
+
+	Some(ScrapedSearchSubreddit {
+		name,
+		url,
+		icon,
+		description,
+		subscribers,
 	})
 }
 
@@ -892,6 +981,7 @@ mod tests {
 	const SUBREDDIT_FIXTURE: &str = include_str!("../tests/fixtures/stock_redlib_subreddit.html");
 	const USER_FIXTURE: &str = include_str!("../tests/fixtures/stock_redlib_user.html");
 	const POST_FIXTURE: &str = include_str!("../tests/fixtures/stock_redlib_post.html");
+	const SEARCH_FIXTURE: &str = include_str!("../tests/fixtures/stock_redlib_search.html");
 	const ANUBIS_FIXTURE: &str = include_str!("../tests/fixtures/anubis_block.html");
 	const HTTP_403_FIXTURE: &str = include_str!("../tests/fixtures/http_403.html");
 
@@ -927,6 +1017,16 @@ mod tests {
 		assert_eq!(parsed.comments.len(), 1);
 		assert_eq!(parsed.comments[0].replies.len(), 1);
 		assert!(parsed.comments[0].replies[0].highlighted);
+	}
+
+	#[test]
+	fn parses_stock_search_fixture() {
+		let parsed = parse_search_page(SEARCH_FIXTURE).unwrap();
+		assert_eq!(parsed.subreddits.len(), 2);
+		assert_eq!(parsed.subreddits[0].name, "rust");
+		assert_eq!(parsed.posts.len(), 2);
+		assert_eq!(parsed.posts[0].title, "Example search result");
+		assert_eq!(parsed.after, "t3_searchnext");
 	}
 
 	#[test]

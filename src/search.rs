@@ -4,6 +4,7 @@
 use crate::utils::{self, catch_random, error, filter_posts, format_num, format_url, get_filters, param, redirect, setting, template, val, Post, Preferences};
 use crate::{
 	client::json,
+	instance_scrape,
 	server::RequestExt,
 	subreddit::{can_access_quarantine, quarantine},
 };
@@ -26,7 +27,7 @@ struct SearchParams {
 
 // STRUCTS
 #[derive(Clone, PartialEq)]
-struct Subreddit {
+pub(crate) struct Subreddit {
 	name: String,
 	url: String,
 	icon: String,
@@ -43,6 +44,7 @@ pub struct SearchTemplate {
 	loading_message: String,
 	posts: Vec<Post>,
 	subreddits: Vec<Subreddit>,
+	fallback_notice: String,
 	sub: String,
 	params: SearchParams,
 	prefs: Preferences,
@@ -65,6 +67,7 @@ crate::impl_template_str_eq!(SearchTemplate);
 struct SearchFragmentTemplate {
 	posts: Vec<Post>,
 	subreddits: Vec<Subreddit>,
+	fallback_notice: String,
 	sub: String,
 	params: SearchParams,
 	prefs: Preferences,
@@ -173,6 +176,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 		loading_message: "Loading search results...".to_string(),
 		posts: Vec::new(),
 		subreddits: Vec::new(),
+		fallback_notice: String::new(),
 		sub,
 		params: search_params_from_request(&path, &query, String::new(), typed),
 		prefs: Preferences::new(&req),
@@ -222,6 +226,49 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 
 	let typed = param(&path, "type").unwrap_or_default();
 	let filters = get_filters(&req);
+	let url = search_current_url(&req);
+	let prefs = Preferences::new(&req);
+	let should_scrape_direct = instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now();
+
+	if should_scrape_direct {
+		return match instance_scrape::scrape_search_page(&url).await {
+			Ok(mut scraped) => {
+				let (_, all_posts_filtered) = filter_posts(&mut scraped.posts, &filters);
+				let no_posts = scraped.posts.is_empty();
+				let all_posts_hidden_nsfw = !no_posts && (scraped.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+				utils::hydrate_post_author_links_from_cache(&mut scraped.posts);
+				render_search_fragment(SearchFragmentTemplate {
+					posts: scraped.posts,
+					subreddits: mark_subreddit_subscriptions(
+						scraped
+							.subreddits
+							.into_iter()
+							.map(|subreddit| Subreddit {
+								name: subreddit.name,
+								url: subreddit.url,
+								icon: subreddit.icon,
+								description: subreddit.description,
+								subscribers: subreddit.subscribers,
+								is_subscribed: false,
+							})
+							.collect(),
+						&prefs.subscriptions,
+					),
+					fallback_notice: instance_scrape::scrape_notice().to_string(),
+					sub,
+					params: search_params_from_request(&path, &query, scraped.after, typed),
+					prefs,
+					url,
+					redirect_url: search_current_url(&req)[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B"),
+					is_filtered: false,
+					all_posts_filtered,
+					all_posts_hidden_nsfw,
+					no_posts,
+				})
+			}
+			Err(_) => error(req, "Too many requests.").await,
+		};
+	}
 
 	// If search is not restricted to this subreddit, show other subreddits in search results
 	let subreddits = if param(&path, "restrict_sr").is_none() {
@@ -232,8 +279,6 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		Vec::new()
 	};
 
-	let url = search_current_url(&req);
-	let prefs = Preferences::new(&req);
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 
 	// If all requested subs are filtered, we don't need to fetch posts.
@@ -241,6 +286,7 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		render_search_fragment(SearchFragmentTemplate {
 			posts: Vec::new(),
 			subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
+			fallback_notice: String::new(),
 			sub,
 			params: search_params_from_request(&path, &query, String::new(), typed),
 			prefs,
@@ -262,6 +308,7 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				render_search_fragment(SearchFragmentTemplate {
 					posts,
 					subreddits: mark_subreddit_subscriptions(subreddits, &prefs.subscriptions),
+					fallback_notice: String::new(),
 					sub,
 					params: search_params_from_request(&path, &query, after, typed),
 					prefs,
@@ -272,6 +319,45 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 					all_posts_hidden_nsfw,
 					no_posts,
 				})
+			}
+			Err(msg) if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) => {
+				match instance_scrape::scrape_search_page(&url).await {
+					Ok(mut scraped) => {
+						let (_, all_posts_filtered) = filter_posts(&mut scraped.posts, &filters);
+						let no_posts = scraped.posts.is_empty();
+						let all_posts_hidden_nsfw = !no_posts && (scraped.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+						utils::hydrate_post_author_links_from_cache(&mut scraped.posts);
+						render_search_fragment(SearchFragmentTemplate {
+							posts: scraped.posts,
+							subreddits: mark_subreddit_subscriptions(
+								scraped
+									.subreddits
+									.into_iter()
+									.map(|subreddit| Subreddit {
+										name: subreddit.name,
+										url: subreddit.url,
+										icon: subreddit.icon,
+										description: subreddit.description,
+										subscribers: subreddit.subscribers,
+										is_subscribed: false,
+									})
+									.collect(),
+								&prefs.subscriptions,
+							),
+							fallback_notice: instance_scrape::scrape_notice().to_string(),
+							sub,
+							params: search_params_from_request(&path, &query, scraped.after, typed),
+							prefs,
+							url,
+							redirect_url,
+							is_filtered: false,
+							all_posts_filtered,
+							all_posts_hidden_nsfw,
+							no_posts,
+						})
+					}
+					Err(_) => error(req, &msg).await,
+				}
 			}
 			Err(msg) => {
 				if msg == "quarantined" || msg == "gated" {
@@ -377,6 +463,7 @@ mod tests {
 			loading_message: "Loading search results...".to_string(),
 			posts: Vec::new(),
 			subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sub: String::new(),
 			params: test_params(),
 			prefs: test_prefs(),
@@ -400,6 +487,7 @@ mod tests {
 		let html = SearchFragmentTemplate {
 			posts: Vec::new(),
 			subreddits: Vec::new(),
+			fallback_notice: String::new(),
 			sub: String::new(),
 			params: SearchParams {
 				after: "t3_test".to_string(),

@@ -1329,7 +1329,16 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let redirect_url = current_url.trim_start_matches('/').replace('?', "%3F").replace('&', "%26");
 	let sort = param(&path, "sort").unwrap_or_default();
 	let cached_listing_page = cached_user_listing_posts(&username, &listing, &sort, query);
-	let user_result = user(&username).await;
+	let pre_scraped = if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
+		instance_scrape::scrape_user_page(&current_url).await.ok()
+	} else {
+		None
+	};
+	let user_result = if let Some(scraped) = &pre_scraped {
+		Ok(scraped.user.clone())
+	} else {
+		user(&username).await
+	};
 	let metadata_error = user_result.as_ref().err().cloned();
 	let metadata_rate_limited = metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback);
 	let user = user_result.unwrap_or_default();
@@ -1369,7 +1378,9 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			&& param(&format!("?{query}"), "after").unwrap_or_default().is_empty()
 			&& param(&format!("?{query}"), "before").unwrap_or_default().is_empty();
 		let mut fallback_notice = String::new();
-		let maybe_scraped = if instance_scrape::instance_scrape_enabled() && metadata_rate_limited {
+		let maybe_scraped = if let Some(scraped) = pre_scraped {
+			Some(scraped)
+		} else if instance_scrape::instance_scrape_enabled() && metadata_rate_limited {
 			instance_scrape::scrape_user_page(&current_url).await.ok()
 		} else {
 			None

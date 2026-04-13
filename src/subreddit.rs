@@ -1263,6 +1263,44 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	} else {
 		build_listing_path(&sub_name, &sort, &reddit_query, &request_after, &request_before)
 	};
+
+	if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
+		let sort_base_path = if aggregate_saved_feeds {
+			String::new()
+		} else if sub_name.is_empty() {
+			String::new()
+		} else {
+			format!("/r/{sub_name}")
+		};
+		let sort_options = build_sort_options(&sort_base_path, &url, &sort, &active_flair_filter);
+		let filters = get_filters(&req);
+		let timeframe = param(&path, "t").unwrap_or_default();
+		let is_flair_subscribed = !active_flair_filter.is_empty()
+			&& sub_name != "all"
+			&& sub_name != "popular"
+			&& prefs
+				.flair_subscriptions
+				.iter()
+				.any(|subscription| subscription.subreddit == sub_name && subscription.flair == active_flair_filter);
+		let scrape_cacheable_first_page = uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty();
+		if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
+			return render_scraped_subreddit_fragment(
+				&req,
+				scraped,
+				&sub_name,
+				&sort,
+				&timeframe,
+				sort_options,
+				&active_flair_filter,
+				&url,
+				&redirect_url,
+				&filters,
+				&request_before,
+				is_flair_subscribed,
+				scrape_cacheable_first_page,
+			);
+		}
+	}
 	let mut metadata_error: Option<String> = None;
 	let sub = if is_subreddit_route && is_single_sub {
 		if prefers_cached_subreddit_page {

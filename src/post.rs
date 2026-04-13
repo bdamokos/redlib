@@ -187,6 +187,32 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let form = url::form_urlencoded::parse(query_string.as_bytes()).collect::<HashMap<_, _>>();
 	let comment_query = form.get("q").unwrap().clone().to_string();
 
+	if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
+		if let Ok(mut scraped) = instance_scrape::scrape_post_page(&url, highlighted_comment).await {
+			let prefs = Preferences::new(&req);
+			instance_scrape::apply_comment_prefs(&mut scraped.comments, &prefs);
+			let body = PostFragmentTemplate {
+				comments: scraped.comments,
+				post: scraped.post,
+				fallback_notice: instance_scrape::scrape_notice().to_string(),
+				sort,
+				prefs,
+				single_thread_str: if single_thread { "true" } else { "false" },
+				url: req.uri().to_string(),
+				url_without_query: url.clone().trim_end_matches(&format!("?q={comment_query}&type=comment")).to_string(),
+				comment_query,
+			}
+			.render()
+			.map_err(|error| error.to_string())?;
+			return Response::builder()
+				.status(200)
+				.header("content-type", "text/html; charset=utf-8")
+				.header("cache-control", "no-store")
+				.body(Body::from(body))
+				.map_err(|error| error.to_string());
+		}
+	}
+
 	// Send a request to the url, receive JSON in response
 	match json(path, quarantined).await {
 		// Otherwise, grab the JSON output from the request

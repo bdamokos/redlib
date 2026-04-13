@@ -50,10 +50,8 @@ COPY --from=builder /tmp/redlib /usr/local/bin/redlib
 COPY --from=builder /usr/src/redlib/templates /templates
 COPY --from=builder /usr/src/redlib/static /static
 
-RUN useradd -r -s /bin/false redlib && \
-    mkdir -p /var/lib/redlib/cache && \
-    chown -R redlib:redlib /var/lib/redlib
-USER redlib
+RUN mkdir -p /var/lib/redlib/cache && \
+    chown -R nobody:nogroup /var/lib/redlib
 
 # Set environment variables
 ENV REDLIB_DEFAULT_THEME=system
