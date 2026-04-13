@@ -10,6 +10,7 @@ use crate::{
 };
 use askama::Template;
 use hyper::{Body, Request, Response};
+use log::{info, warn};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -231,6 +232,7 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let should_scrape_direct = instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now();
 
 	if should_scrape_direct {
+		info!("search: using scrape fallback for {} because Reddit is currently rate limited", url);
 		return match instance_scrape::scrape_search_page(&url).await {
 			Ok(mut scraped) => {
 				let (_, all_posts_filtered) = filter_posts(&mut scraped.posts, &filters);
@@ -266,7 +268,10 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 					no_posts,
 				})
 			}
-			Err(_) => error(req, "Too many requests.").await,
+			Err(scrape_error) => {
+				warn!("search: scrape fallback failed for {}: {}", url, scrape_error);
+				error(req, "Too many requests.").await
+			}
 		};
 	}
 
@@ -321,6 +326,7 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				})
 			}
 			Err(msg) if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) => {
+				info!("search: retrying {} via scrape fallback after Reddit error: {}", url, msg);
 				match instance_scrape::scrape_search_page(&url).await {
 					Ok(mut scraped) => {
 						let (_, all_posts_filtered) = filter_posts(&mut scraped.posts, &filters);
@@ -356,7 +362,10 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 							no_posts,
 						})
 					}
-					Err(_) => error(req, &msg).await,
+					Err(scrape_error) => {
+						warn!("search: scrape fallback failed for {} after Reddit error {}: {}", url, msg, scrape_error);
+						error(req, &msg).await
+					}
 				}
 			}
 			Err(msg) => {

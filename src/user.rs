@@ -11,6 +11,7 @@ use askama::Template;
 use chrono::DateTime;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
+use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration as StdDuration, Instant};
@@ -1330,7 +1331,14 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let sort = param(&path, "sort").unwrap_or_default();
 	let cached_listing_page = cached_user_listing_posts(&username, &listing, &sort, query);
 	let pre_scraped = if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
-		instance_scrape::scrape_user_page(&current_url).await.ok()
+		info!("user: using scrape fallback for {} because Reddit is currently rate limited", current_url);
+		match instance_scrape::scrape_user_page(&current_url).await {
+			Ok(scraped) => Some(scraped),
+			Err(scrape_error) => {
+				warn!("user: preemptive scrape fallback failed for {}: {}", current_url, scrape_error);
+				None
+			}
+		}
 	} else {
 		None
 	};
@@ -1381,7 +1389,18 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		let maybe_scraped = if let Some(scraped) = pre_scraped {
 			Some(scraped)
 		} else if instance_scrape::instance_scrape_enabled() && metadata_rate_limited {
-			instance_scrape::scrape_user_page(&current_url).await.ok()
+			info!(
+				"user: retrying {} via scrape fallback after metadata error: {}",
+				current_url,
+				metadata_error.as_deref().unwrap_or_default()
+			);
+			match instance_scrape::scrape_user_page(&current_url).await {
+				Ok(scraped) => Some(scraped),
+				Err(scrape_error) => {
+					warn!("user: metadata scrape fallback failed for {}: {}", current_url, scrape_error);
+					None
+				}
+			}
 		} else {
 			None
 		};
@@ -1466,6 +1485,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 					all_posts_filtered,
 				),
 				Err(msg) if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) => {
+					info!("user: retrying {} via scrape fallback after listing error: {}", current_url, msg);
 					let scraped = instance_scrape::scrape_user_page(&current_url).await.map_err(|_| msg.clone())?;
 					store_user_metadata(&username, &scraped.user);
 					utils::store_post_flairs(&scraped.posts);
@@ -1481,7 +1501,10 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 					fallback_notice = instance_scrape::scrape_notice().to_string();
 					(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
 				}
-				Err(msg) => return Err(msg),
+				Err(msg) => {
+					warn!("user: direct listing request failed for {} without usable scrape fallback: {}", current_url, msg);
+					return Err(msg);
+				}
 			}
 		};
 		let no_posts = posts.is_empty();

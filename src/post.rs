@@ -10,6 +10,7 @@ use crate::utils::{
 	error, format_num, get_filters, nsfw_landing, param, parse_post, rewrite_emotes, setting, template, time, val, Author, Awards, Comment, Flair, FlairPart, Post, Preferences,
 };
 use hyper::{Body, Request, Response};
+use log::{info, warn};
 
 use askama::Template;
 use regex::Regex;
@@ -188,6 +189,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let comment_query = form.get("q").unwrap().clone().to_string();
 
 	if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
+		info!("post: using scrape fallback for {} because Reddit is currently rate limited", url);
 		if let Ok(mut scraped) = instance_scrape::scrape_post_page(&url, highlighted_comment).await {
 			let prefs = Preferences::new(&req);
 			instance_scrape::apply_comment_prefs(&mut scraped.comments, &prefs);
@@ -211,6 +213,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				.body(Body::from(body))
 				.map_err(|error| error.to_string());
 		}
+		warn!("post: scrape fallback failed for {} while Reddit was already rate limited", url);
 	}
 
 	// Send a request to the url, receive JSON in response
@@ -266,6 +269,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		// If the Reddit API returns an error, exit and send error page to user
 		Err(msg) => {
 			if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) {
+				info!("post: retrying {} via scrape fallback after Reddit error: {}", url, msg);
 				match instance_scrape::scrape_post_page(&url, highlighted_comment).await {
 					Ok(mut scraped) => {
 						let prefs = Preferences::new(&req);
@@ -290,7 +294,9 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 							.body(Body::from(body))
 							.map_err(|error| error.to_string());
 					}
-					Err(_) => {}
+					Err(scrape_error) => {
+						warn!("post: scrape fallback failed for {} after Reddit error {}: {}", url, msg, scrape_error);
+					}
 				}
 			}
 			if msg == "quarantined" || msg == "gated" {

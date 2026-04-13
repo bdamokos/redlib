@@ -54,6 +54,11 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const showErrorState = () => {
+        window.console?.warn?.("page_fragment: failed to load", {
+            fragmentUrl,
+            replaceSelector,
+        });
+
         if (banner) {
             banner.textContent = errorMessage;
             banner.classList.remove("warming");
@@ -125,6 +130,11 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             if (!response.ok) {
+                window.console?.warn?.("page_fragment: non-OK response", {
+                    fragmentUrl,
+                    status: response.status,
+                    attempt,
+                });
                 if (!shouldRetryResponse(response.status)) {
                     showErrorState();
                     return;
@@ -135,7 +145,12 @@ document.addEventListener("DOMContentLoaded", () => {
             const html = await response.text();
             writeCachedFragment(html);
             replaceFragment(html);
-        } catch (_) {
+        } catch (error) {
+            window.console?.warn?.("page_fragment: fetch attempt failed", {
+                fragmentUrl,
+                attempt,
+                error: String(error),
+            });
             if (attempt < maxAttempts) {
                 showRetryState(attempt);
                 await waitForRetry();

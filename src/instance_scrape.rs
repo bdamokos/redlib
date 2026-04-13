@@ -3,12 +3,14 @@ use chrono::NaiveDateTime;
 use hyper::body::to_bytes;
 use hyper::header::{ACCEPT, USER_AGENT};
 use hyper::{Body, Method, Request, StatusCode};
-use log::info;
+use log::{info, warn};
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -21,12 +23,17 @@ const INSTANCE_CATALOG_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 const SOURCE_FAILURE_BACKOFF_SECS: u64 = 10 * 60;
 const PROBE_PATH: &str = "/r/rust/new";
 const DEFAULT_TIMEOUT_SECS: u64 = 6;
+const PROBE_TIMEOUT_SECS: u64 = 3;
 const SCRAPE_NOTICE: &str = "Showing content fetched from a public Redlib instance because Reddit rate limited this request.";
 const PROBE_CONCURRENCY: usize = 8;
+const MAX_USABLE_ORIGINS: usize = 6;
 const SCRAPE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
 static INSTANCE_HEALTH_CACHE: LazyLock<Mutex<Option<InstanceHealthCache>>> = LazyLock::new(|| Mutex::new(None));
 static INSTANCE_FAILURE_BACKOFF: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static INSTANCE_REFRESH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+static LAST_SUCCESSFUL_ORIGIN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static CATALOG_REFRESH_SCHEDULED: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 
 static SEL_SUB_TITLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("#sub_title").unwrap());
 static SEL_SUB_NAME: LazyLock<Selector> = LazyLock::new(|| Selector::parse("#sub_name").unwrap());
@@ -174,9 +181,15 @@ fn request_timeout() -> Duration {
 	Duration::from_secs(secs)
 }
 
+fn probe_timeout() -> Duration {
+	Duration::from_secs(PROBE_TIMEOUT_SECS.min(request_timeout().as_secs().max(1)))
+}
+
 async fn fetch_page_html(path_and_query: &str) -> Result<String, String> {
+	let request_started = Instant::now();
 	let origins = candidate_origins().await?;
 	if origins.is_empty() {
+		warn!("instance_scrape: no healthy origins available for {path_and_query}");
 		return Err("no healthy Redlib instances available for scrape fallback".to_string());
 	}
 
@@ -186,9 +199,11 @@ async fn fetch_page_html(path_and_query: &str) -> Result<String, String> {
 		format!("/{path_and_query}")
 	};
 
+	info!("instance_scrape: attempting fallback for {} using {} candidate origins", path_and_query, origins.len());
 	let mut last_error = String::from("no scrape candidate attempted");
-	for origin in origins {
+	for (attempt, origin) in origins.into_iter().enumerate() {
 		if source_is_backed_off(&origin) {
+			info!("instance_scrape: skipping backed off origin {} for {}", origin, path_and_query);
 			continue;
 		}
 
@@ -197,32 +212,48 @@ async fn fetch_page_html(path_and_query: &str) -> Result<String, String> {
 			Ok((status, body)) => {
 				if status != StatusCode::OK {
 					note_source_failure(&origin);
+					warn!("instance_scrape: origin {} returned HTTP {} for {}", origin, status.as_u16(), path_and_query);
 					last_error = format!("instance returned HTTP {}", status.as_u16());
 					continue;
 				}
 
-				if detect_block_page(status, &body).is_some() {
+				if let Some(reason) = detect_block_page(status, &body) {
 					note_source_failure(&origin);
-					last_error = "instance returned anti-bot interstitial".to_string();
+					warn!("instance_scrape: origin {} was unusable for {}: {}", origin, path_and_query, reason);
+					last_error = format!("instance returned {reason}");
 					continue;
 				}
 
-				info!("instance_scrape: fetched {path_and_query} from {origin}");
+				note_source_success(&origin);
+				info!(
+					"instance_scrape: fetched {} from {} on attempt {} in {:?}",
+					path_and_query,
+					origin,
+					attempt + 1,
+					request_started.elapsed()
+				);
 				return Ok(body);
 			}
 			Err(error) => {
 				note_source_failure(&origin);
+				warn!("instance_scrape: origin {} failed for {}: {}", origin, path_and_query, error);
 				last_error = error;
 			}
 		}
 	}
 
+	warn!(
+		"instance_scrape: all origins failed for {} after {:?}: {}",
+		path_and_query,
+		request_started.elapsed(),
+		last_error
+	);
 	Err(last_error)
 }
 
 async fn candidate_origins() -> Result<Vec<String>, String> {
 	if let Some(overrides) = configured_override_origins() {
-		return Ok(overrides);
+		return Ok(prioritize_last_successful_origin(overrides));
 	}
 
 	{
@@ -231,12 +262,32 @@ async fn candidate_origins() -> Result<Vec<String>, String> {
 		};
 		if let Some(cache) = cache.as_ref() {
 			if cache.refreshed_at.elapsed().as_secs() < INSTANCE_CATALOG_TTL_SECS {
-				return Ok(cache.usable_origins.clone());
+				return Ok(prioritize_last_successful_origin(cache.usable_origins.clone()));
+			}
+			if !cache.usable_origins.is_empty() {
+				info!(
+					"instance_scrape: using stale instance catalog cache with {} origins while refreshing in background",
+					cache.usable_origins.len()
+				);
+				spawn_catalog_refresh();
+				return Ok(prioritize_last_successful_origin(cache.usable_origins.clone()));
 			}
 		}
 	}
 
-	refresh_catalog().await
+	let _refresh_guard = INSTANCE_REFRESH_LOCK.lock().await;
+	{
+		let Ok(cache) = INSTANCE_HEALTH_CACHE.lock() else {
+			return Err("instance health cache lock poisoned".to_string());
+		};
+		if let Some(cache) = cache.as_ref() {
+			if cache.refreshed_at.elapsed().as_secs() < INSTANCE_CATALOG_TTL_SECS {
+				return Ok(prioritize_last_successful_origin(cache.usable_origins.clone()));
+			}
+		}
+	}
+
+	refresh_catalog().await.map(prioritize_last_successful_origin)
 }
 
 fn configured_override_origins() -> Option<Vec<String>> {
@@ -250,7 +301,48 @@ fn configured_override_origins() -> Option<Vec<String>> {
 	(!origins.is_empty()).then_some(origins)
 }
 
+fn spawn_catalog_refresh() {
+	if CATALOG_REFRESH_SCHEDULED.swap(true, Ordering::SeqCst) {
+		return;
+	}
+
+	tokio::spawn(async {
+		let _guard = INSTANCE_REFRESH_LOCK.lock().await;
+		let needs_refresh = {
+			let Ok(cache) = INSTANCE_HEALTH_CACHE.lock() else {
+				return;
+			};
+			cache.as_ref().is_none_or(|cache| cache.refreshed_at.elapsed().as_secs() >= INSTANCE_CATALOG_TTL_SECS)
+		};
+		if !needs_refresh {
+			CATALOG_REFRESH_SCHEDULED.store(false, Ordering::SeqCst);
+			return;
+		}
+		if let Err(error) = refresh_catalog().await {
+			warn!("instance_scrape: background catalog refresh failed: {}", error);
+		}
+		CATALOG_REFRESH_SCHEDULED.store(false, Ordering::SeqCst);
+	});
+}
+
+fn prioritize_last_successful_origin(mut origins: Vec<String>) -> Vec<String> {
+	let last_successful = LAST_SUCCESSFUL_ORIGIN.lock().ok().and_then(|value| value.clone());
+	let Some(last_successful) = last_successful else {
+		return origins;
+	};
+	let Some(index) = origins.iter().position(|origin| *origin == last_successful) else {
+		return origins;
+	};
+	if index > 0 {
+		let origin = origins.remove(index);
+		origins.insert(0, origin);
+	}
+	origins
+}
+
 async fn refresh_catalog() -> Result<Vec<String>, String> {
+	let refresh_started = Instant::now();
+	info!("instance_scrape: refreshing public instance catalog from {}", INSTANCE_CATALOG_URL);
 	let (_, body) = fetch_text(INSTANCE_CATALOG_URL, "application/json").await?;
 	let catalog: CatalogResponse = serde_json::from_str(&body).map_err(|error| error.to_string())?;
 
@@ -261,6 +353,15 @@ async fn refresh_catalog() -> Result<Vec<String>, String> {
 		.filter(|origin| origin.starts_with("https://"))
 		.collect::<Vec<_>>();
 	let usable_origins = probe_catalog_origins(probe_candidates).await;
+	if usable_origins.is_empty() {
+		warn!("instance_scrape: catalog refresh found no usable origins after {:?}", refresh_started.elapsed());
+	} else {
+		info!(
+			"instance_scrape: catalog refresh found {} usable origins after {:?}",
+			usable_origins.len(),
+			refresh_started.elapsed()
+		);
+	}
 
 	let Ok(mut cache) = INSTANCE_HEALTH_CACHE.lock() else {
 		return Err("instance health cache lock poisoned".to_string());
@@ -294,7 +395,11 @@ async fn probe_catalog_origins(origins: Vec<String>) -> Vec<String> {
 	}
 
 	ordered_results.sort_by_key(|(index, _, _)| *index);
-	ordered_results.into_iter().filter_map(|(_, origin, usable)| usable.then_some(origin)).collect()
+	ordered_results
+		.into_iter()
+		.filter_map(|(_, origin, usable)| usable.then_some(origin))
+		.take(MAX_USABLE_ORIGINS)
+		.collect()
 }
 
 async fn join_probe_result(probes: &mut JoinSet<(usize, String, bool)>) -> Option<(usize, String, bool)> {
@@ -308,7 +413,7 @@ async fn join_probe_result(probes: &mut JoinSet<(usize, String, bool)>) -> Optio
 
 async fn probe_instance(origin: &str) -> bool {
 	let url = format!("{origin}{PROBE_PATH}");
-	match fetch_text(&url, "text/html,application/xhtml+xml").await {
+	match fetch_text_with_timeout(&url, "text/html,application/xhtml+xml", probe_timeout()).await {
 		Ok((status, body)) => {
 			if status != StatusCode::OK {
 				return false;
@@ -337,7 +442,20 @@ fn note_source_failure(origin: &str) {
 	}
 }
 
+fn note_source_success(origin: &str) {
+	if let Ok(mut backoff) = INSTANCE_FAILURE_BACKOFF.lock() {
+		backoff.remove(origin);
+	}
+	if let Ok(mut last_successful) = LAST_SUCCESSFUL_ORIGIN.lock() {
+		*last_successful = Some(origin.to_string());
+	}
+}
+
 async fn fetch_text(url: &str, accept: &str) -> Result<(StatusCode, String), String> {
+	fetch_text_with_timeout(url, accept, request_timeout()).await
+}
+
+async fn fetch_text_with_timeout(url: &str, accept: &str, timeout: Duration) -> Result<(StatusCode, String), String> {
 	let request = Request::builder()
 		.method(Method::GET)
 		.uri(url)
@@ -346,7 +464,7 @@ async fn fetch_text(url: &str, accept: &str) -> Result<(StatusCode, String), Str
 		.body(Body::empty())
 		.map_err(|error| error.to_string())?;
 
-	let response = tokio::time::timeout(request_timeout(), CLIENT.request(request))
+	let response = tokio::time::timeout(timeout, CLIENT.request(request))
 		.await
 		.map_err(|_| format!("request timed out for {url}"))?
 		.map_err(|error| error.to_string())?;
@@ -1045,5 +1163,20 @@ mod tests {
 		assert!(!sanitized.contains("<script"));
 		assert!(!sanitized.contains("onclick"));
 		assert!(sanitized.contains("https://example.com"));
+	}
+
+	#[test]
+	fn prioritizes_last_successful_origin_when_present() {
+		*LAST_SUCCESSFUL_ORIGIN.lock().unwrap() = Some("https://b.example".to_string());
+		let prioritized = prioritize_last_successful_origin(vec!["https://a.example".to_string(), "https://b.example".to_string(), "https://c.example".to_string()]);
+		assert_eq!(prioritized[0], "https://b.example");
+		*LAST_SUCCESSFUL_ORIGIN.lock().unwrap() = None;
+	}
+
+	#[test]
+	fn fallback_detection_matches_rate_limit_messages() {
+		assert!(should_attempt_scrape_fallback("Too many requests."));
+		assert!(should_attempt_scrape_fallback("Reddit rate limit hit"));
+		assert!(should_attempt_scrape_fallback("ratelimit exhausted"));
 	}
 }

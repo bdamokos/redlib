@@ -1265,6 +1265,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	};
 
 	if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
+		info!("subreddit: using scrape fallback for {} because Reddit is currently rate limited", req_url);
 		let sort_base_path = if aggregate_saved_feeds {
 			String::new()
 		} else if sub_name.is_empty() {
@@ -1300,6 +1301,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				scrape_cacheable_first_page,
 			);
 		}
+		warn!("subreddit: preemptive scrape fallback failed for {}", req_url);
 	}
 	let mut metadata_error: Option<String> = None;
 	let sub = if is_subreddit_route && is_single_sub {
@@ -1387,6 +1389,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		&& instance_scrape::instance_scrape_enabled()
 		&& metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback)
 	{
+		info!(
+			"subreddit: retrying {} via scrape fallback after metadata error: {}",
+			req_url,
+			metadata_error.as_deref().unwrap_or_default()
+		);
 		if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 			return render_scraped_subreddit_fragment(
 				&req,
@@ -1404,6 +1411,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				scrape_cacheable_first_page,
 			);
 		}
+		warn!("subreddit: metadata scrape fallback failed for {}", req_url);
 	}
 
 	// If all requested subs are filtered, we don't need to fetch posts.
@@ -1793,6 +1801,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					}
 				}
 				if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) {
+					info!("subreddit: retrying {} via scrape fallback after listing error: {}", req_url, msg);
 					if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 						return render_scraped_subreddit_fragment(
 							&req,
@@ -1810,6 +1819,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 							scrape_cacheable_first_page,
 						);
 					}
+					warn!("subreddit: listing scrape fallback failed for {}", req_url);
 				}
 				match msg.as_str() {
 					"quarantined" | "gated" => Ok(quarantine(&req, sub_name, &msg)),
