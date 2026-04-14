@@ -27,6 +27,7 @@
 				<th>Type</th>
 				<th>Cached</th>
 				<th>Posts</th>
+				<th>Head Post Age</th>
 				<th>Cache Expires In</th>
 				<th>Last Fetched</th>
 				<th>Refresh Frequency</th>
@@ -42,6 +43,7 @@
 				<td>{{ source.source_type }}</td>
 				<td>{% if source.cached %}yes{% else %}no{% endif %}</td>
 				<td>{{ source.cached_posts }}</td>
+				<td>{% match source.head_post_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
 				<td>{% match source.cache_expires_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
 				<td>{% match source.cached_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
 				<td>{% match source.refresh_frequency_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>

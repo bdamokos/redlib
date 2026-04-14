@@ -9,7 +9,7 @@ use hyper::{Body, Request, Response, StatusCode};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -32,9 +32,6 @@ const INITIAL_SOURCE_WINDOW: usize = 32;
 const PAGE_FILL_BATCH: usize = 4;
 const MAX_SYNC_FILL_BATCHES: usize = 2;
 const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
-const FRESH_RECENT_SECONDS: i64 = 6 * 60 * 60;
-const FRESH_CUTOFF_SECONDS: i64 = 24 * 60 * 60;
-const MID_CUTOFF_SECONDS: i64 = 48 * 60 * 60;
 pub const POSTS_PER_PAGE: usize = 25;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -168,6 +165,8 @@ pub struct CacheStatusSource {
 	pub cached: bool,
 	pub cached_posts: usize,
 	pub cached_age_secs: Option<u64>,
+	pub head_post_created_ts: Option<u64>,
+	pub head_post_age_secs: Option<u64>,
 	pub cache_expires_in_secs: Option<u64>,
 	pub last_refresh_origin: Option<String>,
 	pub last_refresh_succeeded_secs_ago: Option<u64>,
@@ -191,6 +190,38 @@ struct SessionSourceEntry {
 	source: FeedSource,
 	state: SessionSourceState,
 	last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct ReadySourceQueue {
+	source: FeedSource,
+	posts: VecDeque<Post>,
+	fetched_at: Instant,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ReadyQueueHead {
+	queue_index: usize,
+	head_created_ts: u64,
+	fetched_at: Instant,
+	source_priority: (u8, String, String),
+}
+
+impl Ord for ReadyQueueHead {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self
+			.head_created_ts
+			.cmp(&other.head_created_ts)
+			.then_with(|| self.fetched_at.cmp(&other.fetched_at))
+			.then_with(|| other.source_priority.cmp(&self.source_priority))
+			.then_with(|| other.queue_index.cmp(&self.queue_index))
+	}
+}
+
+impl PartialOrd for ReadyQueueHead {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
 }
 
 #[derive(Clone)]
@@ -1052,7 +1083,7 @@ fn reconcile_session_with_source_cache(session: &mut FeedSession) {
 	}
 }
 
-fn filtered_source_queues(session: &FeedSession) -> Vec<(FeedSource, VecDeque<Post>)> {
+fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 	let mut queues = Vec::new();
 	for entry in &session.sources {
 		if entry.state != SessionSourceState::Ready {
@@ -1075,16 +1106,24 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<(FeedSource, VecDeque<Po
 			.collect::<VecDeque<_>>();
 
 		if !filtered.is_empty() {
-			queues.push((entry.source.clone(), filtered));
+			queues.push(ReadySourceQueue {
+				source: entry.source.clone(),
+				posts: filtered,
+				fetched_at: cached.fetched_at,
+			});
 		}
 	}
 
 	queues
 }
 
-fn active_ready_source_count(session: &FeedSession) -> usize {
-	let queues = filtered_source_queues(session);
-	active_source_keys(&queues, &HashSet::new()).len()
+fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue) -> Option<ReadyQueueHead> {
+	Some(ReadyQueueHead {
+		queue_index,
+		head_created_ts: queue.posts.front()?.created_ts,
+		fetched_at: queue.fetched_at,
+		source_priority: source_priority(&queue.source),
+	})
 }
 
 fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
@@ -1092,96 +1131,30 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 
 	let mut all_posts = Vec::new();
 	let mut seen_ids = HashSet::new();
-	let mut exhausted_sources = HashSet::new();
-	let mut consecutive_stalled_rounds = 0usize;
+	let mut queue_heads = BinaryHeap::new();
 
-	while exhausted_sources.len() < queues.len() {
-		let active_keys = active_source_keys(&queues, &exhausted_sources);
-		if active_keys.is_empty() {
-			break;
+	for (queue_index, queue) in queues.iter().enumerate() {
+		if let Some(head) = ready_queue_head(queue_index, queue) {
+			queue_heads.push(head);
+		}
+	}
+
+	while let Some(head) = queue_heads.pop() {
+		let queue = &mut queues[head.queue_index];
+		let Some(post) = queue.posts.pop_front() else {
+			continue;
+		};
+
+		if seen_ids.insert(post.id.clone()) {
+			all_posts.push(post);
 		}
 
-		let mut made_progress = false;
-
-		for (source, queue) in &mut queues {
-			let cache_key = source.cache_key();
-			if exhausted_sources.contains(&cache_key) || !active_keys.contains(&cache_key) {
-				continue;
-			}
-
-			let mut emitted = false;
-			while let Some(post) = queue.pop_front() {
-				if seen_ids.insert(post.id.clone()) {
-					all_posts.push(post);
-					emitted = true;
-					made_progress = true;
-					break;
-				}
-			}
-
-			if !emitted && queue.is_empty() {
-				exhausted_sources.insert(cache_key);
-			}
-		}
-
-		if !made_progress {
-			consecutive_stalled_rounds += 1;
-			if consecutive_stalled_rounds >= 2 {
-				break;
-			}
-
-			for (source, queue) in &queues {
-				if queue.is_empty() {
-					exhausted_sources.insert(source.cache_key());
-				}
-			}
-		} else {
-			consecutive_stalled_rounds = 0;
+		if let Some(next_head) = ready_queue_head(head.queue_index, queue) {
+			queue_heads.push(next_head);
 		}
 	}
 
 	collapse_duplicate_submissions(all_posts)
-}
-
-fn active_source_keys(queues: &[(FeedSource, VecDeque<Post>)], exhausted_sources: &HashSet<String>) -> HashSet<String> {
-	let now = chrono::Utc::now().timestamp() as u64;
-	let mut heads = queues
-		.iter()
-		.filter_map(|(source, queue)| {
-			let key = source.cache_key();
-			if exhausted_sources.contains(&key) {
-				return None;
-			}
-			queue.front().map(|post| (key, post.created_ts))
-		})
-		.collect::<Vec<_>>();
-
-	if heads.is_empty() {
-		return HashSet::new();
-	}
-
-	heads.sort_by(|left, right| right.1.cmp(&left.1));
-	let freshest_ts = heads[0].1;
-	let freshest_age = now.saturating_sub(freshest_ts);
-	let cutoff = if freshest_age < FRESH_RECENT_SECONDS as u64 {
-		FRESH_CUTOFF_SECONDS as u64
-	} else if freshest_age < FRESH_CUTOFF_SECONDS as u64 {
-		MID_CUTOFF_SECONDS as u64
-	} else {
-		u64::MAX
-	};
-
-	let active = heads
-		.iter()
-		.filter(|(_, ts)| freshest_ts.saturating_sub(*ts) <= cutoff)
-		.map(|(key, _)| key.clone())
-		.collect::<HashSet<_>>();
-
-	if active.is_empty() {
-		heads.into_iter().map(|(key, _)| key).collect()
-	} else {
-		active
-	}
 }
 
 fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> bool {
@@ -1287,20 +1260,20 @@ fn background_target_posts(session: &FeedSession) -> usize {
 	(session.requested_page + 1 + BACKGROUND_LOOKAHEAD_PAGES) * POSTS_PER_PAGE
 }
 
-fn round_robin_source_target(page: usize, per_page: usize) -> usize {
+fn source_budget_target(page: usize, per_page: usize) -> usize {
 	((page + 1) * per_page).max(INITIAL_SOURCE_WINDOW)
 }
 
-fn initial_sync_source_target(page: usize) -> usize {
-	round_robin_source_target(page, POSTS_PER_PAGE)
+fn initial_source_budget_target(page: usize) -> usize {
+	source_budget_target(page, POSTS_PER_PAGE)
 }
 
 fn max_sync_source_budget(page: usize) -> usize {
-	initial_sync_source_target(page) + (MAX_SYNC_FILL_BATCHES * PAGE_FILL_BATCH)
+	initial_source_budget_target(page) + (MAX_SYNC_FILL_BATCHES * PAGE_FILL_BATCH)
 }
 
 fn background_target_sources(session: &FeedSession) -> usize {
-	round_robin_source_target(session.requested_page + BACKGROUND_LOOKAHEAD_PAGES, POSTS_PER_PAGE).min(session.sources.len())
+	source_budget_target(session.requested_page + BACKGROUND_LOOKAHEAD_PAGES, POSTS_PER_PAGE).min(session.sources.len())
 }
 
 fn attempted_source_count(session: &FeedSession) -> usize {
@@ -1308,10 +1281,10 @@ fn attempted_source_count(session: &FeedSession) -> usize {
 }
 
 fn sync_sources_to_request(session: &FeedSession, page: usize) -> usize {
-	initial_sync_source_target(page).saturating_sub(attempted_source_count(session))
+	initial_source_budget_target(page).saturating_sub(attempted_source_count(session))
 }
 
-fn followup_sync_source_budget(session: &FeedSession) -> usize {
+fn followup_source_budget(session: &FeedSession) -> usize {
 	attempted_source_count(session).saturating_add(PAGE_FILL_BATCH).min(session.sources.len())
 }
 
@@ -1323,15 +1296,80 @@ fn session_has_remaining_sources(session: &FeedSession) -> bool {
 	session.sources.iter().any(|entry| entry.state == SessionSourceState::Unstarted)
 }
 
+fn remembered_entry_for_source<'a>(remembered: &'a HashMap<String, RememberedSubredditEntry>, source: &FeedSource) -> Option<&'a RememberedSubredditEntry> {
+	match source {
+		FeedSource::Subreddit { name } if !name.starts_with("u_") => remembered.get(&name.to_lowercase()),
+		_ => None,
+	}
+}
+
+fn compare_optional_instants_desc(left: Option<Instant>, right: Option<Instant>) -> Ordering {
+	match (left, right) {
+		(Some(left), Some(right)) => right.cmp(&left),
+		(None, Some(_)) => Ordering::Greater,
+		(Some(_), None) => Ordering::Less,
+		(None, None) => Ordering::Equal,
+	}
+}
+
+fn compare_warm_target_priority(
+	left_index: usize,
+	left_source: &FeedSource,
+	left_entry: Option<&RememberedSubredditEntry>,
+	right_index: usize,
+	right_source: &FeedSource,
+	right_entry: Option<&RememberedSubredditEntry>,
+) -> Ordering {
+	let left_never_refreshed = left_entry.and_then(|entry| entry.last_refresh_succeeded_at).is_none();
+	let right_never_refreshed = right_entry.and_then(|entry| entry.last_refresh_succeeded_at).is_none();
+	match right_never_refreshed.cmp(&left_never_refreshed) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	match right_entry
+		.and_then(|entry| Some(entry.last_requested_at))
+		.cmp(&left_entry.and_then(|entry| Some(entry.last_requested_at)))
+	{
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	match compare_optional_instants_desc(
+		left_entry.and_then(|entry| entry.last_refresh_succeeded_at),
+		right_entry.and_then(|entry| entry.last_refresh_succeeded_at),
+	) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	match source_priority(left_source).cmp(&source_priority(right_source)) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+
+	left_index.cmp(&right_index)
+}
+
 fn warm_targets(session: &FeedSession, target_count: usize) -> Vec<usize> {
-	session
+	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let mut targets = session
 		.sources
 		.iter()
 		.enumerate()
 		.filter(|(_, entry)| entry.state == SessionSourceState::Unstarted)
-		.take(target_count)
 		.map(|(index, _)| index)
-		.collect()
+		.collect::<Vec<_>>();
+
+	targets.sort_by(|left_index, right_index| {
+		let left_source = &session.sources[*left_index].source;
+		let right_source = &session.sources[*right_index].source;
+		let left_entry = remembered_entry_for_source(&remembered, left_source);
+		let right_entry = remembered_entry_for_source(&remembered, right_source);
+		compare_warm_target_priority(*left_index, left_source, left_entry, *right_index, right_source, right_entry)
+	});
+	targets.truncate(target_count);
+	targets
 }
 
 async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
@@ -1454,36 +1492,6 @@ async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, ma
 	}
 }
 
-async fn warm_session_for_round_robin(session_id: &str, page: usize, per_page: usize) {
-	let target_sources = round_robin_source_target(page, per_page);
-
-	loop {
-		let remaining = {
-			let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-			let Some(session) = sessions.get(session_id) else {
-				return;
-			};
-
-			if active_ready_source_count(session) >= target_sources {
-				return;
-			}
-
-			warm_targets(session, PAGE_FILL_BATCH)
-		};
-
-		if remaining.is_empty() {
-			break;
-		}
-
-		warm_session_indices(session_id, remaining).await;
-	}
-
-	let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-	if let Some(session) = sessions.get_mut(session_id) {
-		touch_session(session);
-	}
-}
-
 async fn warm_session_background(session_id: String) {
 	loop {
 		reconcile_stuck_fetching_sources(&session_id).await;
@@ -1554,7 +1562,7 @@ fn plan_session_warm_mode(session: &mut FeedSession, page: usize, per_page: usiz
 	session.background_complete = false;
 	session.background_active = true;
 	Some(SessionWarmMode::FollowupCachePreferred {
-		max_sources: followup_sync_source_budget(session),
+		max_sources: followup_source_budget(session),
 	})
 }
 
@@ -1600,7 +1608,6 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 	warm_session_indices(&session_id, sync_target).await;
 	if session_is_new {
 		warm_session_to_fill(&session_id, page, per_page, max_sync_source_budget(page)).await;
-		warm_session_for_round_robin(&session_id, page, per_page).await;
 	}
 
 	let warm_mode = {
@@ -1656,7 +1663,6 @@ pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_pa
 			match warm_mode {
 				SessionWarmMode::InitialLoad => {
 					warm_session_to_fill(&background_id, page, per_page, max_sync_source_budget(page)).await;
-					warm_session_for_round_robin(&background_id, page, per_page).await;
 					warm_session_background(background_id).await;
 				}
 				SessionWarmMode::FollowupCachePreferred { max_sources } => {
@@ -1825,6 +1831,8 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 		let cached = cache_entry.is_some();
 		let cached_posts = cache_entry.map(|entry| entry.posts.len()).unwrap_or_default();
 		let cached_age_secs = cache_entry.map(|entry| entry.fetched_at.elapsed().as_secs());
+		let head_post_created_ts = cache_entry.and_then(|entry| entry.posts.first().map(|post| post.created_ts));
+		let head_post_age_secs = head_post_created_ts.map(|created_ts| generated_at_unix.saturating_sub(created_ts));
 		let cache_expires_in_secs = if let Some(entry) = remembered_entry.filter(|entry| remembered_entry_is_active(entry)) {
 			Some(REMEMBERED_SUBREDDIT_TTL_SECS.saturating_sub(entry.last_requested_at.elapsed().as_secs()))
 		} else {
@@ -1874,6 +1882,8 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			cached,
 			cached_posts,
 			cached_age_secs,
+			head_post_created_ts,
+			head_post_age_secs,
 			cache_expires_in_secs,
 			last_refresh_origin: cache_entry.and_then(|entry| entry.refresh_origin).map(|origin| format!("{origin:?}").to_lowercase()),
 			last_refresh_succeeded_secs_ago: remembered_entry
@@ -1907,19 +1917,19 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_browser_session_paths, active_ready_source_count, active_source_keys, attempted_source_count, background_target_reached, background_target_sources,
-		count_sources_in_state, feed_page, feed_status, followup_sync_source_budget, get_cached_source_page, has_active_browser_sessions, initial_sync_source_target,
-		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
-		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request,
-		remembered_refresh_priority, restore_persisted_state, round_robin_source_target, session_status_from_posts, snapshot_persisted_remembered_subreddits,
-		snapshot_persisted_source_entries, sort_sources, source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request,
-		ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
-		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE,
-		REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, cache_status_for_preferences, count_sources_in_state,
+		feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_fetching_sources_failed,
+		max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh,
+		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority,
+		restore_persisted_state, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target,
+		source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession,
+		FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS,
+		ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
+		SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use std::cmp::Ordering;
-	use std::collections::{HashMap, HashSet, VecDeque};
+	use std::collections::{HashMap, HashSet};
 	use std::sync::{LazyLock, Mutex, MutexGuard};
 	use std::time::{Duration, Instant};
 
@@ -2342,30 +2352,38 @@ mod tests {
 	}
 
 	#[test]
-	fn suppresses_clearly_stale_sources_when_fresh_cluster_exists() {
+	fn merged_posts_prioritize_freshest_ready_heads_even_when_sources_repeat() {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let queues = vec![
-			(
-				FeedSource::Subreddit { name: "fresh".to_string() },
-				VecDeque::from(vec![test_post("one", "fresh", now - 60)]),
-			),
-			(
-				FeedSource::Subreddit { name: "recent".to_string() },
-				VecDeque::from(vec![test_post("two", "recent", now - 7_200)]),
-			),
-			(
-				FeedSource::Subreddit { name: "stale".to_string() },
-				VecDeque::from(vec![test_post("three", "stale", now - 172_800)]),
-			),
-		];
+		let fresh_source = FeedSource::Subreddit { name: "fresh".to_string() };
+		let older_source = FeedSource::Subreddit { name: "older".to_string() };
+		seed_source(&fresh_source, vec![test_post("fresh-1", "fresh", now), test_post("fresh-2", "fresh", now - 1)]);
+		seed_source(&older_source, vec![test_post("older-1", "older", now - 2), test_post("older-2", "older", now - 3)]);
 
-		let active = active_source_keys(&queues, &HashSet::new());
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![
+				session_entry(fresh_source, SessionSourceState::Ready),
+				session_entry(older_source, SessionSourceState::Ready),
+			],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
 
-		assert!(active.contains("subreddit:fresh"));
-		assert!(active.contains("subreddit:recent"));
-		assert!(!active.contains("subreddit:stale"));
+		let ids = merged_posts_for_session(&session).into_iter().take(4).map(|post| post.id).collect::<Vec<_>>();
+
+		assert_eq!(ids, vec!["fresh-1", "fresh-2", "older-1", "older-2"]);
 	}
 
 	#[test]
@@ -2436,9 +2454,9 @@ mod tests {
 	fn caps_sync_fill_budget_close_to_initial_window() {
 		let _guard = test_lock();
 		reset_test_caches();
-		assert_eq!(initial_sync_source_target(0), 32);
+		assert_eq!(initial_source_budget_target(0), 32);
 		assert_eq!(max_sync_source_budget(0), 40);
-		assert_eq!(initial_sync_source_target(2), 75);
+		assert_eq!(initial_source_budget_target(2), 75);
 		assert_eq!(max_sync_source_budget(2), 83);
 	}
 
@@ -2539,7 +2557,7 @@ mod tests {
 			revision: 0,
 		};
 
-		assert_eq!(followup_sync_source_budget(&session), 16);
+		assert_eq!(followup_source_budget(&session), 16);
 	}
 
 	#[test]
@@ -2818,23 +2836,30 @@ mod tests {
 	fn round_robin_target_scales_with_requested_page_count() {
 		let _guard = test_lock();
 		reset_test_caches();
-		assert_eq!(round_robin_source_target(0, POSTS_PER_PAGE), 32);
-		assert_eq!(round_robin_source_target(1, POSTS_PER_PAGE), 50);
-		assert_eq!(round_robin_source_target(2, POSTS_PER_PAGE), 75);
-		assert_eq!(initial_sync_source_target(2), 75);
+		assert_eq!(source_budget_target(0, POSTS_PER_PAGE), 32);
+		assert_eq!(source_budget_target(1, POSTS_PER_PAGE), 50);
+		assert_eq!(source_budget_target(2, POSTS_PER_PAGE), 75);
+		assert_eq!(initial_source_budget_target(2), 75);
 	}
 
 	#[test]
-	fn active_ready_source_count_ignores_stale_heads() {
+	fn warm_targets_prioritize_never_refreshed_then_recent_requests() {
 		let _guard = test_lock();
 		reset_test_caches();
-		let now = chrono::Utc::now().timestamp() as u64;
-		let fresh_source = FeedSource::Subreddit { name: "fresh".to_string() };
-		let recent_source = FeedSource::Subreddit { name: "recent".to_string() };
-		let stale_source = FeedSource::Subreddit { name: "stale".to_string() };
-		seed_source(&fresh_source, vec![test_post("one", "fresh", now - 60)]);
-		seed_source(&recent_source, vec![test_post("two", "recent", now - 7_200)]);
-		seed_source(&stale_source, vec![test_post("three", "stale", now - 172_800)]);
+
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let mut older_refreshed = remembered_entry("older_refreshed");
+		older_refreshed.last_requested_at = Instant::now() - Duration::from_secs(30);
+		older_refreshed.last_refresh_succeeded_at = Some(Instant::now() - Duration::from_secs(300));
+		let mut never_recent = remembered_entry("never_recent");
+		never_recent.last_requested_at = Instant::now() - Duration::from_secs(5);
+		let mut never_older = remembered_entry("never_older");
+		never_older.last_requested_at = Instant::now() - Duration::from_secs(60);
+		remembered.insert(older_refreshed.name.clone(), older_refreshed);
+		remembered.insert(never_recent.name.clone(), never_recent);
+		remembered.insert(never_older.name.clone(), never_older);
+		drop(remembered);
+
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -2844,9 +2869,14 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				session_entry(fresh_source, SessionSourceState::Ready),
-				session_entry(recent_source, SessionSourceState::Ready),
-				session_entry(stale_source, SessionSourceState::Ready),
+				session_entry(
+					FeedSource::Subreddit {
+						name: "older_refreshed".to_string(),
+					},
+					SessionSourceState::Unstarted,
+				),
+				session_entry(FeedSource::Subreddit { name: "never_older".to_string() }, SessionSourceState::Unstarted),
+				session_entry(FeedSource::Subreddit { name: "never_recent".to_string() }, SessionSourceState::Unstarted),
 			],
 			frozen_pages: HashMap::new(),
 			background_active: false,
@@ -2856,26 +2886,14 @@ mod tests {
 			revision: 0,
 		};
 
-		assert_eq!(active_ready_source_count(&session), 2);
+		assert_eq!(warm_targets(&session, 3), vec![2, 1, 0]);
 	}
 
 	#[test]
-	fn merged_posts_complete_a_full_first_pass_before_repeating_ready_sources() {
+	fn warm_targets_break_ties_with_source_priority() {
 		let _guard = test_lock();
 		reset_test_caches();
-		let now = chrono::Utc::now().timestamp() as u64;
-		for index in 0..100 {
-			let source = FeedSource::Subreddit {
-				name: format!("subreddit{index}"),
-			};
-			seed_source(
-				&source,
-				vec![
-					test_post(&format!("post-{index}-a"), &format!("subreddit{index}"), now - index as u64),
-					test_post(&format!("post-{index}-b"), &format!("subreddit{index}"), now - index as u64 - 1),
-				],
-			);
-		}
+
 		let session = FeedSession {
 			id: "demo".to_string(),
 			request: FeedSessionRequest {
@@ -2884,32 +2902,58 @@ mod tests {
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
 			},
-			sources: (0..100)
-				.map(|index| {
-					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
-						SessionSourceState::Ready,
-					)
-				})
-				.collect(),
+			sources: vec![
+				session_entry(
+					FeedSource::Flair {
+						subreddit: "rust".to_string(),
+						flair: "News".to_string(),
+					},
+					SessionSourceState::Unstarted,
+				),
+				session_entry(FeedSource::Subreddit { name: "rust".to_string() }, SessionSourceState::Unstarted),
+				session_entry(FeedSource::Subreddit { name: "u_demo".to_string() }, SessionSourceState::Unstarted),
+			],
 			frozen_pages: HashMap::new(),
 			background_active: false,
 			background_complete: false,
-			requested_page: 3,
+			requested_page: 0,
 			last_updated: Instant::now(),
 			revision: 0,
 		};
 
-		let merged = merged_posts_for_session(&session);
-		let first_hundred_sources = merged.iter().take(100).map(|post| post.community.clone()).collect::<HashSet<_>>();
+		assert_eq!(warm_targets(&session, 3), vec![2, 1, 0]);
+	}
 
-		assert_eq!(first_hundred_sources.len(), 100);
+	#[test]
+	fn merged_posts_skip_duplicate_ids_without_stalling_fresher_sources() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let freshest = FeedSource::Subreddit { name: "freshest".to_string() };
+		let duplicate = FeedSource::Subreddit { name: "duplicate".to_string() };
+		seed_source(&freshest, vec![test_post("shared", "freshest", now), test_post("fresh-next", "freshest", now - 2)]);
+		seed_source(&duplicate, vec![test_post("shared", "duplicate", now - 1), test_post("dup-next", "duplicate", now - 3)]);
 
-		let repeated_sources = merged.iter().skip(100).take(25).map(|post| post.community.clone()).collect::<HashSet<_>>();
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+			},
+			sources: vec![session_entry(freshest, SessionSourceState::Ready), session_entry(duplicate, SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
 
-		assert_eq!(repeated_sources.len(), 25);
+		let ids = merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
+
+		assert_eq!(ids, vec!["shared", "fresh-next", "dup-next"]);
 	}
 
 	#[test]
@@ -3112,6 +3156,26 @@ mod tests {
 		assert_eq!(status.daemon_cached_sources, 1);
 		assert!(status.status_message.contains("1 from daemon cache"));
 		assert_eq!(feed_page("demo", 0, POSTS_PER_PAGE).expect("page").posts.len(), 1);
+	}
+
+	#[test]
+	fn cache_status_reports_head_post_freshness_fields() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		seed_source(&rust_source, vec![test_post("rust-1", "rust", now - 90), test_post("rust-2", "rust", now - 120)]);
+
+		let prefs = Preferences {
+			subscriptions: vec!["rust".to_string()],
+			..Preferences::default()
+		};
+
+		let status = cache_status_for_preferences(&prefs);
+		let source = status.sources.iter().find(|source| source.display_name == "rust").expect("rust cache status");
+
+		assert_eq!(source.head_post_created_ts, Some(now - 90));
+		assert!(source.head_post_age_secs.is_some_and(|age| age >= 90));
 	}
 
 	#[test]
