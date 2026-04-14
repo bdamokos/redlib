@@ -2068,6 +2068,20 @@ static REGEX_URL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?
 static REGEX_URL_EXTERNAL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://external\-preview\.redd\.it/(.*)").unwrap());
 static REGEX_URL_STYLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://styles\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_STATIC_MEDIA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://www\.redditstatic\.com/(.*)").unwrap());
+const REDDIT_DELETED_IMAGE_PLACEHOLDER_BASENAME: &str = "p1povyvu85vg1.jpg";
+
+fn is_deleted_reddit_placeholder_url(url: &str) -> bool {
+	let normalized = format_url(url);
+	if normalized.is_empty() {
+		return false;
+	}
+
+	url_path_basename(&normalized).eq_ignore_ascii_case(REDDIT_DELETED_IMAGE_PLACEHOLDER_BASENAME) && normalized.contains("/preview/pre/")
+}
+
+pub fn is_deleted_reddit_placeholder_post(post: &Post) -> bool {
+	post.post_type == "image" && (is_deleted_reddit_placeholder_url(&post.media.url) || is_deleted_reddit_placeholder_url(&post.media.preview_url))
+}
 
 fn image_preview_variants(image: &Value) -> (String, String) {
 	let resolutions = &image["resolutions"];
@@ -3604,6 +3618,21 @@ fn test_url_path_basename() {
 	assert_eq!(url_path_basename("https://doma.in/first/last"), "last");
 	// empty path
 	assert_eq!(url_path_basename("/"), "");
+}
+
+#[test]
+fn test_detects_deleted_reddit_placeholder_posts() {
+	let mut deleted_post = Post::default();
+	deleted_post.post_type = "image".to_string();
+	deleted_post.media.url =
+		"https://redlib1.bdamokos.org/preview/pre/p1povyvu85vg1.jpg?width=1075&format=pjpg&auto=webp&s=a3314a246d276e09c69b745aff5cb5e9168d2a53".to_string();
+
+	let mut normal_post = Post::default();
+	normal_post.post_type = "image".to_string();
+	normal_post.media.url = "https://i.redd.it/example.jpg".to_string();
+
+	assert!(is_deleted_reddit_placeholder_post(&deleted_post));
+	assert!(!is_deleted_reddit_placeholder_post(&normal_post));
 }
 
 #[test]

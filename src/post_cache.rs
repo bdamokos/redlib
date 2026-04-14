@@ -1101,7 +1101,11 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 		let filtered = cached
 			.posts
 			.iter()
-			.filter(|post| !session.request.filters.contains(&post.community) && !session.request.filters.contains(&format!("u_{}", post.author.name)))
+			.filter(|post| {
+				!session.request.filters.contains(&post.community)
+					&& !session.request.filters.contains(&format!("u_{}", post.author.name))
+					&& !crate::utils::is_deleted_reddit_placeholder_post(post)
+			})
 			.cloned()
 			.collect::<VecDeque<_>>();
 

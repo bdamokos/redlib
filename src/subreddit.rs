@@ -897,6 +897,10 @@ fn merge_chunk_posts(
 		let is_filtered = filters.contains(&post.community) || filters.contains(&format!("u_{}", post.author.name));
 		if !is_filtered {
 			*any_post_after_filter = true;
+			if crate::utils::is_deleted_reddit_placeholder_post(&post) {
+				cursor = next_source_index;
+				continue;
+			}
 			if (active_flair_filter.is_empty() || post.flair.text.trim() == active_flair_filter) && !recent_post_ids.contains(&post.id) && seen_post_ids.insert(post.id.clone()) {
 				merged_posts.push(post);
 				if merged_posts.len() >= TARGET_POST_COUNT {
@@ -2530,6 +2534,38 @@ mod tests {
 		);
 
 		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["1", "3"]);
+		assert_eq!(next_source_index, 0);
+	}
+
+	#[test]
+	fn merge_skips_deleted_placeholder_image_posts_on_front_page() {
+		let mut deleted = test_post();
+		deleted.id = "1".to_string();
+		deleted.media.url = "https://redlib1.bdamokos.org/preview/pre/p1povyvu85vg1.jpg?width=1075&format=pjpg&auto=webp&s=a3314a246d276e09c69b745aff5cb5e9168d2a53".to_string();
+
+		let mut normal = test_post();
+		normal.id = "2".to_string();
+		normal.media.url = "https://i.redd.it/example.jpg".to_string();
+
+		let mut chunk_buffers = [VecDeque::from(vec![deleted, normal])];
+		let recent_post_ids = HashSet::new();
+		let mut seen_post_ids = HashSet::new();
+		let mut merged = Vec::new();
+		let mut any_post_after_filter = false;
+
+		let next_source_index = merge_chunk_posts(
+			&mut chunk_buffers,
+			&mut merged,
+			&HashSet::new(),
+			"",
+			&recent_post_ids,
+			&mut seen_post_ids,
+			&mut any_post_after_filter,
+			0,
+		);
+
+		assert!(any_post_after_filter);
+		assert_eq!(merged.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["2"]);
 		assert_eq!(next_source_index, 0);
 	}
 
