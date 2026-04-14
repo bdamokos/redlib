@@ -2080,7 +2080,17 @@ fn is_deleted_reddit_placeholder_url(url: &str) -> bool {
 }
 
 pub fn is_deleted_reddit_placeholder_post(post: &Post) -> bool {
-	post.post_type == "image" && (is_deleted_reddit_placeholder_url(&post.media.url) || is_deleted_reddit_placeholder_url(&post.media.preview_url))
+	match post.post_type.as_str() {
+		"image" => is_deleted_reddit_placeholder_url(&post.media.url) || is_deleted_reddit_placeholder_url(&post.media.preview_url),
+		"gallery" => {
+			!post.gallery.is_empty()
+				&& post
+					.gallery
+					.iter()
+					.all(|image| is_deleted_reddit_placeholder_url(&image.url) || is_deleted_reddit_placeholder_url(&image.preview_url))
+		}
+		_ => false,
+	}
 }
 
 fn image_preview_variants(image: &Value) -> (String, String) {
@@ -3633,6 +3643,58 @@ fn test_detects_deleted_reddit_placeholder_posts() {
 
 	assert!(is_deleted_reddit_placeholder_post(&deleted_post));
 	assert!(!is_deleted_reddit_placeholder_post(&normal_post));
+}
+
+#[test]
+fn test_detects_deleted_reddit_placeholder_galleries() {
+	let mut deleted_gallery = Post::default();
+	deleted_gallery.post_type = "gallery".to_string();
+	deleted_gallery.gallery = vec![
+		GalleryMedia {
+			url: "/preview/pre/p1povyvu85vg1.jpg?width=640&format=pjpg&auto=webp&s=deadbeef".to_string(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
+			width: 0,
+			height: 0,
+			caption: String::new(),
+			outbound_url: String::new(),
+		},
+		GalleryMedia {
+			url: "https://redlib1.bdamokos.org/preview/pre/p1povyvu85vg1.jpg?width=1075&format=pjpg&auto=webp&s=a3314a246d276e09c69b745aff5cb5e9168d2a53".to_string(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
+			width: 0,
+			height: 0,
+			caption: String::new(),
+			outbound_url: String::new(),
+		},
+	];
+
+	let mut mixed_gallery = Post::default();
+	mixed_gallery.post_type = "gallery".to_string();
+	mixed_gallery.gallery = vec![
+		GalleryMedia {
+			url: "/preview/pre/p1povyvu85vg1.jpg?width=640&format=pjpg&auto=webp&s=deadbeef".to_string(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
+			width: 0,
+			height: 0,
+			caption: String::new(),
+			outbound_url: String::new(),
+		},
+		GalleryMedia {
+			url: "https://i.redd.it/example.jpg".to_string(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
+			width: 0,
+			height: 0,
+			caption: String::new(),
+			outbound_url: String::new(),
+		},
+	];
+
+	assert!(is_deleted_reddit_placeholder_post(&deleted_gallery));
+	assert!(!is_deleted_reddit_placeholder_post(&mixed_gallery));
 }
 
 #[test]
