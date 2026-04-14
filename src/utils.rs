@@ -623,6 +623,60 @@ impl Clone for Post {
 	}
 }
 
+impl Default for Post {
+	fn default() -> Self {
+		Self {
+			id: String::new(),
+			kind: "t3".to_string(),
+			title: String::new(),
+			community: String::new(),
+			body: String::new(),
+			author: Author {
+				name: String::new(),
+				flair: Flair {
+					flair_parts: Vec::new(),
+					text: String::new(),
+					background_color: String::new(),
+					foreground_color: String::new(),
+				},
+				distinguished: String::new(),
+				external_links: Vec::new(),
+				avg_video_length: None,
+			},
+			permalink: String::new(),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			poll: None,
+			score: ("0".to_string(), "0".to_string()),
+			upvote_ratio: 0,
+			post_type: "self".to_string(),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+			flags: Flags::new(false, false, false),
+			thumbnail: Media::empty(),
+			media: Media::empty(),
+			domain: String::new(),
+			rel_time: String::new(),
+			created: String::new(),
+			created_ts: 0,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
+		}
+	}
+}
+
 impl Post {
 	/// Fetch posts of a user or subreddit and return a vector of posts and the "after" value
 	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {

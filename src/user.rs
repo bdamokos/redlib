@@ -304,6 +304,17 @@ fn prune_user_video_stats_cache(cache: &mut HashMap<String, CachedUserVideoStats
 	cache.retain(|_, entry| now.duration_since(entry.cached_at) <= USER_VIDEO_STATS_CACHE_TTL);
 }
 
+fn observe_user_video_post(entry: &mut CachedUserVideoStats, post: &Post) {
+	let Some(video_key) = video_aggregate_key(post) else {
+		return;
+	};
+
+	if entry.seen_keys.insert(video_key) {
+		entry.video_count += 1;
+		entry.total_duration_seconds += post.media.duration_seconds;
+	}
+}
+
 fn update_user_video_stats(username: &str, posts: &[Post]) {
 	let cache_key = normalize_user_video_stats_cache_key(username);
 	if cache_key.is_empty() {
@@ -316,7 +327,7 @@ fn update_user_video_stats(username: &str, posts: &[Post]) {
 	prune_user_video_stats_cache(&mut cache);
 
 	let now = Instant::now();
-	let entry = cache.entry(cache_key).or_insert_with(|| CachedUserVideoStats {
+	let entry = cache.entry(cache_key.clone()).or_insert_with(|| CachedUserVideoStats {
 		seen_keys: HashSet::new(),
 		total_duration_seconds: 0,
 		video_count: 0,
@@ -325,14 +336,38 @@ fn update_user_video_stats(username: &str, posts: &[Post]) {
 	entry.cached_at = now;
 
 	for post in posts {
-		let Some(video_key) = video_aggregate_key(post) else {
-			continue;
-		};
+		observe_user_video_post(entry, post);
+	}
 
-		if entry.seen_keys.insert(video_key) {
-			entry.video_count += 1;
-			entry.total_duration_seconds += post.media.duration_seconds;
+	while cache.len() > USER_VIDEO_STATS_CACHE_SIZE {
+		let Some(oldest_key) = cache.iter().min_by_key(|(_, entry)| entry.cached_at).map(|(key, _)| key.clone()) else {
+			break;
+		};
+		cache.remove(&oldest_key);
+	}
+}
+
+pub(crate) fn update_user_video_stats_from_posts(posts: &[Post]) {
+	let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() else {
+		return;
+	};
+	prune_user_video_stats_cache(&mut cache);
+
+	let now = Instant::now();
+	for post in posts {
+		let cache_key = normalize_user_video_stats_cache_key(&post.author.name);
+		if cache_key.is_empty() {
+			continue;
 		}
+
+		let entry = cache.entry(cache_key).or_insert_with(|| CachedUserVideoStats {
+			seen_keys: HashSet::new(),
+			total_duration_seconds: 0,
+			video_count: 0,
+			cached_at: now,
+		});
+		entry.cached_at = now;
+		observe_user_video_post(entry, post);
 	}
 
 	while cache.len() > USER_VIDEO_STATS_CACHE_SIZE {
@@ -374,6 +409,16 @@ pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
 		utils::format_video_duration(stats.average_duration_seconds),
 		format!("from {} seen {count_label}", stats.video_count),
 	))
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_caches() {
+	if let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() {
+		cache.clear();
+	}
+	if let Ok(mut cache) = USER_METADATA_CACHE.lock() {
+		cache.clear();
+	}
 }
 
 pub(crate) fn collapsed_duplicate(post: Post) -> crate::utils::CollapsedDuplicate {

@@ -2,7 +2,7 @@ use crate::cache_persistence::{
 	instant_to_unix, option_instant_to_unix, option_unix_to_instant, unix_to_instant, PersistedRefreshOrigin, PersistedRememberedSubredditEntry, PersistedSourceCacheEntry,
 };
 use crate::oauth::oauth_is_available;
-use crate::user::collapse_duplicate_submissions;
+use crate::user::{collapse_duplicate_submissions, update_user_video_stats_from_posts};
 use crate::utils::{Post, Preferences};
 use hyper::body::to_bytes;
 use hyper::{Body, Request, Response, StatusCode};
@@ -494,6 +494,7 @@ pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) {
 }
 
 fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) {
+	update_user_video_stats_from_posts(&posts);
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
 		cache.insert(
 			source.cache_key(),
@@ -703,10 +704,13 @@ pub(crate) fn restore_persisted_state(
 				return None;
 			}
 
+			let posts = entry.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
+			update_user_video_stats_from_posts(&posts);
+
 			Some((
 				FeedSource::Subreddit { name: subreddit }.cache_key(),
 				CachedSourcePosts {
-					posts: entry.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect(),
+					posts,
 					after: entry.after,
 					fetched_at: unix_to_instant(entry.fetched_at_unix, now_unix),
 					refresh_origin: entry.refresh_origin.map(PersistedRefreshOrigin::into_runtime),
@@ -1948,6 +1952,7 @@ mod tests {
 		FEED_SESSIONS.lock().unwrap().clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap().clear();
+		crate::user::clear_test_caches();
 	}
 
 	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {
@@ -2046,6 +2051,16 @@ mod tests {
 		}
 	}
 
+	fn test_video_post(id: &str, community: &str, author: &str, created_ts: u64, media_url: &str, duration_seconds: i64) -> Post {
+		let mut post = test_post(id, community, created_ts);
+		post.author.name = author.to_string();
+		post.post_type = "video".to_string();
+		post.media.url = media_url.to_string();
+		post.media.duration_seconds = duration_seconds;
+		post.media.duration = crate::utils::format_video_duration(duration_seconds);
+		post
+	}
+
 	#[test]
 	fn sorts_user_sources_before_subreddits_and_flairs() {
 		let _guard = test_lock();
@@ -2064,6 +2079,58 @@ mod tests {
 		assert!(matches!(&sources[0], FeedSource::Subreddit { name } if name == "u_demo"));
 		assert!(matches!(&sources[1], FeedSource::Subreddit { name } if name == "rust"));
 		assert!(matches!(&sources[2], FeedSource::Flair { subreddit, .. } if subreddit == "zeta"));
+	}
+
+	#[test]
+	fn store_source_posts_updates_author_video_stats_from_feed_posts() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		store_source_posts(
+			&source,
+			vec![
+				test_video_post("one", "rust", "author_alpha", 300, "https://v.redd.it/alpha/DASH_720.mp4", 30),
+				test_video_post("two", "rust", "author_alpha", 200, "https://v.redd.it/beta/DASH_720.mp4", 90),
+				test_video_post("three", "rust", "author_bravo", 100, "https://v.redd.it/gamma/DASH_720.mp4", 45),
+			],
+			String::new(),
+		);
+
+		assert_eq!(
+			crate::user::cached_avg_video_length("author_alpha"),
+			Some(("1:00".to_string(), "from 2 seen videos".to_string()))
+		);
+		assert_eq!(
+			crate::user::cached_avg_video_length("author_bravo"),
+			Some(("0:45".to_string(), "from 1 seen video".to_string()))
+		);
+	}
+
+	#[test]
+	fn restored_source_cache_rehydrates_author_video_stats() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		store_source_posts_with_origin(
+			&source,
+			vec![test_video_post("one", "rust", "author_restore", 100, "https://v.redd.it/restore/DASH_720.mp4", 75)],
+			"after".to_string(),
+			Some(RefreshOrigin::Daemon),
+		);
+
+		let now_unix = 1_700_000_000;
+		let source_entries = snapshot_persisted_source_entries(now_unix);
+		let remembered_entries = snapshot_persisted_remembered_subreddits(now_unix);
+
+		reset_test_caches();
+		restore_persisted_state(source_entries, remembered_entries, now_unix, now_unix);
+
+		assert_eq!(
+			crate::user::cached_avg_video_length("author_restore"),
+			Some(("1:15".to_string(), "from 1 seen video".to_string()))
+		);
 	}
 
 	#[test]
