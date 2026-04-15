@@ -570,7 +570,7 @@ fn cached_user_listing_posts(username: &str, listing: &str, sort: &str, query: &
 	let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
 
 	crate::post_cache::get_cached_source_page(
-		&crate::post_cache::FeedSource::Subreddit { name: format!("u_{username}") },
+		&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
 		cache_page,
 		crate::post_cache::POSTS_PER_PAGE,
 	)
@@ -1455,7 +1455,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			utils::store_user_subreddits(&username, &scraped.posts);
 			if cacheable_submitted_first_page {
 				crate::post_cache::store_source_posts_for_cache(
-					&crate::post_cache::FeedSource::Subreddit { name: format!("u_{username}") },
+					&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
 					scraped.posts.clone(),
 					scraped.after.clone(),
 					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
@@ -1537,7 +1537,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 					utils::store_user_subreddits(&username, &scraped.posts);
 					if cacheable_submitted_first_page {
 						crate::post_cache::store_source_posts_for_cache(
-							&crate::post_cache::FeedSource::Subreddit { name: format!("u_{username}") },
+							&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
 							scraped.posts.clone(),
 							scraped.after.clone(),
 							Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),

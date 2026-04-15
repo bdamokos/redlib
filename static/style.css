@@ -444,12 +444,40 @@ body > footer {
 /* Footer in content block. */
 main > * > footer {
     display: flex;
+    flex-wrap: wrap;
     justify-content: center;
+    gap: 8px;
     margin-top: 20px;
 }
 
 main > * > footer > a {
     margin-right: 5px;
+}
+
+.contextual_pagination {
+    display: flex;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    margin-bottom: 6px;
+}
+
+.contextual_page_link {
+    background: var(--accent);
+    border: 1px solid var(--highlighted);
+    border-radius: 999px;
+    color: var(--foreground);
+    font-size: 0.9rem;
+    line-height: 1;
+    padding: 0.45rem 0.8rem;
+    text-decoration: none;
+}
+
+.contextual_page_link.selected {
+    background: var(--highlighted);
+    color: var(--background);
+    font-weight: 700;
 }
 
 /* / Footer in content block. */

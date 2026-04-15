@@ -3,7 +3,7 @@
 use crate::{config, instance_scrape, utils};
 // CRATES
 use crate::cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditMetadataEntry, PersistedSubredditNsfwEntry};
-use crate::post_cache::{FeedSessionRequest, FeedSource};
+use crate::post_cache::{FeedSessionRequest, FeedSort, FeedSource};
 use crate::utils::{
 	catch_random, clear_sharded_cookie, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect,
 	rewrite_urls, setting, template, val, write_sharded_cookie, FlairSubscription, Post, Preferences, Subreddit,
@@ -21,7 +21,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use url::form_urlencoded;
 
@@ -83,6 +83,8 @@ pub struct SubredditTemplate {
 	feed_session_id: String,
 	feed_status_url: String,
 	feed_fragment_url: String,
+	show_contextual_pagination: bool,
+	contextual_pagination: Vec<ContextualPageLink>,
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
@@ -135,9 +137,13 @@ struct SubredditFragmentTemplate {
 	feed_session_id: String,
 	feed_status_url: String,
 	feed_fragment_url: String,
+	show_contextual_pagination: bool,
+	contextual_pagination: Vec<ContextualPageLink>,
 }
 
 crate::impl_template_str_eq!(SubredditFragmentTemplate);
+
+const CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET: usize = 8;
 
 #[derive(Template)]
 #[template(path = "feed_fragment.html")]
@@ -151,6 +157,8 @@ struct FeedFragmentTemplate {
 	all_posts_filtered: bool,
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	show_contextual_pagination: bool,
+	contextual_pagination: Vec<ContextualPageLink>,
 }
 
 impl FeedFragmentTemplate {
@@ -178,6 +186,14 @@ struct FlairFilterOption {
 	url: String,
 	active: bool,
 	flair: crate::utils::Flair,
+}
+
+#[derive(Clone, PartialEq)]
+struct ContextualPageLink {
+	label: String,
+	url: String,
+	current: bool,
+	title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -654,6 +670,8 @@ fn render_scraped_subreddit_fragment(
 		feed_session_id: String::new(),
 		feed_status_url: String::new(),
 		feed_fragment_url: String::new(),
+		show_contextual_pagination: false,
+		contextual_pagination: Vec::new(),
 	})
 }
 
@@ -767,25 +785,61 @@ fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
 	feeds
 }
 
-fn build_feed_sources(preferences: &Preferences) -> Vec<FeedSource> {
-	let mut sources = preferences.subscriptions.iter().cloned().map(|name| FeedSource::Subreddit { name }).collect::<Vec<_>>();
+fn build_feed_sources(preferences: &Preferences, sort: FeedSort) -> Vec<FeedSource> {
+	let mut sources = preferences
+		.subscriptions
+		.iter()
+		.cloned()
+		.map(|name| FeedSource::subreddit(name, sort))
+		.collect::<Vec<_>>();
 
-	sources.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| FeedSource::Flair {
-		subreddit: subscription.subreddit,
-		flair: subscription.flair,
-	}));
+	sources.extend(
+		preferences
+			.flair_subscriptions
+			.iter()
+			.cloned()
+			.map(|subscription| FeedSource::flair(subscription.subreddit, subscription.flair, sort)),
+	);
 
 	crate::post_cache::sort_sources(&mut sources);
 	sources
 }
 
-async fn live_feed_shell_loading_message(req: &Request<Body>, preferences: &Preferences) -> Option<String> {
+fn front_page_uses_contextual_session(is_subreddit_route: bool, sort: &str) -> bool {
+	!is_subreddit_route && matches!(sort, "new" | "hot")
+}
+
+fn build_front_page_session_sources(preferences: &Preferences, front_page_is_default: bool, has_saved_feeds: bool, sub_name: &str, sort: &str) -> Vec<FeedSource> {
+	let listing_sort = FeedSort::from_listing(sort);
+	let mut sources = if front_page_is_default && has_saved_feeds {
+		build_feed_sources(preferences, listing_sort)
+	} else if sub_name.is_empty() {
+		Vec::new()
+	} else {
+		vec![FeedSource::subreddit(sub_name.to_string(), listing_sort)]
+	};
+	crate::post_cache::sort_sources(&mut sources);
+	sources
+}
+
+async fn live_feed_shell_loading_message(
+	req: &Request<Body>,
+	preferences: &Preferences,
+	front_page_is_default: bool,
+	has_saved_feeds: bool,
+	sub_name: &str,
+	sort: &str,
+) -> Option<String> {
 	let query = req.uri().query().unwrap_or_default().to_string();
 	let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
 	let filters = get_filters(req);
+	let sources = build_front_page_session_sources(preferences, front_page_is_default, has_saved_feeds, sub_name, sort);
+	if sources.is_empty() {
+		return None;
+	}
 	let feed_session_id = crate::post_cache::begin_feed_session(
 		FeedSessionRequest {
-			sources: build_feed_sources(preferences),
+			sources,
 			filters,
 			quarantine: true,
 			query_fingerprint: listing_query_fingerprint(&query),
@@ -826,6 +880,149 @@ fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str, be
 		.finish();
 
 	format!("/r/{}/{sort}.json?{query}", chunk.replace('+', "%2B"))
+}
+
+fn feed_page_url(current_url: &str, session_id: &str, page: usize) -> String {
+	update_url_query(
+		current_url,
+		&[
+			("cache_page", Some(&page.to_string())),
+			(FEED_SESSION_PARAM, Some(session_id)),
+			("before", None),
+			("after", None),
+			(FRONT_CURSOR_PARAM, None),
+		],
+	)
+}
+
+fn now_unix() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|duration| duration.as_secs())
+		.unwrap_or_default()
+}
+
+fn representative_age_secs(posts: &[Post], now_unix: u64) -> Option<u64> {
+	let mut created = posts.iter().map(|post| post.created_ts).filter(|ts| *ts > 0).collect::<Vec<_>>();
+	if created.is_empty() {
+		return None;
+	}
+	created.sort_unstable();
+	let median = created[created.len() / 2];
+	Some(now_unix.saturating_sub(median))
+}
+
+fn representative_hot_score(posts: &[Post]) -> Option<i64> {
+	let mut scores = posts
+		.iter()
+		.filter(|post| !post.flags.stickied)
+		.filter_map(|post| post.score.1.parse::<i64>().ok())
+		.collect::<Vec<_>>();
+	if scores.len() < 3 {
+		return None;
+	}
+	scores.sort_unstable();
+	Some(scores[scores.len() / 2])
+}
+
+fn approximate_age_label(age_secs: u64) -> String {
+	const BUCKETS: &[(u64, &str)] = &[
+		(60 * 60, "~1h"),
+		(3 * 60 * 60, "~3h"),
+		(8 * 60 * 60, "~8h"),
+		(24 * 60 * 60, "~1d"),
+		(3 * 24 * 60 * 60, "~3d"),
+		(7 * 24 * 60 * 60, "~7d"),
+		(14 * 24 * 60 * 60, "~14d"),
+		(30 * 24 * 60 * 60, "~30d"),
+	];
+	let (.., label) = BUCKETS
+		.iter()
+		.min_by_key(|(bucket, _)| age_secs.abs_diff(*bucket))
+		.copied()
+		.unwrap_or((60 * 60, "~1h"));
+	label.to_string()
+}
+
+fn round_hot_score_anchor(score: i64) -> i64 {
+	if score == 0 {
+		return 0;
+	}
+	let magnitude = 10_i64.pow(score.abs().to_string().len().saturating_sub(1) as u32);
+	((score as f64 / magnitude as f64).round() as i64) * magnitude
+}
+
+fn approximate_hot_score_label(score: i64) -> String {
+	format!("~{}", format_num(round_hot_score_anchor(score)).0)
+}
+
+fn build_contextual_pagination(current_url: &str, session_id: &str, current_page: usize, sort: &str) -> Vec<ContextualPageLink> {
+	if !matches!(sort, "new" | "hot") {
+		return Vec::new();
+	}
+
+	let mut ready_pages = Vec::new();
+	let mut posts_inspected = 0usize;
+	let mut page_index = current_page;
+	while ready_pages.len() < 4 && posts_inspected < 100 {
+		let Some(page) = crate::post_cache::feed_page(session_id, page_index, crate::post_cache::POSTS_PER_PAGE) else {
+			break;
+		};
+		if !page.ready {
+			break;
+		}
+		posts_inspected += page.posts.len();
+		ready_pages.push((page_index, page.posts));
+		page_index += 1;
+	}
+
+	if ready_pages.len() < 3 {
+		return Vec::new();
+	}
+
+	let now = now_unix();
+	let mut links = Vec::new();
+	let mut seen_labels = HashSet::new();
+	for (page, posts) in ready_pages {
+		let (label, title) = match sort {
+			"new" => {
+				let Some(age_secs) = representative_age_secs(&posts, now) else {
+					continue;
+				};
+				(
+					approximate_age_label(age_secs),
+					format!("Jump to posts around {}", approximate_age_label(age_secs).trim_start_matches('~')),
+				)
+			}
+			"hot" => {
+				let Some(score) = representative_hot_score(&posts) else {
+					continue;
+				};
+				let label = approximate_hot_score_label(score);
+				(label.clone(), format!("Jump to posts around {} score", label.trim_start_matches('~')))
+			}
+			_ => continue,
+		};
+
+		if !seen_labels.insert(label.clone()) {
+			continue;
+		}
+
+		links.push(ContextualPageLink {
+			label,
+			url: feed_page_url(current_url, session_id, page),
+			current: page == current_page,
+			title,
+		});
+	}
+
+	let non_current = links.iter().filter(|link| !link.current).count();
+	if non_current < 2 {
+		return Vec::new();
+	}
+
+	links.truncate(5);
+	links
 }
 
 fn encode_front_cursor(cursor: &AggregateFrontCursor) -> Option<String> {
@@ -1115,10 +1312,10 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
-	let aggregate_saved_feeds = req.param("sub").is_none() && front_page_is_default && has_saved_feeds;
+	let contextual_front_page = front_page_uses_contextual_session(req.param("sub").is_some(), &sort);
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
-	let loading_message = if aggregate_saved_feeds && sort == "new" {
-		live_feed_shell_loading_message(&req, &prefs)
+	let loading_message = if contextual_front_page {
+		live_feed_shell_loading_message(&req, &prefs, front_page_is_default, has_saved_feeds, &sub_name, &sort)
 			.await
 			.unwrap_or_else(|| "Loading followed feeds in the background.".to_string())
 	} else {
@@ -1225,6 +1422,12 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let reddit_query = subreddit_listing_query(&query, sub_name == "popular");
 	let aggregate_sources = build_aggregate_sources(&prefs, &sort, &reddit_query);
 	let aggregate_saved_feeds = !is_subreddit_route && front_page_is_default && !aggregate_sources.is_empty();
+	let contextual_front_page = front_page_uses_contextual_session(is_subreddit_route, &sort);
+	let front_page_session_sources = if contextual_front_page {
+		build_front_page_session_sources(&prefs, front_page_is_default, has_saved_feeds, &sub_name, &sort)
+	} else {
+		Vec::new()
+	};
 
 	let fragment_request_url = req.uri().to_string();
 	let req_url = fragment_request_url.replacen("/subreddit-fragment", "", 1);
@@ -1445,100 +1648,87 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
 			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
 		})
-	} else if aggregate_saved_feeds {
-		if sort == "new" {
-			let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
-				.and_then(|p| p.parse::<usize>().ok())
-				.unwrap_or(0);
+	} else if contextual_front_page {
+		let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
+			.and_then(|p| p.parse::<usize>().ok())
+			.unwrap_or(0);
+		let query_fingerprint = listing_query_fingerprint(&query);
+		let feed_session_id = crate::post_cache::ensure_feed_session_with_budget(
+			FeedSessionRequest {
+				sources: front_page_session_sources,
+				filters: filters.clone(),
+				quarantine: quarantined,
+				query_fingerprint,
+			},
+			cache_page,
+			crate::post_cache::POSTS_PER_PAGE,
+			CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET,
+		)
+		.await;
 
-			let query_fingerprint = listing_query_fingerprint(&query);
-			let feed_session_id = crate::post_cache::begin_feed_session(
-				FeedSessionRequest {
-					sources: build_feed_sources(&prefs),
-					filters: filters.clone(),
-					quarantine: quarantined,
-					query_fingerprint,
-				},
-				cache_page,
-				crate::post_cache::POSTS_PER_PAGE,
-			)
-			.await;
+		if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
+			let feed_status = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
+			let page_ready = feed_status.as_ref().map(|status| status.current_page_ready).unwrap_or(false);
+			let ready_sources = feed_status.as_ref().map(|status| status.ready_sources).unwrap_or_default();
+			let daemon_cached_sources = feed_status.as_ref().map(|status| status.daemon_cached_sources).unwrap_or_default();
+			let merged_posts = feed_status.as_ref().map(|status| status.posts_merged).unwrap_or_default();
+			info!(
+				"post_cache: serving page {} from session {} ({} session sources ready, {} from daemon cache, {} total posts)",
+				cache_page, feed_session_id, ready_sources, daemon_cached_sources, merged_posts
+			);
+			let no_posts = page_ready && page.posts.is_empty();
+			let all_posts_hidden_nsfw = !no_posts && (page.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			utils::hydrate_post_author_links_from_cache(&mut page.posts);
 
-			if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
-				let feed_status = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
-				let page_ready = feed_status.as_ref().map(|status| status.current_page_ready).unwrap_or(false);
-				let ready_sources = feed_status.as_ref().map(|status| status.ready_sources).unwrap_or_default();
-				let daemon_cached_sources = feed_status.as_ref().map(|status| status.daemon_cached_sources).unwrap_or_default();
-				let merged_posts = feed_status.as_ref().map(|status| status.posts_merged).unwrap_or_default();
-				info!(
-					"post_cache: serving page {} from session {} ({} session sources ready, {} from daemon cache, {} total posts)",
-					cache_page, feed_session_id, ready_sources, daemon_cached_sources, merged_posts
-				);
-				let no_posts = page_ready && page.posts.is_empty();
-				let all_posts_hidden_nsfw = !no_posts && (page.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-				utils::hydrate_post_author_links_from_cache(&mut page.posts);
+			let prev_page_url = if cache_page > 0 {
+				feed_page_url(&url, &feed_session_id, cache_page - 1)
+			} else {
+				String::new()
+			};
+			let next_page_url = if page.has_next {
+				feed_page_url(&url, &feed_session_id, cache_page + 1)
+			} else {
+				String::new()
+			};
+			let contextual_pagination = build_contextual_pagination(&url, &feed_session_id, cache_page, &sort);
 
-				let prev_page_url = if cache_page > 0 {
-					update_url_query(
-						&url,
-						&[
-							("cache_page", Some(&(cache_page - 1).to_string())),
-							(FEED_SESSION_PARAM, Some(&feed_session_id)),
-							("before", None),
-							("after", None),
-							(FRONT_CURSOR_PARAM, None),
-						],
-					)
-				} else {
-					String::new()
-				};
-				let next_page_url = if page.has_next {
-					update_url_query(
-						&url,
-						&[
-							("cache_page", Some(&(cache_page + 1).to_string())),
-							(FEED_SESSION_PARAM, Some(&feed_session_id)),
-							("before", None),
-							("after", None),
-							(FRONT_CURSOR_PARAM, None),
-						],
-					)
-				} else {
-					String::new()
-				};
-
-				return render_subreddit_fragment(SubredditFragmentTemplate {
-					sub,
-					posts: page.posts,
-					top_users,
-					sort: (sort.clone(), timeframe.clone()),
-					sort_options,
-					flair_filters,
-					active_flair_filter: active_flair_filter.clone(),
-					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-					clear_flair_filter_url: update_url_query(
-						&url,
-						&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
-					),
-					prev_page_url,
-					next_page_url,
-					prefs: Preferences::new(&req),
-					url: url.clone(),
-					redirect_url,
-					enable_duplicate_collapse: true,
-					is_filtered: false,
-					all_posts_filtered: false,
-					all_posts_hidden_nsfw,
-					no_posts,
-					cache_notice: String::new(),
-					is_flair_subscribed,
-					feed_session_id: feed_session_id.clone(),
-					feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
-					feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
-				});
-			}
+			return render_subreddit_fragment(SubredditFragmentTemplate {
+				sub,
+				posts: page.posts,
+				top_users,
+				sort: (sort.clone(), timeframe.clone()),
+				sort_options,
+				flair_filters,
+				active_flair_filter: active_flair_filter.clone(),
+				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+				clear_flair_filter_url: update_url_query(
+					&url,
+					&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+				),
+				prev_page_url,
+				next_page_url,
+				prefs: Preferences::new(&req),
+				url: url.clone(),
+				redirect_url,
+				enable_duplicate_collapse: true,
+				is_filtered: false,
+				all_posts_filtered: false,
+				all_posts_hidden_nsfw,
+				no_posts,
+				cache_notice: String::new(),
+				is_flair_subscribed,
+				feed_session_id: feed_session_id.clone(),
+				feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
+				feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
+				show_contextual_pagination: !contextual_pagination.is_empty(),
+				contextual_pagination,
+			});
 		}
+		return error(req, "Feed session not found or expired").await;
+	} else if aggregate_saved_feeds {
 
 		let query_fingerprint = listing_query_fingerprint(&query);
 		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
@@ -1595,6 +1785,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					feed_session_id: String::new(),
 					feed_status_url: String::new(),
 					feed_fragment_url: String::new(),
+					show_contextual_pagination: false,
+					contextual_pagination: Vec::new(),
 				})
 			}
 			Err(msg) => error(req, &msg).await,
@@ -1651,6 +1843,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
 				feed_fragment_url: String::new(),
+				show_contextual_pagination: false,
+				contextual_pagination: Vec::new(),
 			});
 
 			// Fall through to normal fetch if not cached.
@@ -1741,6 +1935,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					feed_session_id: String::new(),
 					feed_status_url: String::new(),
 					feed_fragment_url: String::new(),
+					show_contextual_pagination: false,
+					contextual_pagination: Vec::new(),
 				})
 			}
 			Err(msg) => {
@@ -1800,6 +1996,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								feed_session_id: String::new(),
 								feed_status_url: String::new(),
 								feed_fragment_url: String::new(),
+								show_contextual_pagination: false,
+								contextual_pagination: Vec::new(),
 							});
 						}
 					}
@@ -1847,6 +2045,7 @@ mod tests {
 	use std::collections::{HashSet, VecDeque};
 	use std::time::Instant;
 
+	use crate::post_cache::{self, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
 
 	fn empty_flair() -> Flair {
@@ -1912,6 +2111,34 @@ mod tests {
 		}
 	}
 
+	fn metric_post(id: &str, community: &str, created_ts: u64, score: i64, stickied: bool) -> Post {
+		let mut post = test_post();
+		post.id = id.to_string();
+		post.title = format!("Post {id}");
+		post.community = community.to_string();
+		post.created_ts = created_ts;
+		post.score = crate::utils::format_num(score);
+		post.flags = Flags::new(false, false, stickied);
+		post.media.url = format!("https://i.redd.it/{id}.jpg");
+		post.permalink = format!("/r/{community}/comments/{id}/");
+		post
+	}
+
+	async fn seed_contextual_session(source: FeedSource, posts: Vec<Post>, fingerprint: &str) -> String {
+		post_cache::store_source_posts_for_cache(&source, posts, String::new(), Some(RefreshOrigin::FrontPageSession));
+		post_cache::ensure_feed_session(
+			FeedSessionRequest {
+				sources: vec![source],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: fingerprint.to_string(),
+			},
+			0,
+			post_cache::POSTS_PER_PAGE,
+		)
+		.await
+	}
+
 	#[test]
 	fn enables_duplicate_collapse_for_aggregate_feeds() {
 		assert!(should_enable_duplicate_collapse(""));
@@ -1951,6 +2178,8 @@ mod tests {
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
 			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
 		}
 		.render()
 		.unwrap();
@@ -1992,6 +2221,8 @@ mod tests {
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
 			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
 		}
 		.render()
 		.unwrap();
@@ -2175,6 +2406,8 @@ mod tests {
 			feed_session_id: "demo".to_string(),
 			feed_status_url: "/feed-status?feed_session=demo".to_string(),
 			feed_fragment_url: "/feed-fragment?feed_session=demo".to_string(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
 		}
 		.render()
 		.unwrap();
@@ -2215,11 +2448,125 @@ mod tests {
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
 			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
 		}
 		.render()
 		.unwrap();
 
 		assert!(!html.contains("id=\"sidebar\""));
+	}
+
+	#[test]
+	fn subreddit_fragment_renders_contextual_pagination_links() {
+		let html = super::SubredditFragmentTemplate {
+			sub: Subreddit::default(),
+			posts: vec![test_post()],
+			top_users: Vec::new(),
+			sort: ("hot".to_string(), String::new()),
+			sort_options: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: "/".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/hot".to_string(),
+			redirect_url: String::new(),
+			enable_duplicate_collapse: false,
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			cache_notice: String::new(),
+			is_flair_subscribed: false,
+			feed_session_id: "demo".to_string(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+			show_contextual_pagination: true,
+			contextual_pagination: vec![
+				super::ContextualPageLink {
+					label: "~5k".to_string(),
+					url: "/hot?cache_page=0&feed_session=demo".to_string(),
+					current: true,
+					title: "Jump to posts around 5k score".to_string(),
+				},
+				super::ContextualPageLink {
+					label: "~500".to_string(),
+					url: "/hot?cache_page=1&feed_session=demo".to_string(),
+					current: false,
+					title: "Jump to posts around 500 score".to_string(),
+				},
+			],
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("contextual_pagination"));
+		assert!(html.contains("contextual_page_link selected"));
+		assert!(html.contains("~5k"));
+		assert!(html.contains("~500"));
+	}
+
+	#[tokio::test]
+	async fn contextual_pagination_for_new_uses_ready_page_age_bands() {
+		let now = super::now_unix();
+		let source = FeedSource::subreddit("contextual-new-test", FeedSort::New);
+		let mut posts = Vec::new();
+		for index in 0..25 {
+			posts.push(metric_post(&format!("new-a-{index}"), "contextual-new-test", now - 1_800 - index * 60, 100, false));
+		}
+		for index in 0..25 {
+			posts.push(metric_post(&format!("new-b-{index}"), "contextual-new-test", now - 4 * 3_600 - index * 120, 95, false));
+		}
+		for index in 0..25 {
+			posts.push(metric_post(&format!("new-c-{index}"), "contextual-new-test", now - 36 * 3_600 - index * 600, 90, false));
+		}
+		for index in 0..25 {
+			posts.push(metric_post(&format!("new-d-{index}"), "contextual-new-test", now - 7 * 24 * 3_600 - index * 3_600, 85, false));
+		}
+
+		let session_id = seed_contextual_session(source, posts, "contextual-new-fingerprint").await;
+		let links = super::build_contextual_pagination("/new", &session_id, 0, "new");
+
+		assert!(links.len() >= 3);
+		assert!(links.iter().any(|link| link.current));
+		assert!(links.iter().all(|link| link.label.starts_with('~')));
+		let unique = links.iter().map(|link| link.label.clone()).collect::<HashSet<_>>();
+		assert_eq!(unique.len(), links.len());
+	}
+
+	#[tokio::test]
+	async fn contextual_pagination_for_hot_uses_score_bands_and_suppresses_hidden_scores() {
+		let source = FeedSource::subreddit("contextual-hot-test", FeedSort::Hot);
+		let mut posts = Vec::new();
+		for index in 0..25 {
+			posts.push(metric_post(&format!("hot-a-{index}"), "contextual-hot-test", 1_000 - index as u64, 5_000 - index as i64 * 10, false));
+		}
+		for index in 0..25 {
+			posts.push(metric_post(&format!("hot-b-{index}"), "contextual-hot-test", 900 - index as u64, 700 - index as i64 * 5, false));
+		}
+		for index in 0..25 {
+			posts.push(metric_post(&format!("hot-c-{index}"), "contextual-hot-test", 800 - index as u64, 80 - index as i64, false));
+		}
+		let session_id = seed_contextual_session(source, posts, "contextual-hot-fingerprint").await;
+		let links = super::build_contextual_pagination("/hot", &session_id, 0, "hot");
+
+		assert!(links.len() >= 3);
+		assert!(links.iter().any(|link| link.current));
+		assert!(links.iter().all(|link| link.label.starts_with('~')));
+
+		let hidden_source = FeedSource::subreddit("contextual-hot-hidden", FeedSort::Hot);
+		let hidden_posts = (0..75)
+			.map(|index| {
+				let mut post = metric_post(&format!("hidden-{index}"), "contextual-hot-hidden", 700 - index as u64, 0, false);
+				post.score = ("\u{2022}".to_string(), "Hidden".to_string());
+				post
+			})
+			.collect::<Vec<_>>();
+		let hidden_session = seed_contextual_session(hidden_source, hidden_posts, "contextual-hot-hidden-fingerprint").await;
+		assert!(super::build_contextual_pagination("/hot", &hidden_session, 0, "hot").is_empty());
 	}
 
 	#[test]
@@ -2771,12 +3118,10 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
 		.and_then(|value| value.parse::<usize>().ok())
 		.unwrap_or(0);
-	let page_ready = crate::post_cache::feed_status(&session_id, page, crate::post_cache::POSTS_PER_PAGE)
-		.map(|status| status.current_page_ready)
-		.unwrap_or(false);
 	let Some(mut feed_page) = crate::post_cache::feed_page(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
 		return error(req, "Feed session not found or expired").await;
 	};
+	let page_ready = feed_page.ready;
 	utils::hydrate_post_author_links_from_cache(&mut feed_page.posts);
 
 	let current_url = param(&format!("?{}", req.uri().query().unwrap_or_default()), "current_url").unwrap_or_else(|| "/".to_string());
@@ -2810,6 +3155,10 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	};
 	let no_posts = page_ready && feed_page.posts.is_empty();
 	let all_posts_hidden_nsfw = !no_posts && (feed_page.posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+	let session_sort = crate::post_cache::feed_session_sort(&session_id)
+		.map(|sort| sort.as_str().to_string())
+		.unwrap_or_default();
+	let contextual_pagination = build_contextual_pagination(&current_url, &session_id, page, &session_sort);
 
 	render_feed_fragment(FeedFragmentTemplate {
 		posts: feed_page.posts,
@@ -2821,6 +3170,8 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		all_posts_filtered: false,
 		all_posts_hidden_nsfw,
 		no_posts,
+		show_contextual_pagination: !contextual_pagination.is_empty(),
+		contextual_pagination,
 	})
 }
 

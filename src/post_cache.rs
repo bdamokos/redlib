@@ -53,34 +53,79 @@ struct ActiveBrowserSession {
 	last_seen: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FeedSort {
+	New,
+	Hot,
+}
+
+impl FeedSort {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::New => "new",
+			Self::Hot => "hot",
+		}
+	}
+
+	pub fn from_listing(sort: &str) -> Self {
+		match sort {
+			"hot" => Self::Hot,
+			_ => Self::New,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FeedSource {
-	Subreddit { name: String },
-	Flair { subreddit: String, flair: String },
+	Subreddit { name: String, sort: FeedSort },
+	Flair { subreddit: String, flair: String, sort: FeedSort },
 }
 
 impl FeedSource {
+	pub fn subreddit(name: impl Into<String>, sort: FeedSort) -> Self {
+		Self::Subreddit {
+			name: name.into(),
+			sort,
+		}
+	}
+
+	pub fn flair(subreddit: impl Into<String>, flair: impl Into<String>, sort: FeedSort) -> Self {
+		Self::Flair {
+			subreddit: subreddit.into(),
+			flair: flair.into(),
+			sort,
+		}
+	}
+
+	pub fn sort(&self) -> FeedSort {
+		match self {
+			Self::Subreddit { sort, .. } | Self::Flair { sort, .. } => *sort,
+		}
+	}
+
 	pub fn display_name(&self) -> String {
 		match self {
-			Self::Subreddit { name } => name.clone(),
-			Self::Flair { subreddit, flair } => format!("{subreddit}#{flair}"),
+			Self::Subreddit { name, .. } => name.clone(),
+			Self::Flair { subreddit, flair, .. } => format!("{subreddit}#{flair}"),
 		}
 	}
 
 	fn cache_key(&self) -> String {
 		match self {
-			Self::Subreddit { name } => format!("subreddit:{}", name.to_lowercase()),
-			Self::Flair { subreddit, flair } => format!("flair:{}:{}", subreddit.to_lowercase(), flair.to_lowercase()),
+			Self::Subreddit { name, sort } => format!("subreddit:{}:{}", name.to_lowercase(), sort.as_str()),
+			Self::Flair { subreddit, flair, sort } => {
+				format!("flair:{}:{}:{}", subreddit.to_lowercase(), flair.to_lowercase(), sort.as_str())
+			}
 		}
 	}
 
 	fn build_path(&self) -> String {
 		match self {
-			Self::Subreddit { name } => {
-				format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", name.replace('+', "%2B"))
+			Self::Subreddit { name, sort } => {
+				format!("/r/{}/{}.json?limit={PER_SOURCE_LIMIT}&raw_json=1", name.replace('+', "%2B"), sort.as_str())
 			}
-			Self::Flair { subreddit, .. } => {
-				format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"))
+			Self::Flair { subreddit, sort, .. } => {
+				format!("/r/{}/{}.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"), sort.as_str())
 			}
 		}
 	}
@@ -202,7 +247,8 @@ struct ReadySourceQueue {
 #[derive(Clone, Eq, PartialEq)]
 struct ReadyQueueHead {
 	queue_index: usize,
-	head_created_ts: u64,
+	primary_metric: i64,
+	secondary_metric: u64,
 	fetched_at: Instant,
 	source_priority: (u8, String, String),
 }
@@ -210,8 +256,9 @@ struct ReadyQueueHead {
 impl Ord for ReadyQueueHead {
 	fn cmp(&self, other: &Self) -> Ordering {
 		self
-			.head_created_ts
-			.cmp(&other.head_created_ts)
+			.primary_metric
+			.cmp(&other.primary_metric)
+			.then_with(|| self.secondary_metric.cmp(&other.secondary_metric))
 			.then_with(|| self.fetched_at.cmp(&other.fetched_at))
 			.then_with(|| other.source_priority.cmp(&self.source_priority))
 			.then_with(|| other.queue_index.cmp(&self.queue_index))
@@ -250,6 +297,7 @@ pub struct FeedPage {
 	pub posts: Vec<Post>,
 	pub has_prev: bool,
 	pub has_next: bool,
+	pub ready: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -300,7 +348,7 @@ fn normalize_plain_subreddit_name(subreddit: &str) -> Option<String> {
 }
 
 fn is_plain_subreddit_source(source: &FeedSource) -> bool {
-	matches!(source, FeedSource::Subreddit { name } if normalize_plain_subreddit_name(name).is_some())
+	matches!(source, FeedSource::Subreddit { name, .. } if normalize_plain_subreddit_name(name).is_some())
 }
 
 fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
@@ -373,7 +421,7 @@ fn source_cache_is_servable_with_mode(source: &FeedSource, entry: &CachedSourceP
 	}
 
 	match source {
-		FeedSource::Subreddit { name } if !name.starts_with("u_") => is_subreddit_remembered(name) || !source_cache_is_expired(entry),
+		FeedSource::Subreddit { name, .. } if !name.starts_with("u_") => is_subreddit_remembered(name) || !source_cache_is_expired(entry),
 		_ => !source_cache_is_expired(entry),
 	}
 }
@@ -517,7 +565,7 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	};
 
 	crate::utils::store_post_flairs(&posts);
-	store_source_posts_with_origin(&FeedSource::Subreddit { name: normalized.clone() }, posts.clone(), after.clone(), Some(refresh_origin));
+	store_source_posts_with_origin(&FeedSource::subreddit(normalized.clone(), FeedSort::New), posts.clone(), after.clone(), Some(refresh_origin));
 	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
 		crate::video_preview::prewarm_listing_video_previews(&posts);
 		spawn_author_link_prefetch(posts.clone());
@@ -609,7 +657,7 @@ pub fn cleanup_decayed_remembered_subreddits() {
 
 	let mut cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
 	for subreddit in &decayed {
-		cache.remove(&FeedSource::Subreddit { name: subreddit.clone() }.cache_key());
+		cache.remove(&FeedSource::subreddit(subreddit.clone(), FeedSort::New).cache_key());
 		crate::subreddit::remove_subreddit_metadata_cache(subreddit);
 	}
 	crate::cache_persistence::mark_dirty();
@@ -627,8 +675,12 @@ pub(crate) fn snapshot_persisted_source_entries(now_unix: u64) -> Vec<PersistedS
 	cache
 		.iter()
 		.filter_map(|(key, entry)| {
-			let subreddit = key.strip_prefix("subreddit:")?.to_string();
-			normalize_plain_subreddit_name(&subreddit)?;
+			let rest = key.strip_prefix("subreddit:")?;
+			let (subreddit, sort) = rest.rsplit_once(':').map_or((rest, "new"), |(subreddit, sort)| (subreddit, sort));
+			if sort != "new" {
+				return None;
+			}
+			let subreddit = normalize_plain_subreddit_name(subreddit)?;
 			Some(PersistedSourceCacheEntry {
 				subreddit,
 				posts: entry.posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
@@ -708,7 +760,7 @@ pub(crate) fn restore_persisted_state(
 			update_user_video_stats_from_posts(&posts);
 
 			Some((
-				FeedSource::Subreddit { name: subreddit }.cache_key(),
+				FeedSource::subreddit(subreddit, FeedSort::New).cache_key(),
 				CachedSourcePosts {
 					posts,
 					after: entry.after,
@@ -894,9 +946,13 @@ fn session_is_expired(entry: &FeedSession) -> bool {
 
 fn source_priority(source: &FeedSource) -> (u8, String, String) {
 	match source {
-		FeedSource::Subreddit { name } if name.starts_with("u_") => (0, name.to_lowercase(), String::new()),
-		FeedSource::Subreddit { name } => (1, name.to_lowercase(), String::new()),
-		FeedSource::Flair { subreddit, flair } => (2, subreddit.to_lowercase(), flair.to_lowercase()),
+		FeedSource::Subreddit { name, sort } if name.starts_with("u_") => {
+			(0, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new())
+		}
+		FeedSource::Subreddit { name, sort } => (1, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new()),
+		FeedSource::Flair { subreddit, flair, sort } => {
+			(2, format!("{}:{}", sort.as_str(), subreddit.to_lowercase()), flair.to_lowercase())
+		}
 	}
 }
 
@@ -931,7 +987,7 @@ pub fn get_cached_source_page(source: &FeedSource, page: usize, per_page: usize)
 }
 
 pub fn get_cached_subreddit_page_with_mode(subreddit: &str, page: usize, per_page: usize, mode: CacheServeMode) -> Option<(Vec<Post>, String, bool, bool)> {
-	get_cached_source_page_with_mode(&FeedSource::Subreddit { name: subreddit.to_string() }, page, per_page, mode)
+	get_cached_source_page_with_mode(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New), page, per_page, mode)
 }
 
 pub fn get_cached_subreddit_page(subreddit: &str, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
@@ -975,7 +1031,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		return Ok(entry);
 	}
 
-	if let FeedSource::Subreddit { name } = &source {
+	if let FeedSource::Subreddit { name, .. } = &source {
 		if !matches!(refresh_origin, RefreshOrigin::DirectLiveFetch) {
 			let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 			if remembered
@@ -998,19 +1054,21 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 					return Ok(entry);
 				}
 			}
-			if let FeedSource::Subreddit { name } = &source {
+			if let FeedSource::Subreddit { name, .. } = &source {
 				record_plain_subreddit_refresh_failure(name, &error, refresh_origin);
 			}
 			return Err(error);
 		}
 	};
 	let posts = source.filter_posts(posts);
-	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) && !matches!(&source, FeedSource::Subreddit { name } if !name.starts_with("u_")) {
+	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession)
+		&& !matches!(&source, FeedSource::Subreddit { name, .. } if !name.starts_with("u_"))
+	{
 		spawn_author_link_prefetch(posts.clone());
 	}
 
 	match &source {
-		FeedSource::Subreddit { name } if !name.starts_with("u_") => {
+		FeedSource::Subreddit { name, .. } if !name.starts_with("u_") => {
 			publish_plain_subreddit_refresh(name, posts.clone(), after.clone(), refresh_origin);
 		}
 		_ => {
@@ -1024,7 +1082,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		after,
 		fetched_at: Instant::now(),
 		refresh_origin: match source {
-			FeedSource::Subreddit { ref name } if !name.starts_with("u_") => Some(refresh_origin),
+			FeedSource::Subreddit { name, .. } if !name.starts_with("u_") => Some(refresh_origin),
 			_ => None,
 		},
 	})
@@ -1125,10 +1183,21 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 	queues
 }
 
+fn parse_numeric_score(post: &Post) -> Option<i64> {
+	post.score.1.parse::<i64>().ok()
+}
+
 fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue) -> Option<ReadyQueueHead> {
+	let post = queue.posts.front()?;
+	let (primary_metric, secondary_metric) = match queue.source.sort() {
+		FeedSort::New => (post.created_ts as i64, post.created_ts),
+		FeedSort::Hot => (parse_numeric_score(post).unwrap_or(i64::MIN), post.created_ts),
+	};
+
 	Some(ReadyQueueHead {
 		queue_index,
-		head_created_ts: queue.posts.front()?.created_ts,
+		primary_metric,
+		secondary_metric,
 		fetched_at: queue.fetched_at,
 		source_priority: source_priority(&queue.source),
 	})
@@ -1169,9 +1238,14 @@ fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per
 	posts.len() >= ((page + 1) * per_page) || session.background_complete || session.frozen_pages.contains_key(&page)
 }
 
-fn sort_page_posts_by_date_desc(mut posts: Vec<Post>) -> Vec<Post> {
-	posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
-	posts
+fn finalize_page_posts(sort: FeedSort, mut posts: Vec<Post>) -> Vec<Post> {
+	match sort {
+		FeedSort::New => {
+			posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+			posts
+		}
+		FeedSort::Hot => posts,
+	}
 }
 
 fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> FeedSessionStatus {
@@ -1185,13 +1259,13 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 	let total_user_sources = session
 		.sources
 		.iter()
-		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name } if name.starts_with("u_")))
+		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name, .. } if name.starts_with("u_")))
 		.count();
 	let ready_user_sources = session
 		.sources
 		.iter()
 		.filter(|entry| entry.state == SessionSourceState::Ready)
-		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name } if name.starts_with("u_")))
+		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name, .. } if name.starts_with("u_")))
 		.count();
 	let current_page_ready = current_page_is_ready(session, posts, page, per_page);
 	let next_page_ready = posts.len() >= ((page + 2) * per_page);
@@ -1306,7 +1380,7 @@ fn session_has_remaining_sources(session: &FeedSession) -> bool {
 
 fn remembered_entry_for_source<'a>(remembered: &'a HashMap<String, RememberedSubredditEntry>, source: &FeedSource) -> Option<&'a RememberedSubredditEntry> {
 	match source {
-		FeedSource::Subreddit { name } if !name.starts_with("u_") => remembered.get(&name.to_lowercase()),
+		FeedSource::Subreddit { name, .. } if !name.starts_with("u_") => remembered.get(&name.to_lowercase()),
 		_ => None,
 	}
 }
@@ -1587,7 +1661,12 @@ async fn warm_session_followup_cached(session_id: String, page: usize, per_page:
 	}
 }
 
-pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
+async fn ensure_feed_session_inner(
+	request: FeedSessionRequest,
+	page: usize,
+	per_page: usize,
+	max_sync_sources_override: Option<usize>,
+) -> String {
 	let session_id = build_session_id(&request);
 	reconcile_stuck_fetching_sources(&session_id).await;
 
@@ -1608,14 +1687,21 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 		let Some(session) = sessions.get(&session_id) else {
 			return session_id;
 		};
-		warm_targets(session, sync_sources_to_request(session, page))
+		let sync_sources = sync_sources_to_request(session, page);
+		warm_targets(session, max_sync_sources_override.unwrap_or(sync_sources).min(sync_sources))
 	} else {
 		Vec::new()
 	};
 
 	warm_session_indices(&session_id, sync_target).await;
 	if session_is_new {
-		warm_session_to_fill(&session_id, page, per_page, max_sync_source_budget(page)).await;
+		warm_session_to_fill(
+			&session_id,
+			page,
+			per_page,
+			max_sync_sources_override.unwrap_or_else(|| max_sync_source_budget(page)),
+		)
+		.await;
 	}
 
 	let warm_mode = {
@@ -1639,6 +1725,19 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 	}
 
 	session_id
+}
+
+pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
+	ensure_feed_session_inner(request, page, per_page, None).await
+}
+
+pub async fn ensure_feed_session_with_budget(
+	request: FeedSessionRequest,
+	page: usize,
+	per_page: usize,
+	max_sync_sources: usize,
+) -> String {
+	ensure_feed_session_inner(request, page, per_page, Some(max_sync_sources)).await
 }
 
 pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
@@ -1693,14 +1792,16 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 
 	let merged_posts = merged_posts_for_session(session);
 	let merged_len = merged_posts.len();
+	let page_ready = current_page_is_ready(session, &merged_posts, page, per_page);
+	let sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
 	let posts = if let Some(frozen_posts) = session.frozen_pages.get(&page) {
 		frozen_posts.clone()
 	} else {
-		if current_page_is_ready(session, &merged_posts, page, per_page) {
+		if page_ready {
 			let start = page * per_page;
 			let end = (start + per_page).min(merged_posts.len());
 			let frozen = if start < merged_posts.len() {
-				sort_page_posts_by_date_desc(merged_posts[start..end].to_vec())
+				finalize_page_posts(sort, merged_posts[start..end].to_vec())
 			} else {
 				Vec::new()
 			};
@@ -1710,7 +1811,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 			let start = page * per_page;
 			let end = (start + per_page).min(merged_posts.len());
 			if start < merged_posts.len() {
-				sort_page_posts_by_date_desc(merged_posts[start..end].to_vec())
+				finalize_page_posts(sort, merged_posts[start..end].to_vec())
 			} else {
 				Vec::new()
 			}
@@ -1721,6 +1822,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		posts,
 		has_prev: page > 0,
 		has_next: ((page + 1) * per_page) < merged_len || has_more_available,
+		ready: page_ready,
 	})
 }
 
@@ -1736,15 +1838,26 @@ pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<Fee
 	Some(session_status_from_posts(session, &posts, page, per_page))
 }
 
+pub fn feed_session_sort(session_id: &str) -> Option<FeedSort> {
+	let sessions = FEED_SESSIONS.lock().ok()?;
+	let session = sessions.get(session_id)?;
+	if session_is_expired(session) {
+		return None;
+	}
+	session.sources.first().map(|entry| entry.source.sort())
+}
+
 pub fn cache_stats() -> (usize, usize) {
 	fn source_from_cache_key(key: &str) -> Option<FeedSource> {
 		if let Some(name) = key.strip_prefix("subreddit:") {
-			Some(FeedSource::Subreddit { name: name.to_string() })
+			let (name, sort) = name.rsplit_once(':').map_or((name, FeedSort::New), |(name, sort)| (name, FeedSort::from_listing(sort)));
+			Some(FeedSource::subreddit(name.to_string(), sort))
 		} else if let Some(rest) = key.strip_prefix("flair:") {
-			let mut parts = rest.splitn(2, ':');
+			let mut parts = rest.splitn(3, ':');
 			let subreddit = parts.next().unwrap_or_default().to_string();
 			let flair = parts.next().unwrap_or_default().to_string();
-			Some(FeedSource::Flair { subreddit, flair })
+			let sort = FeedSort::from_listing(parts.next().unwrap_or("new"));
+			Some(FeedSource::flair(subreddit, flair, sort))
 		} else {
 			None
 		}
@@ -1772,7 +1885,7 @@ fn visible_sources_from_preferences(preferences: &Preferences) -> Vec<FeedSource
 		if normalized.is_empty() {
 			continue;
 		}
-		let source = FeedSource::Subreddit { name: normalized.to_string() };
+		let source = FeedSource::subreddit(normalized.to_string(), FeedSort::New);
 		if seen.insert(source.cache_key()) {
 			sources.push(source);
 		}
@@ -1782,10 +1895,7 @@ fn visible_sources_from_preferences(preferences: &Preferences) -> Vec<FeedSource
 		if subscription.subreddit.trim().is_empty() || subscription.flair.trim().is_empty() {
 			continue;
 		}
-		let source = FeedSource::Flair {
-			subreddit: subscription.subreddit.clone(),
-			flair: subscription.flair.clone(),
-		};
+		let source = FeedSource::flair(subscription.subreddit.clone(), subscription.flair.clone(), FeedSort::New);
 		if seen.insert(source.cache_key()) {
 			sources.push(source);
 		}
@@ -1832,10 +1942,10 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 		let cache_key = source.cache_key();
 		let cache_entry = cache.get(&cache_key);
 		let remembered_entry = match &source {
-			FeedSource::Subreddit { name } if !name.starts_with("u_") => remembered.get(&name.to_lowercase()),
+			FeedSource::Subreddit { name, .. } if !name.starts_with("u_") => remembered.get(&name.to_lowercase()),
 			_ => None,
 		};
-		let daemon_managed = matches!(&source, FeedSource::Subreddit { name } if !name.starts_with("u_"));
+		let daemon_managed = matches!(&source, FeedSource::Subreddit { name, .. } if !name.starts_with("u_"));
 		let cached = cache_entry.is_some();
 		let cached_posts = cache_entry.map(|entry| entry.posts.len()).unwrap_or_default();
 		let cached_age_secs = cache_entry.map(|entry| entry.fetched_at.elapsed().as_secs());
@@ -1925,13 +2035,13 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, cache_status_for_preferences, count_sources_in_state,
+		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, build_session_id, cache_status_for_preferences, count_sources_in_state,
 		feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_fetching_sources_failed,
 		max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh,
 		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority,
 		restore_persisted_state, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target,
 		source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession,
-		FeedSessionRequest, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS,
+		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS,
 		ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
 		SOURCE_CACHE,
 	};
@@ -2061,24 +2171,106 @@ mod tests {
 		post
 	}
 
+	fn new_source(name: &str) -> FeedSource {
+		FeedSource::subreddit(name.to_string(), FeedSort::New)
+	}
+
+	fn hot_source(name: &str) -> FeedSource {
+		FeedSource::subreddit(name.to_string(), FeedSort::Hot)
+	}
+
+	fn new_flair_source(subreddit: &str, flair: &str) -> FeedSource {
+		FeedSource::flair(subreddit.to_string(), flair.to_string(), FeedSort::New)
+	}
+
 	#[test]
 	fn sorts_user_sources_before_subreddits_and_flairs() {
 		let _guard = test_lock();
 		reset_test_caches();
 		let mut sources = vec![
-			FeedSource::Flair {
-				subreddit: "zeta".to_string(),
-				flair: "Tag".to_string(),
-			},
-			FeedSource::Subreddit { name: "rust".to_string() },
-			FeedSource::Subreddit { name: "u_demo".to_string() },
+			new_flair_source("zeta", "Tag"),
+			new_source("rust"),
+			new_source("u_demo"),
 		];
 
 		sort_sources(&mut sources);
 
-		assert!(matches!(&sources[0], FeedSource::Subreddit { name } if name == "u_demo"));
-		assert!(matches!(&sources[1], FeedSource::Subreddit { name } if name == "rust"));
+		assert!(matches!(&sources[0], FeedSource::Subreddit { name, .. } if name == "u_demo"));
+		assert!(matches!(&sources[1], FeedSource::Subreddit { name, .. } if name == "rust"));
 		assert!(matches!(&sources[2], FeedSource::Flair { subreddit, .. } if subreddit == "zeta"));
+	}
+
+	#[test]
+	fn source_cache_keys_and_paths_are_sort_aware() {
+		let source_new = new_source("rust");
+		let source_hot = hot_source("rust");
+
+		assert_eq!(source_new.cache_key(), "subreddit:rust:new");
+		assert_eq!(source_hot.cache_key(), "subreddit:rust:hot");
+		assert_eq!(source_new.build_path(), "/r/rust/new.json?limit=40&raw_json=1");
+		assert_eq!(source_hot.build_path(), "/r/rust/hot.json?limit=40&raw_json=1");
+	}
+
+	#[test]
+	fn session_identity_differs_across_listing_sorts() {
+		let request_new = FeedSessionRequest {
+			sources: vec![new_source("rust")],
+			filters: HashSet::new(),
+			quarantine: false,
+			query_fingerprint: "sort=new".to_string(),
+		};
+		let request_hot = FeedSessionRequest {
+			sources: vec![hot_source("rust")],
+			filters: HashSet::new(),
+			quarantine: false,
+			query_fingerprint: "sort=hot".to_string(),
+		};
+
+		assert_ne!(build_session_id(&request_new), build_session_id(&request_hot));
+	}
+
+	#[test]
+	fn hot_sessions_merge_posts_by_score_desc() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let mut top = test_post("top", "rust", 100);
+		top.score = ("5.0k".to_string(), "5000".to_string());
+		let mut mid = test_post("mid", "programming", 200);
+		mid.score = ("900".to_string(), "900".to_string());
+		let mut low = test_post("low", "science", 300);
+		low.score = ("75".to_string(), "75".to_string());
+
+		let left = hot_source("rust");
+		let right = hot_source("programming");
+		let third = hot_source("science");
+		seed_source(&left, vec![mid.clone()]);
+		seed_source(&right, vec![top.clone()]);
+		seed_source(&third, vec![low.clone()]);
+
+		let session = FeedSession {
+			id: "hot-demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![left.clone(), right.clone(), third.clone()],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "sort=hot".to_string(),
+			},
+			sources: vec![
+				session_entry(left, SessionSourceState::Ready),
+				session_entry(right, SessionSourceState::Ready),
+				session_entry(third, SessionSourceState::Ready),
+			],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let ids = merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
+		assert_eq!(ids, vec!["top", "mid", "low"]);
 	}
 
 	#[test]
@@ -2086,7 +2278,7 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		let source = new_source("rust");
 		store_source_posts(
 			&source,
 			vec![
@@ -2112,7 +2304,7 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		let source = new_source("rust");
 		store_source_posts_with_origin(
 			&source,
 			vec![test_video_post("one", "rust", "author_restore", 100, "https://v.redd.it/restore/DASH_720.mp4", 75)],
@@ -2167,7 +2359,7 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		let source = new_source("rust");
 		remember_subreddit_request("rust");
 		seed_source(&source, vec![test_post("one", "rust", 100)]);
 		SOURCE_CACHE.lock().unwrap().get_mut(&source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
@@ -2184,7 +2376,7 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let source = FeedSource::Subreddit { name: "rust".to_string() };
+		let source = new_source("rust");
 		seed_source(&source, vec![test_post("one", "rust", 100)]);
 		SOURCE_CACHE.lock().unwrap().get_mut(&source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
 
@@ -2200,11 +2392,8 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let flair_source = FeedSource::Flair {
-			subreddit: "rust".to_string(),
-			flair: "News".to_string(),
-		};
-		let user_source = FeedSource::Subreddit { name: "u_demo".to_string() };
+		let flair_source = new_flair_source("rust", "News");
+		let user_source = new_source("u_demo");
 		seed_source(&flair_source, vec![test_post("flair", "rust", 100)]);
 		seed_source(&user_source, vec![test_post("user", "u_demo", 99)]);
 		SOURCE_CACHE.lock().unwrap().get_mut(&flair_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
@@ -2284,7 +2473,7 @@ mod tests {
 			RefreshOrigin::FrontPageSession,
 		);
 
-		assert!(get_cached_source_page(&FeedSource::Subreddit { name: "rust".to_string() }, 0, 25).is_some());
+		assert!(get_cached_source_page(&new_source("rust"), 0, 25).is_some());
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		let entry = remembered.get("rust").unwrap();
 		assert!(entry.last_refresh_succeeded_at.is_some());
@@ -2409,7 +2598,7 @@ mod tests {
 	fn gets_cached_pages_for_user_sources() {
 		let _guard = test_lock();
 		reset_test_caches();
-		let user_source = FeedSource::Subreddit { name: "u_demo".to_string() };
+		let user_source = new_source("u_demo");
 		let posts = (0..30)
 			.map(|index| test_post(&index.to_string(), "u_demo", chrono::Utc::now().timestamp() as u64 - index as u64))
 			.collect::<Vec<_>>();
@@ -2427,8 +2616,8 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let fresh_source = FeedSource::Subreddit { name: "fresh".to_string() };
-		let older_source = FeedSource::Subreddit { name: "older".to_string() };
+		let fresh_source = new_source("fresh");
+		let older_source = new_source("older");
 		seed_source(&fresh_source, vec![test_post("fresh-1", "fresh", now), test_post("fresh-2", "fresh", now - 1)]);
 		seed_source(&older_source, vec![test_post("older-1", "older", now - 2), test_post("older-2", "older", now - 3)]);
 
@@ -2461,7 +2650,7 @@ mod tests {
 	fn status_message_mentions_followed_feeds_while_users_are_still_warming() {
 		let _guard = test_lock();
 		reset_test_caches();
-		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let rust_source = new_source("rust");
 		seed_source(&rust_source, vec![test_post("one", "rust", chrono::Utc::now().timestamp() as u64)]);
 		let session = FeedSession {
 			id: "demo".to_string(),
@@ -2472,7 +2661,7 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				session_entry(FeedSource::Subreddit { name: "u_demo".to_string() }, SessionSourceState::Unstarted),
+				session_entry(new_source("u_demo"), SessionSourceState::Unstarted),
 				session_entry(rust_source, SessionSourceState::Ready),
 			],
 			frozen_pages: HashMap::new(),
@@ -2496,7 +2685,7 @@ mod tests {
 		let posts = (0..post_count)
 			.map(|index| test_post(&index.to_string(), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
 			.collect::<Vec<_>>();
-		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let rust_source = new_source("rust");
 		seed_source(&rust_source, posts.clone());
 		let session = FeedSession {
 			id: "demo".to_string(),
@@ -2546,9 +2735,7 @@ mod tests {
 			sources: (0..120)
 				.map(|index| {
 					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
+						new_source(&format!("subreddit{index}")),
 						SessionSourceState::Unstarted,
 					)
 				})
@@ -2579,9 +2766,7 @@ mod tests {
 			sources: (0..40)
 				.map(|index| {
 					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
+						new_source(&format!("subreddit{index}")),
 						if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
 					)
 				})
@@ -2613,9 +2798,7 @@ mod tests {
 			sources: (0..32)
 				.map(|index| {
 					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
+						new_source(&format!("subreddit{index}")),
 						if index < 12 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
 					)
 				})
@@ -2637,9 +2820,7 @@ mod tests {
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
 		for index in 0..25 {
-			let source = FeedSource::Subreddit {
-				name: format!("subreddit{index}"),
-			};
+			let source = new_source(&format!("subreddit{index}"));
 			seed_source(&source, vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]);
 		}
 
@@ -2654,9 +2835,7 @@ mod tests {
 			sources: (0..30)
 				.map(|index| {
 					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
+						new_source(&format!("subreddit{index}")),
 						if index < 25 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
 					)
 				})
@@ -2681,9 +2860,7 @@ mod tests {
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
 		for index in 0..8 {
-			let source = FeedSource::Subreddit {
-				name: format!("subreddit{index}"),
-			};
+			let source = new_source(&format!("subreddit{index}"));
 			seed_source(&source, vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]);
 		}
 
@@ -2698,9 +2875,7 @@ mod tests {
 			sources: (0..20)
 				.map(|index| {
 					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
+						new_source(&format!("subreddit{index}")),
 						if index < 8 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
 					)
 				})
@@ -2726,7 +2901,7 @@ mod tests {
 		let posts = (0..100)
 			.map(|index| test_post(&format!("post-{index}"), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
 			.collect::<Vec<_>>();
-		let hot_source = FeedSource::Subreddit { name: "subreddit0".to_string() };
+		let hot_source = new_source("subreddit0");
 		seed_source(&hot_source, posts);
 		let session = FeedSession {
 			id: "demo".to_string(),
@@ -2739,9 +2914,7 @@ mod tests {
 			sources: (0..200)
 				.map(|index| {
 					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
+						new_source(&format!("subreddit{index}")),
 						if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
 					)
 				})
@@ -2762,8 +2935,8 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let fresh_source = FeedSource::Subreddit { name: "fresh".to_string() };
-		let stale_source = FeedSource::Subreddit { name: "stale".to_string() };
+		let fresh_source = new_source("fresh");
+		let stale_source = new_source("stale");
 		seed_source(&fresh_source, vec![test_post("fresh-post", "fresh", now - 60)]);
 		seed_source(&stale_source, vec![test_post("stale-post", "stale", now - 172_800)]);
 		let session = FeedSession {
@@ -2796,7 +2969,7 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let posts = vec![test_post("one", "rust", chrono::Utc::now().timestamp() as u64)];
-		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let rust_source = new_source("rust");
 		seed_source(&rust_source, posts.clone());
 		let session = FeedSession {
 			id: "demo".to_string(),
@@ -2825,7 +2998,7 @@ mod tests {
 	fn mark_fetching_sources_failed_recovers_stuck_session_entries() {
 		let _guard = test_lock();
 		reset_test_caches();
-		let ready_source = FeedSource::Subreddit { name: "ready".to_string() };
+		let ready_source = new_source("ready");
 		seed_source(&ready_source, vec![test_post("one", "ready", chrono::Utc::now().timestamp() as u64)]);
 		let mut session = FeedSession {
 			id: "demo".to_string(),
@@ -2837,7 +3010,7 @@ mod tests {
 			},
 			sources: vec![
 				session_entry(ready_source, SessionSourceState::Ready),
-				session_entry(FeedSource::Subreddit { name: "stuck".to_string() }, SessionSourceState::Fetching),
+				session_entry(new_source("stuck"), SessionSourceState::Fetching),
 			],
 			frozen_pages: HashMap::new(),
 			background_active: true,
@@ -2861,9 +3034,7 @@ mod tests {
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
 		for index in 0..32 {
-			let source = FeedSource::Subreddit {
-				name: format!("subreddit{index}"),
-			};
+			let source = new_source(&format!("subreddit{index}"));
 			seed_source(&source, vec![test_post(&format!("post-{index}"), &format!("subreddit{index}"), now - index as u64)]);
 		}
 		let session = FeedSession {
@@ -2877,9 +3048,7 @@ mod tests {
 			sources: (0..40)
 				.map(|index| {
 					session_entry(
-						FeedSource::Subreddit {
-							name: format!("subreddit{index}"),
-						},
+						new_source(&format!("subreddit{index}")),
 						if index < 32 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
 					)
 				})
@@ -2941,13 +3110,11 @@ mod tests {
 			},
 			sources: vec![
 				session_entry(
-					FeedSource::Subreddit {
-						name: "older_refreshed".to_string(),
-					},
+					new_source("older_refreshed"),
 					SessionSourceState::Unstarted,
 				),
-				session_entry(FeedSource::Subreddit { name: "never_older".to_string() }, SessionSourceState::Unstarted),
-				session_entry(FeedSource::Subreddit { name: "never_recent".to_string() }, SessionSourceState::Unstarted),
+				session_entry(new_source("never_older"), SessionSourceState::Unstarted),
+				session_entry(new_source("never_recent"), SessionSourceState::Unstarted),
 			],
 			frozen_pages: HashMap::new(),
 			background_active: false,
@@ -2975,14 +3142,11 @@ mod tests {
 			},
 			sources: vec![
 				session_entry(
-					FeedSource::Flair {
-						subreddit: "rust".to_string(),
-						flair: "News".to_string(),
-					},
+					new_flair_source("rust", "News"),
 					SessionSourceState::Unstarted,
 				),
-				session_entry(FeedSource::Subreddit { name: "rust".to_string() }, SessionSourceState::Unstarted),
-				session_entry(FeedSource::Subreddit { name: "u_demo".to_string() }, SessionSourceState::Unstarted),
+				session_entry(new_source("rust"), SessionSourceState::Unstarted),
+				session_entry(new_source("u_demo"), SessionSourceState::Unstarted),
 			],
 			frozen_pages: HashMap::new(),
 			background_active: false,
@@ -3000,8 +3164,8 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let freshest = FeedSource::Subreddit { name: "freshest".to_string() };
-		let duplicate = FeedSource::Subreddit { name: "duplicate".to_string() };
+		let freshest = new_source("freshest");
+		let duplicate = new_source("duplicate");
 		seed_source(&freshest, vec![test_post("shared", "freshest", now), test_post("fresh-next", "freshest", now - 2)]);
 		seed_source(&duplicate, vec![test_post("shared", "duplicate", now - 1), test_post("dup-next", "duplicate", now - 3)]);
 
@@ -3032,8 +3196,8 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let older_source = FeedSource::Subreddit { name: "older".to_string() };
-		let newer_source = FeedSource::Subreddit { name: "newer".to_string() };
+		let older_source = new_source("older");
+		let newer_source = new_source("newer");
 		let older_posts = (0..30)
 			.map(|index| test_post(&format!("older-{index}"), "older", now - 1_000 - index as u64))
 			.collect::<Vec<_>>();
@@ -3084,8 +3248,8 @@ mod tests {
 	fn feed_page_sorts_selected_posts_newest_first() {
 		let _guard = test_lock();
 		reset_test_caches();
-		let source_a = FeedSource::Subreddit { name: "alpha".to_string() };
-		let source_b = FeedSource::Subreddit { name: "beta".to_string() };
+		let source_a = new_source("alpha");
+		let source_b = new_source("beta");
 		seed_source(&source_a, vec![test_post("alpha-1", "alpha", 100), test_post("alpha-2", "alpha", 97)]);
 		seed_source(&source_b, vec![test_post("beta-1", "beta", 99), test_post("beta-2", "beta", 98)]);
 
@@ -3120,8 +3284,8 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
-		let golang_source = FeedSource::Subreddit { name: "golang".to_string() };
+		let rust_source = new_source("rust");
+		let golang_source = new_source("golang");
 		seed_source(&rust_source, vec![test_post("rust-1", "rust", now)]);
 		seed_source(&golang_source, vec![test_post("go-1", "golang", now - 1)]);
 
@@ -3157,8 +3321,8 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
-		let programming_source = FeedSource::Subreddit { name: "programming".to_string() };
+		let rust_source = new_source("rust");
+		let programming_source = new_source("programming");
 		seed_source(&rust_source, vec![test_post("rust-1", "rust", now)]);
 		seed_source(&programming_source, vec![test_post("prog-1", "programming", now - 1)]);
 
@@ -3198,7 +3362,7 @@ mod tests {
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
 		remember_subreddit_request("rust");
-		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let rust_source = new_source("rust");
 		store_source_posts_with_origin(&rust_source, vec![test_post("rust-1", "rust", now)], String::new(), Some(RefreshOrigin::Daemon));
 		SOURCE_CACHE.lock().unwrap().get_mut(&rust_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
 
@@ -3234,7 +3398,7 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
-		let rust_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let rust_source = new_source("rust");
 		seed_source(&rust_source, vec![test_post("rust-1", "rust", now - 90), test_post("rust-2", "rust", now - 120)]);
 
 		let prefs = Preferences {
@@ -3270,7 +3434,7 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let stale_source = FeedSource::Subreddit { name: "rust".to_string() };
+		let stale_source = new_source("rust");
 		store_source_posts_with_origin(&stale_source, vec![test_post("one", "rust", 100)], "after".to_string(), None);
 		SOURCE_CACHE.lock().unwrap().get_mut(&stale_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
 
@@ -3280,7 +3444,7 @@ mod tests {
 		assert!(SOURCE_CACHE.lock().unwrap().is_empty());
 
 		remember_subreddit_request("remembered");
-		let remembered_source = FeedSource::Subreddit { name: "remembered".to_string() };
+		let remembered_source = new_source("remembered");
 		store_source_posts_with_origin(&remembered_source, vec![test_post("two", "remembered", 200)], "after".to_string(), None);
 		SOURCE_CACHE.lock().unwrap().get_mut(&remembered_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
 

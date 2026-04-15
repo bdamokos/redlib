@@ -29,6 +29,16 @@
 {% endif %}
 
 <footer>
+    {% if show_contextual_pagination %}
+    <div class="contextual_pagination">
+        {% for link in contextual_pagination %}
+        <a
+            class="contextual_page_link{% if link.current %} selected{% endif %}"
+            href="{{ link.url }}"
+            title="{{ link.title }}">{{ link.label }}</a>
+        {% endfor %}
+    </div>
+    {% endif %}
     {% if !prev_page_url.is_empty() %}
     <a href="{{ prev_page_url }}" accesskey="P">PREV</a>
     {% endif %}
