@@ -1,4 +1,6 @@
 use crate::utils::Post;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use url::form_urlencoded;
@@ -9,14 +11,24 @@ pub const VIDEO_SUB_MODE_PARAM: &str = "video_sub_mode";
 pub const VIDEO_USER_MODE_PARAM: &str = "video_user_mode";
 pub const VIDEO_AGE_MIN_HOURS_PARAM: &str = "video_age_min_hours";
 pub const VIDEO_AGE_MAX_HOURS_PARAM: &str = "video_age_max_hours";
+pub const VIDEO_MODE_QUERY_COOKIE: &str = "video_mode_query";
 const MIN_AGE_BOUND_HOURS: u32 = 24;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FacetMode {
+	#[default]
+	Include,
+	Exclude,
+	None,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoModeQuery {
 	pub selected_subreddits: Vec<String>,
 	pub selected_users: Vec<String>,
-	pub clear_subreddits: bool,
-	pub clear_users: bool,
+	pub subreddit_mode: FacetMode,
+	pub user_mode: FacetMode,
 	pub age_min_hours: u32,
 	pub age_max_hours: Option<u32>,
 }
@@ -76,8 +88,16 @@ pub fn parse_query(query: &str) -> VideoModeQuery {
 		match key.as_str() {
 			VIDEO_SUB_PARAM => parsed.selected_subreddits.push(value),
 			VIDEO_USER_PARAM => parsed.selected_users.push(value),
-			VIDEO_SUB_MODE_PARAM => parsed.clear_subreddits = value == "none",
-			VIDEO_USER_MODE_PARAM => parsed.clear_users = value == "none",
+			VIDEO_SUB_MODE_PARAM => {
+				if value == "none" {
+					parsed.subreddit_mode = FacetMode::None;
+				}
+			}
+			VIDEO_USER_MODE_PARAM => {
+				if value == "none" {
+					parsed.user_mode = FacetMode::None;
+				}
+			}
 			VIDEO_AGE_MIN_HOURS_PARAM => {
 				parsed.age_min_hours = value.parse::<u32>().unwrap_or_default();
 			}
@@ -90,6 +110,32 @@ pub fn parse_query(query: &str) -> VideoModeQuery {
 	parsed.selected_subreddits = normalize_values(parsed.selected_subreddits);
 	parsed.selected_users = normalize_values(parsed.selected_users);
 	parsed
+}
+
+fn query_has_video_params(query: &str) -> bool {
+	for (key, _) in form_urlencoded::parse(query.as_bytes()).into_owned() {
+		match key.as_str() {
+			VIDEO_SUB_PARAM | VIDEO_USER_PARAM | VIDEO_SUB_MODE_PARAM | VIDEO_USER_MODE_PARAM | VIDEO_AGE_MIN_HOURS_PARAM | VIDEO_AGE_MAX_HOURS_PARAM => return true,
+			_ => {}
+		}
+	}
+	false
+}
+
+fn decode_query_cookie(encoded: &str) -> Result<VideoModeQuery, String> {
+	if encoded.trim().is_empty() {
+		return Ok(VideoModeQuery::default());
+	}
+	let bytes = URL_SAFE_NO_PAD.decode(encoded.trim()).map_err(|e| e.to_string())?;
+	let json = crate::utils::deflate_decompress(bytes)?;
+	serde_json::from_slice(&json).map_err(|e| e.to_string())
+}
+
+pub fn parse_query_or_cookie(query: &str, cookie_encoded: &str) -> VideoModeQuery {
+	if query_has_video_params(query) {
+		return parse_query(query);
+	}
+	decode_query_cookie(cookie_encoded).unwrap_or_default()
 }
 
 pub fn query_pairs(query: &str) -> Vec<(String, String)> {
@@ -108,14 +154,14 @@ pub fn strip_video_query_pairs(query_pairs: &mut Vec<(String, String)>) {
 }
 
 pub fn append_query_pairs(query_pairs: &mut Vec<(String, String)>, query: &VideoModeQuery) {
-	if query.clear_subreddits && query.selected_subreddits.is_empty() {
+	if query.subreddit_mode == FacetMode::None && query.selected_subreddits.is_empty() {
 		query_pairs.push((VIDEO_SUB_MODE_PARAM.to_string(), "none".to_string()));
 	} else {
 		for subreddit in &query.selected_subreddits {
 			query_pairs.push((VIDEO_SUB_PARAM.to_string(), subreddit.clone()));
 		}
 	}
-	if query.clear_users && query.selected_users.is_empty() {
+	if query.user_mode == FacetMode::None && query.selected_users.is_empty() {
 		query_pairs.push((VIDEO_USER_MODE_PARAM.to_string(), "none".to_string()));
 	} else {
 		for user in &query.selected_users {
@@ -179,14 +225,28 @@ pub fn build_listing(posts: &[Post], filters: &HashSet<String>, query: &VideoMod
 	let selected_subreddits = query.selected_subreddits.iter().map(|value| value.to_lowercase()).collect::<HashSet<_>>();
 	let selected_users = query.selected_users.iter().map(|value| value.to_lowercase()).collect::<HashSet<_>>();
 
-	let subreddit_options = facet_options(&age_filtered, |post| post.community.clone(), &selected_subreddits, query.clear_subreddits);
-	let user_options = facet_options(&age_filtered, |post| post.author.name.clone(), &selected_users, query.clear_users);
+	let subreddit_options = facet_options(&age_filtered, |post| post.community.clone(), &selected_subreddits, query.subreddit_mode);
+	let user_options = facet_options(&age_filtered, |post| post.author.name.clone(), &selected_users, query.user_mode);
 
 	let mut filtered_posts = age_filtered
 		.into_iter()
 		.filter(|post| {
-			(!query.clear_subreddits && (selected_subreddits.is_empty() || selected_subreddits.contains(&post.community.to_lowercase())))
-				&& (!query.clear_users && (selected_users.is_empty() || selected_users.contains(&post.author.name.to_lowercase())))
+			let community = post.community.to_lowercase();
+			let author = post.author.name.to_lowercase();
+
+			let allow_subreddit = match query.subreddit_mode {
+				FacetMode::None => false,
+				FacetMode::Include => selected_subreddits.is_empty() || selected_subreddits.contains(&community),
+				FacetMode::Exclude => !selected_subreddits.contains(&community),
+			};
+
+			let allow_user = match query.user_mode {
+				FacetMode::None => false,
+				FacetMode::Include => selected_users.is_empty() || selected_users.contains(&author),
+				FacetMode::Exclude => !selected_users.contains(&author),
+			};
+
+			allow_subreddit && allow_user
 		})
 		.collect::<Vec<_>>();
 
@@ -242,7 +302,7 @@ fn post_age_hours(post: &Post, now_unix: u64) -> u32 {
 	now_unix.saturating_sub(post.created_ts).div_ceil(3600) as u32
 }
 
-fn facet_options<F>(posts: &[Post], value_fn: F, active_values: &HashSet<String>, clear_group: bool) -> Vec<VideoModeFilterOption>
+fn facet_options<F>(posts: &[Post], value_fn: F, values: &HashSet<String>, mode: FacetMode) -> Vec<VideoModeFilterOption>
 where
 	F: Fn(&Post) -> String,
 {
@@ -258,7 +318,14 @@ where
 	let mut options = counts
 		.into_iter()
 		.map(|(name, count)| VideoModeFilterOption {
-			active: !clear_group && (active_values.is_empty() || active_values.contains(&name.to_lowercase())),
+			active: {
+				let key = name.to_lowercase();
+				match mode {
+					FacetMode::None => false,
+					FacetMode::Include => values.is_empty() || values.contains(&key),
+					FacetMode::Exclude => !values.contains(&key),
+				}
+			},
 			name,
 			count,
 			page_count: 0,

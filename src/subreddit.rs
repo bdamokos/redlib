@@ -801,10 +801,16 @@ fn encode_query_value(value: &str) -> String {
 
 fn normalized_video_mode_query(query: &video_mode::VideoModeQuery, listing: &video_mode::VideoModeListing) -> video_mode::VideoModeQuery {
 	video_mode::VideoModeQuery {
-		selected_subreddits: video_mode::normalize_selected_values(&query.selected_subreddits, &listing.subreddit_options),
-		selected_users: video_mode::normalize_selected_values(&query.selected_users, &listing.user_options),
-		clear_subreddits: video_mode::normalize_clear_flag(query.clear_subreddits, &query.selected_subreddits, &listing.subreddit_options),
-		clear_users: video_mode::normalize_clear_flag(query.clear_users, &query.selected_users, &listing.user_options),
+		selected_subreddits: match query.subreddit_mode {
+			video_mode::FacetMode::Include => video_mode::normalize_selected_values(&query.selected_subreddits, &listing.subreddit_options),
+			_ => query.selected_subreddits.clone(),
+		},
+		selected_users: match query.user_mode {
+			video_mode::FacetMode::Include => video_mode::normalize_selected_values(&query.selected_users, &listing.user_options),
+			_ => query.selected_users.clone(),
+		},
+		subreddit_mode: query.subreddit_mode,
+		user_mode: query.user_mode,
 		age_min_hours: listing.age_min_hours,
 		age_max_hours: Some(listing.age_max_hours),
 	}
@@ -875,7 +881,8 @@ fn render_video_mode_subreddit_fragment(
 	cache_notice: String,
 ) -> Result<Response<Body>, String> {
 	let query = req.uri().query().unwrap_or_default();
-	let parsed_query = video_mode::parse_query(query);
+	let cookie_value = crate::utils::read_sharded_cookie(req, video_mode::VIDEO_MODE_QUERY_COOKIE);
+	let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
 	let listing = video_mode::build_listing(&source_posts, filters, &parsed_query, now_unix());
 	let normalized_query = normalized_video_mode_query(&parsed_query, &listing);
 	let (page_posts, has_prev, has_next) = paginate_posts(&listing.posts, cache_page, crate::post_cache::POSTS_PER_PAGE);
@@ -1643,7 +1650,10 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		let listing = video_mode::build_listing(
 			&source_posts,
 			&get_filters(&req),
-			&video_mode::parse_query(req.uri().query().unwrap_or_default()),
+			&video_mode::parse_query_or_cookie(
+				req.uri().query().unwrap_or_default(),
+				&crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE),
+			),
 			now_unix(),
 		);
 		let preview_posts = listing.posts.iter().take(crate::post_cache::POSTS_PER_PAGE).cloned().collect::<Vec<_>>();
@@ -1789,12 +1799,10 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 
 	if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
 		info!("subreddit: using scrape fallback for {} because Reddit is currently rate limited", req_url);
-		let sort_base_path = if aggregate_saved_feeds {
-			if is_following_route(&url) {
-				FOLLOWING_ROUTE.to_string()
-			} else {
-				String::new()
-			}
+		let sort_base_path = if is_following_route(&url) {
+			FOLLOWING_ROUTE.to_string()
+		} else if aggregate_saved_feeds {
+			String::new()
 		} else if sub_name.is_empty() {
 			String::new()
 		} else {
@@ -1890,12 +1898,10 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	} else {
 		Vec::new()
 	};
-	let sort_base_path = if aggregate_saved_feeds {
-		if is_following_route(&url) {
-			FOLLOWING_ROUTE.to_string()
-		} else {
-			String::new()
-		}
+	let sort_base_path = if is_following_route(&url) {
+		FOLLOWING_ROUTE.to_string()
+	} else if aggregate_saved_feeds {
+		String::new()
 	} else if sub_name.is_empty() {
 		String::new()
 	} else {
@@ -3164,6 +3170,16 @@ mod tests {
 		assert_eq!(top.url, "/top?t=day");
 		assert_eq!(rising.url, "/rising?t=day");
 		assert_eq!(controversial.url, "/controversial?t=day");
+	}
+
+	#[test]
+	fn following_sort_links_use_following_routes() {
+		let options = super::build_sort_options("/following", "/following/hot?front_cursor=abc&after=t3_demo&t=day", "hot", "");
+		let top = options.iter().find(|option| option.label == "Top").unwrap();
+		let video_length = options.iter().find(|option| option.label == "Video Length").unwrap();
+
+		assert_eq!(top.url, "/following/top?t=day");
+		assert_eq!(video_length.url, "/following/video-length?t=day");
 	}
 
 	#[test]

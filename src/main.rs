@@ -14,7 +14,9 @@ use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
-use redlib::{cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, user, video_preview};
+use redlib::{
+	cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, user, video_mode_api, video_preview,
+};
 use url::Url;
 
 use redlib::client::OAUTH_CLIENT;
@@ -364,6 +366,8 @@ async fn main() {
 	app.at("/api/video-previews/lease").post(|r| video_preview::lease(r).boxed());
 	app.at("/api/video-previews/heartbeat").post(|r| video_preview::heartbeat(r).boxed());
 	app.at("/api/video-previews/release").post(|r| video_preview::release(r).boxed());
+	app.at("/api/video-mode/apply").post(|r| video_mode_api::apply(r).boxed());
+	app.at("/api/video-mode/clear").post(|r| video_mode_api::clear(r).boxed());
 	app.at("/api/browser-sessions/heartbeat").post(|r| post_cache::browser_session_heartbeat(r).boxed());
 	app.at("/api/browser-sessions/release").post(|r| post_cache::browser_session_release(r).boxed());
 	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());
