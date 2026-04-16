@@ -127,6 +127,11 @@ pub(crate) struct ScrapedSearchPage {
 	pub after: String,
 }
 
+struct FetchedPage {
+	origin: String,
+	html: String,
+}
+
 pub(crate) fn scrape_notice() -> &'static str {
 	SCRAPE_NOTICE
 }
@@ -154,23 +159,20 @@ pub(crate) fn apply_comment_prefs(comments: &mut [Comment], prefs: &Preferences)
 }
 
 pub(crate) async fn scrape_subreddit_page(path_and_query: &str) -> Result<ScrapedSubredditPage, String> {
-	let html = fetch_page_html(path_and_query).await?;
-	parse_subreddit_page(&html)
+	scrape_with_verification(path_and_query, "subreddit", parse_subreddit_page, suspicious_subreddit_reason, subreddit_result_quality).await
 }
 
 pub(crate) async fn scrape_user_page(path_and_query: &str) -> Result<ScrapedUserPage, String> {
-	let html = fetch_page_html(path_and_query).await?;
-	parse_user_page(&html)
+	scrape_with_verification(path_and_query, "user", parse_user_page, suspicious_user_reason, user_result_quality).await
 }
 
 pub(crate) async fn scrape_post_page(path_and_query: &str, highlighted_comment_id: &str) -> Result<ScrapedPostPage, String> {
-	let html = fetch_page_html(path_and_query).await?;
-	parse_post_page(&html, highlighted_comment_id)
+	let parser = |document: &str| parse_post_page(document, highlighted_comment_id);
+	scrape_with_verification(path_and_query, "post", parser, suspicious_post_reason, post_result_quality).await
 }
 
 pub(crate) async fn scrape_search_page(path_and_query: &str) -> Result<ScrapedSearchPage, String> {
-	let html = fetch_page_html(path_and_query).await?;
-	parse_search_page(&html)
+	scrape_with_verification(path_and_query, "search", parse_search_page, suspicious_search_reason, search_result_quality).await
 }
 
 fn request_timeout() -> Duration {
@@ -185,9 +187,13 @@ fn probe_timeout() -> Duration {
 	Duration::from_secs(PROBE_TIMEOUT_SECS.min(request_timeout().as_secs().max(1)))
 }
 
-async fn fetch_page_html(path_and_query: &str) -> Result<String, String> {
+async fn fetch_page_html_from_origins(path_and_query: &str, excluded_origins: &[String]) -> Result<FetchedPage, String> {
 	let request_started = Instant::now();
-	let origins = candidate_origins().await?;
+	let origins = candidate_origins()
+		.await?
+		.into_iter()
+		.filter(|origin| !excluded_origins.iter().any(|excluded| excluded == origin))
+		.collect::<Vec<_>>();
 	if origins.is_empty() {
 		warn!("instance_scrape: no healthy origins available for {path_and_query}");
 		return Err("no healthy Redlib instances available for scrape fallback".to_string());
@@ -232,7 +238,7 @@ async fn fetch_page_html(path_and_query: &str) -> Result<String, String> {
 					attempt + 1,
 					request_started.elapsed()
 				);
-				return Ok(body);
+				return Ok(FetchedPage { origin, html: body });
 			}
 			Err(error) => {
 				note_source_failure(&origin);
@@ -249,6 +255,79 @@ async fn fetch_page_html(path_and_query: &str) -> Result<String, String> {
 		last_error
 	);
 	Err(last_error)
+}
+
+async fn scrape_with_verification<T, Parse, Reason, Quality>(
+	path_and_query: &str,
+	page_kind: &str,
+	parse: Parse,
+	suspicious_reason: Reason,
+	quality: Quality,
+) -> Result<T, String>
+where
+	Parse: Fn(&str) -> Result<T, String>,
+	Reason: Fn(&T) -> Option<&'static str>,
+	Quality: Fn(&T) -> usize,
+{
+	let first = fetch_page_html_from_origins(path_and_query, &[]).await?;
+	let first_parsed = parse(&first.html)?;
+	let Some(first_reason) = suspicious_reason(&first_parsed) else {
+		return Ok(first_parsed);
+	};
+
+	warn!(
+		"instance_scrape: {} scrape from {} for {} looked suspicious ({}); verifying against another instance",
+		page_kind, first.origin, path_and_query, first_reason
+	);
+
+	let second = match fetch_page_html_from_origins(path_and_query, std::slice::from_ref(&first.origin)).await {
+		Ok(second) => second,
+		Err(error) => {
+			warn!(
+				"instance_scrape: could not verify suspicious {} scrape for {} after {}: {}",
+				page_kind, path_and_query, first.origin, error
+			);
+			return Ok(first_parsed);
+		}
+	};
+
+	let second_parsed = match parse(&second.html) {
+		Ok(parsed) => parsed,
+		Err(error) => {
+			warn!(
+				"instance_scrape: verification scrape from {} for {} could not be parsed: {}",
+				second.origin, path_and_query, error
+			);
+			return Ok(first_parsed);
+		}
+	};
+
+	match suspicious_reason(&second_parsed) {
+		None => {
+			info!(
+				"instance_scrape: accepted verified {} scrape for {} from {} after suspicious result from {}",
+				page_kind, path_and_query, second.origin, first.origin
+			);
+			Ok(second_parsed)
+		}
+		Some(second_reason) => {
+			let first_quality = quality(&first_parsed);
+			let second_quality = quality(&second_parsed);
+			if second_quality > first_quality {
+				warn!(
+					"instance_scrape: both {} scrapes for {} looked suspicious ({} vs {}), preferring richer result from {} over {}",
+					page_kind, path_and_query, first_reason, second_reason, second.origin, first.origin
+				);
+				Ok(second_parsed)
+			} else {
+				warn!(
+					"instance_scrape: both {} scrapes for {} looked suspicious ({} vs {}), keeping initial result from {}",
+					page_kind, path_and_query, first_reason, second_reason, first.origin
+				);
+				Ok(first_parsed)
+			}
+		}
+	}
 }
 
 async fn candidate_origins() -> Result<Vec<String>, String> {
@@ -822,6 +901,80 @@ fn parse_search_subreddit_card(element: ElementRef<'_>) -> Option<ScrapedSearchS
 	})
 }
 
+fn suspicious_subreddit_reason(page: &ScrapedSubredditPage) -> Option<&'static str> {
+	if page.posts.is_empty() {
+		Some("zero posts")
+	} else if subreddit_picture_count(page) == 0 {
+		Some("zero pictures")
+	} else {
+		None
+	}
+}
+
+fn suspicious_user_reason(page: &ScrapedUserPage) -> Option<&'static str> {
+	if page.posts.is_empty() {
+		Some("zero posts")
+	} else if user_picture_count(page) == 0 {
+		Some("zero pictures")
+	} else {
+		None
+	}
+}
+
+fn suspicious_post_reason(page: &ScrapedPostPage) -> Option<&'static str> {
+	if page.post.title.is_empty() && page.post.body.is_empty() && page.comments.is_empty() {
+		Some("zero post content")
+	} else {
+		None
+	}
+}
+
+fn suspicious_search_reason(page: &ScrapedSearchPage) -> Option<&'static str> {
+	if page.posts.is_empty() {
+		Some("zero posts")
+	} else if search_picture_count(page) == 0 {
+		Some("zero pictures")
+	} else {
+		None
+	}
+}
+
+fn subreddit_result_quality(page: &ScrapedSubredditPage) -> usize {
+	page.posts.len() * 10 + subreddit_picture_count(page)
+}
+
+fn user_result_quality(page: &ScrapedUserPage) -> usize {
+	page.posts.len() * 10 + user_picture_count(page)
+}
+
+fn post_result_quality(page: &ScrapedPostPage) -> usize {
+	usize::from(!page.post.title.is_empty()) + usize::from(!page.post.body.is_empty()) + page.comments.len() * 2 + post_picture_count(&page.post)
+}
+
+fn search_result_quality(page: &ScrapedSearchPage) -> usize {
+	page.posts.len() * 10 + page.subreddits.len() * 5 + search_picture_count(page)
+}
+
+fn subreddit_picture_count(page: &ScrapedSubredditPage) -> usize {
+	usize::from(!page.subreddit.icon.is_empty()) + posts_picture_count(&page.posts)
+}
+
+fn user_picture_count(page: &ScrapedUserPage) -> usize {
+	usize::from(!page.user.icon.is_empty()) + posts_picture_count(&page.posts)
+}
+
+fn search_picture_count(page: &ScrapedSearchPage) -> usize {
+	page.subreddits.iter().filter(|subreddit| !subreddit.icon.is_empty()).count() + posts_picture_count(&page.posts)
+}
+
+fn posts_picture_count(posts: &[Post]) -> usize {
+	posts.iter().map(post_picture_count).sum()
+}
+
+fn post_picture_count(post: &Post) -> usize {
+	usize::from(!post.thumbnail.url.is_empty()) + usize::from(!post.media.url.is_empty()) + usize::from(!post.media.preview_url.is_empty()) + post.gallery.len()
+}
+
 fn parse_user_comment_card(element: ElementRef<'_>, user: &User) -> Option<Post> {
 	let link = element.select(&SEL_COMMENT_LINK).next()?;
 	let created = element
@@ -1178,5 +1331,120 @@ mod tests {
 		assert!(should_attempt_scrape_fallback("Too many requests."));
 		assert!(should_attempt_scrape_fallback("Reddit rate limit hit"));
 		assert!(should_attempt_scrape_fallback("ratelimit exhausted"));
+	}
+
+	#[test]
+	fn flags_zero_post_scrapes_as_suspicious() {
+		let subreddit = ScrapedSubredditPage {
+			subreddit: Subreddit::default(),
+			posts: Vec::new(),
+			after: String::new(),
+		};
+		assert_eq!(suspicious_subreddit_reason(&subreddit), Some("zero posts"));
+
+		let user = ScrapedUserPage {
+			user: User::default(),
+			posts: Vec::new(),
+			after: String::new(),
+		};
+		assert_eq!(suspicious_user_reason(&user), Some("zero posts"));
+
+		let search = ScrapedSearchPage {
+			posts: Vec::new(),
+			subreddits: vec![ScrapedSearchSubreddit {
+				name: "rust".to_string(),
+				url: "/r/rust".to_string(),
+				icon: "/style/rust.png".to_string(),
+				description: String::new(),
+				subscribers: ("1".to_string(), "1".to_string()),
+			}],
+			after: String::new(),
+		};
+		assert_eq!(suspicious_search_reason(&search), Some("zero posts"));
+	}
+
+	#[test]
+	fn flags_zero_picture_listing_scrapes_as_suspicious() {
+		let post = test_post("Example");
+		let subreddit = ScrapedSubredditPage {
+			subreddit: Subreddit {
+				name: "rust".to_string(),
+				..Subreddit::default()
+			},
+			posts: vec![post.clone()],
+			after: String::new(),
+		};
+		assert_eq!(suspicious_subreddit_reason(&subreddit), Some("zero pictures"));
+
+		let user = ScrapedUserPage {
+			user: User {
+				name: "spez".to_string(),
+				..User::default()
+			},
+			posts: vec![post.clone()],
+			after: String::new(),
+		};
+		assert_eq!(suspicious_user_reason(&user), Some("zero pictures"));
+
+		let search = ScrapedSearchPage {
+			posts: vec![post],
+			subreddits: Vec::new(),
+			after: String::new(),
+		};
+		assert_eq!(suspicious_search_reason(&search), Some("zero pictures"));
+	}
+
+	#[test]
+	fn accepts_fixtures_with_real_content() {
+		let subreddit = parse_subreddit_page(SUBREDDIT_FIXTURE).unwrap();
+		assert_eq!(suspicious_subreddit_reason(&subreddit), None);
+
+		let user = parse_user_page(USER_FIXTURE).unwrap();
+		assert_eq!(suspicious_user_reason(&user), None);
+
+		let search = parse_search_page(SEARCH_FIXTURE).unwrap();
+		assert_eq!(suspicious_search_reason(&search), None);
+	}
+
+	fn test_post(title: &str) -> Post {
+		Post {
+			id: "demo".to_string(),
+			kind: "t3".to_string(),
+			title: title.to_string(),
+			community: "rust".to_string(),
+			body: String::new(),
+			author: Author {
+				name: "demo_author".to_string(),
+				flair: empty_flair(),
+				distinguished: String::new(),
+				external_links: Vec::new(),
+				avg_video_length: None,
+			},
+			permalink: "/r/rust/comments/demo/example/".to_string(),
+			parent_kind: String::new(),
+			link_title: title.to_string(),
+			link_permalink: "/r/rust/comments/demo/example/".to_string(),
+			poll: None,
+			score: ("1".to_string(), "1".to_string()),
+			upvote_ratio: 0,
+			post_type: "self".to_string(),
+			flair: empty_flair(),
+			flags: Flags::new(false, false, false),
+			thumbnail: Media::empty(),
+			media: Media::empty(),
+			domain: String::new(),
+			rel_time: String::new(),
+			created: String::new(),
+			created_ts: 0,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
+		}
 	}
 }
