@@ -444,6 +444,8 @@ async fn main() {
 	app.at("/feed-fragment").get(|r| subreddit::feed_fragment(r).boxed());
 	app.at("/subreddit-fragment").get(|r| subreddit::community_fragment(r).boxed());
 	app.at("/subreddit-fragment/:sort").get(|r| subreddit::community_fragment(r).boxed());
+	app.at("/subreddit-fragment/following").get(|r| subreddit::community_fragment(r).boxed());
+	app.at("/subreddit-fragment/following/:sort").get(|r| subreddit::community_fragment(r).boxed());
 	app.at("/subreddit-fragment/r/:sub").get(|r| subreddit::community_fragment(r).boxed());
 	app.at("/subreddit-fragment/r/:sub/:sort").get(|r| subreddit::community_fragment(r).boxed());
 
@@ -494,6 +496,8 @@ async fn main() {
 	app.at("/r/:sub/:sort").get(|r| subreddit::community(r).boxed());
 
 	// Front page
+	app.at("/following").get(|r| subreddit::community(r).boxed());
+	app.at("/following/:sort").get(|r| subreddit::community(r).boxed());
 	app.at("/").get(|r| subreddit::community(r).boxed());
 
 	// View Reddit wiki

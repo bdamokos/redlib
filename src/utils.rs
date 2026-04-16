@@ -1783,6 +1783,14 @@ impl Preferences {
 		self.subscriptions.iter().any(|subscription| subscription.eq_ignore_ascii_case(value))
 	}
 
+	pub fn has_followed_users(&self) -> bool {
+		self.subscriptions.iter().any(|subscription| subscription.starts_with("u_"))
+	}
+
+	pub fn has_subreddit_subscriptions(&self) -> bool {
+		self.subscriptions.iter().any(|subscription| !subscription.starts_with("u_"))
+	}
+
 	pub fn has_filter(&self, value: &str) -> bool {
 		self.filters.iter().any(|filter| filter.eq_ignore_ascii_case(value))
 	}

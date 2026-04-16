@@ -27,6 +27,8 @@ use url::form_urlencoded;
 
 const FRONT_CURSOR_PARAM: &str = "front_cursor";
 const FEED_SESSION_PARAM: &str = "feed_session";
+const FOLLOWING_FRONT_PAGE: &str = "following";
+const FOLLOWING_ROUTE: &str = "/following";
 const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
@@ -999,8 +1001,39 @@ fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
 	feeds
 }
 
+fn is_followed_user_subscription(name: &str) -> bool {
+	name.starts_with("u_")
+}
+
+fn followed_user_subscriptions(preferences: &Preferences) -> Vec<String> {
+	preferences.subscriptions.iter().filter(|name| is_followed_user_subscription(name)).cloned().collect()
+}
+
+fn is_following_route(path: &str) -> bool {
+	let path = path.strip_prefix("/subreddit-fragment").unwrap_or(path);
+	path == FOLLOWING_ROUTE || path.starts_with("/following/")
+}
+
+fn front_page_override(path: &str) -> Option<&'static str> {
+	if is_following_route(path) {
+		Some(FOLLOWING_FRONT_PAGE)
+	} else {
+		None
+	}
+}
+
+fn is_following_front_page(front_page: &str) -> bool {
+	front_page == FOLLOWING_FRONT_PAGE
+}
+
+fn build_subscription_sources(subscriptions: &[String], sort: FeedSort) -> Vec<FeedSource> {
+	let mut sources = subscriptions.iter().cloned().map(|name| FeedSource::subreddit(name, sort)).collect::<Vec<_>>();
+	crate::post_cache::sort_sources(&mut sources);
+	sources
+}
+
 fn build_feed_sources(preferences: &Preferences, sort: FeedSort) -> Vec<FeedSource> {
-	let mut sources = preferences.subscriptions.iter().cloned().map(|name| FeedSource::subreddit(name, sort)).collect::<Vec<_>>();
+	let mut sources = build_subscription_sources(&preferences.subscriptions, sort);
 
 	sources.extend(
 		preferences
@@ -1014,14 +1047,32 @@ fn build_feed_sources(preferences: &Preferences, sort: FeedSort) -> Vec<FeedSour
 	sources
 }
 
+fn build_video_mode_front_page_sources(preferences: &Preferences, front_page: &str) -> Vec<FeedSource> {
+	let sort = FeedSort::New;
+	if is_following_front_page(front_page) {
+		build_subscription_sources(&followed_user_subscriptions(preferences), sort)
+	} else {
+		build_feed_sources(preferences, sort)
+	}
+}
+
 fn front_page_uses_contextual_session(is_subreddit_route: bool, sort: &str) -> bool {
 	!is_subreddit_route && matches!(sort, "new" | "hot")
 }
 
-fn build_front_page_session_sources(preferences: &Preferences, front_page_is_default: bool, has_saved_feeds: bool, sub_name: &str, sort: &str) -> Vec<FeedSource> {
+fn build_front_page_session_sources(
+	preferences: &Preferences,
+	front_page: &str,
+	front_page_is_default: bool,
+	has_saved_feeds: bool,
+	sub_name: &str,
+	sort: &str,
+) -> Vec<FeedSource> {
 	let listing_sort = FeedSort::from_listing(sort);
 	let mut sources = if front_page_is_default && has_saved_feeds {
 		build_feed_sources(preferences, listing_sort)
+	} else if is_following_front_page(front_page) && has_saved_feeds {
+		build_subscription_sources(&followed_user_subscriptions(preferences), listing_sort)
 	} else if sub_name.is_empty() {
 		Vec::new()
 	} else {
@@ -1034,6 +1085,7 @@ fn build_front_page_session_sources(preferences: &Preferences, front_page_is_def
 async fn live_feed_shell_loading_message(
 	req: &Request<Body>,
 	preferences: &Preferences,
+	front_page: &str,
 	front_page_is_default: bool,
 	has_saved_feeds: bool,
 	sub_name: &str,
@@ -1042,7 +1094,7 @@ async fn live_feed_shell_loading_message(
 	let query = req.uri().query().unwrap_or_default().to_string();
 	let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
 	let filters = get_filters(req);
-	let sources = build_front_page_session_sources(preferences, front_page_is_default, has_saved_feeds, sub_name, sort);
+	let sources = build_front_page_session_sources(preferences, front_page, front_page_is_default, has_saved_feeds, sub_name, sort);
 	if sources.is_empty() {
 		return None;
 	}
@@ -1061,16 +1113,24 @@ async fn live_feed_shell_loading_message(
 	crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).map(|status| status.status_message)
 }
 
-fn build_aggregate_sources(preferences: &Preferences, sort: &str, reddit_query: &str) -> Vec<AggregateFeedSource> {
-	let mut sources = split_subscriptions_for_listing(&preferences.subscriptions, sort, reddit_query)
+fn build_aggregate_sources(preferences: &Preferences, front_page: &str, sort: &str, reddit_query: &str) -> Vec<AggregateFeedSource> {
+	let subscriptions = if is_following_front_page(front_page) {
+		followed_user_subscriptions(preferences)
+	} else {
+		preferences.subscriptions.clone()
+	};
+
+	let mut sources = split_subscriptions_for_listing(&subscriptions, sort, reddit_query)
 		.into_iter()
 		.map(|chunk| AggregateFeedSource::SubredditChunk { chunk })
 		.collect::<Vec<_>>();
 
-	sources.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| AggregateFeedSource::Flair {
-		subreddit: subscription.subreddit,
-		flair: subscription.flair,
-	}));
+	if !is_following_front_page(front_page) {
+		sources.extend(preferences.flair_subscriptions.iter().cloned().map(|subscription| AggregateFeedSource::Flair {
+			subreddit: subscription.subreddit,
+			flair: subscription.flair,
+		}));
+	}
 
 	sources
 }
@@ -1469,28 +1529,39 @@ async fn fetch_aggregated_subscription_feed(
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let prefs = Preferences::new(&req);
 	let subscribed = prefs.subscriptions.join("+");
-	let has_saved_feeds = !saved_feeds(&prefs).is_empty();
-	let front_page = setting(&req, "front_page");
+	let path = req.uri().path().to_string();
+	let has_default_saved_feeds = !saved_feeds(&prefs).is_empty();
+	let front_page = front_page_override(&path).map(str::to_string).unwrap_or_else(|| setting(&req, "front_page"));
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
+	let front_page_is_following = is_following_front_page(&front_page);
+	let followed_users = followed_user_subscriptions(&prefs);
+	let has_followed_users = !followed_users.is_empty();
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
+	let aggregate_front_page = req.param("sub").is_none() && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
 		String::new()
 	} else if front_page_is_default {
-		if has_saved_feeds {
+		if has_default_saved_feeds {
 			subscribed.clone()
 		} else {
 			"popular".to_string()
 		}
+	} else if front_page_is_following {
+		followed_users.join("+")
 	} else {
 		front_page.clone()
 	});
 
+	if !video_mode_front_page && front_page_is_following && !has_followed_users && req.param("sub").is_none() {
+		return info(req, "Follow some users to populate the followed users view.").await;
+	}
+
 	if !video_mode_front_page && (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
-		if !has_saved_feeds {
+		if !has_default_saved_feeds {
 			return info(req, "Subscribe to some subreddits! (Default feeds disabled in settings)").await;
 		} else {
 			return info(
@@ -1516,14 +1587,22 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let loading_message = if is_video_length_sort(&sort) {
 		"Loading videos...".to_string()
 	} else if contextual_front_page {
-		live_feed_shell_loading_message(&req, &prefs, front_page_is_default, has_saved_feeds, &sub_name, &sort)
+		live_feed_shell_loading_message(&req, &prefs, &front_page, front_page_is_default, aggregate_front_page, &sub_name, &sort)
 			.await
-			.unwrap_or_else(|| "Loading followed feeds in the background.".to_string())
+			.unwrap_or_else(|| {
+				if front_page_is_following {
+					"Loading followed users in the background.".to_string()
+				} else {
+					"Loading followed feeds in the background.".to_string()
+				}
+			})
 	} else {
 		"Loading posts...".to_string()
 	};
 	let placeholder_message = "Loading posts...".to_string();
-	let cached_sub = if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
+	let cached_sub = if aggregate_front_page {
+		Subreddit::default()
+	} else if !sub_name.is_empty() && sub_name != "all" && sub_name != "popular" && !sub_name.contains('+') {
 		cached_subreddit_metadata(&sub_name).unwrap_or_else(|| placeholder_subreddit(&sub_name))
 	} else {
 		Subreddit {
@@ -1559,7 +1638,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			filter_posts_by_flair(&mut cached_posts, &active_flair_filter);
 			cached_posts
 		} else {
-			collect_cached_source_posts(&build_feed_sources(&prefs, FeedSort::New))
+			collect_cached_source_posts(&build_video_mode_front_page_sources(&prefs, &front_page))
 		};
 		let listing = video_mode::build_listing(
 			&source_posts,
@@ -1599,29 +1678,40 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let query = req.uri().query().unwrap_or_default().to_string();
 	let prefs = Preferences::new(&req);
 	let subscribed = prefs.subscriptions.join("+");
-	let has_saved_feeds = !saved_feeds(&prefs).is_empty();
-	let front_page = setting(&req, "front_page");
+	let request_path = req.uri().path().to_string();
+	let has_default_saved_feeds = !saved_feeds(&prefs).is_empty();
+	let front_page = front_page_override(&request_path).map(str::to_string).unwrap_or_else(|| setting(&req, "front_page"));
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
 	let is_subreddit_route = req.uri().path().starts_with("/subreddit-fragment/r/");
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
+	let front_page_is_following = is_following_front_page(&front_page);
+	let followed_users = followed_user_subscriptions(&prefs);
+	let has_followed_users = !followed_users.is_empty();
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 	let video_mode_front_page = !is_subreddit_route && is_video_length_sort(&sort);
+	let aggregate_front_page = !is_subreddit_route && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
 		String::new()
 	} else if front_page_is_default {
-		if has_saved_feeds {
+		if has_default_saved_feeds {
 			subscribed.clone()
 		} else {
 			"popular".to_string()
 		}
+	} else if front_page_is_following {
+		followed_users.join("+")
 	} else {
 		front_page.clone()
 	});
 
+	if !video_mode_front_page && front_page_is_following && !has_followed_users && !is_subreddit_route {
+		return info(req, "Follow some users to populate the followed users view.").await;
+	}
+
 	if !video_mode_front_page && (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
-		if !has_saved_feeds {
+		if !has_default_saved_feeds {
 			return info(req, "Subscribe to some subreddits! (Default feeds disabled in settings)").await;
 		} else {
 			// If there are subscribed subs, but we get here, then the problem is that front_page pref is set to something besides default.
@@ -1646,11 +1736,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	}
 
 	let reddit_query = subreddit_listing_query(&query, sub_name == "popular");
-	let aggregate_sources = build_aggregate_sources(&prefs, &sort, &reddit_query);
-	let aggregate_saved_feeds = !is_subreddit_route && front_page_is_default && !aggregate_sources.is_empty();
+	let aggregate_sources = build_aggregate_sources(&prefs, &front_page, &sort, &reddit_query);
+	let aggregate_saved_feeds = aggregate_front_page && !aggregate_sources.is_empty();
 	let contextual_front_page = front_page_uses_contextual_session(is_subreddit_route, &sort);
 	let front_page_session_sources = if contextual_front_page {
-		build_front_page_session_sources(&prefs, front_page_is_default, has_saved_feeds, &sub_name, &sort)
+		build_front_page_session_sources(&prefs, &front_page, front_page_is_default, aggregate_front_page, &sub_name, &sort)
 	} else {
 		Vec::new()
 	};
@@ -1700,7 +1790,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
 		info!("subreddit: using scrape fallback for {} because Reddit is currently rate limited", req_url);
 		let sort_base_path = if aggregate_saved_feeds {
-			String::new()
+			if is_following_route(&url) {
+				FOLLOWING_ROUTE.to_string()
+			} else {
+				String::new()
+			}
 		} else if sub_name.is_empty() {
 			String::new()
 		} else {
@@ -1797,7 +1891,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		Vec::new()
 	};
 	let sort_base_path = if aggregate_saved_feeds {
-		String::new()
+		if is_following_route(&url) {
+			FOLLOWING_ROUTE.to_string()
+		} else {
+			String::new()
+		}
 	} else if sub_name.is_empty() {
 		String::new()
 	} else {
@@ -1885,7 +1983,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			filter_posts_by_flair(&mut posts, &active_flair_filter);
 			posts
 		} else if !is_subreddit_route {
-			collect_cached_source_posts(&build_feed_sources(&prefs, FeedSort::New))
+			collect_cached_source_posts(&build_video_mode_front_page_sources(&prefs, &front_page))
 		} else {
 			Vec::new()
 		};

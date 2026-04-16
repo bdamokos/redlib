@@ -64,14 +64,27 @@
 		<div class="feed_list">
 			<p>MAIN FEEDS</p>
 			<a href="/">Home</a>
+			{% if prefs.has_followed_users() %}
+				<a href="/following" {% if current == "__following__" %}class="selected"{% endif %}>Following</a>
+			{% endif %}
 			{% if prefs.remove_default_feeds != "on" %}
 				<a href="/r/popular">Popular</a>
 				<a href="/r/all">All</a>
 			{% endif %}
-			{% if prefs.subscriptions.len() > 0 %}
+			{% if prefs.has_subreddit_subscriptions() %}
 				<p>REDDIT FEEDS</p>
 				{% for sub in prefs.subscriptions %}
-					<a href="/r/{{ sub }}" {% if sub == current && current_flair.is_empty() %}class="selected"{% endif %}>{{ sub }}</a>
+					{% if !sub.starts_with("u_") %}
+						<a href="/r/{{ sub }}" {% if sub == current && current_flair.is_empty() %}class="selected"{% endif %}>{{ sub }}</a>
+					{% endif %}
+				{% endfor %}
+			{% endif %}
+			{% if prefs.has_followed_users() %}
+				<p>USER FEEDS</p>
+				{% for sub in prefs.subscriptions %}
+					{% if sub.starts_with("u_") %}
+						<a href="/user/{{ sub.get(2..).unwrap_or_default() }}">u/{{ sub.get(2..).unwrap_or_default() }}</a>
+					{% endif %}
 				{% endfor %}
 			{% endif %}
 			{% if prefs.flair_subscriptions.len() > 0 %}

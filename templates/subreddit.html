@@ -17,7 +17,11 @@
 {% endblock %}
 
 {% block subscriptions %}
+	{% if url == "/following" || url.starts_with("/following?") || url.starts_with("/following/") %}
+	{% call utils::sub_list("__following__", active_flair_filter.as_str()) %}
+	{% else %}
 	{% call utils::sub_list(sub.name.as_str(), active_flair_filter.as_str()) %}
+	{% endif %}
 {% endblock %}
 
 {% block body %}
