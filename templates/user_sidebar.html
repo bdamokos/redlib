@@ -2,6 +2,7 @@
     {% if is_filtered %}
     <center>(Content from u/{{ user.name }} has been filtered)</center>
     {% endif %}
+    {% include "video_mode_sidebar.html" %}
     <details class="panel" id="user" open>
         <summary id="user_label">User</summary>
         <div id="user_meta">

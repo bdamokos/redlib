@@ -16,4 +16,5 @@ pub mod site_icon;
 pub mod subreddit;
 pub mod user;
 pub mod utils;
+pub mod video_mode;
 pub mod video_preview;

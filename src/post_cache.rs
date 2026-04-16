@@ -34,6 +34,10 @@ const MAX_SYNC_FILL_BATCHES: usize = 2;
 const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
 pub const POSTS_PER_PAGE: usize = 25;
 
+pub const fn per_source_limit() -> usize {
+	PER_SOURCE_LIMIT
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct BrowserSessionHeartbeatRequest {
 	pub session_id: String,
@@ -83,10 +87,7 @@ pub enum FeedSource {
 
 impl FeedSource {
 	pub fn subreddit(name: impl Into<String>, sort: FeedSort) -> Self {
-		Self::Subreddit {
-			name: name.into(),
-			sort,
-		}
+		Self::Subreddit { name: name.into(), sort }
 	}
 
 	pub fn flair(subreddit: impl Into<String>, flair: impl Into<String>, sort: FeedSort) -> Self {
@@ -313,6 +314,15 @@ pub struct FeedSessionStatus {
 	pub posts_merged: usize,
 	pub status_message: String,
 	pub refresh_token: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct FeedSessionPageMetric {
+	pub page: usize,
+	pub full_page: bool,
+	pub ready: bool,
+	pub representative_created_ts: Option<u64>,
+	pub representative_score: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -565,7 +575,12 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	};
 
 	crate::utils::store_post_flairs(&posts);
-	store_source_posts_with_origin(&FeedSource::subreddit(normalized.clone(), FeedSort::New), posts.clone(), after.clone(), Some(refresh_origin));
+	store_source_posts_with_origin(
+		&FeedSource::subreddit(normalized.clone(), FeedSort::New),
+		posts.clone(),
+		after.clone(),
+		Some(refresh_origin),
+	);
 	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
 		crate::video_preview::prewarm_listing_video_previews(&posts);
 		spawn_author_link_prefetch(posts.clone());
@@ -946,13 +961,9 @@ fn session_is_expired(entry: &FeedSession) -> bool {
 
 fn source_priority(source: &FeedSource) -> (u8, String, String) {
 	match source {
-		FeedSource::Subreddit { name, sort } if name.starts_with("u_") => {
-			(0, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new())
-		}
+		FeedSource::Subreddit { name, sort } if name.starts_with("u_") => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new()),
 		FeedSource::Subreddit { name, sort } => (1, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new()),
-		FeedSource::Flair { subreddit, flair, sort } => {
-			(2, format!("{}:{}", sort.as_str(), subreddit.to_lowercase()), flair.to_lowercase())
-		}
+		FeedSource::Flair { subreddit, flair, sort } => (2, format!("{}:{}", sort.as_str(), subreddit.to_lowercase()), flair.to_lowercase()),
 	}
 }
 
@@ -984,6 +995,10 @@ pub fn get_cached_source_page_with_mode(source: &FeedSource, page: usize, per_pa
 
 pub fn get_cached_source_page(source: &FeedSource, page: usize, per_page: usize) -> Option<(Vec<Post>, String, bool, bool)> {
 	get_cached_source_page_with_mode(source, page, per_page, CacheServeMode::Normal)
+}
+
+pub fn servable_cached_source_posts(source: &FeedSource) -> Option<Vec<Post>> {
+	cached_source_posts_with_mode(source, CacheServeMode::Normal).map(|entry| entry.posts)
 }
 
 pub fn get_cached_subreddit_page_with_mode(subreddit: &str, page: usize, per_page: usize, mode: CacheServeMode) -> Option<(Vec<Post>, String, bool, bool)> {
@@ -1061,9 +1076,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		}
 	};
 	let posts = source.filter_posts(posts);
-	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession)
-		&& !matches!(&source, FeedSource::Subreddit { name, .. } if !name.starts_with("u_"))
-	{
+	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) && !matches!(&source, FeedSource::Subreddit { name, .. } if !name.starts_with("u_")) {
 		spawn_author_link_prefetch(posts.clone());
 	}
 
@@ -1185,6 +1198,24 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 
 fn parse_numeric_score(post: &Post) -> Option<i64> {
 	post.score.1.parse::<i64>().ok()
+}
+
+fn representative_created_ts(posts: &[Post]) -> Option<u64> {
+	let mut created = posts.iter().map(|post| post.created_ts).filter(|ts| *ts > 0).collect::<Vec<_>>();
+	if created.is_empty() {
+		return None;
+	}
+	created.sort_unstable();
+	Some(created[created.len() / 2])
+}
+
+fn representative_score(posts: &[Post]) -> Option<i64> {
+	let mut scores = posts.iter().filter(|post| !post.flags.stickied).filter_map(parse_numeric_score).collect::<Vec<_>>();
+	if scores.len() < 3 {
+		return None;
+	}
+	scores.sort_unstable();
+	Some(scores[scores.len() / 2])
 }
 
 fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue) -> Option<ReadyQueueHead> {
@@ -1661,12 +1692,7 @@ async fn warm_session_followup_cached(session_id: String, page: usize, per_page:
 	}
 }
 
-async fn ensure_feed_session_inner(
-	request: FeedSessionRequest,
-	page: usize,
-	per_page: usize,
-	max_sync_sources_override: Option<usize>,
-) -> String {
+async fn ensure_feed_session_inner(request: FeedSessionRequest, page: usize, per_page: usize, max_sync_sources_override: Option<usize>) -> String {
 	let session_id = build_session_id(&request);
 	reconcile_stuck_fetching_sources(&session_id).await;
 
@@ -1695,13 +1721,7 @@ async fn ensure_feed_session_inner(
 
 	warm_session_indices(&session_id, sync_target).await;
 	if session_is_new {
-		warm_session_to_fill(
-			&session_id,
-			page,
-			per_page,
-			max_sync_sources_override.unwrap_or_else(|| max_sync_source_budget(page)),
-		)
-		.await;
+		warm_session_to_fill(&session_id, page, per_page, max_sync_sources_override.unwrap_or_else(|| max_sync_source_budget(page))).await;
 	}
 
 	let warm_mode = {
@@ -1731,12 +1751,7 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 	ensure_feed_session_inner(request, page, per_page, None).await
 }
 
-pub async fn ensure_feed_session_with_budget(
-	request: FeedSessionRequest,
-	page: usize,
-	per_page: usize,
-	max_sync_sources: usize,
-) -> String {
+pub async fn ensure_feed_session_with_budget(request: FeedSessionRequest, page: usize, per_page: usize, max_sync_sources: usize) -> String {
 	ensure_feed_session_inner(request, page, per_page, Some(max_sync_sources)).await
 }
 
@@ -1836,6 +1851,29 @@ pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<Fee
 
 	let posts = merged_posts_for_session(session);
 	Some(session_status_from_posts(session, &posts, page, per_page))
+}
+
+pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Vec<FeedSessionPageMetric>> {
+	let mut sessions = FEED_SESSIONS.lock().ok()?;
+	let session = sessions.get_mut(session_id)?;
+	if session_is_expired(session) {
+		return None;
+	}
+	reconcile_session_with_source_cache(session);
+
+	let posts = merged_posts_for_session(session);
+	let mut metrics = Vec::new();
+	for (page, chunk) in posts.chunks(per_page).enumerate() {
+		metrics.push(FeedSessionPageMetric {
+			page,
+			full_page: chunk.len() == per_page,
+			ready: current_page_is_ready(session, &posts, page, per_page),
+			representative_created_ts: representative_created_ts(chunk),
+			representative_score: representative_score(chunk),
+		});
+	}
+
+	Some(metrics)
 }
 
 pub fn feed_session_sort(session_id: &str) -> Option<FeedSort> {
@@ -2035,15 +2073,15 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, build_session_id, cache_status_for_preferences, count_sources_in_state,
-		feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_fetching_sources_failed,
-		max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh,
-		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority,
-		restore_persisted_state, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target,
-		source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession,
-		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS,
-		ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
-		SOURCE_CACHE,
+		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, build_session_id, cache_status_for_preferences,
+		count_sources_in_state, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
+		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
+		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request,
+		remembered_refresh_priority, restore_persisted_state, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries,
+		sort_sources, source_budget_target, source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets,
+		ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState,
+		SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS,
+		POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use std::cmp::Ordering;
@@ -2187,11 +2225,7 @@ mod tests {
 	fn sorts_user_sources_before_subreddits_and_flairs() {
 		let _guard = test_lock();
 		reset_test_caches();
-		let mut sources = vec![
-			new_flair_source("zeta", "Tag"),
-			new_source("rust"),
-			new_source("u_demo"),
-		];
+		let mut sources = vec![new_flair_source("zeta", "Tag"), new_source("rust"), new_source("u_demo")];
 
 		sort_sources(&mut sources);
 
@@ -2733,12 +2767,7 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: (0..120)
-				.map(|index| {
-					session_entry(
-						new_source(&format!("subreddit{index}")),
-						SessionSourceState::Unstarted,
-					)
-				})
+				.map(|index| session_entry(new_source(&format!("subreddit{index}")), SessionSourceState::Unstarted))
 				.collect(),
 			frozen_pages: HashMap::new(),
 			background_active: true,
@@ -3109,10 +3138,7 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				session_entry(
-					new_source("older_refreshed"),
-					SessionSourceState::Unstarted,
-				),
+				session_entry(new_source("older_refreshed"), SessionSourceState::Unstarted),
 				session_entry(new_source("never_older"), SessionSourceState::Unstarted),
 				session_entry(new_source("never_recent"), SessionSourceState::Unstarted),
 			],
@@ -3141,10 +3167,7 @@ mod tests {
 				query_fingerprint: "demo".to_string(),
 			},
 			sources: vec![
-				session_entry(
-					new_flair_source("rust", "News"),
-					SessionSourceState::Unstarted,
-				),
+				session_entry(new_flair_source("rust", "News"), SessionSourceState::Unstarted),
 				session_entry(new_source("rust"), SessionSourceState::Unstarted),
 				session_entry(new_source("u_demo"), SessionSourceState::Unstarted),
 			],

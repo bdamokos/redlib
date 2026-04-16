@@ -774,6 +774,96 @@ aside {
     margin-top: 20px;
 }
 
+.video_mode_sidebar {
+    margin-bottom: 20px;
+}
+
+.video_mode_sidebar_inner {
+    padding-top: 6px;
+}
+
+.video_mode_filter_form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.video_mode_filter_group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.video_mode_filter_group > label,
+.video_mode_filter_group_header > label {
+    font-weight: 600;
+}
+
+.video_mode_filter_group_header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.video_mode_filter_bulk_actions {
+    display: inline-flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.video_mode_filter_bulk_actions button {
+    appearance: none;
+    border: 0;
+    background: none;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    opacity: 0.8;
+    padding: 0;
+    text-decoration: underline;
+}
+
+.video_mode_filter_bulk_actions button:hover {
+    opacity: 1;
+}
+
+.video_mode_filter_list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.video_mode_filter_option {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 8px;
+}
+
+.video_mode_filter_option span {
+    overflow-wrap: anywhere;
+}
+
+.video_mode_filter_count,
+.video_mode_age_hint {
+    opacity: 0.7;
+    font-size: 12px;
+}
+
+.video_mode_age_values {
+    display: flex;
+    justify-content: space-between;
+    font-variant-numeric: tabular-nums;
+}
+
+.video_mode_filter_actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
 .sub_flairs_header {
     display: flex;
     align-items: center;

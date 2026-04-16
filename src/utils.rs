@@ -2248,6 +2248,30 @@ pub fn format_url(url: &str) -> String {
 	}
 }
 
+pub fn canonical_reddit_path(path: &str) -> String {
+	let (raw_path, _) = path.split_once('?').unwrap_or((path, ""));
+
+	if raw_path == "/video-length" {
+		return "/new".to_string();
+	}
+
+	if let Some(rest) = raw_path.strip_prefix("/r/") {
+		let mut parts = rest.split('/');
+		if let (Some(subreddit), Some("video-length"), None) = (parts.next(), parts.next(), parts.next()) {
+			return format!("/r/{subreddit}/new");
+		}
+	}
+
+	if let Some(rest) = raw_path.strip_prefix("/user/") {
+		let mut parts = rest.split('/');
+		if let (Some(username), Some("videos"), None) = (parts.next(), parts.next(), parts.next()) {
+			return format!("/user/{username}/submitted?sort=new");
+		}
+	}
+
+	path.to_string()
+}
+
 static REGEX_BULLET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^- (.*)$").unwrap());
 static REGEX_BULLET_CONSECUTIVE_LINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"</ul>\n<ul>").unwrap());
 
@@ -3491,6 +3515,20 @@ mod tests {
 		assert_eq!(format_url("default"), "");
 		assert_eq!(format_url("nsfw"), "");
 		assert_eq!(format_url("spoiler"), "");
+	}
+
+	#[test]
+	fn canonical_reddit_path_maps_local_video_modes_to_real_reddit_routes() {
+		assert_eq!(super::canonical_reddit_path("/video-length"), "/new");
+		assert_eq!(super::canonical_reddit_path("/video-length?video_sub=rust"), "/new");
+		assert_eq!(super::canonical_reddit_path("/r/videos/video-length"), "/r/videos/new");
+		assert_eq!(super::canonical_reddit_path("/r/videos/video-length?video_age_min_hours=4"), "/r/videos/new");
+		assert_eq!(super::canonical_reddit_path("/user/spez/videos"), "/user/spez/submitted?sort=new");
+		assert_eq!(
+			super::canonical_reddit_path("/user/spez/videos?video_user=spez&video_age_max_hours=24"),
+			"/user/spez/submitted?sort=new"
+		);
+		assert_eq!(super::canonical_reddit_path("/r/rust/new"), "/r/rust/new");
 	}
 
 	#[test]

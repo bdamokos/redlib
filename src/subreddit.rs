@@ -1,6 +1,6 @@
 #![allow(clippy::cmp_owned)]
 
-use crate::{config, instance_scrape, utils};
+use crate::{config, instance_scrape, utils, video_mode};
 // CRATES
 use crate::cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditMetadataEntry, PersistedSubredditNsfwEntry};
 use crate::post_cache::{FeedSessionRequest, FeedSort, FeedSource};
@@ -35,6 +35,7 @@ const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 100;
 const AGGREGATE_FETCH_CONCURRENCY: usize = 4;
 const SUBREDDIT_METADATA_CACHE_TTL_SECS: u64 = 10_800;
 const OAUTH_CACHE_NOTICE: &str = "Showing cached posts because live Reddit authentication is temporarily unavailable. Content may be stale.";
+const CONTEXTUAL_PAGINATION_MAX_LINKS: usize = 6;
 static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
 static SUBREDDIT_METADATA_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditMetadata>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SUBREDDIT_NSFW_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditNsfwStatus>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -85,6 +86,8 @@ pub struct SubredditTemplate {
 	feed_fragment_url: String,
 	show_contextual_pagination: bool,
 	contextual_pagination: Vec<ContextualPageLink>,
+	video_mode_enabled: bool,
+	video_mode_sidebar: video_mode::VideoModeSidebarData,
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
@@ -106,6 +109,9 @@ pub struct SubredditShellTemplate {
 	fragment_url: String,
 	loading_message: String,
 	placeholder_message: String,
+	replace_selector: String,
+	video_mode_enabled: bool,
+	video_mode_sidebar: video_mode::VideoModeSidebarData,
 }
 
 crate::impl_template_str_eq!(SubredditShellTemplate);
@@ -139,6 +145,8 @@ struct SubredditFragmentTemplate {
 	feed_fragment_url: String,
 	show_contextual_pagination: bool,
 	contextual_pagination: Vec<ContextualPageLink>,
+	video_mode_enabled: bool,
+	video_mode_sidebar: video_mode::VideoModeSidebarData,
 }
 
 crate::impl_template_str_eq!(SubredditFragmentTemplate);
@@ -529,6 +537,76 @@ fn update_url_query(url: &str, updates: &[(&str, Option<&str>)]) -> String {
 	}
 }
 
+fn build_url_from_query_pairs(path: &str, query_pairs: &[(String, String)]) -> String {
+	let query = form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+		.finish();
+	if query.is_empty() {
+		path.to_string()
+	} else {
+		format!("{path}?{query}")
+	}
+}
+
+fn current_url_parts(url: &str) -> (&str, &str) {
+	url.split_once('?').unwrap_or((url, ""))
+}
+
+fn is_video_length_sort(sort: &str) -> bool {
+	sort == "video-length"
+}
+
+fn sort_option_label(method: &str) -> String {
+	match method {
+		"video-length" => "Video Length".to_string(),
+		_ => format!("{}{}", method.get(0..1).unwrap_or_default().to_uppercase(), method.get(1..).unwrap_or_default()),
+	}
+}
+
+fn listing_sort_path(base_path: &str, method: &str) -> String {
+	if base_path.is_empty() || base_path == "/" {
+		format!("/{method}")
+	} else {
+		format!("{base_path}/{method}")
+	}
+}
+
+fn empty_video_mode_sidebar() -> video_mode::VideoModeSidebarData {
+	video_mode::VideoModeSidebarData::default()
+}
+
+fn build_video_mode_sidebar(url: &str, listing: &video_mode::VideoModeListing, page_posts: &[Post]) -> video_mode::VideoModeSidebarData {
+	let (path, query) = current_url_parts(url);
+	let mut hidden_query_pairs = video_mode::query_pairs(query);
+	video_mode::strip_video_query_pairs(&mut hidden_query_pairs);
+	hidden_query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after" && key != FRONT_CURSOR_PARAM && key != FEED_SESSION_PARAM);
+
+	video_mode::VideoModeSidebarData {
+		action_url: path.to_string(),
+		clear_url: build_url_from_query_pairs(path, &hidden_query_pairs),
+		hidden_query_pairs,
+		subreddit_options: video_mode::sort_options_by_page_count(&listing.subreddit_options, page_posts, |post| post.community.clone()),
+		user_options: video_mode::sort_options_by_page_count(&listing.user_options, page_posts, |post| post.author.name.clone()),
+		clear_subreddits: !listing.subreddit_options.is_empty() && listing.subreddit_options.iter().all(|option| !option.active),
+		clear_users: !listing.user_options.is_empty() && listing.user_options.iter().all(|option| !option.active),
+		age_min_hours: listing.age_min_hours,
+		age_max_hours: listing.age_max_hours,
+		age_bound_hours: listing.age_bound_hours,
+	}
+}
+
+fn video_mode_page_url(current_url: &str, page: usize, query: &video_mode::VideoModeQuery) -> String {
+	let (path, raw_query) = current_url_parts(current_url);
+	let mut query_pairs = video_mode::query_pairs(raw_query);
+	query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after" && key != FRONT_CURSOR_PARAM && key != FEED_SESSION_PARAM);
+	video_mode::strip_video_query_pairs(&mut query_pairs);
+	video_mode::append_query_pairs(&mut query_pairs, query);
+	if page > 0 {
+		query_pairs.push(("cache_page".to_string(), page.to_string()));
+	}
+	build_url_from_query_pairs(path, &query_pairs)
+}
+
 fn filter_posts_by_flair(posts: &mut Vec<Post>, flair: &str) {
 	let flair = flair.trim();
 	if flair.is_empty() {
@@ -672,24 +750,28 @@ fn render_scraped_subreddit_fragment(
 		feed_fragment_url: String::new(),
 		show_contextual_pagination: false,
 		contextual_pagination: Vec::new(),
+		video_mode_enabled: false,
+		video_mode_sidebar: empty_video_mode_sidebar(),
 	})
 }
 
 fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
-	["hot", "new", "top", "rising", "controversial"]
+	let (_, query) = current_url_parts(current_query_url);
+	["hot", "new", "top", "rising", "controversial", "video-length"]
 		.into_iter()
 		.map(|method| SortOption {
-			label: format!("{}{}", method.get(0..1).unwrap_or_default().to_uppercase(), method.get(1..).unwrap_or_default()),
-			url: update_url_query(
-				&format!("{base_path}/{method}"),
-				&[
-					("flair", (!flair_filter.is_empty()).then_some(flair_filter)),
-					("t", param(current_query_url, "t").as_deref()),
-					(FRONT_CURSOR_PARAM, None),
-					("before", None),
-					("after", None),
-				],
-			),
+			label: sort_option_label(method),
+			url: {
+				let mut query_pairs = video_mode::query_pairs(query);
+				query_pairs.retain(|(key, _)| key != "before" && key != "after" && key != FRONT_CURSOR_PARAM && key != "cache_page" && key != FEED_SESSION_PARAM);
+				if method != "video-length" || !is_video_length_sort(selected_sort) {
+					video_mode::strip_video_query_pairs(&mut query_pairs);
+				}
+				if flair_filter.is_empty() {
+					query_pairs.retain(|(key, _)| key != "flair");
+				}
+				build_url_from_query_pairs(&listing_sort_path(base_path, method), &query_pairs)
+			},
 			selected: method == selected_sort,
 		})
 		.collect()
@@ -713,6 +795,138 @@ fn build_flair_filters(current_url: &str, active_flair_filter: &str, flairs: Vec
 
 fn encode_query_value(value: &str) -> String {
 	form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn normalized_video_mode_query(query: &video_mode::VideoModeQuery, listing: &video_mode::VideoModeListing) -> video_mode::VideoModeQuery {
+	video_mode::VideoModeQuery {
+		selected_subreddits: video_mode::normalize_selected_values(&query.selected_subreddits, &listing.subreddit_options),
+		selected_users: video_mode::normalize_selected_values(&query.selected_users, &listing.user_options),
+		clear_subreddits: video_mode::normalize_clear_flag(query.clear_subreddits, &query.selected_subreddits, &listing.subreddit_options),
+		clear_users: video_mode::normalize_clear_flag(query.clear_users, &query.selected_users, &listing.user_options),
+		age_min_hours: listing.age_min_hours,
+		age_max_hours: Some(listing.age_max_hours),
+	}
+}
+
+fn paginate_posts(posts: &[Post], page: usize, per_page: usize) -> (Vec<Post>, bool, bool) {
+	let start = page.saturating_mul(per_page);
+	if start >= posts.len() {
+		return (Vec::new(), page > 0, false);
+	}
+	let end = (start + per_page).min(posts.len());
+	(posts[start..end].to_vec(), page > 0, end < posts.len())
+}
+
+fn video_mode_visibility_counts(posts: &[Post], filters: &HashSet<String>, now_unix: u64) -> (usize, usize) {
+	let eligible = posts
+		.iter()
+		.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+		.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
+		.filter(|post| video_mode::is_video_post(post))
+		.count();
+	let eligible_with_timestamp = posts
+		.iter()
+		.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+		.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
+		.filter(|post| video_mode::is_video_post(post))
+		.filter(|post| now_unix >= post.created_ts)
+		.count();
+	(eligible, eligible_with_timestamp)
+}
+
+fn collect_cached_source_posts(sources: &[FeedSource]) -> Vec<Post> {
+	let mut posts = Vec::new();
+	for source in sources {
+		if let Some(mut cached_posts) = crate::post_cache::servable_cached_source_posts(source) {
+			posts.append(&mut cached_posts);
+		}
+	}
+	posts
+}
+
+async fn cached_or_live_new_subreddit_posts(subreddit: &str, quarantined: bool) -> Result<Vec<Post>, String> {
+	let source = FeedSource::subreddit(subreddit.to_string(), FeedSort::New);
+	if let Some(posts) = crate::post_cache::servable_cached_source_posts(&source) {
+		return Ok(posts);
+	}
+
+	let path = format!("/r/{}/new.json?limit={}&raw_json=1", subreddit.replace('+', "%2B"), crate::post_cache::per_source_limit());
+	let (posts, after) = Post::fetch(&path, quarantined).await?;
+	crate::post_cache::publish_plain_subreddit_refresh(subreddit, posts.clone(), after, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+	Ok(posts)
+}
+
+fn render_video_mode_subreddit_fragment(
+	req: &Request<Body>,
+	sub: Subreddit,
+	source_posts: Vec<Post>,
+	top_users: Vec<SubredditUserEntry>,
+	sort: String,
+	sort_options: Vec<SortOption>,
+	flair_filters: Vec<FlairFilterOption>,
+	active_flair_filter: String,
+	url: String,
+	redirect_url: String,
+	is_flair_subscribed: bool,
+	filters: &HashSet<String>,
+	cache_page: usize,
+	cache_notice: String,
+) -> Result<Response<Body>, String> {
+	let query = req.uri().query().unwrap_or_default();
+	let parsed_query = video_mode::parse_query(query);
+	let listing = video_mode::build_listing(&source_posts, filters, &parsed_query, now_unix());
+	let normalized_query = normalized_video_mode_query(&parsed_query, &listing);
+	let (page_posts, has_prev, has_next) = paginate_posts(&listing.posts, cache_page, crate::post_cache::POSTS_PER_PAGE);
+	let prefs = Preferences::new(req);
+	let no_posts = listing.posts.is_empty();
+	let all_posts_hidden_nsfw = !page_posts.is_empty() && (page_posts.iter().all(|p| p.flags.nsfw) && setting(req, "show_nsfw") != "on");
+	let (eligible_videos, _) = video_mode_visibility_counts(&source_posts, filters, now_unix());
+	let all_posts_filtered = eligible_videos > 0 && listing.posts.is_empty();
+	let mut page_posts = page_posts;
+	utils::hydrate_post_author_links_from_cache(&mut page_posts);
+	let video_mode_sidebar = build_video_mode_sidebar(&url, &listing, &page_posts);
+
+	render_subreddit_fragment(SubredditFragmentTemplate {
+		sub,
+		posts: page_posts,
+		top_users,
+		sort: (sort, String::new()),
+		sort_options,
+		flair_filters,
+		active_flair_filter: active_flair_filter.clone(),
+		active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+		clear_flair_filter_url: update_url_query(
+			&url,
+			&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+		),
+		prev_page_url: if has_prev {
+			video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query)
+		} else {
+			String::new()
+		},
+		next_page_url: if has_next {
+			video_mode_page_url(&url, cache_page + 1, &normalized_query)
+		} else {
+			String::new()
+		},
+		prefs,
+		url: url.clone(),
+		redirect_url,
+		enable_duplicate_collapse: true,
+		is_filtered: false,
+		all_posts_filtered,
+		all_posts_hidden_nsfw,
+		no_posts,
+		cache_notice,
+		is_flair_subscribed,
+		feed_session_id: String::new(),
+		feed_status_url: String::new(),
+		feed_fragment_url: String::new(),
+		show_contextual_pagination: false,
+		contextual_pagination: Vec::new(),
+		video_mode_enabled: true,
+		video_mode_sidebar,
+	})
 }
 
 fn subreddit_listing_query(query: &str, include_geo_filter: bool) -> String {
@@ -786,12 +1000,7 @@ fn saved_feeds(preferences: &Preferences) -> Vec<SavedFeed> {
 }
 
 fn build_feed_sources(preferences: &Preferences, sort: FeedSort) -> Vec<FeedSource> {
-	let mut sources = preferences
-		.subscriptions
-		.iter()
-		.cloned()
-		.map(|name| FeedSource::subreddit(name, sort))
-		.collect::<Vec<_>>();
+	let mut sources = preferences.subscriptions.iter().cloned().map(|name| FeedSource::subreddit(name, sort)).collect::<Vec<_>>();
 
 	sources.extend(
 		preferences
@@ -896,33 +1105,7 @@ fn feed_page_url(current_url: &str, session_id: &str, page: usize) -> String {
 }
 
 fn now_unix() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.map(|duration| duration.as_secs())
-		.unwrap_or_default()
-}
-
-fn representative_age_secs(posts: &[Post], now_unix: u64) -> Option<u64> {
-	let mut created = posts.iter().map(|post| post.created_ts).filter(|ts| *ts > 0).collect::<Vec<_>>();
-	if created.is_empty() {
-		return None;
-	}
-	created.sort_unstable();
-	let median = created[created.len() / 2];
-	Some(now_unix.saturating_sub(median))
-}
-
-fn representative_hot_score(posts: &[Post]) -> Option<i64> {
-	let mut scores = posts
-		.iter()
-		.filter(|post| !post.flags.stickied)
-		.filter_map(|post| post.score.1.parse::<i64>().ok())
-		.collect::<Vec<_>>();
-	if scores.len() < 3 {
-		return None;
-	}
-	scores.sort_unstable();
-	Some(scores[scores.len() / 2])
+	SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_secs()).unwrap_or_default()
 }
 
 fn approximate_age_label(age_secs: u64) -> String {
@@ -936,11 +1119,7 @@ fn approximate_age_label(age_secs: u64) -> String {
 		(14 * 24 * 60 * 60, "~14d"),
 		(30 * 24 * 60 * 60, "~30d"),
 	];
-	let (.., label) = BUCKETS
-		.iter()
-		.min_by_key(|(bucket, _)| age_secs.abs_diff(*bucket))
-		.copied()
-		.unwrap_or((60 * 60, "~1h"));
+	let (.., label) = BUCKETS.iter().min_by_key(|(bucket, _)| age_secs.abs_diff(*bucket)).copied().unwrap_or((60 * 60, "~1h"));
 	label.to_string()
 }
 
@@ -956,46 +1135,59 @@ fn approximate_hot_score_label(score: i64) -> String {
 	format!("~{}", format_num(round_hot_score_anchor(score)).0)
 }
 
+fn limit_contextual_links(mut links: Vec<ContextualPageLink>) -> Vec<ContextualPageLink> {
+	if links.len() <= CONTEXTUAL_PAGINATION_MAX_LINKS {
+		return links;
+	}
+
+	let current_index = links.iter().position(|link| link.current).unwrap_or(0);
+	let half_window = CONTEXTUAL_PAGINATION_MAX_LINKS / 2;
+	let mut start = current_index.saturating_sub(half_window);
+	let end = (start + CONTEXTUAL_PAGINATION_MAX_LINKS).min(links.len());
+	start = end.saturating_sub(CONTEXTUAL_PAGINATION_MAX_LINKS);
+	links.drain(..start);
+	links.truncate(end - start);
+	links
+}
+
+fn should_replace_contextual_label(current_page: usize, existing_page: usize, candidate_page: usize) -> bool {
+	let existing_distance = existing_page.abs_diff(current_page);
+	let candidate_distance = candidate_page.abs_diff(current_page);
+	candidate_distance < existing_distance || (candidate_distance == existing_distance && candidate_page == current_page)
+}
+
 fn build_contextual_pagination(current_url: &str, session_id: &str, current_page: usize, sort: &str) -> Vec<ContextualPageLink> {
 	if !matches!(sort, "new" | "hot") {
 		return Vec::new();
 	}
 
-	let mut ready_pages = Vec::new();
-	let mut posts_inspected = 0usize;
-	let mut page_index = current_page;
-	while ready_pages.len() < 4 && posts_inspected < 100 {
-		let Some(page) = crate::post_cache::feed_page(session_id, page_index, crate::post_cache::POSTS_PER_PAGE) else {
-			break;
-		};
-		if !page.ready {
-			break;
-		}
-		posts_inspected += page.posts.len();
-		ready_pages.push((page_index, page.posts));
-		page_index += 1;
-	}
-
-	if ready_pages.len() < 3 {
+	let Some(page_metrics) = crate::post_cache::feed_session_page_metrics(session_id, crate::post_cache::POSTS_PER_PAGE) else {
+		return Vec::new();
+	};
+	if page_metrics.len() < 3 {
 		return Vec::new();
 	}
 
 	let now = now_unix();
-	let mut links = Vec::new();
-	let mut seen_labels = HashSet::new();
-	for (page, posts) in ready_pages {
+	let mut links_by_label = HashMap::new();
+	for metric in page_metrics {
+		if !metric.full_page && !metric.ready && metric.page != current_page {
+			continue;
+		}
+
 		let (label, title) = match sort {
 			"new" => {
-				let Some(age_secs) = representative_age_secs(&posts, now) else {
+				let Some(created_ts) = metric.representative_created_ts else {
 					continue;
 				};
+				let age_secs = now.saturating_sub(created_ts);
 				(
 					approximate_age_label(age_secs),
 					format!("Jump to posts around {}", approximate_age_label(age_secs).trim_start_matches('~')),
 				)
 			}
 			"hot" => {
-				let Some(score) = representative_hot_score(&posts) else {
+				let Some(score) = metric.representative_score else {
 					continue;
 				};
 				let label = approximate_hot_score_label(score);
@@ -1004,25 +1196,29 @@ fn build_contextual_pagination(current_url: &str, session_id: &str, current_page
 			_ => continue,
 		};
 
-		if !seen_labels.insert(label.clone()) {
-			continue;
-		}
-
-		links.push(ContextualPageLink {
-			label,
-			url: feed_page_url(current_url, session_id, page),
-			current: page == current_page,
+		let link = ContextualPageLink {
+			label: label.clone(),
+			url: feed_page_url(current_url, session_id, metric.page),
+			current: metric.page == current_page,
 			title,
-		});
+		};
+		match links_by_label.get(&label) {
+			Some((existing_page, _)) if !should_replace_contextual_label(current_page, *existing_page, metric.page) => {}
+			_ => {
+				links_by_label.insert(label, (metric.page, link));
+			}
+		}
 	}
 
+	let mut links = links_by_label.into_values().collect::<Vec<_>>();
+	links.sort_by_key(|(page, _)| *page);
+	let links = links.into_iter().map(|(_, link)| link).collect::<Vec<_>>();
 	let non_current = links.iter().filter(|link| !link.current).count();
 	if non_current < 2 {
 		return Vec::new();
 	}
 
-	links.truncate(5);
-	links
+	limit_contextual_links(links)
 }
 
 fn encode_front_cursor(cursor: &AggregateFrontCursor) -> Option<String> {
@@ -1279,8 +1475,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
+	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
 
-	let sub_name = req.param("sub").unwrap_or(if front_page_is_default {
+	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
+		String::new()
+	} else if front_page_is_default {
 		if has_saved_feeds {
 			subscribed.clone()
 		} else {
@@ -1290,7 +1489,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		front_page.clone()
 	});
 
-	if (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
+	if !video_mode_front_page && (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
 		if !has_saved_feeds {
 			return info(req, "Subscribe to some subreddits! (Default feeds disabled in settings)").await;
 		} else {
@@ -1314,7 +1513,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
 	let contextual_front_page = front_page_uses_contextual_session(req.param("sub").is_some(), &sort);
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
-	let loading_message = if contextual_front_page {
+	let loading_message = if is_video_length_sort(&sort) {
+		"Loading videos...".to_string()
+	} else if contextual_front_page {
 		live_feed_shell_loading_message(&req, &prefs, front_page_is_default, has_saved_feeds, &sub_name, &sort)
 			.await
 			.unwrap_or_else(|| "Loading followed feeds in the background.".to_string())
@@ -1352,6 +1553,25 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			.flair_subscriptions
 			.iter()
 			.any(|subscription| subscription.subreddit == cached_sub.name && subscription.flair == active_flair_filter);
+	let video_mode_sidebar = if is_video_length_sort(&sort) {
+		let source_posts = if req.param("sub").is_some() {
+			let mut cached_posts = crate::post_cache::servable_cached_source_posts(&FeedSource::subreddit(sub_name.clone(), FeedSort::New)).unwrap_or_default();
+			filter_posts_by_flair(&mut cached_posts, &active_flair_filter);
+			cached_posts
+		} else {
+			collect_cached_source_posts(&build_feed_sources(&prefs, FeedSort::New))
+		};
+		let listing = video_mode::build_listing(
+			&source_posts,
+			&get_filters(&req),
+			&video_mode::parse_query(req.uri().query().unwrap_or_default()),
+			now_unix(),
+		);
+		let preview_posts = listing.posts.iter().take(crate::post_cache::POSTS_PER_PAGE).cloned().collect::<Vec<_>>();
+		build_video_mode_sidebar(&url, &listing, &preview_posts)
+	} else {
+		empty_video_mode_sidebar()
+	};
 
 	Ok(template(&SubredditShellTemplate {
 		sub: cached_sub,
@@ -1368,6 +1588,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		fragment_url: subreddit_fragment_path(&req),
 		loading_message,
 		placeholder_message,
+		replace_selector: if is_video_length_sort(&sort) { "main".to_string() } else { "#column_one".to_string() },
+		video_mode_enabled: is_video_length_sort(&sort),
+		video_mode_sidebar,
 	}))
 }
 
@@ -1383,8 +1606,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
 	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
+	let video_mode_front_page = !is_subreddit_route && is_video_length_sort(&sort);
 
-	let sub_name = req.param("sub").unwrap_or(if front_page_is_default {
+	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
+		String::new()
+	} else if front_page_is_default {
 		if has_saved_feeds {
 			subscribed.clone()
 		} else {
@@ -1394,7 +1620,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		front_page.clone()
 	});
 
-	if (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
+	if !video_mode_front_page && (sub_name == "popular" || sub_name == "all") && remove_default_feeds {
 		if !has_saved_feeds {
 			return info(req, "Subscribe to some subreddits! (Default feeds disabled in settings)").await;
 		} else {
@@ -1650,7 +1876,36 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			feed_fragment_url: String::new(),
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: empty_video_mode_sidebar(),
 		})
+	} else if is_video_length_sort(&sort) {
+		let source_posts = if is_subreddit_route && is_single_sub {
+			let mut posts = cached_or_live_new_subreddit_posts(&sub_name, quarantined).await?;
+			filter_posts_by_flair(&mut posts, &active_flair_filter);
+			posts
+		} else if !is_subreddit_route {
+			collect_cached_source_posts(&build_feed_sources(&prefs, FeedSort::New))
+		} else {
+			Vec::new()
+		};
+
+		render_video_mode_subreddit_fragment(
+			&req,
+			sub,
+			source_posts,
+			top_users,
+			sort,
+			sort_options,
+			flair_filters,
+			active_flair_filter,
+			url,
+			redirect_url,
+			is_flair_subscribed,
+			&filters,
+			cache_page,
+			String::new(),
+		)
 	} else if contextual_front_page {
 		let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
 			.and_then(|p| p.parse::<usize>().ok())
@@ -1725,11 +1980,12 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
 				show_contextual_pagination: !contextual_pagination.is_empty(),
 				contextual_pagination,
+				video_mode_enabled: false,
+				video_mode_sidebar: empty_video_mode_sidebar(),
 			});
 		}
 		return error(req, "Feed session not found or expired").await;
 	} else if aggregate_saved_feeds {
-
 		let query_fingerprint = listing_query_fingerprint(&query);
 		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
 			.and_then(|encoded| decode_front_cursor(&encoded))
@@ -1787,6 +2043,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					feed_fragment_url: String::new(),
 					show_contextual_pagination: false,
 					contextual_pagination: Vec::new(),
+					video_mode_enabled: false,
+					video_mode_sidebar: empty_video_mode_sidebar(),
 				})
 			}
 			Err(msg) => error(req, &msg).await,
@@ -1845,6 +2103,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				feed_fragment_url: String::new(),
 				show_contextual_pagination: false,
 				contextual_pagination: Vec::new(),
+				video_mode_enabled: false,
+				video_mode_sidebar: empty_video_mode_sidebar(),
 			});
 
 			// Fall through to normal fetch if not cached.
@@ -1937,6 +2197,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					feed_fragment_url: String::new(),
 					show_contextual_pagination: false,
 					contextual_pagination: Vec::new(),
+					video_mode_enabled: false,
+					video_mode_sidebar: empty_video_mode_sidebar(),
 				})
 			}
 			Err(msg) => {
@@ -1998,6 +2260,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								feed_fragment_url: String::new(),
 								show_contextual_pagination: false,
 								contextual_pagination: Vec::new(),
+								video_mode_enabled: false,
+								video_mode_sidebar: empty_video_mode_sidebar(),
 							});
 						}
 					}
@@ -2180,6 +2444,8 @@ mod tests {
 			feed_fragment_url: String::new(),
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2223,6 +2489,8 @@ mod tests {
 			feed_fragment_url: String::new(),
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2252,6 +2520,9 @@ mod tests {
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2260,6 +2531,68 @@ mod tests {
 		assert!(html.contains("data-error-message=\"Loading posts is taking longer than expected.\""));
 		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading posts..."));
+	}
+
+	#[test]
+	fn subreddit_video_length_shell_uses_canonical_reddit_target() {
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit {
+				name: "videos".to_string(),
+				..Default::default()
+			},
+			top_users: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
+			prefs: test_prefs(),
+			url: "/r/videos/video-length".to_string(),
+			redirect_url: "r/videos/video-length".to_string(),
+			is_filtered: false,
+			is_flair_subscribed: false,
+			fragment_url: "/subreddit-fragment/r/videos/video-length".to_string(),
+			loading_message: "Loading videos...".to_string(),
+			placeholder_message: "Loading videos...".to_string(),
+			replace_selector: "main".to_string(),
+			video_mode_enabled: true,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("https://www.reddit.com/r/videos/new"));
+		assert!(!html.contains("https://www.reddit.com/r/videos/video-length"));
+	}
+
+	#[test]
+	fn subreddit_video_mode_uses_reddit_new_as_external_fallback() {
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit {
+				name: "videos".to_string(),
+				..Default::default()
+			},
+			top_users: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
+			prefs: test_prefs(),
+			url: "/r/videos/video-length".to_string(),
+			redirect_url: "r/videos/video-length".to_string(),
+			is_filtered: false,
+			is_flair_subscribed: false,
+			fragment_url: "/subreddit-fragment/r/videos/video-length".to_string(),
+			loading_message: "Loading videos...".to_string(),
+			placeholder_message: "Loading videos...".to_string(),
+			replace_selector: "main".to_string(),
+			video_mode_enabled: true,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("https://www.reddit.com/r/videos/new"));
+		assert!(!html.contains("https://www.reddit.com/r/videos/video-length"));
 	}
 
 	#[test]
@@ -2282,6 +2615,9 @@ mod tests {
 			fragment_url: "/subreddit-fragment".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2311,6 +2647,9 @@ mod tests {
 			fragment_url: "/subreddit-fragment/new".to_string(),
 			loading_message: loading_message.clone(),
 			placeholder_message: "Loading posts...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2344,6 +2683,9 @@ mod tests {
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2408,6 +2750,8 @@ mod tests {
 			feed_fragment_url: "/feed-fragment?feed_session=demo".to_string(),
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2450,6 +2794,8 @@ mod tests {
 			feed_fragment_url: String::new(),
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2499,6 +2845,8 @@ mod tests {
 					title: "Jump to posts around 500 score".to_string(),
 				},
 			],
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -2524,7 +2872,13 @@ mod tests {
 			posts.push(metric_post(&format!("new-c-{index}"), "contextual-new-test", now - 36 * 3_600 - index * 600, 90, false));
 		}
 		for index in 0..25 {
-			posts.push(metric_post(&format!("new-d-{index}"), "contextual-new-test", now - 7 * 24 * 3_600 - index * 3_600, 85, false));
+			posts.push(metric_post(
+				&format!("new-d-{index}"),
+				"contextual-new-test",
+				now - 7 * 24 * 3_600 - index * 3_600,
+				85,
+				false,
+			));
 		}
 
 		let session_id = seed_contextual_session(source, posts, "contextual-new-fingerprint").await;
@@ -2542,10 +2896,22 @@ mod tests {
 		let source = FeedSource::subreddit("contextual-hot-test", FeedSort::Hot);
 		let mut posts = Vec::new();
 		for index in 0..25 {
-			posts.push(metric_post(&format!("hot-a-{index}"), "contextual-hot-test", 1_000 - index as u64, 5_000 - index as i64 * 10, false));
+			posts.push(metric_post(
+				&format!("hot-a-{index}"),
+				"contextual-hot-test",
+				1_000 - index as u64,
+				5_000 - index as i64 * 10,
+				false,
+			));
 		}
 		for index in 0..25 {
-			posts.push(metric_post(&format!("hot-b-{index}"), "contextual-hot-test", 900 - index as u64, 700 - index as i64 * 5, false));
+			posts.push(metric_post(
+				&format!("hot-b-{index}"),
+				"contextual-hot-test",
+				900 - index as u64,
+				700 - index as i64 * 5,
+				false,
+			));
 		}
 		for index in 0..25 {
 			posts.push(metric_post(&format!("hot-c-{index}"), "contextual-hot-test", 800 - index as u64, 80 - index as i64, false));
@@ -2567,6 +2933,62 @@ mod tests {
 			.collect::<Vec<_>>();
 		let hidden_session = seed_contextual_session(hidden_source, hidden_posts, "contextual-hot-hidden-fingerprint").await;
 		assert!(super::build_contextual_pagination("/hot", &hidden_session, 0, "hot").is_empty());
+	}
+
+	#[tokio::test]
+	async fn contextual_pagination_for_later_pages_uses_surrounding_ready_pages() {
+		let now = super::now_unix();
+		let source = FeedSource::subreddit("contextual-window-test", FeedSort::New);
+		let mut posts = Vec::new();
+		let page_ages = [60 * 60, 3 * 60 * 60, 8 * 60 * 60, 24 * 60 * 60, 3 * 24 * 60 * 60, 7 * 24 * 60 * 60];
+
+		for (page_index, age_secs) in page_ages.into_iter().enumerate() {
+			for post_index in 0..25 {
+				posts.push(metric_post(
+					&format!("window-{page_index}-{post_index}"),
+					"contextual-window-test",
+					now - age_secs - post_index * 60,
+					100 - page_index as i64,
+					false,
+				));
+			}
+		}
+
+		let session_id = seed_contextual_session(source, posts, "contextual-window-fingerprint").await;
+		let links = super::build_contextual_pagination("/new", &session_id, 3, "new");
+
+		assert!(links.len() >= 5);
+		assert!(links.iter().any(|link| link.current));
+		assert!(links.iter().any(|link| link.url.contains("cache_page=1")));
+		assert!(links.iter().any(|link| link.url.contains("cache_page=4")));
+	}
+
+	#[tokio::test]
+	async fn contextual_pagination_for_front_page_uses_all_cached_pages() {
+		let now = super::now_unix();
+		let source = FeedSource::subreddit("contextual-front-window-test", FeedSort::New);
+		let mut posts = Vec::new();
+		let page_ages = [60 * 60, 3 * 60 * 60, 8 * 60 * 60, 24 * 60 * 60, 3 * 24 * 60 * 60, 7 * 24 * 60 * 60];
+
+		for (page_index, age_secs) in page_ages.into_iter().enumerate() {
+			for post_index in 0..25 {
+				posts.push(metric_post(
+					&format!("front-window-{page_index}-{post_index}"),
+					"contextual-front-window-test",
+					now - age_secs - post_index * 60,
+					100 - page_index as i64,
+					false,
+				));
+			}
+		}
+
+		let session_id = seed_contextual_session(source, posts, "contextual-front-window-fingerprint").await;
+		let links = super::build_contextual_pagination("/new", &session_id, 0, "new");
+
+		assert!(links.len() >= 5);
+		assert!(links.iter().any(|link| link.current));
+		assert!(links.iter().any(|link| link.url.contains("cache_page=4")));
+		assert!(links.iter().any(|link| link.url.contains("cache_page=5")));
 	}
 
 	#[test]
@@ -2644,6 +3066,60 @@ mod tests {
 		assert_eq!(top.url, "/top?t=day");
 		assert_eq!(rising.url, "/rising?t=day");
 		assert_eq!(controversial.url, "/controversial?t=day");
+	}
+
+	#[test]
+	fn video_length_sort_option_uses_human_label_and_clears_stale_filters_when_entering_mode() {
+		let options = super::build_sort_options(
+			"/r/rust",
+			"/r/rust/hot?video_sub=rust&video_user=alice&video_age_min_hours=4&video_age_max_hours=48&cache_page=2&t=day",
+			"hot",
+			"",
+		);
+		let video_length = options.iter().find(|option| option.label == "Video Length").unwrap();
+
+		assert_eq!(video_length.url, "/r/rust/video-length?t=day");
+	}
+
+	#[test]
+	fn video_length_sort_links_preserve_filters_within_video_mode_only() {
+		let options = super::build_sort_options(
+			"/r/rust",
+			"/r/rust/video-length?video_sub=rust&video_user=alice&video_age_min_hours=4&video_age_max_hours=48&cache_page=2&t=day",
+			"video-length",
+			"",
+		);
+		let video_length = options.iter().find(|option| option.label == "Video Length").unwrap();
+		let hot = options.iter().find(|option| option.label == "Hot").unwrap();
+
+		assert_eq!(
+			video_length.url,
+			"/r/rust/video-length?video_sub=rust&video_user=alice&video_age_min_hours=4&video_age_max_hours=48&t=day"
+		);
+		assert_eq!(hot.url, "/r/rust/hot?t=day");
+	}
+
+	#[test]
+	fn video_mode_sidebar_clear_url_strips_video_filters_and_pagination() {
+		let sidebar = super::build_video_mode_sidebar(
+			"/video-length?video_sub=rust&video_user=alice&video_age_min_hours=4&video_age_max_hours=48&cache_page=2&t=day&flair=News",
+			&crate::video_mode::VideoModeListing {
+				posts: Vec::new(),
+				subreddit_options: Vec::new(),
+				user_options: Vec::new(),
+				age_min_hours: 4,
+				age_max_hours: 48,
+				age_bound_hours: 72,
+			},
+			&[],
+		);
+
+		assert_eq!(sidebar.action_url, "/video-length");
+		assert_eq!(sidebar.clear_url, "/video-length?t=day&flair=News");
+		assert_eq!(
+			sidebar.hidden_query_pairs,
+			vec![("t".to_string(), "day".to_string()), ("flair".to_string(), "News".to_string())]
+		);
 	}
 
 	#[test]
@@ -3155,9 +3631,7 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	};
 	let no_posts = page_ready && feed_page.posts.is_empty();
 	let all_posts_hidden_nsfw = !no_posts && (feed_page.posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-	let session_sort = crate::post_cache::feed_session_sort(&session_id)
-		.map(|sort| sort.as_str().to_string())
-		.unwrap_or_default();
+	let session_sort = crate::post_cache::feed_session_sort(&session_id).map(|sort| sort.as_str().to_string()).unwrap_or_default();
 	let contextual_pagination = build_contextual_pagination(&current_url, &session_id, page, &session_sort);
 
 	render_feed_fragment(FeedFragmentTemplate {

@@ -19,7 +19,7 @@
     <div
         id="page_fragment"
         data-fragment-url="{{ fragment_url }}"
-        data-replace-selector="#column_one"
+        data-replace-selector="{{ replace_selector }}"
         data-loading-message="{{ loading_message }}"
         data-error-message="Loading the user page is taking longer than expected."
         data-timeout-ms="20000">
@@ -31,8 +31,6 @@
         </main>
     </div>
     {% else %}
-    <main>
-        {% include "user_fragment.html" %}
-    </main>
+    {% include "user_fragment.html" %}
     {% endif %}
 {% endblock %}

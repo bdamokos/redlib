@@ -1,8 +1,9 @@
-{% if is_filtered || (!sub.name.is_empty() && !str_eq(sub.name, "all") && !str_eq(sub.name, "popular") && !sub.name.contains("+")) && !str_eq(prefs.hide_sidebar_and_summary, "on") %}
+{% if (is_filtered || video_mode_enabled || (!sub.name.is_empty() && !str_eq(sub.name, "all") && !str_eq(sub.name, "popular") && !sub.name.contains("+"))) && !str_eq(prefs.hide_sidebar_and_summary, "on") %}
 <aside>
 	{% if is_filtered %}
 		<center>(Content from r/{{ sub.name }} has been filtered)</center>
 	{% endif %}
+	{% include "video_mode_sidebar.html" %}
 	{% if !sub.name.is_empty() && !str_eq(sub.name, "all") && !str_eq(sub.name, "popular") && !sub.name.contains("+") %}
 	<details class="panel" id="subreddit" open>
 		<summary id="subreddit_label">Subreddit</summary>

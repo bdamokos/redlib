@@ -1,0 +1,72 @@
+{% if video_mode_enabled %}
+<details class="panel video_mode_sidebar" id="video_mode" open>
+	<summary>Video Filters</summary>
+	<div class="video_mode_sidebar_inner">
+		<form action="{{ video_mode_sidebar.action_url }}" method="GET" class="video_mode_filter_form">
+			{% for pair in video_mode_sidebar.hidden_query_pairs %}
+			<input type="hidden" name="{{ pair.0 }}" value="{{ pair.1 }}">
+			{% endfor %}
+
+			{% if video_mode_sidebar.subreddit_options.len() > 1 %}
+			<div class="video_mode_filter_group">
+				<div class="video_mode_filter_group_header">
+					<label>Subreddits</label>
+					<div class="video_mode_filter_bulk_actions">
+						<button type="button" data-video-filter-toggle="clear" data-video-filter-target="video_sub">Clear all</button>
+						<button type="button" data-video-filter-toggle="check" data-video-filter-target="video_sub">Check all</button>
+					</div>
+				</div>
+				<input type="hidden" name="video_sub_mode" value="{% if video_mode_sidebar.clear_subreddits %}none{% endif %}" data-video-filter-mode="video_sub">
+				<div class="video_mode_filter_list">
+					{% for option in video_mode_sidebar.subreddit_options %}
+					<label class="video_mode_filter_option">
+						<input type="checkbox" name="video_sub" value="{{ option.name }}" {% if option.active %}checked{% endif %}>
+						<span>{{ option.name }}</span>
+						<span class="video_mode_filter_count">{{ option.count }}</span>
+					</label>
+					{% endfor %}
+				</div>
+			</div>
+			{% endif %}
+
+			{% if video_mode_sidebar.user_options.len() > 1 %}
+			<div class="video_mode_filter_group">
+				<div class="video_mode_filter_group_header">
+					<label>Users</label>
+					<div class="video_mode_filter_bulk_actions">
+						<button type="button" data-video-filter-toggle="clear" data-video-filter-target="video_user">Clear all</button>
+						<button type="button" data-video-filter-toggle="check" data-video-filter-target="video_user">Check all</button>
+					</div>
+				</div>
+				<input type="hidden" name="video_user_mode" value="{% if video_mode_sidebar.clear_users %}none{% endif %}" data-video-filter-mode="video_user">
+				<div class="video_mode_filter_list">
+					{% for option in video_mode_sidebar.user_options %}
+					<label class="video_mode_filter_option">
+						<input type="checkbox" name="video_user" value="{{ option.name }}" {% if option.active %}checked{% endif %}>
+						<span>u/{{ option.name }}</span>
+						<span class="video_mode_filter_count">{{ option.count }}</span>
+					</label>
+					{% endfor %}
+				</div>
+			</div>
+			{% endif %}
+
+			<div class="video_mode_filter_group">
+				<label>Post Age</label>
+				<div class="video_mode_age_values">
+					<span>{{ video_mode_sidebar.age_min_hours }}h</span>
+					<span>{{ video_mode_sidebar.age_max_hours }}h</span>
+				</div>
+				<input type="range" name="video_age_min_hours" min="0" max="{{ video_mode_sidebar.age_bound_hours }}" value="{{ video_mode_sidebar.age_min_hours }}">
+				<input type="range" name="video_age_max_hours" min="0" max="{{ video_mode_sidebar.age_bound_hours }}" value="{{ video_mode_sidebar.age_max_hours }}">
+				<div class="video_mode_age_hint">0h to {{ video_mode_sidebar.age_bound_hours }}h</div>
+			</div>
+
+			<div class="video_mode_filter_actions">
+				<button class="subscribe" type="submit">Apply</button>
+				<a href="{{ video_mode_sidebar.clear_url }}">Clear</a>
+			</div>
+		</form>
+	</div>
+</details>
+{% endif %}

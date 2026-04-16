@@ -539,7 +539,7 @@ async fn main() {
 		Box::pin(async move {
 			match req.param("id").as_deref() {
 				// Sort front page
-				Some("best" | "hot" | "new" | "top" | "rising" | "controversial") => subreddit::community(req).await,
+				Some("best" | "hot" | "new" | "top" | "rising" | "controversial" | "video-length") => subreddit::community(req).await,
 
 				// Short link for post
 				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {

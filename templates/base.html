@@ -36,6 +36,7 @@
 			<script src="/feed_status.js?v={{ env!("GIT_HASH") }}" defer></script>
 			<script src="/page_fragment.js?v={{ env!("GIT_HASH") }}" defer></script>
 			<script src="/video_preview_gallery.js?v={{ env!("GIT_HASH") }}" defer></script>
+			<script src="/video_mode_filters.js?v={{ env!("GIT_HASH") }}" defer></script>
 			<script src="/dynamic_content.js?v={{ env!("GIT_HASH") }}" defer></script>
 		<!-- Video quality -->
 		<div id="video_quality" data-value="{{ prefs.video_quality }}"></div>
@@ -57,7 +58,7 @@
 			</div>
 			{% block search %}{% endblock %}
 			<div id="links">
-				<a id="reddit_link" {% if !str_eq(prefs.disable_visit_reddit_confirmation, "on") %}href="#popup"{% else %}href="https://www.reddit.com{{ url }}" rel="nofollow"{% endif %}>
+				<a id="reddit_link" {% if !str_eq(prefs.disable_visit_reddit_confirmation, "on") %}href="#popup"{% else %}href="https://www.reddit.com{{ crate::utils::canonical_reddit_path(url) }}" rel="nofollow"{% endif %}>
 					<span>reddit</span>
 					<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M22 2L12 22"/>
@@ -65,7 +66,7 @@
 					</svg>
 				</a>
 				{% if !str_eq(prefs.disable_visit_reddit_confirmation, "on") %}
-					{% call utils::visit_reddit_confirmation(url) %}
+					{% call utils::visit_reddit_confirmation(crate::utils::canonical_reddit_path(url)) %}
 				{% endif %}
 				<a id="settings_link" href="/settings">
 					<span>settings</span>

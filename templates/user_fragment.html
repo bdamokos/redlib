@@ -1,11 +1,13 @@
 {% import "utils.html" as utils %}
 
+<main>
 {% if !is_filtered %}
 <div id="column_one">
     <form id="sort">
         <div id="listing_options">
-            {% call utils::sort(["/user/", user.name.as_str()].concat(), ["overview", "comments", "submitted"], listing) %}
+            {% call utils::sort(["/user/", user.name.as_str()].concat(), ["overview", "comments", "submitted", "videos"], listing) %}
         </div>
+        {% if !str_eq(listing, "videos") %}
         <select id="sort_select" name="sort">
             {% call utils::options(sort.0, ["hot", "new", "top", "controversial"], "") %}
         </select>
@@ -21,6 +23,7 @@
                 &rarr;
             </svg>
         </button>
+        {% endif %}
     </form>
 
     {% if all_posts_hidden_nsfw %}
@@ -67,3 +70,4 @@
 </div>
 {% endif %}
 {% include "user_sidebar.html" %}
+</main>

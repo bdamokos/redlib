@@ -6,7 +6,7 @@ use crate::instance_scrape;
 use crate::redgifs;
 use crate::server::RequestExt;
 use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
-use crate::{config, utils};
+use crate::{config, utils, video_mode};
 use askama::Template;
 use chrono::DateTime;
 use htmlescape::decode_html;
@@ -78,9 +78,12 @@ pub struct UserTemplate {
 	no_posts: bool,
 	shell_mode: bool,
 	fragment_url: String,
+	replace_selector: String,
 	prev_page_url: String,
 	next_page_url: String,
 	loading_message: String,
+	video_mode_enabled: bool,
+	video_mode_sidebar: video_mode::VideoModeSidebarData,
 }
 
 crate::impl_template_str_eq!(UserTemplate);
@@ -105,6 +108,8 @@ struct UserFragmentTemplate {
 	no_posts: bool,
 	prev_page_url: String,
 	next_page_url: String,
+	video_mode_enabled: bool,
+	video_mode_sidebar: video_mode::VideoModeSidebarData,
 }
 
 impl UserFragmentTemplate {
@@ -474,10 +479,80 @@ fn default_user_sort(req: &Request<Body>) -> String {
 	}
 }
 
+fn is_video_listing(listing: &str) -> bool {
+	listing == "videos"
+}
+
+fn current_url_parts(url: &str) -> (&str, &str) {
+	url.split_once('?').unwrap_or((url, ""))
+}
+
+fn build_url_from_query_pairs(path: &str, query_pairs: &[(String, String)]) -> String {
+	let query = form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+		.finish();
+	if query.is_empty() {
+		path.to_string()
+	} else {
+		format!("{path}?{query}")
+	}
+}
+
+fn now_unix() -> u64 {
+	OffsetDateTime::now_utc().unix_timestamp().max(0) as u64
+}
+
+fn empty_video_mode_sidebar() -> video_mode::VideoModeSidebarData {
+	video_mode::VideoModeSidebarData::default()
+}
+
+fn build_video_mode_sidebar(url: &str, listing: &video_mode::VideoModeListing, page_posts: &[Post]) -> video_mode::VideoModeSidebarData {
+	let (path, query) = current_url_parts(url);
+	let mut hidden_query_pairs = video_mode::query_pairs(query);
+	video_mode::strip_video_query_pairs(&mut hidden_query_pairs);
+	hidden_query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after");
+
+	video_mode::VideoModeSidebarData {
+		action_url: path.to_string(),
+		clear_url: build_url_from_query_pairs(path, &hidden_query_pairs),
+		hidden_query_pairs,
+		subreddit_options: video_mode::sort_options_by_page_count(&listing.subreddit_options, page_posts, |post| post.community.clone()),
+		user_options: video_mode::sort_options_by_page_count(&listing.user_options, page_posts, |post| post.author.name.clone()),
+		clear_subreddits: !listing.subreddit_options.is_empty() && listing.subreddit_options.iter().all(|option| !option.active),
+		clear_users: !listing.user_options.is_empty() && listing.user_options.iter().all(|option| !option.active),
+		age_min_hours: listing.age_min_hours,
+		age_max_hours: listing.age_max_hours,
+		age_bound_hours: listing.age_bound_hours,
+	}
+}
+
+fn normalized_video_mode_query(query: &video_mode::VideoModeQuery, listing: &video_mode::VideoModeListing) -> video_mode::VideoModeQuery {
+	video_mode::VideoModeQuery {
+		selected_subreddits: video_mode::normalize_selected_values(&query.selected_subreddits, &listing.subreddit_options),
+		selected_users: video_mode::normalize_selected_values(&query.selected_users, &listing.user_options),
+		clear_subreddits: video_mode::normalize_clear_flag(query.clear_subreddits, &query.selected_subreddits, &listing.subreddit_options),
+		clear_users: video_mode::normalize_clear_flag(query.clear_users, &query.selected_users, &listing.user_options),
+		age_min_hours: listing.age_min_hours,
+		age_max_hours: Some(listing.age_max_hours),
+	}
+}
+
+fn video_mode_page_url(current_url: &str, page: usize, query: &video_mode::VideoModeQuery) -> String {
+	let (path, raw_query) = current_url_parts(current_url);
+	let mut query_pairs = video_mode::query_pairs(raw_query);
+	query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after");
+	video_mode::strip_video_query_pairs(&mut query_pairs);
+	video_mode::append_query_pairs(&mut query_pairs, query);
+	if page > 0 {
+		query_pairs.push(("cache_page".to_string(), page.to_string()));
+	}
+	build_url_from_query_pairs(path, &query_pairs)
+}
+
 fn user_listing_path(username: &str, listing: &str, query: &str, default_sort: &str) -> String {
 	let mut query_pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes()).into_owned().collect();
 
-	if !query_pairs.iter().any(|(key, _)| key == "sort") {
+	if !is_video_listing(listing) && !query_pairs.iter().any(|(key, _)| key == "sort") {
 		query_pairs.push(("sort".to_string(), default_sort.to_string()));
 	}
 
@@ -574,6 +649,21 @@ fn cached_user_listing_posts(username: &str, listing: &str, sort: &str, query: &
 		cache_page,
 		crate::post_cache::POSTS_PER_PAGE,
 	)
+}
+
+async fn cached_or_live_user_video_posts(username: &str) -> Result<Vec<Post>, String> {
+	let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
+	if let Some(posts) = crate::post_cache::servable_cached_source_posts(&source) {
+		return Ok(posts);
+	}
+
+	let path = format!("/user/{username}/submitted.json?sort=new&limit={}&raw_json=1", crate::post_cache::per_source_limit());
+	let (posts, after) = Post::fetch(&path, false).await?;
+	utils::store_post_flairs(&posts);
+	utils::store_user_subreddits(username, &posts);
+	update_user_video_stats(username, &posts);
+	crate::post_cache::store_source_posts_for_cache(&source, posts.clone(), after, Some(crate::post_cache::RefreshOrigin::DirectLiveFetch));
+	Ok(posts)
 }
 
 #[cfg(test)]
@@ -861,6 +951,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -908,6 +1001,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -942,6 +1038,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: "Loading user page...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -953,6 +1052,187 @@ mod tests {
 		assert!(html.contains("id=\"page_fragment\""));
 		assert!(html.contains("<main>"));
 		assert!(html.contains("<aside>"));
+	}
+
+	#[test]
+	fn renders_videos_listing_without_sort_controls_and_hides_single_option_filter_groups() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "video", "https://v.redd.it/example", &[])],
+			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "videos".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user/videos".to_string(),
+			redirect_url: "user/demo_user/videos".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "main".to_string(),
+			video_mode_enabled: true,
+			video_mode_sidebar: crate::video_mode::VideoModeSidebarData {
+				action_url: "/user/demo_user/videos".to_string(),
+				clear_url: "/user/demo_user/videos?sort=new".to_string(),
+				hidden_query_pairs: vec![("sort".to_string(), "new".to_string())],
+				subreddit_options: vec![crate::video_mode::VideoModeFilterOption {
+					name: "demo_sub".to_string(),
+					count: 1,
+					page_count: 1,
+					active: false,
+				}],
+				user_options: vec![crate::video_mode::VideoModeFilterOption {
+					name: "demo_user".to_string(),
+					count: 1,
+					page_count: 1,
+					active: false,
+				}],
+				clear_subreddits: false,
+				clear_users: false,
+				age_min_hours: 0,
+				age_max_hours: 24,
+				age_bound_hours: 24,
+			},
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("class=\"selected\" href=\"/user/demo_user/videos\""));
+		assert!(html.contains("Video Filters"));
+		assert!(html.contains("href=\"https://www.reddit.com/user/demo_user/submitted?sort=new\""));
+		assert!(html.contains("name=\"video_age_min_hours\""));
+		assert!(html.contains("href=\"/user/demo_user/videos?sort=new\""));
+		assert!(!html.contains("id=\"sort_select\""));
+		assert!(!html.contains("id=\"sort_submit\""));
+		assert!(!html.contains(">Subreddits<"));
+		assert!(!html.contains(">Users<"));
+	}
+
+	#[test]
+	fn video_sidebar_defaults_to_checked_options_and_renders_bulk_toggle_buttons() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: Vec::new(),
+			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "videos".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user/videos".to_string(),
+			redirect_url: "user/demo_user/videos".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: true,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "main".to_string(),
+			video_mode_enabled: true,
+			video_mode_sidebar: crate::video_mode::VideoModeSidebarData {
+				action_url: "/user/demo_user/videos".to_string(),
+				clear_url: "/user/demo_user/videos".to_string(),
+				hidden_query_pairs: Vec::new(),
+				subreddit_options: vec![
+					crate::video_mode::VideoModeFilterOption {
+						name: "demo_sub".to_string(),
+						count: 3,
+						page_count: 2,
+						active: true,
+					},
+					crate::video_mode::VideoModeFilterOption {
+						name: "other_sub".to_string(),
+						count: 1,
+						page_count: 0,
+						active: true,
+					},
+				],
+				user_options: vec![
+					crate::video_mode::VideoModeFilterOption {
+						name: "demo_user".to_string(),
+						count: 2,
+						page_count: 2,
+						active: true,
+					},
+					crate::video_mode::VideoModeFilterOption {
+						name: "other_user".to_string(),
+						count: 1,
+						page_count: 0,
+						active: true,
+					},
+				],
+				clear_subreddits: false,
+				clear_users: false,
+				age_min_hours: 0,
+				age_max_hours: 24,
+				age_bound_hours: 24,
+			},
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-video-filter-toggle=\"clear\""));
+		assert!(html.contains("data-video-filter-toggle=\"check\""));
+		assert!(html.contains("name=\"video_sub\" value=\"demo_sub\" checked"));
+		assert!(html.contains("name=\"video_user\" value=\"demo_user\" checked"));
+	}
+
+	#[test]
+	fn user_video_mode_uses_submitted_new_as_external_fallback() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: Vec::new(),
+			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "videos".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user/videos".to_string(),
+			redirect_url: "user/demo_user/videos".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: true,
+			fragment_url: "/user-fragment/demo_user/videos".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: "Loading videos...".to_string(),
+			replace_selector: "main".to_string(),
+			video_mode_enabled: true,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("https://www.reddit.com/user/demo_user/submitted?sort=new"));
+		assert!(!html.contains("https://www.reddit.com/user/demo_user/videos"));
 	}
 
 	#[test]
@@ -968,6 +1248,14 @@ mod tests {
 		assert_eq!(
 			super::user_listing_path("demo_user", "submitted", "sort=new&t=day", "top"),
 			"/user/demo_user/submitted.json?sort=new&t=day&raw_json=1"
+		);
+	}
+
+	#[test]
+	fn user_listing_path_omits_sort_for_videos() {
+		assert_eq!(
+			super::user_listing_path("demo_user", "videos", "video_sub=rust&video_user=alice", "top"),
+			"/user/demo_user/videos.json?video_sub=rust&video_user=alice&raw_json=1"
 		);
 	}
 
@@ -1028,6 +1316,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -1173,6 +1464,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -1209,6 +1503,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -1253,6 +1550,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -1302,6 +1602,9 @@ mod tests {
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
 			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
 		}
 		.render()
 		.unwrap();
@@ -1320,6 +1623,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let username = req.param("name").unwrap_or_else(|| "reddit".to_string());
 	let default_sort = default_user_sort(&req);
 	let query = req.uri().query().unwrap_or_default();
+	let video_listing = is_video_listing(&listing);
 
 	// Build the Reddit JSON API path
 	let path = user_listing_path(&username, &listing, query, &default_sort);
@@ -1337,6 +1641,15 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		.into_iter()
 		.map(|(name, count)| UserSubredditEntry { name, count })
 		.collect();
+	let video_mode_sidebar = if video_listing {
+		let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
+		let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
+		let listing_data = video_mode::build_listing(&cached_posts, &get_filters(&req), &video_mode::parse_query(query), now_unix());
+		let preview_posts = listing_data.posts.iter().take(crate::post_cache::POSTS_PER_PAGE).cloned().collect::<Vec<_>>();
+		build_video_mode_sidebar(&url, &listing_data, &preview_posts)
+	} else {
+		empty_video_mode_sidebar()
+	};
 
 	Ok(template(&UserTemplate {
 		user: cached_user,
@@ -1357,9 +1670,16 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		no_posts: false,
 		shell_mode: true,
 		fragment_url: user_fragment_path(&username, &listing, query),
+		replace_selector: if video_listing { "main".to_string() } else { "#column_one".to_string() },
 		prev_page_url: String::new(),
 		next_page_url: String::new(),
-		loading_message: "Loading user page...".to_string(),
+		loading_message: if video_listing {
+			"Loading videos...".to_string()
+		} else {
+			"Loading user page...".to_string()
+		},
+		video_mode_enabled: video_listing,
+		video_mode_sidebar,
 	}))
 }
 
@@ -1368,6 +1688,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let username = req.param("name").unwrap_or_else(|| "reddit".to_string());
 	let default_sort = default_user_sort(&req);
 	let query = req.uri().query().unwrap_or_default();
+	let video_listing = is_video_listing(&listing);
 
 	let path = user_listing_path(&username, &listing, query, &default_sort);
 	let url = user_reddit_path(&username, &listing, query);
@@ -1424,6 +1745,66 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			no_posts: false,
 			prev_page_url: String::new(),
 			next_page_url: String::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: empty_video_mode_sidebar(),
+		}
+	} else if video_listing {
+		let source_posts = cached_or_live_user_video_posts(&username).await?;
+		let parsed_query = video_mode::parse_query(query);
+		let listing_data = video_mode::build_listing(&source_posts, &filters, &parsed_query, now_unix());
+		let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
+		let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+		let start = cache_page.saturating_mul(crate::post_cache::POSTS_PER_PAGE);
+		let end = (start + crate::post_cache::POSTS_PER_PAGE).min(listing_data.posts.len());
+		let posts = if start < listing_data.posts.len() {
+			listing_data.posts[start..end].to_vec()
+		} else {
+			Vec::new()
+		};
+		let no_posts = listing_data.posts.is_empty();
+		let all_posts_hidden_nsfw = !posts.is_empty() && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+		let eligible_video_posts = source_posts
+			.iter()
+			.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+			.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
+			.filter(|post| video_mode::is_video_post(post))
+			.count();
+		let avg_video_length = cached_avg_video_length(&username);
+		let mut posts = posts;
+		utils::hydrate_post_author_links_from_cache(&mut posts);
+		let video_mode_sidebar = build_video_mode_sidebar(&url, &listing_data, &posts);
+
+		UserFragmentTemplate {
+			user: user.clone(),
+			posts,
+			user_subreddits: utils::cached_user_subreddits(&username)
+				.into_iter()
+				.map(|(name, count)| UserSubredditEntry { name, count })
+				.collect(),
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing,
+			prefs: Preferences::new(&req),
+			url: url.clone(),
+			redirect_url,
+			is_filtered: false,
+			all_posts_filtered: eligible_video_posts > 0 && listing_data.posts.is_empty(),
+			all_posts_hidden_nsfw,
+			avg_video_length,
+			no_posts,
+			prev_page_url: if cache_page > 0 {
+				video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query)
+			} else {
+				String::new()
+			},
+			next_page_url: if end < listing_data.posts.len() {
+				video_mode_page_url(&url, cache_page + 1, &normalized_query)
+			} else {
+				String::new()
+			},
+			video_mode_enabled: true,
+			video_mode_sidebar,
 		}
 	} else {
 		let cacheable_submitted_first_page = listing == "submitted"
@@ -1576,6 +1957,8 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			no_posts,
 			prev_page_url,
 			next_page_url,
+			video_mode_enabled: false,
+			video_mode_sidebar: empty_video_mode_sidebar(),
 		}
 	};
 
