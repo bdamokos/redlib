@@ -79,6 +79,34 @@ pub fn filter_and_record_seen(session_id: &str, hide_seen: bool, posts: Vec<Post
 	result
 }
 
+pub fn filter_unseen(session_id: &str, posts: &[Post]) -> Vec<Post> {
+	if session_id.trim().is_empty() {
+		return posts.to_vec();
+	}
+	let mut map = SEEN_BY_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+	prune_seen_locked(&mut map);
+	let seen = map.get(session_id).map(|s| &s.ids);
+	posts
+		.iter()
+		.filter(|post| seen.map_or(true, |ids| !ids.contains(&post.id)))
+		.cloned()
+		.collect()
+}
+
+pub fn record_seen(session_id: &str, posts: &[Post]) {
+	if session_id.trim().is_empty() {
+		return;
+	}
+	let mut map = SEEN_BY_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+	prune_seen_locked(&mut map);
+	let entry = map.entry(session_id.to_string()).or_insert(SeenState {
+		ids: HashSet::new(),
+		last_touch: Instant::now(),
+	});
+	entry.ids.extend(posts.iter().map(|p| p.id.clone()));
+	entry.last_touch = Instant::now();
+}
+
 /// Select a page of posts, optionally skipping posts already seen in this session, and record
 /// only the returned posts as seen.
 ///

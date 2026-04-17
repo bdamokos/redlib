@@ -2249,75 +2249,139 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		return error(req, "Feed session not found or expired").await;
 	} else if aggregate_saved_feeds {
 		let query_fingerprint = listing_query_fingerprint(&query);
-		let cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
+		let mut cursor = param(&format!("?{}", req.uri().query().unwrap_or_default()), FRONT_CURSOR_PARAM)
 			.and_then(|encoded| decode_front_cursor(&encoded))
 			.filter(|cursor| cursor_matches_request(cursor, &aggregate_sources, &sort, &timeframe, &query_fingerprint));
 
-		match fetch_aggregated_subscription_feed(
-			&aggregate_sources,
-			cursor,
-			&sort,
-			&timeframe,
-			&reddit_query,
-			&query_fingerprint,
-			&filters,
-			&active_flair_filter,
-			quarantined,
-		)
-		.await
-		{
-			Ok(mut feed) => {
-				if sort == "new" {
-					feed.posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
-					feed.posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
-				}
-				let no_posts = feed.posts.is_empty();
-				let all_posts_hidden_nsfw = !no_posts && (feed.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-				utils::hydrate_post_author_links_from_cache(&mut feed.posts);
-				if feed.partial_failure && feed.posts.is_empty() {
-					warn!("Aggregate front page rendered without posts after partial failures");
-				}
+		// If hide-seen is on, keep fetching additional cursor pages until we have enough unseen posts
+		// to display a full page (or we run out of cursor / hit a safety cap).
+		let wants_unseen_fill = feed_seen_ctx.as_ref().is_some_and(|ctx| ctx.applies && ctx.hide_seen_on);
+		let mut collected_posts: Vec<Post> = Vec::new();
+		let mut next_cursor: Option<String> = None;
+		let mut prev_cursor: Option<String> = None;
+		let mut all_posts_filtered = false;
+		let mut partial_failure = false;
 
-				render_subreddit_fragment(
-					&req,
-					SubredditFragmentTemplate {
-						sub,
-						posts: feed.posts,
-						top_users,
-						sort: (sort.clone(), timeframe.clone()),
-						sort_options,
-						flair_filters,
-						active_flair_filter: active_flair_filter.clone(),
-						active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-						clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
-						prev_page_url: feed.prev_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
-						next_page_url: feed.next_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
-						prefs: Preferences::new(&req),
-						url,
-						redirect_url,
-						enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
-						is_filtered: false,
-						all_posts_filtered: feed.all_posts_filtered,
-						all_posts_hidden_nsfw,
-						no_posts,
-						cache_notice: String::new(),
-						is_flair_subscribed,
-						feed_session_id: String::new(),
-						feed_status_url: String::new(),
-						feed_fragment_url: String::new(),
-						show_contextual_pagination: false,
-						contextual_pagination: Vec::new(),
-						video_mode_enabled: false,
-						video_mode_sidebar: empty_video_mode_sidebar(),
-						show_hide_seen_toggle: false,
-						hide_seen_on: false,
-						hide_seen_toggle_url: String::new(),
-					},
-					feed_seen_ctx.clone(),
-				)
+		for _round in 0..MAX_AGGREGATE_FILL_ROUNDS {
+			let feed = match fetch_aggregated_subscription_feed(
+				&aggregate_sources,
+				cursor.clone(),
+				&sort,
+				&timeframe,
+				&reddit_query,
+				&query_fingerprint,
+				&filters,
+				&active_flair_filter,
+				quarantined,
+			)
+			.await
+			{
+				Ok(feed) => feed,
+				Err(msg) => return error(req, &msg).await,
+			};
+
+			all_posts_filtered |= feed.all_posts_filtered;
+			partial_failure |= feed.partial_failure;
+			if prev_cursor.is_none() {
+				prev_cursor = feed.prev_cursor.clone();
 			}
-			Err(msg) => error(req, &msg).await,
+
+			collected_posts.extend(feed.posts);
+			next_cursor = feed.next_cursor.clone();
+
+			if !wants_unseen_fill {
+				prev_cursor = feed.prev_cursor;
+				break;
+			}
+
+			let ctx = feed_seen_ctx.as_ref().expect("wants_unseen_fill implies ctx");
+			let unseen = seen_posts::filter_unseen(&ctx.session_id, &collected_posts);
+			if unseen.len() >= crate::post_cache::POSTS_PER_PAGE {
+				prev_cursor = feed.prev_cursor;
+				break;
+			}
+
+			// No more cursor: can't fill further.
+			let Some(encoded_next) = next_cursor.as_deref() else {
+				prev_cursor = feed.prev_cursor;
+				break;
+			};
+			cursor = decode_front_cursor(encoded_next);
+			if cursor.is_none() {
+				prev_cursor = feed.prev_cursor;
+				break;
+			}
 		}
+
+		let mut posts = if wants_unseen_fill {
+			let ctx = feed_seen_ctx.as_ref().expect("wants_unseen_fill implies ctx");
+			let mut unseen = seen_posts::filter_unseen(&ctx.session_id, &collected_posts);
+			// Avoid discarding unseen posts we've already fetched: show all unseen up to a safe cap.
+			if unseen.len() > crate::post_cache::POSTS_PER_PAGE * 4 {
+				unseen.truncate(crate::post_cache::POSTS_PER_PAGE * 4);
+			}
+			seen_posts::record_seen(&ctx.session_id, &unseen);
+			unseen
+		} else {
+			collected_posts
+		};
+
+		if sort == "new" {
+			posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+			posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+		}
+
+		let no_posts = posts.is_empty();
+		let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+		utils::hydrate_post_author_links_from_cache(&mut posts);
+		if partial_failure && posts.is_empty() {
+			warn!("Aggregate front page rendered without posts after partial failures");
+		}
+
+		let next_page_url = next_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default();
+		let prev_page_url = prev_cursor
+			.as_deref()
+			.filter(|c| !c.is_empty())
+			.map(|cursor| build_front_cursor_url(&url, cursor))
+			.unwrap_or_default();
+
+		render_subreddit_fragment(
+			&req,
+			SubredditFragmentTemplate {
+				sub,
+				posts,
+				top_users,
+				sort: (sort.clone(), timeframe.clone()),
+				sort_options,
+				flair_filters,
+				active_flair_filter: active_flair_filter.clone(),
+				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+				clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+				prev_page_url,
+				next_page_url,
+				prefs: Preferences::new(&req),
+				url,
+				redirect_url,
+				enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
+				is_filtered: false,
+				all_posts_filtered,
+				all_posts_hidden_nsfw,
+				no_posts,
+				cache_notice: String::new(),
+				is_flair_subscribed,
+				feed_session_id: String::new(),
+				feed_status_url: String::new(),
+				feed_fragment_url: String::new(),
+				show_contextual_pagination: false,
+				contextual_pagination: Vec::new(),
+				video_mode_enabled: false,
+				video_mode_sidebar: empty_video_mode_sidebar(),
+				show_hide_seen_toggle: false,
+				hide_seen_on: false,
+				hide_seen_toggle_url: String::new(),
+			},
+			feed_seen_ctx.clone(),
+		)
 	} else {
 		// For single subreddits with sort=new, serve from the per-sub cache before any live Reddit listing fetch.
 		if let Some((mut posts, after, has_prev, has_next)) = cached_subreddit_page {
