@@ -157,6 +157,9 @@ html.fixed_navbar {
 
 body {
     background: var(--background);
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
     padding-bottom: var(--footer-height);
     font-size: 15px;
     position: relative;
@@ -172,10 +175,13 @@ body.fixed_navbar {
 }
 
 .image_quality_status {
-    display: none;
+    position: fixed;
+    top: 56px;
+    right: 20px;
+    z-index: 3;
     width: fit-content;
     max-width: calc(100% - 40px);
-    margin: 0 20px 10px auto;
+    margin: 0;
     padding: 6px 12px;
     border: var(--panel-border);
     border-radius: 999px;
@@ -185,18 +191,20 @@ body.fixed_navbar {
     font-size: 12px;
     font-weight: 600;
     line-height: 1.35;
+    visibility: hidden;
+    pointer-events: none;
 }
 
 .image_quality_status.visible {
-    display: block;
+    visibility: visible;
+    pointer-events: auto;
 }
 
 @media screen and (max-width: 800px) {
     .image_quality_status {
         font-size: 11px;
         max-width: calc(100% - 20px);
-        margin: 8px 10px 10px;
-        width: auto;
+        right: 10px;
     }
 }
 
@@ -398,10 +406,18 @@ main {
     margin: 0 auto 12px;
     max-width: min(100%, 750px);
     min-width: 0;
+    overflow: hidden;
     overflow-wrap: anywhere;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     padding: 0 12px;
     text-align: center;
     width: 100%;
+    min-height: 1.2em;
+}
+
+.feed_status_banner.is-hidden {
+    visibility: hidden;
 }
 
 #column_one {
@@ -425,7 +441,8 @@ body > footer {
     align-items: center;
     width: 100%;
     background: var(--post);
-    position: absolute;
+    position: fixed;
+    left: 0;
     bottom: 0;
 }
 

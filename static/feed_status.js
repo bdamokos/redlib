@@ -2,6 +2,19 @@
     const pollIntervalMs = 2000;
     const requestTimeoutMs = 15000;
 
+    const setBannerVisible = (banner, visible) => {
+        if (!banner) {
+            return;
+        }
+
+        banner.classList.toggle("is-hidden", !visible);
+        if (visible) {
+            banner.removeAttribute("aria-hidden");
+        } else {
+            banner.setAttribute("aria-hidden", "true");
+        }
+    };
+
     const fetchWithTimeout = async (url, options = {}) => {
         const controller = new AbortController();
         const timeoutId = window.setTimeout(() => controller.abort(), requestTimeoutMs);
@@ -39,7 +52,7 @@
                 if (!banner) {
                     return;
                 }
-                banner.hidden = false;
+                setBannerVisible(banner, true);
                 banner.textContent = "Updating the feed is taking longer than expected.";
                 banner.classList.remove("warming");
             };
@@ -101,7 +114,7 @@
 
                 const status = await statusResponse.json();
                 if (banner && typeof status.status_message === "string") {
-                    banner.hidden = false;
+                    setBannerVisible(banner, true);
                     banner.textContent = status.status_message;
                     banner.classList.toggle("warming", !!status.warming);
                 }

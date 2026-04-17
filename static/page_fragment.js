@@ -17,6 +17,19 @@ document.addEventListener("DOMContentLoaded", () => {
     const replaceSelector = container.dataset.replaceSelector || "";
     const banner = document.querySelector(".feed_status_banner");
 
+    const setBannerVisible = (visible) => {
+        if (!banner) {
+            return;
+        }
+
+        banner.classList.toggle("is-hidden", !visible);
+        if (visible) {
+            banner.removeAttribute("aria-hidden");
+        } else {
+            banner.setAttribute("aria-hidden", "true");
+        }
+    };
+
     const replaceFragment = (html) => {
         if (replaceSelector) {
             const template = document.createElement("template");
@@ -46,6 +59,7 @@ document.addEventListener("DOMContentLoaded", () => {
             banner.textContent = errorMessage;
             banner.classList.remove("warming");
         }
+        setBannerVisible(true);
 
         const target = replaceSelector ? document.querySelector(replaceSelector) : container;
         if (!target) {
@@ -69,13 +83,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const activeFeed = document.querySelector("#feed_content[data-feed-session-id]");
         if (activeFeed) {
-            banner.hidden = false;
+            setBannerVisible(true);
             return;
         }
 
-        banner.hidden = true;
         banner.textContent = "";
         banner.classList.remove("warming");
+        setBannerVisible(false);
     };
 
     const showRetryState = (attempt) => {
@@ -83,7 +97,7 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
 
-        banner.hidden = false;
+        setBannerVisible(true);
         banner.classList.add("warming");
         banner.textContent = attempt < maxAttempts ? `${loadingMessage} Retrying…` : errorMessage;
     };
@@ -96,7 +110,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const loadFragment = async (attempt = 1) => {
         if (banner) {
-            banner.hidden = false;
+            setBannerVisible(true);
             banner.textContent = loadingMessage;
         }
 
