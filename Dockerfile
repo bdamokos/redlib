@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /usr/src/redlib
 
 # Prime Cargo's dependency cache before copying the full source tree.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && printf 'fn main() {}\n' > src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
@@ -24,14 +24,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release --locked --bin redlib
 RUN rm src/main.rs && rmdir src
 
-COPY . .
+COPY src ./src
+COPY static ./static
+COPY templates ./templates
 
 # Build the application
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     --mount=type=cache,target=/usr/src/redlib/target,sharing=locked \
     cargo build --release --locked --bin redlib && \
-    cp target/release/redlib /tmp/redlib
+    install -Dm755 target/release/redlib /tmp/redlib
 
 # Runtime stage
 FROM debian:bookworm-slim

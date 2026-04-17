@@ -5,7 +5,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      pull: true
       args:
         GIT_HASH: "${GIT_HASH:-dev}"
     image: redlib:local
