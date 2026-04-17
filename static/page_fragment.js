@@ -61,11 +61,16 @@ document.addEventListener("DOMContentLoaded", () => {
         settleBannerState();
     };
 
-    const showErrorState = () => {
+    const showErrorState = (cachedHtml) => {
         window.console?.warn?.("page_fragment: failed to load", {
             fragmentUrl,
             replaceSelector,
         });
+
+        if (cachedHtml) {
+            replaceFragment(cachedHtml);
+            return;
+        }
 
         if (banner) {
             banner.textContent = errorMessage;
@@ -119,7 +124,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const shouldRetryResponse = (status) => status >= 500;
 
-    const loadFragment = async (attempt = 1) => {
+    const loadFragment = async (attempt = 1, cachedHtml = null) => {
         if (banner) {
             banner.hidden = false;
             banner.textContent = loadingMessage;
@@ -144,7 +149,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     attempt,
                 });
                 if (!shouldRetryResponse(response.status)) {
-                    showErrorState();
+                    showErrorState(cachedHtml);
                     return;
                 }
                 throw new Error(`Fragment request failed: ${response.status}`);
@@ -162,18 +167,14 @@ document.addEventListener("DOMContentLoaded", () => {
             if (attempt < maxAttempts) {
                 showRetryState(attempt);
                 await waitForRetry();
-                return loadFragment(attempt + 1);
+                return loadFragment(attempt + 1, cachedHtml);
             }
-            showErrorState();
+            showErrorState(cachedHtml);
         } finally {
             window.clearTimeout(timeoutId);
         }
     };
 
     const cachedHtml = readCachedFragment();
-    if (cachedHtml) {
-        replaceFragment(cachedHtml);
-    }
-
-    void loadFragment();
+    void loadFragment(1, cachedHtml);
 });
