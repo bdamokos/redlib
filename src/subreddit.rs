@@ -112,6 +112,7 @@ pub struct SubredditShellTemplate {
 	is_filtered: bool,
 	is_flair_subscribed: bool,
 	fragment_url: String,
+	fragment_cache_enabled: bool,
 	loading_message: String,
 	placeholder_message: String,
 	replace_selector: String,
@@ -1762,6 +1763,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		is_filtered: false,
 		is_flair_subscribed,
 		fragment_url: subreddit_fragment_path(&req),
+		fragment_cache_enabled: !feed_seen_shell.as_ref().is_some_and(|ctx| ctx.applies && ctx.hide_seen_on),
 		loading_message,
 		placeholder_message,
 		replace_selector: if is_video_length_sort(&sort) { "main".to_string() } else { "#column_one".to_string() },
@@ -2854,6 +2856,7 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
+			fragment_cache_enabled: true,
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -2887,6 +2890,7 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/videos/video-length".to_string(),
+			fragment_cache_enabled: true,
 			loading_message: "Loading videos...".to_string(),
 			placeholder_message: "Loading videos...".to_string(),
 			replace_selector: "main".to_string(),
@@ -2918,6 +2922,7 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/videos/video-length".to_string(),
+			fragment_cache_enabled: true,
 			loading_message: "Loading videos...".to_string(),
 			placeholder_message: "Loading videos...".to_string(),
 			replace_selector: "main".to_string(),
@@ -2949,6 +2954,7 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment".to_string(),
+			fragment_cache_enabled: true,
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -2981,6 +2987,7 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/new".to_string(),
+			fragment_cache_enabled: true,
 			loading_message: loading_message.clone(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -3017,6 +3024,7 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
+			fragment_cache_enabled: true,
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -3027,6 +3035,34 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-subscription-target=\"subreddit:rust\""));
+	}
+
+	#[test]
+	fn subreddit_shell_disables_fragment_cache_for_seen_filtered_feeds() {
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit::default(),
+			top_users: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
+			prefs: test_prefs(),
+			url: "/".to_string(),
+			redirect_url: String::new(),
+			is_filtered: false,
+			is_flair_subscribed: false,
+			fragment_url: "/subreddit-fragment".to_string(),
+			fragment_cache_enabled: false,
+			loading_message: "Loading posts...".to_string(),
+			placeholder_message: "Loading posts...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-fragment-cache-enabled=\"false\""));
 	}
 
 	#[test]
@@ -3334,6 +3370,43 @@ mod tests {
 		assert!(links.iter().any(|link| link.current));
 		assert!(links.iter().any(|link| link.url.contains("cache_page=4")));
 		assert!(links.iter().any(|link| link.url.contains("cache_page=5")));
+	}
+
+	#[tokio::test]
+	async fn feed_fragment_replaces_seen_posts_with_next_unseen_posts() {
+		let source = FeedSource::subreddit("feed-fragment-seen-fill-test", FeedSort::New);
+		let posts = (0..30)
+			.map(|index| {
+				metric_post(
+					&format!("seen-fill-{index}"),
+					"feed-fragment-seen-fill-test",
+					1_000 - index as u64,
+					100 - index as i64,
+					false,
+				)
+			})
+			.collect::<Vec<_>>();
+
+		let session_id = seed_contextual_session(source, posts, "feed-fragment-seen-fill-fingerprint").await;
+		let merged_posts = post_cache::feed_merged_posts(&session_id).expect("merged session posts");
+		assert_eq!(merged_posts.len(), 30);
+		let browser_session_id = format!("seen-fill-browser-{session_id}");
+		let (first_page, _) = crate::seen_posts::page_and_record_seen(&browser_session_id, true, &merged_posts, 0, post_cache::POSTS_PER_PAGE);
+		assert_eq!(first_page.len(), post_cache::POSTS_PER_PAGE);
+
+		let req = Request::builder()
+			.uri(format!("/feed-fragment?feed_session={session_id}&cache_page=0&current_url=/new"))
+			.header("cookie", format!("rl_session={browser_session_id}"))
+			.body(Body::empty())
+			.unwrap();
+		let response = super::feed_fragment(req).await.expect("feed fragment response");
+		let body = hyper::body::to_bytes(response.into_body()).await.expect("feed fragment body");
+		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
+
+		assert!(html.contains("Post seen-fill-25"), "{html}");
+		assert!(html.contains("Post seen-fill-29"), "{html}");
+		assert!(!html.contains("Post seen-fill-24"), "{html}");
+		assert!(!html.contains("No posts were found."), "{html}");
 	}
 
 	#[test]
@@ -3964,7 +4037,6 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	};
 	let page_ready = feed_page.ready;
 	let current_url = param(&format!("?{}", req.uri().query().unwrap_or_default()), "current_url").unwrap_or_else(|| "/".to_string());
-	utils::hydrate_post_author_links_from_cache(&mut feed_page.posts);
 
 	let feed_seen_scope = seen_posts::public_page_is_feed_seen_scope(&current_url);
 	let (rl_session_id, needs_rl_session_cookie) = if feed_seen_scope {
@@ -3973,12 +4045,13 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		(String::new(), false)
 	};
 	let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, feed_seen_scope);
-	let merged_posts = std::mem::take(&mut feed_page.posts);
-	let (posts, has_next_unseen) = if feed_seen_scope {
+	let merged_posts = crate::post_cache::feed_merged_posts(&session_id).unwrap_or_else(|| std::mem::take(&mut feed_page.posts));
+	let (mut posts, has_next_unseen) = if feed_seen_scope {
 		seen_posts::page_and_record_seen(&rl_session_id, hide_seen_on, &merged_posts, page, crate::post_cache::POSTS_PER_PAGE)
 	} else {
 		seen_posts::page_and_record_seen("anon", false, &merged_posts, page, crate::post_cache::POSTS_PER_PAGE)
 	};
+	utils::hydrate_post_author_links_from_cache(&mut posts);
 
 	let prev_page_url = if page > 0 {
 		update_url_query(

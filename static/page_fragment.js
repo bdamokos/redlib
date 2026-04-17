@@ -18,8 +18,12 @@ document.addEventListener("DOMContentLoaded", () => {
     const banner = document.querySelector(".feed_status_banner");
     const cacheVersion = container.dataset.fragmentCacheVersion || "1";
     const cacheKey = `page-fragment:v${cacheVersion}:${fragmentUrl}`;
+    const cacheEnabled = container.dataset.fragmentCacheEnabled !== "false";
 
     const readCachedFragment = () => {
+        if (!cacheEnabled) {
+            return null;
+        }
         try {
             return window.sessionStorage.getItem(cacheKey);
         } catch (_) {
@@ -28,6 +32,9 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const writeCachedFragment = (html) => {
+        if (!cacheEnabled) {
+            return;
+        }
         try {
             window.sessionStorage.setItem(cacheKey, html);
         } catch (_) {
