@@ -713,11 +713,6 @@ fn render_subreddit_fragment(
 ) -> Result<Response<Body>, String> {
 	if let Some(ref ctx) = feed_seen {
 		if ctx.applies {
-			template_data.posts = seen_posts::filter_and_record_seen(
-				&ctx.session_id,
-				ctx.hide_seen_on,
-				std::mem::take(&mut template_data.posts),
-			);
 			template_data.show_hide_seen_toggle = true;
 			template_data.hide_seen_on = ctx.hide_seen_on;
 			template_data.hide_seen_toggle_url = update_url_query(
