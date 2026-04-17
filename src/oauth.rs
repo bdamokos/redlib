@@ -386,7 +386,7 @@ impl Device {
 	fn android() -> Self {
 		let uuid = uuid::Uuid::new_v4().to_string();
 		let android_app_version = choose(ANDROID_APP_VERSION_LIST).to_string();
-		let android_version = fastrand::u8(9..=14);
+		let android_version = fastrand::u8(10..=16);
 		let android_user_agent = format!("Reddit/{android_app_version}/Android {android_version}");
 		let qos = format!("{:.3}", fastrand::u32(1000..=100_000) as f32 / 1000.0);
 		let codecs = TextGenerator::new().generate("available-codecs=video/avc, video/hevc{, video/x-vnd.on2.vp9|}");
