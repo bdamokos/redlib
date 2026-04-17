@@ -1073,6 +1073,7 @@ pub fn cached_author_external_links(name: &str) -> Vec<ExternalLink> {
 pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
 	for post in posts.iter_mut() {
 		post.author.external_links = cached_author_external_links(&post.author.name);
+		post.author.avg_video_length = crate::user::cached_avg_video_length(&post.author.name);
 	}
 }
 
@@ -3193,8 +3194,8 @@ mod tests {
 	use super::{
 		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
 		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
-		read_sharded_cookie, refresh_post_times, rewrite_urls, time, user_profile_details, write_sharded_cookie, Author, Awards, ExternalLink, Flags, Flair, FlairSubscription,
-		Media, Post, Preferences,
+		hydrate_post_author_links_from_cache, read_sharded_cookie, refresh_post_times, rewrite_urls, time, user_profile_details, write_sharded_cookie, Author, Awards,
+		ExternalLink, Flags, Flair, FlairSubscription, Media, Post, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
@@ -3287,6 +3288,73 @@ mod tests {
 			),
 			"e.g. &lt;a href=\"/r/linux_gaming/comments/ql9j15/anyone_else_confused_with_linus_linux_issues/\"&gt;https://www.reddit.com/r/linux_gaming/comments/ql9j15/anyone_else_confused_with_linus_linux_issues/&lt;/a&gt;"
 		);
+	}
+
+	#[test]
+	fn hydrate_post_author_links_from_cache_refreshes_avg_video_length() {
+		crate::user::clear_test_caches();
+
+		let mut posts = vec![Post {
+			id: "demo".to_string(),
+			kind: "t3".to_string(),
+			title: "Demo".to_string(),
+			community: "demo_sub".to_string(),
+			body: String::new(),
+			author: Author {
+				name: "demo_user".to_string(),
+				flair: Flair {
+					flair_parts: Vec::new(),
+					text: String::new(),
+					background_color: String::new(),
+					foreground_color: String::new(),
+				},
+				distinguished: String::new(),
+				external_links: Vec::new(),
+				avg_video_length: None,
+			},
+			permalink: "/r/demo_sub/comments/demo/".to_string(),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			poll: None,
+			score: ("1".to_string(), "1".to_string()),
+			upvote_ratio: 100,
+			post_type: "video".to_string(),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+			flags: Flags::new(false, false, false),
+			thumbnail: Media::empty(),
+			media: Media {
+				url: "https://v.redd.it/demo/DASH_720.mp4".to_string(),
+				duration_seconds: 30,
+				duration: "0:30".to_string(),
+				..Media::empty()
+			},
+			domain: "v.redd.it".to_string(),
+			rel_time: String::new(),
+			created: String::new(),
+			created_ts: 0,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
+		}];
+
+		assert_eq!(posts[0].author.avg_video_length, None);
+
+		crate::user::update_user_video_stats_from_posts(&posts);
+		hydrate_post_author_links_from_cache(&mut posts);
+
+		assert_eq!(posts[0].author.avg_video_length, Some(("0:30".to_string(), "from 1 seen video".to_string())));
 	}
 
 	#[test]
