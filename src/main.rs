@@ -14,9 +14,7 @@ use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
-use redlib::{
-	cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, user, video_mode_api, video_preview,
-};
+use redlib::{cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, user, video_mode_api, video_preview};
 use url::Url;
 
 use redlib::client::OAUTH_CLIENT;
@@ -362,6 +360,9 @@ async fn main() {
 	app
 		.at("/submitted_duplicates.js")
 		.get(|_| resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).boxed());
+	app
+		.at("/video_mode_filters.js")
+		.get(|_| resource(include_str!("../static/video_mode_filters.js"), "text/javascript", false).boxed());
 
 	app.at("/api/video-previews/lease").post(|r| video_preview::lease(r).boxed());
 	app.at("/api/video-previews/heartbeat").post(|r| video_preview::heartbeat(r).boxed());

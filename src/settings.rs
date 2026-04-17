@@ -200,7 +200,8 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
-	let body = hyper::body::to_bytes(req.into_body())
+	let (parts, body_stream) = req.into_parts();
+	let body = hyper::body::to_bytes(body_stream)
 		.await
 		.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
 
@@ -226,9 +227,18 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 
 	prefs.available_themes = vec![];
 
-	let url = format!("/settings/restore/?redirect=settings%3Fstatus%3Dimported&{}", prefs.to_urlencoded()?);
-
-	Ok(redirect(&url))
+	// Avoid redirecting the *browser* to a massive URL (can exceed URL limits for large subscription lists).
+	// Instead, internally reuse the existing restore logic to set cookies, and redirect the client to a short URL.
+	let restore_uri = format!("/settings/restore?redirect=settings%3Fstatus%3Dimported&{}", prefs.to_urlencoded()?);
+	let restore_req = Request::from_parts(
+		{
+			let mut parts = parts;
+			parts.uri = restore_uri.parse().map_err(|e| format!("Failed to build restore URI: {e}"))?;
+			parts
+		},
+		Body::empty(),
+	);
+	Ok(set_cookies_method(restore_req, true))
 }
 
 #[cfg(test)]

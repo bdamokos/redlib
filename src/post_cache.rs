@@ -583,8 +583,11 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	);
 	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
 		crate::video_preview::prewarm_listing_video_previews(&posts);
-		spawn_author_link_prefetch(posts.clone());
 	}
+	// Even when the listing itself came from a scrape/backup instance (DirectLiveFetch),
+	// we still want to populate cached author profile links so `hydrate_post_author_links_from_cache`
+	// has something to attach for the page render.
+	spawn_author_link_prefetch(posts.clone());
 
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let Some(entry) = remembered.get_mut(&normalized) else {

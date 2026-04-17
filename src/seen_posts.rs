@@ -86,11 +86,7 @@ pub fn filter_unseen(session_id: &str, posts: &[Post]) -> Vec<Post> {
 	let mut map = SEEN_BY_SESSION.lock().unwrap_or_else(|e| e.into_inner());
 	prune_seen_locked(&mut map);
 	let seen = map.get(session_id).map(|s| &s.ids);
-	posts
-		.iter()
-		.filter(|post| seen.map_or(true, |ids| !ids.contains(&post.id)))
-		.cloned()
-		.collect()
+	posts.iter().filter(|post| seen.map_or(true, |ids| !ids.contains(&post.id))).cloned().collect()
 }
 
 pub fn record_seen(session_id: &str, posts: &[Post]) {
@@ -236,10 +232,7 @@ pub fn public_page_is_feed_seen_scope(path_and_query: &str) -> bool {
 	}
 	if path.starts_with('/') && path.matches('/').count() == 1 {
 		let seg = path.trim_start_matches('/');
-		return matches!(
-			seg,
-			"best" | "hot" | "new" | "top" | "rising" | "controversial" | "video-length"
-		);
+		return matches!(seg, "best" | "hot" | "new" | "top" | "rising" | "controversial" | "video-length");
 	}
 	false
 }

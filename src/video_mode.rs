@@ -93,20 +93,16 @@ pub fn parse_query(query: &str) -> VideoModeQuery {
 		match key.as_str() {
 			VIDEO_SUB_PARAM => parsed.selected_subreddits.push(value),
 			VIDEO_USER_PARAM => parsed.selected_users.push(value),
-			VIDEO_SUB_MODE_PARAM => {
-				match value.as_str() {
-					"none" => parsed.subreddit_mode = FacetMode::None,
-					"exclude" => parsed.subreddit_mode = FacetMode::Exclude,
-					_ => {}
-				}
-			}
-			VIDEO_USER_MODE_PARAM => {
-				match value.as_str() {
-					"none" => parsed.user_mode = FacetMode::None,
-					"exclude" => parsed.user_mode = FacetMode::Exclude,
-					_ => {}
-				}
-			}
+			VIDEO_SUB_MODE_PARAM => match value.as_str() {
+				"none" => parsed.subreddit_mode = FacetMode::None,
+				"exclude" => parsed.subreddit_mode = FacetMode::Exclude,
+				_ => {}
+			},
+			VIDEO_USER_MODE_PARAM => match value.as_str() {
+				"none" => parsed.user_mode = FacetMode::None,
+				"exclude" => parsed.user_mode = FacetMode::Exclude,
+				_ => {}
+			},
 			VIDEO_AGE_MIN_HOURS_PARAM => {
 				parsed.age_min_hours = value.parse::<u32>().unwrap_or_default();
 			}

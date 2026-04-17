@@ -66,12 +66,14 @@ pub async fn apply(mut req: Request<Body>) -> Result<Response<Body>, String> {
 
 	let encoded = encode_query_cookie(&query)?;
 	if encoded.len() > MAX_VIDEO_MODE_COOKIE_CHARS {
-		return Ok(Response::builder()
-			.status(StatusCode::PAYLOAD_TOO_LARGE)
-			.header("content-type", "application/json; charset=utf-8")
-			.header("cache-control", "no-store")
-			.body(Body::from(r#"{"error":"video_mode_cookie_too_large"}"#))
-			.map_err(|e| e.to_string())?);
+		return Ok(
+			Response::builder()
+				.status(StatusCode::PAYLOAD_TOO_LARGE)
+				.header("content-type", "application/json; charset=utf-8")
+				.header("cache-control", "no-store")
+				.body(Body::from(r#"{"error":"video_mode_cookie_too_large"}"#))
+				.map_err(|e| e.to_string())?,
+		);
 	}
 
 	let mut response = Response::builder()

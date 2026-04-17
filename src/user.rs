@@ -514,12 +514,7 @@ fn video_mode_facet_hidden_value(mode: video_mode::FacetMode) -> &'static str {
 	}
 }
 
-fn build_video_mode_sidebar(
-	url: &str,
-	listing: &video_mode::VideoModeListing,
-	page_posts: &[Post],
-	query: &video_mode::VideoModeQuery,
-) -> video_mode::VideoModeSidebarData {
+fn build_video_mode_sidebar(url: &str, listing: &video_mode::VideoModeListing, page_posts: &[Post], query: &video_mode::VideoModeQuery) -> video_mode::VideoModeSidebarData {
 	let (path, query_str) = current_url_parts(url);
 	let mut hidden_query_pairs = video_mode::query_pairs(query_str);
 	video_mode::strip_video_query_pairs(&mut hidden_query_pairs);
@@ -1175,9 +1170,7 @@ mod tests {
 	fn video_sidebar_defaults_to_checked_options_and_renders_bulk_toggle_buttons() {
 		let clear_redirect = format!(
 			"/api/video-mode/clear-redirect?{}",
-			form_urlencoded::Serializer::new(String::new())
-				.append_pair("redirect", "/user/demo_user/videos")
-				.finish()
+			form_urlencoded::Serializer::new(String::new()).append_pair("redirect", "/user/demo_user/videos").finish()
 		);
 		let html = super::UserTemplate {
 			user: crate::utils::User {

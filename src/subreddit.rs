@@ -591,12 +591,7 @@ fn video_mode_facet_hidden_value(mode: video_mode::FacetMode) -> &'static str {
 	}
 }
 
-fn build_video_mode_sidebar(
-	url: &str,
-	listing: &video_mode::VideoModeListing,
-	page_posts: &[Post],
-	query: &video_mode::VideoModeQuery,
-) -> video_mode::VideoModeSidebarData {
+fn build_video_mode_sidebar(url: &str, listing: &video_mode::VideoModeListing, page_posts: &[Post], query: &video_mode::VideoModeQuery) -> video_mode::VideoModeSidebarData {
 	let (path, query_str) = current_url_parts(url);
 	let mut hidden_query_pairs = video_mode::query_pairs(query_str);
 	video_mode::strip_video_query_pairs(&mut hidden_query_pairs);
@@ -715,10 +710,7 @@ fn render_subreddit_fragment(
 		if ctx.applies {
 			template_data.show_hide_seen_toggle = true;
 			template_data.hide_seen_on = ctx.hide_seen_on;
-			template_data.hide_seen_toggle_url = update_url_query(
-				&template_data.url,
-				&[("hide_seen", Some(if ctx.hide_seen_on { "off" } else { "on" }))],
-			);
+			template_data.hide_seen_toggle_url = update_url_query(&template_data.url, &[("hide_seen", Some(if ctx.hide_seen_on { "off" } else { "on" }))]);
 		}
 	} else {
 		template_data.show_hide_seen_toggle = false;
@@ -737,12 +729,7 @@ fn render_subreddit_fragment(
 
 	if let Some(ref ctx) = feed_seen {
 		if ctx.applies {
-			seen_posts::attach_rl_feed_cookies(
-				&mut response,
-				&ctx.session_id,
-				ctx.needs_session_cookie,
-				ctx.hide_seen_cookie_override.as_deref(),
-			);
+			seen_posts::attach_rl_feed_cookies(&mut response, &ctx.session_id, ctx.needs_session_cookie, ctx.hide_seen_cookie_override.as_deref());
 		}
 	}
 	Ok(response)
@@ -1747,8 +1734,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		empty_video_mode_sidebar()
 	};
 
-	let feed_seen_scope_shell = req.param("sub").is_none()
-		&& (aggregate_front_page || contextual_front_page || video_mode_front_page);
+	let feed_seen_scope_shell = req.param("sub").is_none() && (aggregate_front_page || contextual_front_page || video_mode_front_page);
 	let feed_seen_shell = if feed_seen_scope_shell {
 		let (session_id, needs_session_cookie) = seen_posts::ensure_rl_session_id(&req);
 		let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, true);
@@ -1784,12 +1770,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	});
 	if let Some(ref ctx) = feed_seen_shell {
 		if ctx.applies {
-			seen_posts::attach_rl_feed_cookies(
-				&mut response,
-				&ctx.session_id,
-				ctx.needs_session_cookie,
-				ctx.hide_seen_cookie_override.as_deref(),
-			);
+			seen_posts::attach_rl_feed_cookies(&mut response, &ctx.session_id, ctx.needs_session_cookie, ctx.hide_seen_cookie_override.as_deref());
 		}
 	}
 	Ok(response)
@@ -2204,7 +2185,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				&req,
 				SubredditFragmentTemplate {
 					sub,
-				posts: page_posts,
+					posts: page_posts,
 					top_users,
 					sort: (sort.clone(), timeframe.clone()),
 					sort_options,
@@ -4060,12 +4041,7 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		contextual_pagination,
 	})?;
 	if feed_seen_scope {
-		seen_posts::attach_rl_feed_cookies(
-			&mut response,
-			&rl_session_id,
-			needs_rl_session_cookie,
-			hide_seen_cookie_override.as_deref(),
-		);
+		seen_posts::attach_rl_feed_cookies(&mut response, &rl_session_id, needs_rl_session_cookie, hide_seen_cookie_override.as_deref());
 	}
 	Ok(response)
 }
