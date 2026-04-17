@@ -16,7 +16,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const retryDelayMs = Number.parseInt(container.dataset.retryDelayMs || "1500", 10);
     const replaceSelector = container.dataset.replaceSelector || "";
     const banner = document.querySelector(".feed_status_banner");
-    const cacheKey = `page-fragment:${fragmentUrl}`;
+    const cacheVersion = container.dataset.fragmentCacheVersion || "1";
+    const cacheKey = `page-fragment:v${cacheVersion}:${fragmentUrl}`;
 
     const readCachedFragment = () => {
         try {
