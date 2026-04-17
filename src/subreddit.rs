@@ -1735,7 +1735,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		empty_video_mode_sidebar()
 	};
 
-	let feed_seen_scope_shell = req.param("sub").is_none() && (aggregate_front_page || contextual_front_page || video_mode_front_page);
+	let feed_seen_scope_shell = req.param("sub").is_none() && seen_posts::public_page_is_feed_seen_scope(&url);
 	let feed_seen_shell = if feed_seen_scope_shell {
 		let (session_id, needs_session_cookie) = seen_posts::ensure_rl_session_id(&req);
 		let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, true);
@@ -1850,7 +1850,19 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		Vec::new()
 	};
 
-	let feed_seen_scope = !is_subreddit_route && (aggregate_saved_feeds || contextual_front_page || video_mode_front_page);
+	let fragment_request_url = req.uri().to_string();
+	let req_url = fragment_request_url.replacen("/subreddit-fragment", "", 1);
+
+	let url = {
+		let fragment_url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+		let original_url = fragment_url.replacen("/subreddit-fragment", "", 1);
+		if original_url.is_empty() {
+			"/".to_string()
+		} else {
+			original_url
+		}
+	};
+	let feed_seen_scope = !is_subreddit_route && seen_posts::public_page_is_feed_seen_scope(&url);
 	let feed_seen_ctx = if feed_seen_scope {
 		let (session_id, needs_session_cookie) = seen_posts::ensure_rl_session_id(&req);
 		let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, true);
@@ -1863,19 +1875,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		})
 	} else {
 		None
-	};
-
-	let fragment_request_url = req.uri().to_string();
-	let req_url = fragment_request_url.replacen("/subreddit-fragment", "", 1);
-
-	let url = {
-		let fragment_url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
-		let original_url = fragment_url.replacen("/subreddit-fragment", "", 1);
-		if original_url.is_empty() {
-			"/".to_string()
-		} else {
-			original_url
-		}
 	};
 	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
 	let active_flair_filter = param(&format!("?{}", req.uri().query().unwrap_or_default()), "flair").unwrap_or_default();
@@ -3406,6 +3405,43 @@ mod tests {
 		assert!(html.contains("Post seen-fill-25"), "{html}");
 		assert!(html.contains("Post seen-fill-29"), "{html}");
 		assert!(!html.contains("Post seen-fill-24"), "{html}");
+		assert!(!html.contains("No posts were found."), "{html}");
+	}
+
+	#[tokio::test]
+	async fn feed_fragment_replaces_seen_posts_with_next_unseen_posts_for_following_routes() {
+		let source = FeedSource::subreddit("following-seen-fill-test", FeedSort::New);
+		let posts = (0..30)
+			.map(|index| {
+				metric_post(
+					&format!("following-seen-fill-{index}"),
+					"following-seen-fill-test",
+					1_000 - index as u64,
+					100 - index as i64,
+					false,
+				)
+			})
+			.collect::<Vec<_>>();
+
+		let session_id = seed_contextual_session(source, posts, "following-seen-fill-fingerprint").await;
+		let merged_posts = post_cache::feed_merged_posts(&session_id).expect("merged session posts");
+		assert_eq!(merged_posts.len(), 30);
+		let browser_session_id = format!("following-seen-fill-browser-{session_id}");
+		let (first_page, _) = crate::seen_posts::page_and_record_seen(&browser_session_id, true, &merged_posts, 0, post_cache::POSTS_PER_PAGE);
+		assert_eq!(first_page.len(), post_cache::POSTS_PER_PAGE);
+
+		let req = Request::builder()
+			.uri(format!("/feed-fragment?feed_session={session_id}&cache_page=0&current_url=/following/new"))
+			.header("cookie", format!("rl_session={browser_session_id}"))
+			.body(Body::empty())
+			.unwrap();
+		let response = super::feed_fragment(req).await.expect("feed fragment response");
+		let body = hyper::body::to_bytes(response.into_body()).await.expect("feed fragment body");
+		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
+
+		assert!(html.contains("Post following-seen-fill-25"), "{html}");
+		assert!(html.contains("Post following-seen-fill-29"), "{html}");
+		assert!(!html.contains("Post following-seen-fill-24"), "{html}");
 		assert!(!html.contains("No posts were found."), "{html}");
 	}
 
