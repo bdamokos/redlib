@@ -103,19 +103,6 @@
         writeShardedCookie("flair_subscriptions", base64UrlEncode(JSON.stringify(normalized)));
     };
 
-    const invalidateCurrentPageFragmentCache = () => {
-        const container = document.querySelector("#page_fragment[data-fragment-url]");
-        const fragmentUrl = container?.dataset?.fragmentUrl;
-        if (!fragmentUrl) {
-            return;
-        }
-        try {
-            window.sessionStorage.removeItem(`page-fragment:${fragmentUrl}`);
-        } catch (_) {
-            // Ignore sessionStorage failures.
-        }
-    };
-
     const updateFormState = (form, nextState) => {
         const button = form.querySelector("button");
         if (!button) {
@@ -290,7 +277,6 @@
                 syncTargetStateFromCookies(target);
                 mutateCookies(form);
                 toggleTarget(target);
-                invalidateCurrentPageFragmentCache();
 
                 const response = await fetch(requestAction, {
                     method: form.method || "POST",

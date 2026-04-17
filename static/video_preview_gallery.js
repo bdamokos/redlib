@@ -4,6 +4,10 @@
         return;
     }
 
+    var DEFAULT_RENDER_MODE = "animation";
+    // Deprecated legacy gallery mode. Retained for rollback/debugging.
+    var LEGACY_GALLERY_MODE = "gallery";
+
     var pageSessionId = window.crypto.randomUUID();
     var activeHosts = new Map();
     var heartbeatTimer = null;
@@ -27,6 +31,66 @@
             body: body,
             keepalive: true
         });
+    }
+
+    function renderModeForHost(host) {
+        return host.dataset.previewRenderMode || DEFAULT_RENDER_MODE;
+    }
+
+    function previewImage(host) {
+        return host.querySelector(".video_preview_image");
+    }
+
+    function previewVideo(host) {
+        return host.querySelector("video.post_media_video");
+    }
+
+    function hidePreviewImage(host) {
+        var image = previewImage(host);
+        if (!image) {
+            return;
+        }
+
+        image.hidden = true;
+        image.classList.add("is-hidden");
+    }
+
+    function syncPreviewImageVisibility(host) {
+        var image = previewImage(host);
+        var video = previewVideo(host);
+        if (!image || !video) {
+            return;
+        }
+
+        var shouldShow = video.paused && video.currentTime <= 0.05;
+        image.hidden = !shouldShow;
+        image.classList.toggle("is-hidden", !shouldShow);
+    }
+
+    function bindPreviewLifecycle(host) {
+        if (host.dataset.previewLifecycleBound === "true") {
+            return;
+        }
+
+        host.dataset.previewLifecycleBound = "true";
+        var video = previewVideo(host);
+        if (!video) {
+            return;
+        }
+
+        video.addEventListener("play", function () {
+            hidePreviewImage(host);
+        });
+        video.addEventListener("playing", function () {
+            hidePreviewImage(host);
+        });
+        ["pause", "emptied", "loadstart", "loadeddata", "loadedmetadata", "seeked"].forEach(function (eventName) {
+            video.addEventListener(eventName, function () {
+                syncPreviewImageVisibility(host);
+            });
+        });
+
+        syncPreviewImageVisibility(host);
     }
 
     function ensureHeartbeat() {
@@ -56,7 +120,8 @@
         }
     }
 
-    function renderGallery(host, frames) {
+    // Deprecated legacy gallery renderer. Retained for rollback/debugging only.
+    function renderLegacyGallery(host, frames) {
         var gallery = host.querySelector(".video_preview_gallery");
         if (!gallery) {
             return;
@@ -109,14 +174,67 @@
         return rect.top <= window.innerHeight;
     }
 
-    function flushReadyHost(host, state) {
-        if (!state || state.rendered || !state.ready) {
+    function renderAnimatedPreview(host, state) {
+        if (!state || !state.preview || !state.preview.image_path) {
+            state.rendered = true;
             return;
         }
 
-        renderGallery(host, state.frames || []);
-        state.rendered = true;
-        state.preloadedFrames = [];
+        var image = previewImage(host);
+        if (!image) {
+            state.rendered = true;
+            return;
+        }
+
+        var nextPath = state.preview.image_path;
+        if (image.dataset.previewSrc === nextPath) {
+            state.rendered = true;
+            syncPreviewImageVisibility(host);
+            return;
+        }
+
+        if (state.renderingPreviewPath === nextPath) {
+            return;
+        }
+
+        state.renderingPreviewPath = nextPath;
+
+        var preload = new Image();
+        preload.decoding = "async";
+        preload.onload = function () {
+            var current = activeHosts.get(host);
+            if (!current || !current.preview || current.preview.image_path !== nextPath) {
+                return;
+            }
+
+            image.src = nextPath;
+            image.dataset.previewSrc = nextPath;
+            current.rendered = true;
+            current.renderingPreviewPath = "";
+            syncPreviewImageVisibility(host);
+        };
+        preload.onerror = function () {
+            var current = activeHosts.get(host);
+            if (current) {
+                current.renderingPreviewPath = "";
+            }
+        };
+        preload.src = nextPath;
+    }
+
+    function flushReadyHost(host, state) {
+        if (!state || !state.ready || state.rendered) {
+            return;
+        }
+
+        if (renderModeForHost(host) === LEGACY_GALLERY_MODE) {
+            renderLegacyGallery(host, state.frames || []);
+            state.rendered = true;
+            state.preloadedFrames = [];
+            return;
+        }
+
+        renderAnimatedPreview(host, state);
     }
 
     function flushPendingRenders() {
@@ -127,7 +245,7 @@
                 return;
             }
 
-            if (shouldRenderHost(host)) {
+            if (renderModeForHost(host) !== LEGACY_GALLERY_MODE || shouldRenderHost(host)) {
                 flushReadyHost(host, state);
             }
         });
@@ -154,7 +272,7 @@
         var spinner = loading.querySelector(".video_preview_spinner");
         var statusText = loading.querySelector(".video_preview_status_text");
         if (statusText) {
-            statusText.textContent = state === "queued" ? "Queued for preview generation…" : "Generating preview frames…";
+            statusText.textContent = state === "queued" ? "Queued for animated preview generation…" : "Generating animated preview…";
         }
         if (spinner) {
             spinner.hidden = state === "queued";
@@ -198,14 +316,13 @@
 
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
+                    current.preview = payload.preview || null;
                     current.frames = payload.frames || [];
-                    preloadFrames(current, current.frames);
-                    setLoadingState(host, "ready");
-                    if (shouldRenderHost(host)) {
-                        flushReadyHost(host, current);
-                    } else {
-                        schedulePendingRenderCheck();
+                    if (renderModeForHost(host) === LEGACY_GALLERY_MODE) {
+                        preloadFrames(current, current.frames);
                     }
+                    setLoadingState(host, "ready");
+                    flushReadyHost(host, current);
                     return;
                 }
 
@@ -289,14 +406,13 @@
 
                 if (payload.state && payload.state.status === "ready") {
                     current.ready = true;
+                    current.preview = payload.preview || null;
                     current.frames = payload.frames || [];
-                    preloadFrames(current, current.frames);
-                    setLoadingState(host, "ready");
-                    if (shouldRenderHost(host)) {
-                        flushReadyHost(host, current);
-                    } else {
-                        schedulePendingRenderCheck();
+                    if (renderModeForHost(host) === LEGACY_GALLERY_MODE) {
+                        preloadFrames(current, current.frames);
                     }
+                    setLoadingState(host, "ready");
+                    flushReadyHost(host, current);
                     return;
                 }
 
@@ -343,9 +459,12 @@
 
     function observeHosts(root) {
         (root || document).querySelectorAll(".video_preview_host[data-media-url]").forEach(function (host) {
+            bindPreviewLifecycle(host);
+
             if (!activeHosts.has(host)) {
                 activeHosts.set(host, {});
             }
+
             leaseHost(host);
         });
     }
@@ -358,6 +477,7 @@
 
         observeHosts(document);
         ensureHeartbeat();
+        schedulePendingRenderCheck();
     });
 
     window.addEventListener("pagehide", function () {

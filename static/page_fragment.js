@@ -16,31 +16,6 @@ document.addEventListener("DOMContentLoaded", () => {
     const retryDelayMs = Number.parseInt(container.dataset.retryDelayMs || "1500", 10);
     const replaceSelector = container.dataset.replaceSelector || "";
     const banner = document.querySelector(".feed_status_banner");
-    const cacheVersion = container.dataset.fragmentCacheVersion || "1";
-    const cacheKey = `page-fragment:v${cacheVersion}:${fragmentUrl}`;
-    const cacheEnabled = container.dataset.fragmentCacheEnabled !== "false";
-
-    const readCachedFragment = () => {
-        if (!cacheEnabled) {
-            return null;
-        }
-        try {
-            return window.sessionStorage.getItem(cacheKey);
-        } catch (_) {
-            return null;
-        }
-    };
-
-    const writeCachedFragment = (html) => {
-        if (!cacheEnabled) {
-            return;
-        }
-        try {
-            window.sessionStorage.setItem(cacheKey, html);
-        } catch (_) {
-            // Ignore sessionStorage failures.
-        }
-    };
 
     const replaceFragment = (html) => {
         if (replaceSelector) {
@@ -61,16 +36,11 @@ document.addEventListener("DOMContentLoaded", () => {
         settleBannerState();
     };
 
-    const showErrorState = (cachedHtml) => {
+    const showErrorState = () => {
         window.console?.warn?.("page_fragment: failed to load", {
             fragmentUrl,
             replaceSelector,
         });
-
-        if (cachedHtml) {
-            replaceFragment(cachedHtml);
-            return;
-        }
 
         if (banner) {
             banner.textContent = errorMessage;
@@ -124,7 +94,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const shouldRetryResponse = (status) => status >= 500;
 
-    const loadFragment = async (attempt = 1, cachedHtml = null) => {
+    const loadFragment = async (attempt = 1) => {
         if (banner) {
             banner.hidden = false;
             banner.textContent = loadingMessage;
@@ -149,14 +119,13 @@ document.addEventListener("DOMContentLoaded", () => {
                     attempt,
                 });
                 if (!shouldRetryResponse(response.status)) {
-                    showErrorState(cachedHtml);
+                    showErrorState();
                     return;
                 }
                 throw new Error(`Fragment request failed: ${response.status}`);
             }
 
             const html = await response.text();
-            writeCachedFragment(html);
             replaceFragment(html);
         } catch (error) {
             window.console?.warn?.("page_fragment: fetch attempt failed", {
@@ -167,14 +136,13 @@ document.addEventListener("DOMContentLoaded", () => {
             if (attempt < maxAttempts) {
                 showRetryState(attempt);
                 await waitForRetry();
-                return loadFragment(attempt + 1, cachedHtml);
+                return loadFragment(attempt + 1);
             }
-            showErrorState(cachedHtml);
+            showErrorState();
         } finally {
             window.clearTimeout(timeoutId);
         }
     };
 
-    const cachedHtml = readCachedFragment();
-    void loadFragment(1, cachedHtml);
+    void loadFragment(1);
 });

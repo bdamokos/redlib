@@ -72,7 +72,6 @@ pub struct SubredditTemplate {
 	prefs: Preferences,
 	url: String,
 	redirect_url: String,
-	enable_duplicate_collapse: bool,
 	/// Whether the subreddit itself is filtered.
 	is_filtered: bool,
 	/// Whether all fetched posts are filtered (to differentiate between no posts fetched in the first place,
@@ -112,7 +111,6 @@ pub struct SubredditShellTemplate {
 	is_filtered: bool,
 	is_flair_subscribed: bool,
 	fragment_url: String,
-	fragment_cache_enabled: bool,
 	loading_message: String,
 	placeholder_message: String,
 	replace_selector: String,
@@ -139,7 +137,6 @@ struct SubredditFragmentTemplate {
 	prefs: Preferences,
 	url: String,
 	redirect_url: String,
-	enable_duplicate_collapse: bool,
 	is_filtered: bool,
 	all_posts_filtered: bool,
 	all_posts_hidden_nsfw: bool,
@@ -170,7 +167,6 @@ struct FeedFragmentTemplate {
 	next_page_url: String,
 	prefs: Preferences,
 	url: String,
-	enable_duplicate_collapse: bool,
 	all_posts_filtered: bool,
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
@@ -327,10 +323,6 @@ impl CacheStatusTemplate {
 }
 
 static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
-
-fn should_enable_duplicate_collapse(sub_name: &str) -> bool {
-	sub_name.is_empty() || sub_name.contains('+') || sub_name == "all" || sub_name == "popular"
-}
 
 fn placeholder_subreddit(name: &str) -> Subreddit {
 	Subreddit {
@@ -802,7 +794,6 @@ fn render_scraped_subreddit_fragment(
 			prefs,
 			url: url.to_string(),
 			redirect_url: redirect_url.to_string(),
-			enable_duplicate_collapse: should_enable_duplicate_collapse(sub_name),
 			is_filtered: false,
 			all_posts_filtered,
 			all_posts_hidden_nsfw,
@@ -992,7 +983,6 @@ fn render_video_mode_subreddit_fragment(
 			prefs,
 			url: url.clone(),
 			redirect_url,
-			enable_duplicate_collapse: true,
 			is_filtered: false,
 			all_posts_filtered,
 			all_posts_hidden_nsfw,
@@ -1763,7 +1753,6 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		is_filtered: false,
 		is_flair_subscribed,
 		fragment_url: subreddit_fragment_path(&req),
-		fragment_cache_enabled: !feed_seen_shell.as_ref().is_some_and(|ctx| ctx.applies && ctx.hide_seen_on),
 		loading_message,
 		placeholder_message,
 		replace_selector: if is_video_length_sort(&sort) { "main".to_string() } else { "#column_one".to_string() },
@@ -2079,7 +2068,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				prefs: Preferences::new(&req),
 				url,
 				redirect_url,
-				enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 				is_filtered: true,
 				all_posts_filtered: false,
 				all_posts_hidden_nsfw: false,
@@ -2202,7 +2190,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					prefs: Preferences::new(&req),
 					url: url.clone(),
 					redirect_url,
-					enable_duplicate_collapse: true,
 					is_filtered: false,
 					all_posts_filtered: false,
 					all_posts_hidden_nsfw,
@@ -2339,7 +2326,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				prefs: Preferences::new(&req),
 				url,
 				redirect_url,
-				enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 				is_filtered: false,
 				all_posts_filtered,
 				all_posts_hidden_nsfw,
@@ -2403,7 +2389,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					prefs: Preferences::new(&req),
 					url,
 					redirect_url,
-					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
 					is_filtered: false,
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
@@ -2504,7 +2489,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						prefs: Preferences::new(&req),
 						url,
 						redirect_url,
-						enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
 						is_filtered: false,
 						all_posts_filtered,
 						all_posts_hidden_nsfw,
@@ -2574,7 +2558,6 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 									prefs: Preferences::new(&req),
 									url,
 									redirect_url,
-									enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
 									is_filtered: false,
 									all_posts_filtered,
 									all_posts_hidden_nsfw,
@@ -2632,8 +2615,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 #[cfg(test)]
 mod tests {
 	use super::{
-		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, should_enable_duplicate_collapse,
-		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate, FRONT_CURSOR_PARAM,
+		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, split_subscriptions_for_listing,
+		update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use hyper::{Body, Request};
@@ -2735,16 +2718,7 @@ mod tests {
 	}
 
 	#[test]
-	fn enables_duplicate_collapse_for_aggregate_feeds() {
-		assert!(should_enable_duplicate_collapse(""));
-		assert!(should_enable_duplicate_collapse("popular"));
-		assert!(should_enable_duplicate_collapse("all"));
-		assert!(should_enable_duplicate_collapse("rust+programming"));
-		assert!(!should_enable_duplicate_collapse("rust"));
-	}
-
-	#[test]
-	fn renders_duplicate_script_for_aggregate_feed_pages() {
+	fn aggregate_feed_pages_do_not_render_client_duplicate_script_by_default() {
 		let html = SubredditTemplate {
 			sub: Subreddit {
 				name: "rust+programming".to_string(),
@@ -2763,7 +2737,6 @@ mod tests {
 			prefs: test_prefs(),
 			url: "/r/rust+programming".to_string(),
 			redirect_url: "r/rust%2Bprogramming".to_string(),
-			enable_duplicate_collapse: true,
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
@@ -2784,7 +2757,7 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(html.contains("submitted_duplicates.js"));
+		assert!(!html.contains("submitted_duplicates.js"));
 	}
 
 	#[test]
@@ -2811,7 +2784,6 @@ mod tests {
 			prefs: test_prefs(),
 			url: "/r/rust".to_string(),
 			redirect_url: "r/rust".to_string(),
-			enable_duplicate_collapse: false,
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
@@ -2855,7 +2827,6 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
-			fragment_cache_enabled: true,
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -2889,7 +2860,6 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/videos/video-length".to_string(),
-			fragment_cache_enabled: true,
 			loading_message: "Loading videos...".to_string(),
 			placeholder_message: "Loading videos...".to_string(),
 			replace_selector: "main".to_string(),
@@ -2921,7 +2891,6 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/videos/video-length".to_string(),
-			fragment_cache_enabled: true,
 			loading_message: "Loading videos...".to_string(),
 			placeholder_message: "Loading videos...".to_string(),
 			replace_selector: "main".to_string(),
@@ -2953,7 +2922,6 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment".to_string(),
-			fragment_cache_enabled: true,
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -2986,7 +2954,6 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/new".to_string(),
-			fragment_cache_enabled: true,
 			loading_message: loading_message.clone(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -3023,7 +2990,6 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment/r/rust".to_string(),
-			fragment_cache_enabled: true,
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -3037,7 +3003,7 @@ mod tests {
 	}
 
 	#[test]
-	fn subreddit_shell_disables_fragment_cache_for_seen_filtered_feeds() {
+	fn subreddit_shell_does_not_emit_fragment_cache_attrs() {
 		let html = super::SubredditShellTemplate {
 			sub: Subreddit::default(),
 			top_users: Vec::new(),
@@ -3051,7 +3017,6 @@ mod tests {
 			is_filtered: false,
 			is_flair_subscribed: false,
 			fragment_url: "/subreddit-fragment".to_string(),
-			fragment_cache_enabled: false,
 			loading_message: "Loading posts...".to_string(),
 			placeholder_message: "Loading posts...".to_string(),
 			replace_selector: "#column_one".to_string(),
@@ -3061,7 +3026,8 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(html.contains("data-fragment-cache-enabled=\"false\""));
+		assert!(!html.contains("data-fragment-cache-enabled="));
+		assert!(!html.contains("data-fragment-cache-version="));
 	}
 
 	#[test]
@@ -3109,7 +3075,6 @@ mod tests {
 			prefs: test_prefs(),
 			url: "/".to_string(),
 			redirect_url: String::new(),
-			enable_duplicate_collapse: true,
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
@@ -3156,7 +3121,6 @@ mod tests {
 			prefs: test_prefs(),
 			url: "/r/rust".to_string(),
 			redirect_url: "r/rust".to_string(),
-			enable_duplicate_collapse: false,
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
@@ -3197,7 +3161,6 @@ mod tests {
 			prefs: test_prefs(),
 			url: "/hot".to_string(),
 			redirect_url: String::new(),
-			enable_duplicate_collapse: false,
 			is_filtered: false,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
@@ -4142,7 +4105,6 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		next_page_url,
 		prefs: Preferences::new(&req),
 		url: current_url,
-		enable_duplicate_collapse: true,
 		all_posts_filtered: false,
 		all_posts_hidden_nsfw,
 		no_posts,

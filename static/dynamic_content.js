@@ -8,7 +8,6 @@
         window.initializeDashVideos?.(root);
         window.observeVideoPreviewHosts?.(root);
         window.observeVideoVisibility?.(root);
-        window.initializeSubmittedDuplicates?.();
     };
 
     window.refreshDynamicContent = initialize;

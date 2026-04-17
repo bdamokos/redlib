@@ -48,6 +48,11 @@
                 window.refreshDynamicContent?.(dynamicRoot || document);
             };
 
+            const hasVisiblePosts = () => {
+                const currentPosts = container.querySelector("#posts");
+                return !!currentPosts?.querySelector(".post");
+            };
+
             const updateFeedContent = (html) => {
                 if (lastFragmentHtml === html) {
                     return;
@@ -62,27 +67,20 @@
 
                 const nextPosts = nextRoot.querySelector("#posts");
                 const currentPosts = container.querySelector("#posts");
-                // Once the user can see posts for the current page, keep that list stable.
-                // We still update the footer/banner so navigation and warmup state stay current.
-                const shouldReplaceVisiblePosts =
+                const shouldInitialFillPosts =
                     nextPosts &&
                     currentPosts &&
-                    currentPosts.children.length === 0 &&
+                    !hasVisiblePosts() &&
+                    currentPosts.querySelector(".post") === null &&
                     nextPosts.innerHTML !== currentPosts.innerHTML;
 
-                if (shouldReplaceVisiblePosts) {
+                if (shouldInitialFillPosts) {
                     currentPosts.innerHTML = nextPosts.innerHTML;
                     refreshDynamicContent(currentPosts);
                 }
 
-                const nextFooter = nextRoot.querySelector("footer");
-                const currentFooter = container.querySelector("footer");
-                if (nextFooter && currentFooter && nextFooter.innerHTML !== currentFooter.innerHTML) {
-                    currentFooter.innerHTML = nextFooter.innerHTML;
-                }
-
-                if (!currentPosts || !nextPosts) {
-                    container.innerHTML = html;
+                if ((!currentPosts || !nextPosts) && !hasVisiblePosts()) {
+                    container.replaceChildren(...nextRoot.childNodes);
                     refreshDynamicContent(container);
                 }
 

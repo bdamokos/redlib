@@ -995,7 +995,7 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(html.contains("submitted_duplicates.js"));
+		assert!(!html.contains("submitted_duplicates.js"));
 		assert!(html.contains("Also posted to 2 other subreddits"));
 		assert!(html.contains("Other title one"));
 		assert!(html.contains("Other title two"));
@@ -1012,7 +1012,7 @@ mod tests {
 	}
 
 	#[test]
-	fn renders_duplicate_script_in_overview_listing() {
+	fn does_not_render_duplicate_script_in_overview_listing_by_default() {
 		let html = super::UserTemplate {
 			user: crate::utils::User {
 				name: "demo_user".to_string(),
@@ -1045,7 +1045,7 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(html.contains("submitted_duplicates.js"));
+		assert!(!html.contains("submitted_duplicates.js"));
 	}
 
 	#[test]

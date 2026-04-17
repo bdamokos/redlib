@@ -377,6 +377,7 @@ async fn main() {
 	app.at("/api/browser-sessions/heartbeat").post(|r| post_cache::browser_session_heartbeat(r).boxed());
 	app.at("/api/browser-sessions/release").post(|r| post_cache::browser_session_release(r).boxed());
 	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());
+	app.at("/api/video-previews/:job_id/animation").get(|r| video_preview::animation(r).boxed());
 	app.at("/api/video-previews/:job_id/frame/:index").get(|r| video_preview::frame(r).boxed());
 
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());

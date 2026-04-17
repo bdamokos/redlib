@@ -83,9 +83,6 @@
 				<script src="/hls.min.js"></script>
 				<script src="/playHLSVideo.js"></script>
 				{% endif %}
-				{% if enable_duplicate_collapse %}
-				<script src="/submitted_duplicates.js?v={{ env!("GIT_HASH") }}" defer></script>
-				{% endif %}
 				</div>
 				<footer>
 					{% if show_contextual_pagination %}

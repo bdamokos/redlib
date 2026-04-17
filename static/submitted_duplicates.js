@@ -1,3 +1,6 @@
+// Deprecated legacy client-side duplicate collapsing/refill pipeline.
+// It is intentionally disconnected from the default frontend path so visible
+// posts remain stable after first render. Keep this file for rollback/debugging.
 const SIMILAR_DUPLICATE_WINDOW_MS = 72 * 60 * 60 * 1000;
 const HASH_SIZE = 12;
 const VISUAL_KEY_SIZE = 32;
