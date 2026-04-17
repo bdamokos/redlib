@@ -1853,6 +1853,20 @@ pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<Fee
 	Some(session_status_from_posts(session, &posts, page, per_page))
 }
 
+/// Returns the fully merged feed posts for a session (pre-pagination).
+///
+/// This is intended for higher-level pagination strategies (e.g. skipping seen posts)
+/// that need to scan beyond a fixed page slice.
+pub fn feed_merged_posts(session_id: &str) -> Option<Vec<Post>> {
+	let mut sessions = FEED_SESSIONS.lock().ok()?;
+	let session = sessions.get_mut(session_id)?;
+	if session_is_expired(session) {
+		return None;
+	}
+	reconcile_session_with_source_cache(session);
+	Some(merged_posts_for_session(session))
+}
+
 pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Vec<FeedSessionPageMetric>> {
 	let mut sessions = FEED_SESSIONS.lock().ok()?;
 	let session = sessions.get_mut(session_id)?;

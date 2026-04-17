@@ -2178,9 +2178,20 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				"post_cache: serving page {} from session {} ({} session sources ready, {} from daemon cache, {} total posts)",
 				cache_page, feed_session_id, ready_sources, daemon_cached_sources, merged_posts
 			);
-			let no_posts = page_ready && page.posts.is_empty();
-			let all_posts_hidden_nsfw = !no_posts && (page.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-			utils::hydrate_post_author_links_from_cache(&mut page.posts);
+			// Instead of serving a short page when many posts are seen, page over the full merged feed
+			// and pick a full window of unseen posts.
+			let merged_posts = crate::post_cache::feed_merged_posts(&feed_session_id).unwrap_or_else(|| std::mem::take(&mut page.posts));
+			let (page_posts, has_next_unseen) = if let Some(ref ctx) = feed_seen_ctx {
+				seen_posts::page_and_record_seen(&ctx.session_id, ctx.hide_seen_on, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
+			} else {
+				seen_posts::page_and_record_seen("anon", false, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
+			};
+			let mut page_posts = page_posts;
+			page.has_next = page.has_next || has_next_unseen;
+
+			let no_posts = page_ready && page_posts.is_empty();
+			let all_posts_hidden_nsfw = !no_posts && (page_posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			utils::hydrate_post_author_links_from_cache(&mut page_posts);
 
 			let prev_page_url = if cache_page > 0 {
 				feed_page_url(&url, &feed_session_id, cache_page - 1)
@@ -2198,7 +2209,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				&req,
 				SubredditFragmentTemplate {
 					sub,
-					posts: page.posts,
+				posts: page_posts,
 					top_users,
 					sort: (sort.clone(), timeframe.clone()),
 					sort_options,
@@ -3922,10 +3933,11 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		(String::new(), false)
 	};
 	let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, feed_seen_scope);
-	let posts = if feed_seen_scope {
-		seen_posts::filter_and_record_seen(&rl_session_id, hide_seen_on, std::mem::take(&mut feed_page.posts))
+	let merged_posts = std::mem::take(&mut feed_page.posts);
+	let (posts, has_next_unseen) = if feed_seen_scope {
+		seen_posts::page_and_record_seen(&rl_session_id, hide_seen_on, &merged_posts, page, crate::post_cache::POSTS_PER_PAGE)
 	} else {
-		std::mem::take(&mut feed_page.posts)
+		seen_posts::page_and_record_seen("anon", false, &merged_posts, page, crate::post_cache::POSTS_PER_PAGE)
 	};
 
 	let prev_page_url = if page > 0 {
@@ -3955,6 +3967,20 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		)
 	} else {
 		String::new()
+	};
+	let next_page_url = if has_next_unseen && next_page_url.is_empty() {
+		update_url_query(
+			&current_url,
+			&[
+				("cache_page", Some(&(page + 1).to_string())),
+				(FEED_SESSION_PARAM, Some(&session_id)),
+				("before", None),
+				("after", None),
+				(FRONT_CURSOR_PARAM, None),
+			],
+		)
+	} else {
+		next_page_url
 	};
 	let no_posts = page_ready && posts.is_empty();
 	let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");

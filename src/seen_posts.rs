@@ -79,6 +79,70 @@ pub fn filter_and_record_seen(session_id: &str, hide_seen: bool, posts: Vec<Post
 	result
 }
 
+/// Select a page of posts, optionally skipping posts already seen in this session, and record
+/// only the returned posts as seen.
+///
+/// Returns `(page_posts, has_next)` where `has_next` is based on unseen availability when
+/// hide-seen is enabled; otherwise it mirrors plain pagination.
+pub fn page_and_record_seen(session_id: &str, hide_seen: bool, posts: &[Post], page: usize, per_page: usize) -> (Vec<Post>, bool) {
+	if session_id.trim().is_empty() || per_page == 0 {
+		return (Vec::new(), false);
+	}
+
+	let mut map = SEEN_BY_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+	prune_seen_locked(&mut map);
+
+	// Non-hide mode: plain paging but still mark served IDs.
+	if !hide_seen {
+		let start = page.saturating_mul(per_page);
+		let end = (start + per_page).min(posts.len());
+		let page_posts = if start < posts.len() { posts[start..end].to_vec() } else { Vec::new() };
+		let has_next = end < posts.len();
+
+		let entry = map.entry(session_id.to_string()).or_insert(SeenState {
+			ids: HashSet::new(),
+			last_touch: Instant::now(),
+		});
+		entry.ids.extend(page_posts.iter().map(|p| p.id.clone()));
+		entry.last_touch = Instant::now();
+
+		return (page_posts, has_next);
+	}
+
+	let seen_ids = map.get(session_id).map(|s| &s.ids);
+	let wanted_start = page.saturating_mul(per_page);
+	let wanted_end = wanted_start.saturating_add(per_page);
+
+	let mut unseen_index = 0usize;
+	let mut page_posts = Vec::new();
+	let mut page_ids = Vec::new();
+	let mut has_more_unseen = false;
+
+	for post in posts {
+		if seen_ids.is_some_and(|ids| ids.contains(&post.id)) {
+			continue;
+		}
+		if unseen_index >= wanted_end {
+			has_more_unseen = true;
+			break;
+		}
+		if unseen_index >= wanted_start && page_posts.len() < per_page {
+			page_ids.push(post.id.clone());
+			page_posts.push(post.clone());
+		}
+		unseen_index += 1;
+	}
+
+	let entry = map.entry(session_id.to_string()).or_insert(SeenState {
+		ids: HashSet::new(),
+		last_touch: Instant::now(),
+	});
+	entry.ids.extend(page_ids);
+	entry.last_touch = Instant::now();
+
+	(page_posts, has_more_unseen)
+}
+
 pub fn ensure_rl_session_id(req: &Request<Body>) -> (String, bool) {
 	if let Some(c) = req.cookie(RL_SESSION_COOKIE) {
 		let v = c.value().trim();
