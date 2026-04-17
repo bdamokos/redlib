@@ -1,6 +1,6 @@
 #![allow(clippy::cmp_owned)]
 
-use crate::{config, instance_scrape, utils, video_mode};
+use crate::{config, instance_scrape, seen_posts, utils, video_mode};
 // CRATES
 use crate::cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditMetadataEntry, PersistedSubredditNsfwEntry};
 use crate::post_cache::{FeedSessionRequest, FeedSort, FeedSource};
@@ -90,6 +90,9 @@ pub struct SubredditTemplate {
 	contextual_pagination: Vec<ContextualPageLink>,
 	video_mode_enabled: bool,
 	video_mode_sidebar: video_mode::VideoModeSidebarData,
+	show_hide_seen_toggle: bool,
+	hide_seen_on: bool,
+	hide_seen_toggle_url: String,
 }
 
 crate::impl_template_str_eq!(SubredditTemplate);
@@ -149,6 +152,9 @@ struct SubredditFragmentTemplate {
 	contextual_pagination: Vec<ContextualPageLink>,
 	video_mode_enabled: bool,
 	video_mode_sidebar: video_mode::VideoModeSidebarData,
+	show_hide_seen_toggle: bool,
+	hide_seen_on: bool,
+	hide_seen_toggle_url: String,
 }
 
 crate::impl_template_str_eq!(SubredditFragmentTemplate);
@@ -577,32 +583,67 @@ fn empty_video_mode_sidebar() -> video_mode::VideoModeSidebarData {
 	video_mode::VideoModeSidebarData::default()
 }
 
-fn build_video_mode_sidebar(url: &str, listing: &video_mode::VideoModeListing, page_posts: &[Post]) -> video_mode::VideoModeSidebarData {
-	let (path, query) = current_url_parts(url);
-	let mut hidden_query_pairs = video_mode::query_pairs(query);
+fn video_mode_facet_hidden_value(mode: video_mode::FacetMode) -> &'static str {
+	match mode {
+		video_mode::FacetMode::None => "none",
+		video_mode::FacetMode::Exclude => "exclude",
+		video_mode::FacetMode::Include => "",
+	}
+}
+
+fn build_video_mode_sidebar(
+	url: &str,
+	listing: &video_mode::VideoModeListing,
+	page_posts: &[Post],
+	query: &video_mode::VideoModeQuery,
+) -> video_mode::VideoModeSidebarData {
+	let (path, query_str) = current_url_parts(url);
+	let mut hidden_query_pairs = video_mode::query_pairs(query_str);
 	video_mode::strip_video_query_pairs(&mut hidden_query_pairs);
 	hidden_query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after" && key != FRONT_CURSOR_PARAM && key != FEED_SESSION_PARAM);
 
+	let clear_url = build_url_from_query_pairs(path, &hidden_query_pairs);
+	let clear_cookie_redirect_href = format!(
+		"/api/video-mode/clear-redirect?{}",
+		form_urlencoded::Serializer::new(String::new()).append_pair("redirect", &clear_url).finish()
+	);
+
+	let video_sub_mode_value = if !listing.subreddit_options.is_empty() && listing.subreddit_options.iter().all(|option| !option.active) {
+		"none".to_string()
+	} else {
+		video_mode_facet_hidden_value(query.subreddit_mode).to_string()
+	};
+	let video_user_mode_value = if !listing.user_options.is_empty() && listing.user_options.iter().all(|option| !option.active) {
+		"none".to_string()
+	} else {
+		video_mode_facet_hidden_value(query.user_mode).to_string()
+	};
+
 	video_mode::VideoModeSidebarData {
 		action_url: path.to_string(),
-		clear_url: build_url_from_query_pairs(path, &hidden_query_pairs),
+		clear_url,
+		clear_cookie_redirect_href,
 		hidden_query_pairs,
 		subreddit_options: video_mode::sort_options_by_page_count(&listing.subreddit_options, page_posts, |post| post.community.clone()),
 		user_options: video_mode::sort_options_by_page_count(&listing.user_options, page_posts, |post| post.author.name.clone()),
 		clear_subreddits: !listing.subreddit_options.is_empty() && listing.subreddit_options.iter().all(|option| !option.active),
 		clear_users: !listing.user_options.is_empty() && listing.user_options.iter().all(|option| !option.active),
+		video_sub_mode_value,
+		video_user_mode_value,
 		age_min_hours: listing.age_min_hours,
 		age_max_hours: listing.age_max_hours,
 		age_bound_hours: listing.age_bound_hours,
 	}
 }
 
-fn video_mode_page_url(current_url: &str, page: usize, query: &video_mode::VideoModeQuery) -> String {
+fn video_mode_page_url(current_url: &str, page: usize, query: &video_mode::VideoModeQuery, embed_video_params_in_url: bool) -> String {
 	let (path, raw_query) = current_url_parts(current_url);
 	let mut query_pairs = video_mode::query_pairs(raw_query);
 	query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after" && key != FRONT_CURSOR_PARAM && key != FEED_SESSION_PARAM);
 	video_mode::strip_video_query_pairs(&mut query_pairs);
-	video_mode::append_query_pairs(&mut query_pairs, query);
+	if embed_video_params_in_url {
+		video_mode::append_query_pairs(&mut query_pairs, query);
+	}
 	if page > 0 {
 		query_pairs.push(("cache_page".to_string(), page.to_string()));
 	}
@@ -665,15 +706,51 @@ fn render_feed_fragment(mut template_data: FeedFragmentTemplate) -> Result<Respo
 		.map_err(|error| error.to_string())
 }
 
-fn render_subreddit_fragment(mut template_data: SubredditFragmentTemplate) -> Result<Response<Body>, String> {
+fn render_subreddit_fragment(
+	_req: &Request<Body>,
+	mut template_data: SubredditFragmentTemplate,
+	feed_seen: Option<seen_posts::FeedSeenCookieCtx>,
+) -> Result<Response<Body>, String> {
+	if let Some(ref ctx) = feed_seen {
+		if ctx.applies {
+			template_data.posts = seen_posts::filter_and_record_seen(
+				&ctx.session_id,
+				ctx.hide_seen_on,
+				std::mem::take(&mut template_data.posts),
+			);
+			template_data.show_hide_seen_toggle = true;
+			template_data.hide_seen_on = ctx.hide_seen_on;
+			template_data.hide_seen_toggle_url = update_url_query(
+				&template_data.url,
+				&[("hide_seen", Some(if ctx.hide_seen_on { "off" } else { "on" }))],
+			);
+		}
+	} else {
+		template_data.show_hide_seen_toggle = false;
+		template_data.hide_seen_on = false;
+		template_data.hide_seen_toggle_url.clear();
+	}
+
 	utils::refresh_post_times(&mut template_data.posts);
 	let body = template_data.render().map_err(|error| error.to_string())?;
-	Response::builder()
+	let mut response = Response::builder()
 		.status(200)
 		.header("content-type", "text/html; charset=utf-8")
 		.header("cache-control", "no-store")
 		.body(Body::from(body))
-		.map_err(|error| error.to_string())
+		.map_err(|error| error.to_string())?;
+
+	if let Some(ref ctx) = feed_seen {
+		if ctx.applies {
+			seen_posts::attach_rl_feed_cookies(
+				&mut response,
+				&ctx.session_id,
+				ctx.needs_session_cookie,
+				ctx.hide_seen_cookie_override.as_deref(),
+			);
+		}
+	}
+	Ok(response)
 }
 
 fn render_scraped_subreddit_fragment(
@@ -711,50 +788,57 @@ fn render_scraped_subreddit_fragment(
 	let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(req, "show_nsfw") != "on");
 	utils::hydrate_post_author_links_from_cache(&mut posts);
 
-	render_subreddit_fragment(SubredditFragmentTemplate {
-		sub: scraped.subreddit,
-		posts,
-		top_users: utils::cached_subreddit_users(sub_name)
-			.into_iter()
-			.map(|(name, count)| SubredditUserEntry { name, count })
-			.collect(),
-		sort: (sort.to_string(), timeframe.to_string()),
-		sort_options,
-		flair_filters: build_flair_filters(url, active_flair_filter, utils::cached_subreddit_flairs(sub_name)),
-		active_flair_filter: active_flair_filter.to_string(),
-		active_flair_filter_encoded: encode_query_value(active_flair_filter),
-		clear_flair_filter_url: update_url_query(url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
-		prev_page_url: if !request_before.is_empty() {
-			update_url_query(url, &[("sort", Some(sort)), ("t", Some(timeframe)), ("before", Some(request_before)), ("after", None)])
-		} else {
-			String::new()
+	render_subreddit_fragment(
+		req,
+		SubredditFragmentTemplate {
+			sub: scraped.subreddit,
+			posts,
+			top_users: utils::cached_subreddit_users(sub_name)
+				.into_iter()
+				.map(|(name, count)| SubredditUserEntry { name, count })
+				.collect(),
+			sort: (sort.to_string(), timeframe.to_string()),
+			sort_options,
+			flair_filters: build_flair_filters(url, active_flair_filter, utils::cached_subreddit_flairs(sub_name)),
+			active_flair_filter: active_flair_filter.to_string(),
+			active_flair_filter_encoded: encode_query_value(active_flair_filter),
+			clear_flair_filter_url: update_url_query(url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+			prev_page_url: if !request_before.is_empty() {
+				update_url_query(url, &[("sort", Some(sort)), ("t", Some(timeframe)), ("before", Some(request_before)), ("after", None)])
+			} else {
+				String::new()
+			},
+			next_page_url: if !scraped.after.is_empty() {
+				update_url_query(
+					url,
+					&[("sort", Some(sort)), ("t", Some(timeframe)), ("before", None), ("after", Some(scraped.after.as_str()))],
+				)
+			} else {
+				String::new()
+			},
+			prefs,
+			url: url.to_string(),
+			redirect_url: redirect_url.to_string(),
+			enable_duplicate_collapse: should_enable_duplicate_collapse(sub_name),
+			is_filtered: false,
+			all_posts_filtered,
+			all_posts_hidden_nsfw,
+			no_posts,
+			cache_notice: instance_scrape::scrape_notice().to_string(),
+			is_flair_subscribed,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
 		},
-		next_page_url: if !scraped.after.is_empty() {
-			update_url_query(
-				url,
-				&[("sort", Some(sort)), ("t", Some(timeframe)), ("before", None), ("after", Some(scraped.after.as_str()))],
-			)
-		} else {
-			String::new()
-		},
-		prefs,
-		url: url.to_string(),
-		redirect_url: redirect_url.to_string(),
-		enable_duplicate_collapse: should_enable_duplicate_collapse(sub_name),
-		is_filtered: false,
-		all_posts_filtered,
-		all_posts_hidden_nsfw,
-		no_posts,
-		cache_notice: instance_scrape::scrape_notice().to_string(),
-		is_flair_subscribed,
-		feed_session_id: String::new(),
-		feed_status_url: String::new(),
-		feed_fragment_url: String::new(),
-		show_contextual_pagination: false,
-		contextual_pagination: Vec::new(),
-		video_mode_enabled: false,
-		video_mode_sidebar: empty_video_mode_sidebar(),
-	})
+		None,
+	)
 }
 
 fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
@@ -879,12 +963,14 @@ fn render_video_mode_subreddit_fragment(
 	filters: &HashSet<String>,
 	cache_page: usize,
 	cache_notice: String,
+	feed_seen: Option<seen_posts::FeedSeenCookieCtx>,
 ) -> Result<Response<Body>, String> {
 	let query = req.uri().query().unwrap_or_default();
 	let cookie_value = crate::utils::read_sharded_cookie(req, video_mode::VIDEO_MODE_QUERY_COOKIE);
 	let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
 	let listing = video_mode::build_listing(&source_posts, filters, &parsed_query, now_unix());
 	let normalized_query = normalized_video_mode_query(&parsed_query, &listing);
+	let request_has_video_params = video_mode::query_has_video_params(query);
 	let (page_posts, has_prev, has_next) = paginate_posts(&listing.posts, cache_page, crate::post_cache::POSTS_PER_PAGE);
 	let prefs = Preferences::new(req);
 	let no_posts = listing.posts.is_empty();
@@ -893,49 +979,56 @@ fn render_video_mode_subreddit_fragment(
 	let all_posts_filtered = eligible_videos > 0 && listing.posts.is_empty();
 	let mut page_posts = page_posts;
 	utils::hydrate_post_author_links_from_cache(&mut page_posts);
-	let video_mode_sidebar = build_video_mode_sidebar(&url, &listing, &page_posts);
+	let video_mode_sidebar = build_video_mode_sidebar(&url, &listing, &page_posts, &normalized_query);
 
-	render_subreddit_fragment(SubredditFragmentTemplate {
-		sub,
-		posts: page_posts,
-		top_users,
-		sort: (sort, String::new()),
-		sort_options,
-		flair_filters,
-		active_flair_filter: active_flair_filter.clone(),
-		active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-		clear_flair_filter_url: update_url_query(
-			&url,
-			&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
-		),
-		prev_page_url: if has_prev {
-			video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query)
-		} else {
-			String::new()
+	render_subreddit_fragment(
+		req,
+		SubredditFragmentTemplate {
+			sub,
+			posts: page_posts,
+			top_users,
+			sort: (sort, String::new()),
+			sort_options,
+			flair_filters,
+			active_flair_filter: active_flair_filter.clone(),
+			active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+			clear_flair_filter_url: update_url_query(
+				&url,
+				&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+			),
+			prev_page_url: if has_prev {
+				video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query, request_has_video_params)
+			} else {
+				String::new()
+			},
+			next_page_url: if has_next {
+				video_mode_page_url(&url, cache_page + 1, &normalized_query, request_has_video_params)
+			} else {
+				String::new()
+			},
+			prefs,
+			url: url.clone(),
+			redirect_url,
+			enable_duplicate_collapse: true,
+			is_filtered: false,
+			all_posts_filtered,
+			all_posts_hidden_nsfw,
+			no_posts,
+			cache_notice,
+			is_flair_subscribed,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+			video_mode_enabled: true,
+			video_mode_sidebar,
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
 		},
-		next_page_url: if has_next {
-			video_mode_page_url(&url, cache_page + 1, &normalized_query)
-		} else {
-			String::new()
-		},
-		prefs,
-		url: url.clone(),
-		redirect_url,
-		enable_duplicate_collapse: true,
-		is_filtered: false,
-		all_posts_filtered,
-		all_posts_hidden_nsfw,
-		no_posts,
-		cache_notice,
-		is_flair_subscribed,
-		feed_session_id: String::new(),
-		feed_status_url: String::new(),
-		feed_fragment_url: String::new(),
-		show_contextual_pagination: false,
-		contextual_pagination: Vec::new(),
-		video_mode_enabled: true,
-		video_mode_sidebar,
-	})
+		feed_seen,
+	)
 }
 
 fn subreddit_listing_query(query: &str, include_geo_filter: bool) -> String {
@@ -1647,22 +1740,35 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		} else {
 			collect_cached_source_posts(&build_video_mode_front_page_sources(&prefs, &front_page))
 		};
-		let listing = video_mode::build_listing(
-			&source_posts,
-			&get_filters(&req),
-			&video_mode::parse_query_or_cookie(
-				req.uri().query().unwrap_or_default(),
-				&crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE),
-			),
-			now_unix(),
+		let parsed_vm = video_mode::parse_query_or_cookie(
+			req.uri().query().unwrap_or_default(),
+			&crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE),
 		);
+		let listing = video_mode::build_listing(&source_posts, &get_filters(&req), &parsed_vm, now_unix());
+		let normalized_vm = normalized_video_mode_query(&parsed_vm, &listing);
 		let preview_posts = listing.posts.iter().take(crate::post_cache::POSTS_PER_PAGE).cloned().collect::<Vec<_>>();
-		build_video_mode_sidebar(&url, &listing, &preview_posts)
+		build_video_mode_sidebar(&url, &listing, &preview_posts, &normalized_vm)
 	} else {
 		empty_video_mode_sidebar()
 	};
 
-	Ok(template(&SubredditShellTemplate {
+	let feed_seen_scope_shell = req.param("sub").is_none()
+		&& (aggregate_front_page || contextual_front_page || video_mode_front_page);
+	let feed_seen_shell = if feed_seen_scope_shell {
+		let (session_id, needs_session_cookie) = seen_posts::ensure_rl_session_id(&req);
+		let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, true);
+		Some(seen_posts::FeedSeenCookieCtx {
+			session_id,
+			hide_seen_on,
+			applies: true,
+			needs_session_cookie,
+			hide_seen_cookie_override,
+		})
+	} else {
+		None
+	};
+
+	let mut response = template(&SubredditShellTemplate {
 		sub: cached_sub,
 		top_users,
 		flair_filters,
@@ -1680,7 +1786,18 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		replace_selector: if is_video_length_sort(&sort) { "main".to_string() } else { "#column_one".to_string() },
 		video_mode_enabled: is_video_length_sort(&sort),
 		video_mode_sidebar,
-	}))
+	});
+	if let Some(ref ctx) = feed_seen_shell {
+		if ctx.applies {
+			seen_posts::attach_rl_feed_cookies(
+				&mut response,
+				&ctx.session_id,
+				ctx.needs_session_cookie,
+				ctx.hide_seen_cookie_override.as_deref(),
+			);
+		}
+	}
+	Ok(response)
 }
 
 pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -1753,6 +1870,21 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		build_front_page_session_sources(&prefs, &front_page, front_page_is_default, aggregate_front_page, &sub_name, &sort)
 	} else {
 		Vec::new()
+	};
+
+	let feed_seen_scope = !is_subreddit_route && (aggregate_saved_feeds || contextual_front_page || video_mode_front_page);
+	let feed_seen_ctx = if feed_seen_scope {
+		let (session_id, needs_session_cookie) = seen_posts::ensure_rl_session_id(&req);
+		let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, true);
+		Some(seen_posts::FeedSeenCookieCtx {
+			session_id,
+			hide_seen_on,
+			applies: true,
+			needs_session_cookie,
+			hide_seen_cookie_override,
+		})
+	} else {
+		None
 	};
 
 	let fragment_request_url = req.uri().to_string();
@@ -1953,36 +2085,43 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
-		render_subreddit_fragment(SubredditFragmentTemplate {
-			sub,
-			posts: Vec::new(),
-			top_users,
-			sort: (sort, param(&path, "t").unwrap_or_default()),
-			sort_options,
-			flair_filters,
-			active_flair_filter: active_flair_filter.clone(),
-			active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-			clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
-			prev_page_url: String::new(),
-			next_page_url: String::new(),
-			prefs: Preferences::new(&req),
-			url,
-			redirect_url,
-			enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
-			is_filtered: true,
-			all_posts_filtered: false,
-			all_posts_hidden_nsfw: false,
-			no_posts: false,
-			cache_notice: String::new(),
-			is_flair_subscribed,
-			feed_session_id: String::new(),
-			feed_status_url: String::new(),
-			feed_fragment_url: String::new(),
-			show_contextual_pagination: false,
-			contextual_pagination: Vec::new(),
-			video_mode_enabled: false,
-			video_mode_sidebar: empty_video_mode_sidebar(),
-		})
+		render_subreddit_fragment(
+			&req,
+			SubredditFragmentTemplate {
+				sub,
+				posts: Vec::new(),
+				top_users,
+				sort: (sort, param(&path, "t").unwrap_or_default()),
+				sort_options,
+				flair_filters,
+				active_flair_filter: active_flair_filter.clone(),
+				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+				clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+				prev_page_url: String::new(),
+				next_page_url: String::new(),
+				prefs: Preferences::new(&req),
+				url,
+				redirect_url,
+				enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
+				is_filtered: true,
+				all_posts_filtered: false,
+				all_posts_hidden_nsfw: false,
+				no_posts: false,
+				cache_notice: String::new(),
+				is_flair_subscribed,
+				feed_session_id: String::new(),
+				feed_status_url: String::new(),
+				feed_fragment_url: String::new(),
+				show_contextual_pagination: false,
+				contextual_pagination: Vec::new(),
+				video_mode_enabled: false,
+				video_mode_sidebar: empty_video_mode_sidebar(),
+				show_hide_seen_toggle: false,
+				hide_seen_on: false,
+				hide_seen_toggle_url: String::new(),
+			},
+			None,
+		)
 	} else if is_video_length_sort(&sort) {
 		let source_posts = if is_subreddit_route && is_single_sub {
 			let mut posts = cached_or_live_new_subreddit_posts(&sub_name, quarantined).await?;
@@ -2009,6 +2148,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			&filters,
 			cache_page,
 			String::new(),
+			feed_seen_ctx.clone(),
 		)
 	} else if contextual_front_page {
 		let cache_page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
@@ -2054,39 +2194,46 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			};
 			let contextual_pagination = build_contextual_pagination(&url, &feed_session_id, cache_page, &sort);
 
-			return render_subreddit_fragment(SubredditFragmentTemplate {
-				sub,
-				posts: page.posts,
-				top_users,
-				sort: (sort.clone(), timeframe.clone()),
-				sort_options,
-				flair_filters,
-				active_flair_filter: active_flair_filter.clone(),
-				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-				clear_flair_filter_url: update_url_query(
-					&url,
-					&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
-				),
-				prev_page_url,
-				next_page_url,
-				prefs: Preferences::new(&req),
-				url: url.clone(),
-				redirect_url,
-				enable_duplicate_collapse: true,
-				is_filtered: false,
-				all_posts_filtered: false,
-				all_posts_hidden_nsfw,
-				no_posts,
-				cache_notice: String::new(),
-				is_flair_subscribed,
-				feed_session_id: feed_session_id.clone(),
-				feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
-				feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
-				show_contextual_pagination: !contextual_pagination.is_empty(),
-				contextual_pagination,
-				video_mode_enabled: false,
-				video_mode_sidebar: empty_video_mode_sidebar(),
-			});
+			return render_subreddit_fragment(
+				&req,
+				SubredditFragmentTemplate {
+					sub,
+					posts: page.posts,
+					top_users,
+					sort: (sort.clone(), timeframe.clone()),
+					sort_options,
+					flair_filters,
+					active_flair_filter: active_flair_filter.clone(),
+					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+					clear_flair_filter_url: update_url_query(
+						&url,
+						&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+					),
+					prev_page_url,
+					next_page_url,
+					prefs: Preferences::new(&req),
+					url: url.clone(),
+					redirect_url,
+					enable_duplicate_collapse: true,
+					is_filtered: false,
+					all_posts_filtered: false,
+					all_posts_hidden_nsfw,
+					no_posts,
+					cache_notice: String::new(),
+					is_flair_subscribed,
+					feed_session_id: feed_session_id.clone(),
+					feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
+					feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
+					show_contextual_pagination: !contextual_pagination.is_empty(),
+					contextual_pagination,
+					video_mode_enabled: false,
+					video_mode_sidebar: empty_video_mode_sidebar(),
+					show_hide_seen_toggle: false,
+					hide_seen_on: false,
+					hide_seen_toggle_url: String::new(),
+				},
+				feed_seen_ctx.clone(),
+			);
 		}
 		return error(req, "Feed session not found or expired").await;
 	} else if aggregate_saved_feeds {
@@ -2120,36 +2267,43 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					warn!("Aggregate front page rendered without posts after partial failures");
 				}
 
-				render_subreddit_fragment(SubredditFragmentTemplate {
-					sub,
-					posts: feed.posts,
-					top_users,
-					sort: (sort.clone(), timeframe.clone()),
-					sort_options,
-					flair_filters,
-					active_flair_filter: active_flair_filter.clone(),
-					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
-					prev_page_url: feed.prev_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
-					next_page_url: feed.next_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
-					prefs: Preferences::new(&req),
-					url,
-					redirect_url,
-					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
-					is_filtered: false,
-					all_posts_filtered: feed.all_posts_filtered,
-					all_posts_hidden_nsfw,
-					no_posts,
-					cache_notice: String::new(),
-					is_flair_subscribed,
-					feed_session_id: String::new(),
-					feed_status_url: String::new(),
-					feed_fragment_url: String::new(),
-					show_contextual_pagination: false,
-					contextual_pagination: Vec::new(),
-					video_mode_enabled: false,
-					video_mode_sidebar: empty_video_mode_sidebar(),
-				})
+				render_subreddit_fragment(
+					&req,
+					SubredditFragmentTemplate {
+						sub,
+						posts: feed.posts,
+						top_users,
+						sort: (sort.clone(), timeframe.clone()),
+						sort_options,
+						flair_filters,
+						active_flair_filter: active_flair_filter.clone(),
+						active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+						clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+						prev_page_url: feed.prev_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
+						next_page_url: feed.next_cursor.as_deref().map(|cursor| build_front_cursor_url(&url, cursor)).unwrap_or_default(),
+						prefs: Preferences::new(&req),
+						url,
+						redirect_url,
+						enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
+						is_filtered: false,
+						all_posts_filtered: feed.all_posts_filtered,
+						all_posts_hidden_nsfw,
+						no_posts,
+						cache_notice: String::new(),
+						is_flair_subscribed,
+						feed_session_id: String::new(),
+						feed_status_url: String::new(),
+						feed_fragment_url: String::new(),
+						show_contextual_pagination: false,
+						contextual_pagination: Vec::new(),
+						video_mode_enabled: false,
+						video_mode_sidebar: empty_video_mode_sidebar(),
+						show_hide_seen_toggle: false,
+						hide_seen_on: false,
+						hide_seen_toggle_url: String::new(),
+					},
+					feed_seen_ctx.clone(),
+				)
 			}
 			Err(msg) => error(req, &msg).await,
 		}
@@ -2177,39 +2331,46 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				String::new()
 			};
 
-			return render_subreddit_fragment(SubredditFragmentTemplate {
-				sub,
-				posts,
-				top_users,
-				sort: (sort.clone(), timeframe.clone()),
-				sort_options,
-				flair_filters,
-				active_flair_filter: active_flair_filter.clone(),
-				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-				clear_flair_filter_url: update_url_query(
-					&url,
-					&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
-				),
-				prev_page_url,
-				next_page_url,
-				prefs: Preferences::new(&req),
-				url,
-				redirect_url,
-				enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
-				is_filtered: false,
-				all_posts_filtered,
-				all_posts_hidden_nsfw,
-				no_posts,
-				cache_notice: String::new(),
-				is_flair_subscribed,
-				feed_session_id: String::new(),
-				feed_status_url: String::new(),
-				feed_fragment_url: String::new(),
-				show_contextual_pagination: false,
-				contextual_pagination: Vec::new(),
-				video_mode_enabled: false,
-				video_mode_sidebar: empty_video_mode_sidebar(),
-			});
+			return render_subreddit_fragment(
+				&req,
+				SubredditFragmentTemplate {
+					sub,
+					posts,
+					top_users,
+					sort: (sort.clone(), timeframe.clone()),
+					sort_options,
+					flair_filters,
+					active_flair_filter: active_flair_filter.clone(),
+					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+					clear_flair_filter_url: update_url_query(
+						&url,
+						&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+					),
+					prev_page_url,
+					next_page_url,
+					prefs: Preferences::new(&req),
+					url,
+					redirect_url,
+					enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+					is_filtered: false,
+					all_posts_filtered,
+					all_posts_hidden_nsfw,
+					no_posts,
+					cache_notice: String::new(),
+					is_flair_subscribed,
+					feed_session_id: String::new(),
+					feed_status_url: String::new(),
+					feed_fragment_url: String::new(),
+					show_contextual_pagination: false,
+					contextual_pagination: Vec::new(),
+					video_mode_enabled: false,
+					video_mode_sidebar: empty_video_mode_sidebar(),
+					show_hide_seen_toggle: false,
+					hide_seen_on: false,
+					hide_seen_toggle_url: String::new(),
+				},
+				None,
+			);
 
 			// Fall through to normal fetch if not cached.
 		}
@@ -2239,71 +2400,78 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				utils::hydrate_post_author_links_from_cache(&mut posts);
 				let timeframe = param(&path, "t").unwrap_or_default();
 				let before = param(&path, "before").unwrap_or_default();
-				render_subreddit_fragment(SubredditFragmentTemplate {
-					sub,
-					posts,
-					top_users: if is_single_sub {
-						utils::cached_subreddit_users(&sub_name)
-							.into_iter()
-							.map(|(name, count)| SubredditUserEntry { name, count })
-							.collect()
-					} else {
-						Vec::new()
+				render_subreddit_fragment(
+					&req,
+					SubredditFragmentTemplate {
+						sub,
+						posts,
+						top_users: if is_single_sub {
+							utils::cached_subreddit_users(&sub_name)
+								.into_iter()
+								.map(|(name, count)| SubredditUserEntry { name, count })
+								.collect()
+						} else {
+							Vec::new()
+						},
+						sort: (sort.clone(), timeframe.clone()),
+						sort_options,
+						flair_filters: if is_single_sub {
+							build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub_name))
+						} else {
+							Vec::new()
+						},
+						active_flair_filter: active_flair_filter.clone(),
+						active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+						clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+						prev_page_url: if !before.is_empty() {
+							update_url_query(
+								&url,
+								&[
+									("sort", Some(sort.as_str())),
+									("t", Some(timeframe.as_str())),
+									("before", Some(before.as_str())),
+									("after", None),
+								],
+							)
+						} else {
+							String::new()
+						},
+						next_page_url: if !after.is_empty() {
+							update_url_query(
+								&url,
+								&[
+									("sort", Some(sort.as_str())),
+									("t", Some(timeframe.as_str())),
+									("before", None),
+									("after", Some(after.as_str())),
+								],
+							)
+						} else {
+							String::new()
+						},
+						prefs: Preferences::new(&req),
+						url,
+						redirect_url,
+						enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
+						is_filtered: false,
+						all_posts_filtered,
+						all_posts_hidden_nsfw,
+						no_posts,
+						cache_notice: String::new(),
+						is_flair_subscribed,
+						feed_session_id: String::new(),
+						feed_status_url: String::new(),
+						feed_fragment_url: String::new(),
+						show_contextual_pagination: false,
+						contextual_pagination: Vec::new(),
+						video_mode_enabled: false,
+						video_mode_sidebar: empty_video_mode_sidebar(),
+						show_hide_seen_toggle: false,
+						hide_seen_on: false,
+						hide_seen_toggle_url: String::new(),
 					},
-					sort: (sort.clone(), timeframe.clone()),
-					sort_options,
-					flair_filters: if is_single_sub {
-						build_flair_filters(&url, &active_flair_filter, utils::cached_subreddit_flairs(&sub_name))
-					} else {
-						Vec::new()
-					},
-					active_flair_filter: active_flair_filter.clone(),
-					active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-					clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
-					prev_page_url: if !before.is_empty() {
-						update_url_query(
-							&url,
-							&[
-								("sort", Some(sort.as_str())),
-								("t", Some(timeframe.as_str())),
-								("before", Some(before.as_str())),
-								("after", None),
-							],
-						)
-					} else {
-						String::new()
-					},
-					next_page_url: if !after.is_empty() {
-						update_url_query(
-							&url,
-							&[
-								("sort", Some(sort.as_str())),
-								("t", Some(timeframe.as_str())),
-								("before", None),
-								("after", Some(after.as_str())),
-							],
-						)
-					} else {
-						String::new()
-					},
-					prefs: Preferences::new(&req),
-					url,
-					redirect_url,
-					enable_duplicate_collapse: aggregate_saved_feeds || should_enable_duplicate_collapse(&sub_name),
-					is_filtered: false,
-					all_posts_filtered,
-					all_posts_hidden_nsfw,
-					no_posts,
-					cache_notice: String::new(),
-					is_flair_subscribed,
-					feed_session_id: String::new(),
-					feed_status_url: String::new(),
-					feed_fragment_url: String::new(),
-					show_contextual_pagination: false,
-					contextual_pagination: Vec::new(),
-					video_mode_enabled: false,
-					video_mode_sidebar: empty_video_mode_sidebar(),
-				})
+					None,
+				)
 			}
 			Err(msg) => {
 				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
@@ -2334,39 +2502,46 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								String::new()
 							};
 
-							return render_subreddit_fragment(SubredditFragmentTemplate {
-								sub,
-								posts,
-								top_users,
-								sort: (sort.clone(), timeframe.clone()),
-								sort_options,
-								flair_filters,
-								active_flair_filter: active_flair_filter.clone(),
-								active_flair_filter_encoded: encode_query_value(&active_flair_filter),
-								clear_flair_filter_url: update_url_query(
-									&url,
-									&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
-								),
-								prev_page_url,
-								next_page_url,
-								prefs: Preferences::new(&req),
-								url,
-								redirect_url,
-								enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
-								is_filtered: false,
-								all_posts_filtered,
-								all_posts_hidden_nsfw,
-								no_posts,
-								cache_notice: OAUTH_CACHE_NOTICE.to_string(),
-								is_flair_subscribed,
-								feed_session_id: String::new(),
-								feed_status_url: String::new(),
-								feed_fragment_url: String::new(),
-								show_contextual_pagination: false,
-								contextual_pagination: Vec::new(),
-								video_mode_enabled: false,
-								video_mode_sidebar: empty_video_mode_sidebar(),
-							});
+							return render_subreddit_fragment(
+								&req,
+								SubredditFragmentTemplate {
+									sub,
+									posts,
+									top_users,
+									sort: (sort.clone(), timeframe.clone()),
+									sort_options,
+									flair_filters,
+									active_flair_filter: active_flair_filter.clone(),
+									active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+									clear_flair_filter_url: update_url_query(
+										&url,
+										&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+									),
+									prev_page_url,
+									next_page_url,
+									prefs: Preferences::new(&req),
+									url,
+									redirect_url,
+									enable_duplicate_collapse: should_enable_duplicate_collapse(&sub_name),
+									is_filtered: false,
+									all_posts_filtered,
+									all_posts_hidden_nsfw,
+									no_posts,
+									cache_notice: OAUTH_CACHE_NOTICE.to_string(),
+									is_flair_subscribed,
+									feed_session_id: String::new(),
+									feed_status_url: String::new(),
+									feed_fragment_url: String::new(),
+									show_contextual_pagination: false,
+									contextual_pagination: Vec::new(),
+									video_mode_enabled: false,
+									video_mode_sidebar: empty_video_mode_sidebar(),
+									show_hide_seen_toggle: false,
+									hide_seen_on: false,
+									hide_seen_toggle_url: String::new(),
+								},
+								None,
+							);
 						}
 					}
 				}
@@ -2550,6 +2725,9 @@ mod tests {
 			contextual_pagination: Vec::new(),
 			video_mode_enabled: false,
 			video_mode_sidebar: super::empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
 		}
 		.render()
 		.unwrap();
@@ -2595,6 +2773,9 @@ mod tests {
 			contextual_pagination: Vec::new(),
 			video_mode_enabled: false,
 			video_mode_sidebar: super::empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
 		}
 		.render()
 		.unwrap();
@@ -2856,6 +3037,9 @@ mod tests {
 			contextual_pagination: Vec::new(),
 			video_mode_enabled: false,
 			video_mode_sidebar: super::empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
 		}
 		.render()
 		.unwrap();
@@ -2900,6 +3084,9 @@ mod tests {
 			contextual_pagination: Vec::new(),
 			video_mode_enabled: false,
 			video_mode_sidebar: super::empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
 		}
 		.render()
 		.unwrap();
@@ -2951,6 +3138,9 @@ mod tests {
 			],
 			video_mode_enabled: false,
 			video_mode_sidebar: super::empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
 		}
 		.render()
 		.unwrap();
@@ -3226,10 +3416,20 @@ mod tests {
 				age_bound_hours: 72,
 			},
 			&[],
+			&crate::video_mode::VideoModeQuery::default(),
 		);
 
 		assert_eq!(sidebar.action_url, "/video-length");
 		assert_eq!(sidebar.clear_url, "/video-length?t=day&flair=News");
+		assert_eq!(
+			sidebar.clear_cookie_redirect_href,
+			format!(
+				"/api/video-mode/clear-redirect?{}",
+				url::form_urlencoded::Serializer::new(String::new())
+					.append_pair("redirect", "/video-length?t=day&flair=News")
+					.finish()
+			)
+		);
 		assert_eq!(
 			sidebar.hidden_query_pairs,
 			vec![("t".to_string(), "day".to_string()), ("flair".to_string(), "News".to_string())]
@@ -3712,9 +3912,22 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		return error(req, "Feed session not found or expired").await;
 	};
 	let page_ready = feed_page.ready;
+	let current_url = param(&format!("?{}", req.uri().query().unwrap_or_default()), "current_url").unwrap_or_else(|| "/".to_string());
 	utils::hydrate_post_author_links_from_cache(&mut feed_page.posts);
 
-	let current_url = param(&format!("?{}", req.uri().query().unwrap_or_default()), "current_url").unwrap_or_else(|| "/".to_string());
+	let feed_seen_scope = seen_posts::public_page_is_feed_seen_scope(&current_url);
+	let (rl_session_id, needs_rl_session_cookie) = if feed_seen_scope {
+		seen_posts::ensure_rl_session_id(&req)
+	} else {
+		(String::new(), false)
+	};
+	let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, feed_seen_scope);
+	let posts = if feed_seen_scope {
+		seen_posts::filter_and_record_seen(&rl_session_id, hide_seen_on, std::mem::take(&mut feed_page.posts))
+	} else {
+		std::mem::take(&mut feed_page.posts)
+	};
+
 	let prev_page_url = if page > 0 {
 		update_url_query(
 			&current_url,
@@ -3743,13 +3956,13 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	} else {
 		String::new()
 	};
-	let no_posts = page_ready && feed_page.posts.is_empty();
-	let all_posts_hidden_nsfw = !no_posts && (feed_page.posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+	let no_posts = page_ready && posts.is_empty();
+	let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 	let session_sort = crate::post_cache::feed_session_sort(&session_id).map(|sort| sort.as_str().to_string()).unwrap_or_default();
 	let contextual_pagination = build_contextual_pagination(&current_url, &session_id, page, &session_sort);
 
-	render_feed_fragment(FeedFragmentTemplate {
-		posts: feed_page.posts,
+	let mut response = render_feed_fragment(FeedFragmentTemplate {
+		posts,
 		prev_page_url,
 		next_page_url,
 		prefs: Preferences::new(&req),
@@ -3760,7 +3973,16 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		no_posts,
 		show_contextual_pagination: !contextual_pagination.is_empty(),
 		contextual_pagination,
-	})
+	})?;
+	if feed_seen_scope {
+		seen_posts::attach_rl_feed_cookies(
+			&mut response,
+			&rl_session_id,
+			needs_rl_session_cookie,
+			hide_seen_cookie_override.as_deref(),
+		);
+	}
+	Ok(response)
 }
 
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header

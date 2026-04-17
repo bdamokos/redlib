@@ -8,6 +8,10 @@
 				{% for option in sort_options %}
 					<a {% if option.selected %}class="selected"{% endif %} href="{{ option.url }}">{{ option.label }}</a>
 				{% endfor %}
+				{% if show_hide_seen_toggle %}
+				<span class="dot">&bull;</span>
+				<a class="hide_seen_toggle" href="{{ hide_seen_toggle_url }}" title="Toggle hiding posts already shown in this session">{% if hide_seen_on %}Show seen{% else %}Hide seen{% endif %}</a>
+				{% endif %}
 			</div>
 			{% if str_eq(sort.0, "top") || str_eq(sort.0, "controversial") %}<select id="timeframe" name="t" title="Timeframe">
 				{% call utils::options(sort.1, ["hour", "day", "week", "month", "year", "all"], "day") %}

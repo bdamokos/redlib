@@ -368,6 +368,7 @@ async fn main() {
 	app.at("/api/video-previews/release").post(|r| video_preview::release(r).boxed());
 	app.at("/api/video-mode/apply").post(|r| video_mode_api::apply(r).boxed());
 	app.at("/api/video-mode/clear").post(|r| video_mode_api::clear(r).boxed());
+	app.at("/api/video-mode/clear-redirect").get(|r| video_mode_api::clear_redirect(r).boxed());
 	app.at("/api/browser-sessions/heartbeat").post(|r| post_cache::browser_session_heartbeat(r).boxed());
 	app.at("/api/browser-sessions/release").post(|r| post_cache::browser_session_release(r).boxed());
 	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());

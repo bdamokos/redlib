@@ -506,20 +506,53 @@ fn empty_video_mode_sidebar() -> video_mode::VideoModeSidebarData {
 	video_mode::VideoModeSidebarData::default()
 }
 
-fn build_video_mode_sidebar(url: &str, listing: &video_mode::VideoModeListing, page_posts: &[Post]) -> video_mode::VideoModeSidebarData {
-	let (path, query) = current_url_parts(url);
-	let mut hidden_query_pairs = video_mode::query_pairs(query);
+fn video_mode_facet_hidden_value(mode: video_mode::FacetMode) -> &'static str {
+	match mode {
+		video_mode::FacetMode::None => "none",
+		video_mode::FacetMode::Exclude => "exclude",
+		video_mode::FacetMode::Include => "",
+	}
+}
+
+fn build_video_mode_sidebar(
+	url: &str,
+	listing: &video_mode::VideoModeListing,
+	page_posts: &[Post],
+	query: &video_mode::VideoModeQuery,
+) -> video_mode::VideoModeSidebarData {
+	let (path, query_str) = current_url_parts(url);
+	let mut hidden_query_pairs = video_mode::query_pairs(query_str);
 	video_mode::strip_video_query_pairs(&mut hidden_query_pairs);
 	hidden_query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after");
 
+	let clear_url = build_url_from_query_pairs(path, &hidden_query_pairs);
+	let clear_cookie_redirect_href = format!(
+		"/api/video-mode/clear-redirect?{}",
+		form_urlencoded::Serializer::new(String::new()).append_pair("redirect", &clear_url).finish()
+	);
+
+	let video_sub_mode_value = if !listing.subreddit_options.is_empty() && listing.subreddit_options.iter().all(|option| !option.active) {
+		"none".to_string()
+	} else {
+		video_mode_facet_hidden_value(query.subreddit_mode).to_string()
+	};
+	let video_user_mode_value = if !listing.user_options.is_empty() && listing.user_options.iter().all(|option| !option.active) {
+		"none".to_string()
+	} else {
+		video_mode_facet_hidden_value(query.user_mode).to_string()
+	};
+
 	video_mode::VideoModeSidebarData {
 		action_url: path.to_string(),
-		clear_url: build_url_from_query_pairs(path, &hidden_query_pairs),
+		clear_url,
+		clear_cookie_redirect_href,
 		hidden_query_pairs,
 		subreddit_options: video_mode::sort_options_by_page_count(&listing.subreddit_options, page_posts, |post| post.community.clone()),
 		user_options: video_mode::sort_options_by_page_count(&listing.user_options, page_posts, |post| post.author.name.clone()),
 		clear_subreddits: !listing.subreddit_options.is_empty() && listing.subreddit_options.iter().all(|option| !option.active),
 		clear_users: !listing.user_options.is_empty() && listing.user_options.iter().all(|option| !option.active),
+		video_sub_mode_value,
+		video_user_mode_value,
 		age_min_hours: listing.age_min_hours,
 		age_max_hours: listing.age_max_hours,
 		age_bound_hours: listing.age_bound_hours,
@@ -528,21 +561,29 @@ fn build_video_mode_sidebar(url: &str, listing: &video_mode::VideoModeListing, p
 
 fn normalized_video_mode_query(query: &video_mode::VideoModeQuery, listing: &video_mode::VideoModeListing) -> video_mode::VideoModeQuery {
 	video_mode::VideoModeQuery {
-		selected_subreddits: video_mode::normalize_selected_values(&query.selected_subreddits, &listing.subreddit_options),
-		selected_users: video_mode::normalize_selected_values(&query.selected_users, &listing.user_options),
-		clear_subreddits: video_mode::normalize_clear_flag(query.clear_subreddits, &query.selected_subreddits, &listing.subreddit_options),
-		clear_users: video_mode::normalize_clear_flag(query.clear_users, &query.selected_users, &listing.user_options),
+		selected_subreddits: match query.subreddit_mode {
+			video_mode::FacetMode::Include => video_mode::normalize_selected_values(&query.selected_subreddits, &listing.subreddit_options),
+			_ => query.selected_subreddits.clone(),
+		},
+		selected_users: match query.user_mode {
+			video_mode::FacetMode::Include => video_mode::normalize_selected_values(&query.selected_users, &listing.user_options),
+			_ => query.selected_users.clone(),
+		},
+		subreddit_mode: query.subreddit_mode,
+		user_mode: query.user_mode,
 		age_min_hours: listing.age_min_hours,
 		age_max_hours: Some(listing.age_max_hours),
 	}
 }
 
-fn video_mode_page_url(current_url: &str, page: usize, query: &video_mode::VideoModeQuery) -> String {
+fn video_mode_page_url(current_url: &str, page: usize, query: &video_mode::VideoModeQuery, embed_video_params_in_url: bool) -> String {
 	let (path, raw_query) = current_url_parts(current_url);
 	let mut query_pairs = video_mode::query_pairs(raw_query);
 	query_pairs.retain(|(key, _)| key != "cache_page" && key != "before" && key != "after");
 	video_mode::strip_video_query_pairs(&mut query_pairs);
-	video_mode::append_query_pairs(&mut query_pairs, query);
+	if embed_video_params_in_url {
+		video_mode::append_query_pairs(&mut query_pairs, query);
+	}
 	if page > 0 {
 		query_pairs.push(("cache_page".to_string(), page.to_string()));
 	}
@@ -670,6 +711,7 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<Vec<Post>, St
 mod tests {
 	use super::collapse_duplicate_submissions;
 	use askama::Template;
+	use url::form_urlencoded;
 
 	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, Media, Post, Preferences};
 
@@ -1056,6 +1098,12 @@ mod tests {
 
 	#[test]
 	fn renders_videos_listing_without_sort_controls_and_hides_single_option_filter_groups() {
+		let clear_redirect = format!(
+			"/api/video-mode/clear-redirect?{}",
+			form_urlencoded::Serializer::new(String::new())
+				.append_pair("redirect", "/user/demo_user/videos?sort=new")
+				.finish()
+		);
 		let html = super::UserTemplate {
 			user: crate::utils::User {
 				name: "demo_user".to_string(),
@@ -1086,6 +1134,7 @@ mod tests {
 			video_mode_sidebar: crate::video_mode::VideoModeSidebarData {
 				action_url: "/user/demo_user/videos".to_string(),
 				clear_url: "/user/demo_user/videos?sort=new".to_string(),
+				clear_cookie_redirect_href: clear_redirect.clone(),
 				hidden_query_pairs: vec![("sort".to_string(), "new".to_string())],
 				subreddit_options: vec![crate::video_mode::VideoModeFilterOption {
 					name: "demo_sub".to_string(),
@@ -1101,6 +1150,8 @@ mod tests {
 				}],
 				clear_subreddits: false,
 				clear_users: false,
+				video_sub_mode_value: String::new(),
+				video_user_mode_value: String::new(),
 				age_min_hours: 0,
 				age_max_hours: 24,
 				age_bound_hours: 24,
@@ -1113,7 +1164,7 @@ mod tests {
 		assert!(html.contains("Video Filters"));
 		assert!(html.contains("href=\"https://www.reddit.com/user/demo_user/submitted?sort=new\""));
 		assert!(html.contains("name=\"video_age_min_hours\""));
-		assert!(html.contains("href=\"/user/demo_user/videos?sort=new\""));
+		assert!(html.contains(&format!("href=\"{clear_redirect}\"")));
 		assert!(!html.contains("id=\"sort_select\""));
 		assert!(!html.contains("id=\"sort_submit\""));
 		assert!(!html.contains(">Subreddits<"));
@@ -1122,6 +1173,12 @@ mod tests {
 
 	#[test]
 	fn video_sidebar_defaults_to_checked_options_and_renders_bulk_toggle_buttons() {
+		let clear_redirect = format!(
+			"/api/video-mode/clear-redirect?{}",
+			form_urlencoded::Serializer::new(String::new())
+				.append_pair("redirect", "/user/demo_user/videos")
+				.finish()
+		);
 		let html = super::UserTemplate {
 			user: crate::utils::User {
 				name: "demo_user".to_string(),
@@ -1152,6 +1209,7 @@ mod tests {
 			video_mode_sidebar: crate::video_mode::VideoModeSidebarData {
 				action_url: "/user/demo_user/videos".to_string(),
 				clear_url: "/user/demo_user/videos".to_string(),
+				clear_cookie_redirect_href: clear_redirect,
 				hidden_query_pairs: Vec::new(),
 				subreddit_options: vec![
 					crate::video_mode::VideoModeFilterOption {
@@ -1183,6 +1241,8 @@ mod tests {
 				],
 				clear_subreddits: false,
 				clear_users: false,
+				video_sub_mode_value: String::new(),
+				video_user_mode_value: String::new(),
 				age_min_hours: 0,
 				age_max_hours: 24,
 				age_bound_hours: 24,
@@ -1644,9 +1704,12 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let video_mode_sidebar = if video_listing {
 		let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
 		let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
-		let listing_data = video_mode::build_listing(&cached_posts, &get_filters(&req), &video_mode::parse_query(query), now_unix());
+		let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
+		let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
+		let listing_data = video_mode::build_listing(&cached_posts, &get_filters(&req), &parsed_query, now_unix());
+		let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
 		let preview_posts = listing_data.posts.iter().take(crate::post_cache::POSTS_PER_PAGE).cloned().collect::<Vec<_>>();
-		build_video_mode_sidebar(&url, &listing_data, &preview_posts)
+		build_video_mode_sidebar(&url, &listing_data, &preview_posts, &normalized_query)
 	} else {
 		empty_video_mode_sidebar()
 	};
@@ -1750,9 +1813,11 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		}
 	} else if video_listing {
 		let source_posts = cached_or_live_user_video_posts(&username).await?;
-		let parsed_query = video_mode::parse_query(query);
+		let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
+		let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
 		let listing_data = video_mode::build_listing(&source_posts, &filters, &parsed_query, now_unix());
 		let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
+		let request_has_video_params = video_mode::query_has_video_params(query);
 		let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
 		let start = cache_page.saturating_mul(crate::post_cache::POSTS_PER_PAGE);
 		let end = (start + crate::post_cache::POSTS_PER_PAGE).min(listing_data.posts.len());
@@ -1772,7 +1837,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		let avg_video_length = cached_avg_video_length(&username);
 		let mut posts = posts;
 		utils::hydrate_post_author_links_from_cache(&mut posts);
-		let video_mode_sidebar = build_video_mode_sidebar(&url, &listing_data, &posts);
+		let video_mode_sidebar = build_video_mode_sidebar(&url, &listing_data, &posts, &normalized_query);
 
 		UserFragmentTemplate {
 			user: user.clone(),
@@ -1794,12 +1859,12 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			avg_video_length,
 			no_posts,
 			prev_page_url: if cache_page > 0 {
-				video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query)
+				video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query, request_has_video_params)
 			} else {
 				String::new()
 			},
 			next_page_url: if end < listing_data.posts.len() {
-				video_mode_page_url(&url, cache_page + 1, &normalized_query)
+				video_mode_page_url(&url, cache_page + 1, &normalized_query, request_has_video_params)
 			} else {
 				String::new()
 			},

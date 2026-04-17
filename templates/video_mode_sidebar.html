@@ -16,7 +16,7 @@
 						<button type="button" data-video-filter-toggle="check" data-video-filter-target="video_sub">Check all</button>
 					</div>
 				</div>
-				<input type="hidden" name="video_sub_mode" value="{% if video_mode_sidebar.clear_subreddits %}none{% endif %}" data-video-filter-mode="video_sub">
+				<input type="hidden" name="video_sub_mode" value="{{ video_mode_sidebar.video_sub_mode_value }}" data-video-filter-mode="video_sub">
 				<div class="video_mode_filter_list">
 					{% for option in video_mode_sidebar.subreddit_options %}
 					<label class="video_mode_filter_option">
@@ -38,7 +38,7 @@
 						<button type="button" data-video-filter-toggle="check" data-video-filter-target="video_user">Check all</button>
 					</div>
 				</div>
-				<input type="hidden" name="video_user_mode" value="{% if video_mode_sidebar.clear_users %}none{% endif %}" data-video-filter-mode="video_user">
+				<input type="hidden" name="video_user_mode" value="{{ video_mode_sidebar.video_user_mode_value }}" data-video-filter-mode="video_user">
 				<div class="video_mode_filter_list">
 					{% for option in video_mode_sidebar.user_options %}
 					<label class="video_mode_filter_option">
@@ -64,7 +64,7 @@
 
 			<div class="video_mode_filter_actions">
 				<button class="subscribe" type="submit">Apply</button>
-				<a href="{{ video_mode_sidebar.clear_url }}">Clear</a>
+				<a href="{{ video_mode_sidebar.clear_cookie_redirect_href }}">Clear</a>
 			</div>
 		</form>
 	</div>
