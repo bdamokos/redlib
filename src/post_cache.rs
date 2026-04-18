@@ -4,6 +4,7 @@ use crate::cache_persistence::{
 use crate::oauth::oauth_is_available;
 use crate::user::{collapse_duplicate_submissions, update_user_video_stats_from_posts};
 use crate::utils::{Post, Preferences};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyper::body::to_bytes;
 use hyper::{Body, Request, Response, StatusCode};
 use log::{info, warn};
@@ -150,6 +151,7 @@ impl FeedSource {
 
 #[derive(Clone)]
 struct CachedSourcePosts {
+	source: FeedSource,
 	posts: Vec<Post>,
 	after: String,
 	fetched_at: Instant,
@@ -375,8 +377,39 @@ fn normalize_remembered_feed_name(name: &str) -> Option<String> {
 	}
 }
 
+fn normalize_remembered_source(source: &FeedSource) -> Option<FeedSource> {
+	match source {
+		FeedSource::Subreddit { name, sort } if *sort == FeedSort::New => {
+			Some(FeedSource::subreddit(normalize_remembered_feed_name(name)?, FeedSort::New))
+		}
+		FeedSource::Flair { subreddit, flair, sort } if *sort == FeedSort::New => {
+			let subreddit = normalize_plain_subreddit_name(subreddit)?;
+			let flair = flair.trim();
+			(!flair.is_empty()).then_some(FeedSource::flair(subreddit, flair.to_string(), FeedSort::New))
+		}
+		_ => None,
+	}
+}
+
+fn remembered_feed_key_for_source(source: &FeedSource) -> Option<String> {
+	match normalize_remembered_source(source)? {
+		FeedSource::Subreddit { name, .. } => Some(name),
+		FeedSource::Flair { subreddit, flair, .. } => Some(format!("flair:{subreddit}:{}", URL_SAFE_NO_PAD.encode(flair.as_bytes()))),
+	}
+}
+
+fn remembered_feed_source_from_key(key: &str) -> Option<FeedSource> {
+	if let Some(rest) = key.strip_prefix("flair:") {
+		let (subreddit, encoded_flair) = rest.split_once(':')?;
+		let flair = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded_flair).ok()?).ok()?;
+		return normalize_remembered_source(&FeedSource::flair(subreddit.to_string(), flair, FeedSort::New));
+	}
+
+	normalize_remembered_source(&FeedSource::subreddit(key.to_string(), FeedSort::New))
+}
+
 fn is_persisted_subreddit_feed_source(source: &FeedSource) -> bool {
-	matches!(source, FeedSource::Subreddit { name, .. } if normalize_remembered_feed_name(name).is_some())
+	remembered_feed_key_for_source(source).is_some()
 }
 
 fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
@@ -411,12 +444,26 @@ pub fn has_active_browser_sessions() -> bool {
 }
 
 pub fn remember_subreddit_request(subreddit: &str) {
-	let Some(normalized) = normalize_remembered_feed_name(subreddit) else {
+	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
+		return;
+	};
+	remember_source_request(&source);
+}
+
+pub fn remember_flair_request(subreddit: &str, flair: &str) {
+	let Some(source) = normalize_remembered_source(&FeedSource::flair(subreddit.to_string(), flair.to_string(), FeedSort::New)) else {
+		return;
+	};
+	remember_source_request(&source);
+}
+
+fn remember_source_request(source: &FeedSource) {
+	let Some(key) = remembered_feed_key_for_source(source) else {
 		return;
 	};
 
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-	let entry = remembered.entry(normalized.clone()).or_insert_with(|| new_remembered_subreddit_entry(normalized));
+	let entry = remembered.entry(key.clone()).or_insert_with(|| new_remembered_subreddit_entry(key));
 	entry.last_requested_at = Instant::now();
 	crate::cache_persistence::mark_dirty();
 }
@@ -427,7 +474,7 @@ pub fn remember_frontpage_subreddits(preferences: &Preferences) {
 	}
 
 	for subscription in &preferences.flair_subscriptions {
-		remember_subreddit_request(&subscription.subreddit);
+		remember_flair_request(&subscription.subreddit, &subscription.flair);
 	}
 }
 
@@ -447,11 +494,12 @@ fn ensure_remembered_feeds_seeded_for_preferences(preferences: &Preferences) {
 		}
 	}
 	for subscription in &preferences.flair_subscriptions {
-		let Some(normalized) = normalize_remembered_feed_name(&subscription.subreddit) else {
+		let Some(source) = normalize_remembered_source(&FeedSource::flair(subscription.subreddit.clone(), subscription.flair.clone(), FeedSort::New)) else {
 			continue;
 		};
-		if !remembered.contains_key(&normalized) {
-			remembered.insert(normalized.clone(), new_remembered_subreddit_entry(normalized));
+		let key = remembered_feed_key_for_source(&source).expect("normalized remembered flair source must have key");
+		if !remembered.contains_key(&key) {
+			remembered.insert(key.clone(), new_remembered_subreddit_entry(key));
 			inserted = true;
 		}
 	}
@@ -473,15 +521,24 @@ pub fn is_subreddit_remembered(subreddit: &str) -> bool {
 		.is_some_and(remembered_entry_is_active)
 }
 
+fn is_source_remembered(source: &FeedSource) -> bool {
+	let Some(key) = remembered_feed_key_for_source(source) else {
+		return false;
+	};
+
+	REMEMBERED_SUBREDDITS
+		.lock()
+		.unwrap_or_else(|e| e.into_inner())
+		.get(&key)
+		.is_some_and(remembered_entry_is_active)
+}
+
 fn source_cache_is_servable_with_mode(source: &FeedSource, entry: &CachedSourcePosts, mode: CacheServeMode) -> bool {
 	if matches!(mode, CacheServeMode::AllowStaleOnOauthOutage) && !oauth_is_available() {
 		return true;
 	}
 
-	match source {
-		FeedSource::Subreddit { name, .. } => is_subreddit_remembered(name) || !source_cache_is_expired(entry),
-		FeedSource::Flair { .. } => !source_cache_is_expired(entry),
-	}
+	is_source_remembered(source) || !source_cache_is_expired(entry)
 }
 
 fn source_cache_is_servable(source: &FeedSource, entry: &CachedSourcePosts) -> bool {
@@ -586,14 +643,22 @@ fn remembered_refresh_priority(left: &RememberedSubredditEntry, right: &Remember
 }
 
 pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) {
-	let Some(normalized) = normalize_remembered_feed_name(subreddit) else {
+	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
+		return;
+	};
+	mark_remembered_source_refresh_started(&source);
+}
+
+fn mark_remembered_source_refresh_started(source: &FeedSource) {
+	let Some(key) = remembered_feed_key_for_source(source) else {
 		return;
 	};
 
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-	let Some(entry) = remembered.get_mut(&normalized) else {
+	let Some(entry) = remembered.get_mut(&key) else {
 		return;
 	};
+
 	entry.last_refresh_started_at = Some(Instant::now());
 	entry.refresh_in_flight = true;
 	crate::cache_persistence::mark_dirty();
@@ -605,6 +670,7 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 		cache.insert(
 			source.cache_key(),
 			CachedSourcePosts {
+				source: source.clone(),
 				posts,
 				after,
 				fetched_at: Instant::now(),
@@ -617,19 +683,16 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	}
 }
 
-pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) {
-	let Some(normalized) = normalize_remembered_feed_name(subreddit) else {
+fn publish_remembered_source_refresh(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) {
+	let Some(source) = normalize_remembered_source(source) else {
 		return;
 	};
 
-	crate::utils::store_subreddit_flairs(&normalized, &posts);
+	match &source {
+		FeedSource::Subreddit { name, .. } | FeedSource::Flair { subreddit: name, .. } => crate::utils::store_subreddit_flairs(name, &posts),
+	}
 	crate::utils::store_post_flairs(&posts);
-	store_source_posts_with_origin(
-		&FeedSource::subreddit(normalized.clone(), FeedSort::New),
-		posts.clone(),
-		after.clone(),
-		Some(refresh_origin),
-	);
+	store_source_posts_with_origin(&source, posts.clone(), after.clone(), Some(refresh_origin));
 	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
 		crate::video_preview::prewarm_listing_video_previews(&posts);
 	}
@@ -638,8 +701,11 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	// has something to attach for the page render.
 	spawn_author_link_prefetch(posts.clone());
 
+	let Some(key) = remembered_feed_key_for_source(&source) else {
+		return;
+	};
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-	let Some(entry) = remembered.get_mut(&normalized) else {
+	let Some(entry) = remembered.get_mut(&key) else {
 		return;
 	};
 
@@ -650,13 +716,21 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	entry.estimated_post_interval_secs = estimate_post_interval_secs(&posts, entry.estimated_post_interval_secs);
 	entry.refresh_in_flight = false;
 	info!(
-		"post_cache: plain subreddit refresh succeeded for {} via {:?}: {} posts, after_present={}",
-		entry.name,
+		"post_cache: remembered feed refresh succeeded for {} via {:?}: {} posts, after_present={}",
+		source.display_name(),
 		refresh_origin,
 		posts.len(),
 		!after.is_empty()
 	);
 	crate::cache_persistence::mark_dirty();
+}
+
+pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) {
+	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
+		return;
+	};
+
+	publish_remembered_source_refresh(&source, posts, after, refresh_origin);
 }
 
 fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
@@ -678,13 +752,19 @@ fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
 }
 
 pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refresh_origin: RefreshOrigin) {
-	let Some(normalized) = normalize_remembered_feed_name(subreddit) else {
+	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
 		return;
 	};
+	record_remembered_source_refresh_failure(&source, error, refresh_origin);
+}
 
+fn record_remembered_source_refresh_failure(source: &FeedSource, error: &str, refresh_origin: RefreshOrigin) {
+	let Some(key) = remembered_feed_key_for_source(source) else {
+		return;
+	};
 	let now = Instant::now();
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-	let Some(entry) = remembered.get_mut(&normalized) else {
+	let Some(entry) = remembered.get_mut(&key) else {
 		return;
 	};
 
@@ -700,7 +780,12 @@ pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refr
 	}
 	entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
 	entry.refresh_in_flight = false;
-	warn!("post_cache: plain subreddit refresh failed for {} via {:?}: {}", entry.name, refresh_origin, error);
+	warn!(
+		"post_cache: remembered feed refresh failed for {} via {:?}: {}",
+		source.display_name(),
+		refresh_origin,
+		error
+	);
 	crate::cache_persistence::mark_dirty();
 }
 
@@ -723,9 +808,14 @@ pub fn cleanup_decayed_remembered_subreddits() {
 	}
 
 	let mut cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-	for subreddit in &decayed {
-		cache.remove(&FeedSource::subreddit(subreddit.clone(), FeedSort::New).cache_key());
-		crate::subreddit::remove_subreddit_metadata_cache(subreddit);
+	for key in &decayed {
+		let Some(source) = remembered_feed_source_from_key(key) else {
+			continue;
+		};
+		cache.remove(&source.cache_key());
+		if let FeedSource::Subreddit { name, .. } = &source {
+			crate::subreddit::remove_subreddit_metadata_cache(name);
+		}
 	}
 	crate::cache_persistence::mark_dirty();
 }
@@ -740,16 +830,11 @@ pub(crate) fn snapshot_persisted_source_entries(now_unix: u64) -> Vec<PersistedS
 	};
 
 	cache
-		.iter()
-		.filter_map(|(key, entry)| {
-			let rest = key.strip_prefix("subreddit:")?;
-			let (subreddit, sort) = rest.rsplit_once(':').map_or((rest, "new"), |(subreddit, sort)| (subreddit, sort));
-			if sort != "new" {
-				return None;
-			}
-			let subreddit = normalize_remembered_feed_name(subreddit)?;
+		.values()
+		.filter_map(|entry| {
+			let source_key = remembered_feed_key_for_source(&entry.source)?;
 			Some(PersistedSourceCacheEntry {
-				subreddit,
+				subreddit: source_key,
 				posts: entry.posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
 				after: entry.after.clone(),
 				fetched_at_unix: instant_to_unix(entry.fetched_at, now_unix),
@@ -790,7 +875,8 @@ pub(crate) fn restore_persisted_state(
 	let restored_remembered = remembered_entries
 		.into_iter()
 		.filter_map(|entry| {
-			let normalized = normalize_remembered_feed_name(&entry.name)?;
+			let source = remembered_feed_source_from_key(&entry.name)?;
+			let normalized = remembered_feed_key_for_source(&source)?;
 			let age_secs = now_unix.saturating_sub(entry.last_requested_at_unix);
 			(age_secs <= REMEMBERED_SUBREDDIT_TTL_SECS).then_some((
 				normalized.clone(),
@@ -816,9 +902,10 @@ pub(crate) fn restore_persisted_state(
 	let restored_sources = source_entries
 		.into_iter()
 		.filter_map(|entry| {
-			let subreddit = normalize_remembered_feed_name(&entry.subreddit)?;
+			let source = remembered_feed_source_from_key(&entry.subreddit)?;
+			let remembered_key = remembered_feed_key_for_source(&source)?;
 			let age_secs = now_unix.saturating_sub(entry.fetched_at_unix);
-			let remember_kept = restored_remembered.get(&subreddit).is_some();
+			let remember_kept = restored_remembered.get(&remembered_key).is_some();
 			if age_secs > CACHE_TTL_SECS && !remember_kept {
 				return None;
 			}
@@ -827,8 +914,9 @@ pub(crate) fn restore_persisted_state(
 			update_user_video_stats_from_posts(&posts);
 
 			Some((
-				FeedSource::subreddit(subreddit, FeedSort::New).cache_key(),
+				source.cache_key(),
 				CachedSourcePosts {
+					source,
 					posts,
 					after: entry.after,
 					fetched_at: unix_to_instant(entry.fetched_at_unix, now_unix),
@@ -924,7 +1012,7 @@ fn spawn_author_link_prefetch(posts: Vec<Post>) {
 	});
 }
 
-pub fn pick_next_remembered_subreddit_to_refresh() -> Option<String> {
+pub fn pick_next_remembered_subreddit_to_refresh() -> Option<FeedSource> {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let mut entries = remembered
 		.values()
@@ -932,45 +1020,41 @@ pub fn pick_next_remembered_subreddit_to_refresh() -> Option<String> {
 		.cloned()
 		.collect::<Vec<_>>();
 	entries.sort_by(remembered_refresh_priority);
-	entries.into_iter().next().map(|entry| entry.name)
+	entries.into_iter().find_map(|entry| remembered_feed_source_from_key(&entry.name))
 }
 
-async fn refresh_remembered_subreddit(subreddit: &str) {
-	mark_plain_subreddit_refresh_started(subreddit);
-	let lower = subreddit.to_lowercase();
-	let listing_result = if let Some(username) = lower.strip_prefix("u_").filter(|rest| !rest.is_empty()) {
-		let listing_path = format!("/user/{username}/submitted.json?sort=new&limit={PER_SOURCE_LIMIT}&raw_json=1");
-		Post::fetch(&listing_path, false).await
-	} else {
-		let listing_path = format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"));
-		Post::fetch(&listing_path, false).await
-	};
+async fn refresh_remembered_subreddit(source: &FeedSource) {
+	mark_remembered_source_refresh_started(source);
+	let listing_result = Post::fetch(&source.build_path(), false).await.map(|(posts, after)| (source.filter_posts(posts), after));
 
 	match listing_result {
 		Ok((posts, after)) => {
-			publish_plain_subreddit_refresh(subreddit, posts, after, RefreshOrigin::Daemon);
+			publish_remembered_source_refresh(source, posts, after, RefreshOrigin::Daemon);
 		}
 		Err(error) => {
-			record_plain_subreddit_refresh_failure(subreddit, &error, RefreshOrigin::Daemon);
+			record_remembered_source_refresh_failure(source, &error, RefreshOrigin::Daemon);
 		}
 	}
 
-	if lower.starts_with("u_") {
+	let FeedSource::Subreddit { name, .. } = source else {
+		return;
+	};
+	if name.to_lowercase().starts_with("u_") {
 		return;
 	}
 
-	match crate::subreddit::refresh_subreddit_metadata(subreddit, false).await {
+	match crate::subreddit::refresh_subreddit_metadata(name, false).await {
 		Ok(metadata) => {
 			info!(
 				"post_cache: refreshed metadata for {} via {:?}: title={}, nsfw={}",
-				subreddit,
+				name,
 				RefreshOrigin::Daemon,
 				metadata.title,
 				metadata.nsfw
 			);
 		}
 		Err(error) => {
-			warn!("post_cache: failed to refresh metadata for {} via {:?}: {}", subreddit, RefreshOrigin::Daemon, error);
+			warn!("post_cache: failed to refresh metadata for {} via {:?}: {}", name, RefreshOrigin::Daemon, error);
 		}
 	}
 }
@@ -997,22 +1081,27 @@ pub fn spawn_remembered_subreddit_daemon() {
 				total, active, eligible, blocked_or_in_flight
 			);
 
-			let Some(subreddit) = pick_next_remembered_subreddit_to_refresh() else {
+			let Some(source) = pick_next_remembered_subreddit_to_refresh() else {
 				info!("post_cache: remembered subreddit daemon idle: no eligible subreddit to refresh");
 				continue;
 			};
 
 			let should_skip = {
 				let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-				remembered.get(&subreddit).is_none_or(|entry| !remembered_entry_is_active(entry) || entry.refresh_in_flight)
+				remembered_feed_key_for_source(&source).map_or(true, |key| {
+					remembered.get(&key).is_none_or(|entry| !remembered_entry_is_active(entry) || entry.refresh_in_flight)
+				})
 			};
 			if should_skip {
-				info!("post_cache: remembered subreddit daemon skipped refresh for {} because it is no longer eligible", subreddit);
+				info!(
+					"post_cache: remembered subreddit daemon skipped refresh for {} because it is no longer eligible",
+					source.display_name()
+				);
 				continue;
 			}
 
-			info!("post_cache: remembered subreddit daemon refreshing {}", subreddit);
-			refresh_remembered_subreddit(&subreddit).await;
+			info!("post_cache: remembered subreddit daemon refreshing {}", source.display_name());
+			refresh_remembered_subreddit(&source).await;
 		}
 	});
 }
@@ -1108,18 +1197,18 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		return Ok(entry);
 	}
 
-	if let FeedSource::Subreddit { name, .. } = &source {
+	if let Some(key) = remembered_feed_key_for_source(&source) {
 		if !matches!(refresh_origin, RefreshOrigin::DirectLiveFetch) {
 			let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 			if remembered
-				.get(&name.to_lowercase())
+				.get(&key)
 				.and_then(|entry| entry.banned_until)
 				.is_some_and(|until| until > Instant::now())
 			{
 				return Err("banned".to_string());
 			}
 		}
-		mark_plain_subreddit_refresh_started(name);
+		mark_remembered_source_refresh_started(&source);
 	}
 
 	let (posts, after) = match Post::fetch(&source.build_path(), quarantine).await {
@@ -1131,34 +1220,29 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 					return Ok(entry);
 				}
 			}
-			if let FeedSource::Subreddit { name, .. } = &source {
-				record_plain_subreddit_refresh_failure(name, &error, refresh_origin);
+			if remembered_feed_key_for_source(&source).is_some() {
+				record_remembered_source_refresh_failure(&source, &error, refresh_origin);
 			}
 			return Err(error);
 		}
 	};
 	let posts = source.filter_posts(posts);
-	match &source {
-		FeedSource::Subreddit { name, sort } if *sort == FeedSort::New && normalize_remembered_feed_name(name).is_some() => {
-			publish_plain_subreddit_refresh(name, posts.clone(), after.clone(), refresh_origin);
-		}
-		_ => {
-			crate::utils::store_post_flairs(&posts);
-			store_source_posts(&source, posts.clone(), after.clone());
-			if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
-				spawn_author_link_prefetch(posts.clone());
-			}
+	if remembered_feed_key_for_source(&source).is_some() {
+		publish_remembered_source_refresh(&source, posts.clone(), after.clone(), refresh_origin);
+	} else {
+		crate::utils::store_post_flairs(&posts);
+		store_source_posts(&source, posts.clone(), after.clone());
+		if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
+			spawn_author_link_prefetch(posts.clone());
 		}
 	}
 
 	Ok(CachedSourcePosts {
+		source: source.clone(),
 		posts,
 		after,
 		fetched_at: Instant::now(),
-		refresh_origin: match &source {
-			FeedSource::Subreddit { name, sort } if *sort == FeedSort::New && normalize_remembered_feed_name(name).is_some() => Some(refresh_origin),
-			_ => None,
-		},
+		refresh_origin: remembered_feed_key_for_source(&source).map(|_| refresh_origin),
 	})
 }
 
@@ -2541,13 +2625,13 @@ mod tests {
 		remembered.insert("gamma".to_string(), third);
 		drop(remembered);
 
-		assert_eq!(pick_next_remembered_subreddit_to_refresh().as_deref(), Some("alpha"));
+		assert_eq!(pick_next_remembered_subreddit_to_refresh().map(|s| s.display_name()), Some("alpha".to_string()));
 
 		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		remembered.get_mut("alpha").unwrap().last_refresh_succeeded_at = Some(Instant::now() - Duration::from_secs(300));
 		drop(remembered);
 
-		assert_eq!(pick_next_remembered_subreddit_to_refresh().as_deref(), Some("gamma"));
+		assert_eq!(pick_next_remembered_subreddit_to_refresh().map(|s| s.display_name()), Some("gamma".to_string()));
 	}
 
 	#[test]
@@ -3583,7 +3667,7 @@ mod tests {
 		remember_subreddit_request("rust");
 		record_plain_subreddit_refresh_failure("vlogsex", "banned", RefreshOrigin::Daemon);
 
-		assert_eq!(pick_next_remembered_subreddit_to_refresh().as_deref(), Some("rust"));
+		assert_eq!(pick_next_remembered_subreddit_to_refresh().map(|s| s.display_name()), Some("rust".to_string()));
 
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		let entry = remembered.get("vlogsex").unwrap();

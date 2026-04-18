@@ -1746,19 +1746,29 @@ a.redgifs_uploader_mismatch {
 }
 
 .video_preview_layer {
+    align-items: center;
     inset: 0;
     opacity: 0;
     pointer-events: none;
     position: absolute;
-    background-position: center;
-    background-repeat: no-repeat;
-    background-size: contain;
+    display: flex;
+    justify-content: center;
     transition: opacity 120ms linear;
     z-index: 2;
 }
 
 .video_preview_layer.is-visible {
     opacity: 1;
+}
+
+.video_preview_image {
+    display: block;
+    height: 100%;
+    margin: 0;
+    max-height: none;
+    max-width: none;
+    object-fit: contain;
+    width: 100%;
 }
 
 .video_preview_loading {

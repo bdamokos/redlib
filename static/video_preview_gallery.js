@@ -37,12 +37,9 @@
         return host.querySelector(".video_preview_layer");
     }
 
-    function cssUrl(path) {
-        if (!path) {
-            return "none";
-        }
-
-        return "url(" + JSON.stringify(String(path)) + ")";
+    function previewImage(host) {
+        var layer = previewLayer(host);
+        return layer ? layer.querySelector(".video_preview_image") : null;
     }
 
     function hideAnimatedPreview(host) {
@@ -132,8 +129,9 @@
         }
 
         var layer = previewLayer(host);
+        var image = previewImage(host);
         var video = previewVideo(host);
-        if (!layer || !video) {
+        if (!layer || !image || !video) {
             state.rendered = true;
             return;
         }
@@ -160,7 +158,7 @@
             }
 
             layer.dataset.previewSrc = nextPath;
-            layer.style.backgroundImage = cssUrl(nextPath);
+            image.src = nextPath;
             video.removeAttribute("poster");
             current.rendered = true;
             current.renderingPreviewPath = "";

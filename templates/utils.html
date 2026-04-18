@@ -591,7 +591,9 @@
 				<a href="{{ post.media.url }}">Video</a>
 			</video>
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
-			<div class="video_preview_layer" aria-hidden="true"></div>
+			<div class="video_preview_layer" aria-hidden="true">
+				<img class="video_preview_image" alt="" />
+			</div>
 			{% endif %}
 			</div>
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}

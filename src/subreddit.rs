@@ -557,6 +557,14 @@ fn is_video_length_sort(sort: &str) -> bool {
 	sort == "video-length"
 }
 
+fn default_post_sort_setting(prefs: &Preferences) -> String {
+	if prefs.post_sort.is_empty() {
+		"hot".to_string()
+	} else {
+		prefs.post_sort.clone()
+	}
+}
+
 fn sort_option_label(method: &str) -> String {
 	match method {
 		"video-length" => "Video Length".to_string(),
@@ -1610,10 +1618,10 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let front_page_is_following = is_following_front_page(&front_page);
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
-	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
+	let post_sort = default_post_sort_setting(&prefs);
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
-	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
 	let aggregate_front_page = req.param("sub").is_none() && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
+	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
 		String::new()
@@ -1883,10 +1891,10 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let front_page_is_following = is_following_front_page(&front_page);
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
-	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
+	let post_sort = default_post_sort_setting(&prefs);
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
-	let video_mode_front_page = !is_subreddit_route && is_video_length_sort(&sort);
 	let aggregate_front_page = !is_subreddit_route && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
+	let video_mode_front_page = !is_subreddit_route && is_video_length_sort(&sort);
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
 		String::new()

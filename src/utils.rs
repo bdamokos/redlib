@@ -321,6 +321,13 @@ impl Media {
 		}
 	}
 
+	fn resolved_dimensions(width: Option<i64>, height: Option<i64>, fallback_width: i64, fallback_height: i64) -> (i64, i64) {
+		match (width.filter(|value| *value > 0), height.filter(|value| *value > 0)) {
+			(Some(width), Some(height)) => (width, height),
+			_ => (fallback_width, fallback_height),
+		}
+	}
+
 	pub async fn parse(data: &Value) -> (String, Self, Vec<GalleryMedia>) {
 		let mut gallery = Vec::new();
 
@@ -347,14 +354,16 @@ impl Media {
 		let embed_code = if redgifs_url.is_some() { String::new() } else { raw_embed_code };
 
 		// RedGifs previews often point at muted Reddit transcodes; use the direct RedGifs MP4 instead.
-		let (post_type, url_val, hls_url_val, dash_url_val) = if let Some(redgifs_url) = redgifs_url.as_ref() {
-			("video", redgifs_url, None, None)
+		let (post_type, url_val, hls_url_val, dash_url_val, media_width, media_height) = if let Some(redgifs_url) = redgifs_url.as_ref() {
+			("video", redgifs_url, None, None, None, None)
 		} else if data_preview["fallback_url"].is_string() {
 			(
 				if data_preview["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
 				&data_preview["fallback_url"],
 				Some(&data_preview["hls_url"]),
 				Some(&data_preview["dash_url"]),
+				data_preview["width"].as_i64(),
+				data_preview["height"].as_i64(),
 			)
 		} else if secure_media["fallback_url"].is_string() {
 			(
@@ -362,6 +371,8 @@ impl Media {
 				&secure_media["fallback_url"],
 				Some(&secure_media["hls_url"]),
 				Some(&secure_media["dash_url"]),
+				secure_media["width"].as_i64(),
+				secure_media["height"].as_i64(),
 			)
 		} else if crosspost_parent_media["fallback_url"].is_string() {
 			(
@@ -369,6 +380,8 @@ impl Media {
 				&crosspost_parent_media["fallback_url"],
 				Some(&crosspost_parent_media["hls_url"]),
 				Some(&crosspost_parent_media["dash_url"]),
+				crosspost_parent_media["width"].as_i64(),
+				crosspost_parent_media["height"].as_i64(),
 			)
 		} else if data["post_hint"].as_str().unwrap_or("") == "image" {
 			// Handle images, whether GIFs or pics
@@ -377,23 +390,23 @@ impl Media {
 
 			if mp4.is_object() {
 				// Return the mp4 if the media is a gif
-				("gif", &mp4["source"]["url"], None, None)
+				("gif", &mp4["source"]["url"], None, None, mp4["source"]["width"].as_i64(), mp4["source"]["height"].as_i64())
 			} else {
 				// Return the picture if the media is an image
 				if data["domain"] == "i.redd.it" {
-					("image", &data["url"], None, None)
+					("image", &data["url"], None, None, None, None)
 				} else {
-					("image", &preview["source"]["url"], None, None)
+					("image", &preview["source"]["url"], None, None, None, None)
 				}
 			}
 		} else if data["is_self"].as_bool().unwrap_or_default() {
 			// If type is self, return permalink
-			("self", &data["permalink"], None, None)
+			("self", &data["permalink"], None, None, None, None)
 		} else if data["is_gallery"].as_bool().unwrap_or_default() {
 			// If this post contains a gallery of images
 			gallery = GalleryMedia::parse(&data["gallery_data"]["items"], &data["media_metadata"]);
 
-			("gallery", &data["url"], None, None)
+			("gallery", &data["url"], None, None, None, None)
 		} else if data["crosspost_parent_list"][0]["is_gallery"].as_bool().unwrap_or_default() {
 			// If this post contains a gallery of images
 			gallery = GalleryMedia::parse(
@@ -401,16 +414,19 @@ impl Media {
 				&data["crosspost_parent_list"][0]["media_metadata"],
 			);
 
-			("gallery", &data["url"], None, None)
+			("gallery", &data["url"], None, None, None, None)
 		} else if data["is_reddit_media_domain"].as_bool().unwrap_or_default() && data["domain"] == "i.redd.it" {
 			// If this post contains a reddit media (image) URL.
-			("image", &data["url"], None, None)
+			("image", &data["url"], None, None, None, None)
 		} else {
 			// If type can't be determined, return url
-			("link", &data["url"], None, None)
+			("link", &data["url"], None, None, None, None)
 		};
 
 		let source = &data["preview"]["images"][0]["source"];
+		let fallback_width = source["width"].as_i64().unwrap_or_default();
+		let fallback_height = source["height"].as_i64().unwrap_or_default();
+		let (width, height) = Self::resolved_dimensions(media_width, media_height, fallback_width, fallback_height);
 
 		let hls_url = hls_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
 		let dash_url = dash_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
@@ -458,8 +474,8 @@ impl Media {
 				preview_srcset,
 				hls_url,
 				dash_url,
-				width: source["width"].as_i64().unwrap_or_default(),
-				height: source["height"].as_i64().unwrap_or_default(),
+				width,
+				height,
 				poster,
 				duration_seconds,
 				duration,
@@ -527,9 +543,7 @@ pub fn creator_identity_slug_from_profile_url(raw_url: &str) -> Option<String> {
 	if trimmed.is_empty() {
 		return None;
 	}
-	let parsed = Url::parse(trimmed)
-		.or_else(|_| Url::parse(&format!("https://{trimmed}")))
-		.ok()?;
+	let parsed = Url::parse(trimmed).or_else(|_| Url::parse(&format!("https://{trimmed}"))).ok()?;
 	let host = parsed.host_str()?.to_lowercase();
 	let segments: Vec<&str> = parsed.path().split('/').filter(|segment| !segment.is_empty()).collect();
 
@@ -1856,7 +1870,10 @@ static DEPLOY_GIT_FOOTER: LazyLock<DeployGitFooter> = LazyLock::new(|| {
 		.filter(|s| !s.is_empty())
 		.unwrap_or_default();
 	if full.is_empty() {
-		return DeployGitFooter { short: String::new(), title: String::new() };
+		return DeployGitFooter {
+			short: String::new(),
+			title: String::new(),
+		};
 	}
 	let short = full.chars().take(7).collect::<String>();
 	let title = format!("Deployed from commit {full}");
@@ -1874,10 +1891,7 @@ pub fn footer_deploy_revision_title() -> &'static str {
 }
 
 fn static_asset_revision_token_ok(s: &str) -> bool {
-	!s.is_empty()
-		&& !s.contains('/')
-		&& !s.contains("..")
-		&& s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+	!s.is_empty() && !s.contains('/') && !s.contains("..") && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
 }
 
 static STATIC_ASSET_REVISION: LazyLock<String> = LazyLock::new(|| {
@@ -3555,6 +3569,42 @@ mod tests {
 			rewrite_urls("printf \"\\npolkit.addRule(function(action, subject)"),
 			"printf \"\\npolkit.addRule(function(action, subject)"
 		);
+	}
+
+	#[test]
+	fn media_parse_prefers_video_dimensions_over_preview_image_dimensions() {
+		let data = json!({
+			"preview": {
+				"images": [{
+					"source": {
+						"url": "https://preview.redd.it/demo.jpg",
+						"width": 640,
+						"height": 640
+					}
+				}],
+				"reddit_video_preview": {
+					"fallback_url": "https://v.redd.it/demo/DASH_720.mp4",
+					"hls_url": "https://v.redd.it/demo/HLSPlaylist.m3u8",
+					"dash_url": "https://v.redd.it/demo/DASHPlaylist.mpd",
+					"width": 720,
+					"height": 1280,
+					"duration": 31,
+					"is_gif": true
+				}
+			},
+			"url": "https://v.redd.it/demo",
+			"domain": "v.redd.it"
+		});
+
+		let (post_type, media, gallery) = block_on(Media::parse(&data));
+
+		assert_eq!(post_type, "gif");
+		assert!(gallery.is_empty());
+		assert_eq!(media.width, 720);
+		assert_eq!(media.height, 1280);
+		assert_eq!(media.url, "/vid/demo/720.mp4");
+		assert_eq!(media.hls_url, "/hls/demo/HLSPlaylist.m3u8");
+		assert_eq!(media.dash_url, "/dash/demo/DASHPlaylist.mpd");
 	}
 
 	#[test]
