@@ -45,7 +45,7 @@
     {% else %}
     <meta property="og:type" content="website">
     {% if str_eq(single_thread_str, "true") %}
-    <script src="/highlighted.js" defer></script>
+    <script src="{{ crate::utils::static_asset_href("highlighted.js") }}" defer></script>
     {% endif %}
     {% endif %}
     {% endif %}

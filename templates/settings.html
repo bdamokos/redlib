@@ -304,7 +304,7 @@
 		{% endmatch %}
 		<br />
 		<div>
-			<script src="/copy.js"></script>
+			<script src="{{ crate::utils::static_asset_href("copy.js") }}"></script>
 			<label for="bincode_str">Or, export/import here (be sure to save first):</label>
 			<br />
 			<input type="text" id="bincode_str" name="bincode_str"

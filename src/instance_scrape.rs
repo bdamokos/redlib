@@ -820,6 +820,7 @@ fn parse_post_card(element: ElementRef<'_>, context: ListingContext) -> Option<P
 
 	let link_title = if matches!(context, ListingContext::PostPage) { String::new() } else { title.clone() };
 	let link_permalink = permalink.clone();
+	let author_links = cached_author_external_links(&author_name);
 	let id = element
 		.value()
 		.attr("id")
@@ -837,8 +838,8 @@ fn parse_post_card(element: ElementRef<'_>, context: ListingContext) -> Option<P
 			name: author_name.clone(),
 			flair: empty_flair(),
 			distinguished,
-			external_links: cached_author_external_links(&author_name),
-			avg_video_length: crate::user::cached_avg_video_length(&author_name),
+			external_links: author_links.clone(),
+			avg_video_length: crate::user::cached_avg_video_length(&author_name, &author_links),
 		},
 		permalink,
 		parent_kind: String::new(),
@@ -1014,7 +1015,7 @@ fn parse_user_comment_card(element: ElementRef<'_>, user: &User) -> Option<Post>
 			flair: empty_flair(),
 			distinguished: String::new(),
 			external_links: user.external_links.clone(),
-			avg_video_length: crate::user::cached_avg_video_length(&user.name),
+			avg_video_length: crate::user::cached_avg_video_length(&user.name, &user.external_links),
 		},
 		permalink: permalink.clone(),
 		parent_kind: "t3".to_string(),

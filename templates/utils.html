@@ -521,11 +521,11 @@
 
 {% macro render_video_js() -%}
 	{% if str_eq(prefs.use_dash, "on") -%}
-	<script src="/dash.all.min.js" defer></script>
-	<script src="/dash-player.js" defer></script>
+	<script src="{{ crate::utils::static_asset_href("dash.all.min.js") }}" defer></script>
+	<script src="{{ crate::utils::static_asset_href("dash-player.js") }}" defer></script>
 	{% else if str_eq(prefs.use_hls, "on") -%}
-	<script src="/hls.min.js" defer></script>
-	<script src="/playHLSVideo.js" defer></script>
+	<script src="{{ crate::utils::static_asset_href("hls.min.js") }}" defer></script>
+	<script src="{{ crate::utils::static_asset_href("playHLSVideo.js") }}" defer></script>
 	{% endif %}
 {%- endmacro %}
 
@@ -602,8 +602,15 @@
 			{% endif %}
 		</div>
 	</div>
-	{% if !post.media.duration.is_empty() %}
-	<div class="post_media_duration">{{ post.media.duration }}</div>
+	{% if !post.media.duration.is_empty() || !post.media.redgifs_username.is_empty() %}
+	<div class="post_media_meta">
+		{% if !post.media.duration.is_empty() %}
+		<span class="post_media_duration">{{ post.media.duration }}</span>
+		{% endif %}
+		{% if !post.media.redgifs_username.is_empty() %}
+		<a class="{{ post.redgifs_uploader_css_classes() }}" href="https://www.redgifs.com/users/{{ post.media.redgifs_username }}" rel="nofollow noopener noreferrer" title="Uploader on RedGifs">{{ post.media.redgifs_username }} on RedGifs</a>
+		{% endif %}
+	</div>
 	{% endif %}
 
 	{% if !use_dash && !use_hls && !str_eq(prefs.hide_hls_notification, "on") %}

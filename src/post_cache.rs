@@ -2341,11 +2341,11 @@ mod tests {
 		);
 
 		assert_eq!(
-			crate::user::cached_avg_video_length("author_alpha"),
+			crate::user::cached_avg_video_length("author_alpha", &[]),
 			Some(("1:00".to_string(), "from 2 seen videos".to_string()))
 		);
 		assert_eq!(
-			crate::user::cached_avg_video_length("author_bravo"),
+			crate::user::cached_avg_video_length("author_bravo", &[]),
 			Some(("0:45".to_string(), "from 1 seen video".to_string()))
 		);
 	}
@@ -2371,7 +2371,7 @@ mod tests {
 		restore_persisted_state(source_entries, remembered_entries, now_unix, now_unix);
 
 		assert_eq!(
-			crate::user::cached_avg_video_length("author_restore"),
+			crate::user::cached_avg_video_length("author_restore", &[]),
 			Some(("1:15".to_string(), "from 1 seen video".to_string()))
 		);
 	}

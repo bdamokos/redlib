@@ -456,6 +456,21 @@ body > footer {
     opacity: 0.8;
 }
 
+#version .deploy-rev {
+    cursor: default;
+    font-size: 0.72em;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+    margin-left: 0.35em;
+    opacity: 0.42;
+    text-decoration: none;
+    user-select: all;
+}
+
+#version .deploy-rev:hover {
+    opacity: 0.65;
+}
+
 /* / Body footer. */
 
 /* Footer in content block. */
@@ -1655,12 +1670,44 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     margin: auto;
 }
 
-.post_media_duration {
+.post_media_meta {
     margin: 0 auto 0.5rem auto;
     max-width: 100%;
     text-align: center;
     font-size: 0.85rem;
     color: var(--fg-2);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: center;
+    gap: 0.35rem 0.6rem;
+}
+
+.post_media_duration {
+    margin: 0;
+    font-size: inherit;
+    color: inherit;
+}
+
+a.redgifs_uploader {
+    font-size: 0.82rem;
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+}
+
+a.redgifs_uploader:hover {
+    border-bottom-color: color-mix(in srgb, var(--fg-2) 55%, transparent);
+}
+
+a.redgifs_uploader_match {
+    color: color-mix(in srgb, var(--fg-2) 92%, var(--accent) 8%);
+    opacity: 0.92;
+}
+
+a.redgifs_uploader_mismatch {
+    color: var(--fg-2);
+    opacity: 0.72;
+    font-style: italic;
 }
 
 .video_preview_host {

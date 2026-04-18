@@ -1740,6 +1740,108 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		None
 	};
 
+	// Avoid post-load DOM fragment replacement on /following by rendering the full page server-side.
+	// The shell->fragment swap causes large CLS when the fragment arrives seconds after first paint.
+	if is_following_route(&url) && contextual_front_page {
+		let query = req.uri().query().unwrap_or_default().to_string();
+		let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
+		let timeframe = param(&format!("?{}", query), "t").unwrap_or_default();
+		let query_fingerprint = listing_query_fingerprint(&query);
+		let front_page_session_sources = build_front_page_session_sources(&prefs, &front_page, front_page_is_default, aggregate_front_page, &sub_name, &sort);
+
+		let feed_session_id = crate::post_cache::ensure_feed_session_with_budget(
+			FeedSessionRequest {
+				sources: front_page_session_sources,
+				filters: get_filters(&req),
+				quarantine: true,
+				query_fingerprint,
+			},
+			cache_page,
+			crate::post_cache::POSTS_PER_PAGE,
+			CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET,
+		)
+		.await;
+
+		if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
+			let merged_posts = crate::post_cache::feed_merged_posts(&feed_session_id).unwrap_or_else(|| std::mem::take(&mut page.posts));
+			let (page_posts, has_next_unseen) = if let Some(ref ctx) = feed_seen_shell {
+				seen_posts::page_and_record_seen(&ctx.session_id, ctx.hide_seen_on, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
+			} else {
+				seen_posts::page_and_record_seen("anon", false, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
+			};
+			let mut page_posts = page_posts;
+			page.has_next = page.has_next || has_next_unseen;
+
+			let no_posts = page_posts.is_empty();
+			let all_posts_hidden_nsfw = !no_posts && (page_posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			utils::hydrate_post_author_links_from_cache(&mut page_posts);
+
+			let prev_page_url = if cache_page > 0 {
+				feed_page_url(&url, &feed_session_id, cache_page - 1)
+			} else {
+				String::new()
+			};
+			let next_page_url = if page.has_next {
+				feed_page_url(&url, &feed_session_id, cache_page + 1)
+			} else {
+				String::new()
+			};
+			let contextual_pagination = build_contextual_pagination(&url, &feed_session_id, cache_page, &sort);
+
+			let mut page_template = SubredditTemplate {
+				sub: cached_sub,
+				posts: page_posts,
+				top_users,
+				sort: (sort.clone(), timeframe),
+				sort_options: build_sort_options(&FOLLOWING_ROUTE.to_string(), &url, &sort, &active_flair_filter),
+				flair_filters,
+				active_flair_filter: active_flair_filter.clone(),
+				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
+				clear_flair_filter_url: update_url_query(
+					&url,
+					&[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None), ("cache_page", None)],
+				),
+				prev_page_url,
+				next_page_url,
+				prefs,
+				url: url.clone(),
+				redirect_url,
+				is_filtered: false,
+				all_posts_filtered: false,
+				all_posts_hidden_nsfw,
+				no_posts,
+				cache_notice: String::new(),
+				is_flair_subscribed,
+				feed_session_id: feed_session_id.clone(),
+				feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
+				feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
+				show_contextual_pagination: !contextual_pagination.is_empty(),
+				contextual_pagination,
+				video_mode_enabled: false,
+				video_mode_sidebar: empty_video_mode_sidebar(),
+				show_hide_seen_toggle: false,
+				hide_seen_on: false,
+				hide_seen_toggle_url: String::new(),
+			};
+
+			if let Some(ref ctx) = feed_seen_shell {
+				if ctx.applies {
+					page_template.show_hide_seen_toggle = true;
+					page_template.hide_seen_on = ctx.hide_seen_on;
+					page_template.hide_seen_toggle_url = update_url_query(&page_template.url, &[("hide_seen", Some(if ctx.hide_seen_on { "off" } else { "on" }))]);
+				}
+			}
+
+			let mut response = template(&page_template);
+			if let Some(ref ctx) = feed_seen_shell {
+				if ctx.applies {
+					seen_posts::attach_rl_feed_cookies(&mut response, &ctx.session_id, ctx.needs_session_cookie, ctx.hide_seen_cookie_override.as_deref());
+				}
+			}
+			return Ok(response);
+		}
+	}
+
 	let mut response = template(&SubredditShellTemplate {
 		sub: cached_sub,
 		top_users,
@@ -2615,8 +2717,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 #[cfg(test)]
 mod tests {
 	use super::{
-		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, split_subscriptions_for_listing,
-		update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate, FRONT_CURSOR_PARAM,
+		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, split_subscriptions_for_listing, update_url_query,
+		AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use hyper::{Body, Request};

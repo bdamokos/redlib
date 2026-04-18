@@ -26,22 +26,22 @@
 		<!-- PWA Manifest -->
 		<link rel="manifest" type="application/json" href="/manifest.json">
 		<link rel="shortcut icon" type="image/x-icon" href="/favicon.ico"> 
-		<link rel="stylesheet" type="text/css" href="/style.css?v={{ env!("GIT_HASH") }}">
-		<script src="/space_scroll.js?v={{ env!("GIT_HASH") }}" defer></script>
-		<script src="/network_image.js?v={{ env!("GIT_HASH") }}" defer></script>
-		<script src="/post_preview.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/browser_session.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/author_links.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/subscription.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/feed_status.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/page_fragment.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/video_preview_gallery.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/video_mode_filters.js?v={{ env!("GIT_HASH") }}" defer></script>
-			<script src="/dynamic_content.js?v={{ env!("GIT_HASH") }}" defer></script>
+		<link rel="stylesheet" type="text/css" href="{{ crate::utils::static_asset_href("style.css") }}">
+		<script src="{{ crate::utils::static_asset_href("space_scroll.js") }}" defer></script>
+		<script src="{{ crate::utils::static_asset_href("network_image.js") }}" defer></script>
+		<script src="{{ crate::utils::static_asset_href("post_preview.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("browser_session.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("author_links.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("subscription.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("feed_status.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("page_fragment.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("video_preview_gallery.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("video_mode_filters.js") }}" defer></script>
+			<script src="{{ crate::utils::static_asset_href("dynamic_content.js") }}" defer></script>
 		<!-- Video quality -->
 		<div id="video_quality" data-value="{{ prefs.video_quality }}"></div>
 		{% call utils::render_video_js() %}
-		<script src="/video_visibility.js?v={{ env!("GIT_HASH") }}" defer></script>
+		<script src="{{ crate::utils::static_asset_href("video_visibility.js") }}" defer></script>
 		{% endblock %}
 		</head>
 	<body data-image-quality="{% if prefs.image_quality.is_empty() %}auto{% else %}{{ prefs.image_quality }}{% endif %}" class="
@@ -92,7 +92,7 @@
 		{% block footer %}
 			<footer>
 				<div class="footer-buttons">
-					<p><span id="version">v{{ env!("CARGO_PKG_VERSION") }}&emsp;</span><a href="/info" title="View instance information">ⓘ View instance info</a>&emsp;<a href="/cache-status" title="View visible cache status">Cache status</a>&emsp;<a href="https://github.com/redlib-org/redlib" title="View code on GitHub">&lt;&gt; Code</a></p>
+					<p><span id="version">v{{ env!("CARGO_PKG_VERSION") }}{% if !crate::utils::footer_deploy_revision_short().is_empty() %}<span class="deploy-rev" title="{{ crate::utils::footer_deploy_revision_title() }}">{{ crate::utils::footer_deploy_revision_short() }}</span>{% endif %}&emsp;</span><a href="/info" title="View instance information">ⓘ View instance info</a>&emsp;<a href="/cache-status" title="View visible cache status">Cache status</a>&emsp;<a href="https://github.com/redlib-org/redlib" title="View code on GitHub">&lt;&gt; Code</a></p>
 				</div>
 			</footer>
 		{% endblock %}

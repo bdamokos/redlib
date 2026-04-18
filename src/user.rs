@@ -37,6 +37,7 @@ struct CachedUserMetadata {
 #[derive(Clone)]
 struct CachedUserVideoStats {
 	seen_keys: HashSet<String>,
+	seen_redgifs_users: HashSet<String>,
 	total_duration_seconds: i64,
 	video_count: usize,
 	cached_at: Instant,
@@ -310,6 +311,13 @@ fn prune_user_video_stats_cache(cache: &mut HashMap<String, CachedUserVideoStats
 }
 
 fn observe_user_video_post(entry: &mut CachedUserVideoStats, post: &Post) {
+	if matches!(post.post_type.as_str(), "video" | "gif") && !post.media.redgifs_username.is_empty() {
+		let slug = utils::normalize_creator_identity_slug(&post.media.redgifs_username);
+		if !slug.is_empty() {
+			entry.seen_redgifs_users.insert(slug);
+		}
+	}
+
 	let Some(video_key) = video_aggregate_key(post) else {
 		return;
 	};
@@ -334,6 +342,7 @@ fn update_user_video_stats(username: &str, posts: &[Post]) {
 	let now = Instant::now();
 	let entry = cache.entry(cache_key.clone()).or_insert_with(|| CachedUserVideoStats {
 		seen_keys: HashSet::new(),
+		seen_redgifs_users: HashSet::new(),
 		total_duration_seconds: 0,
 		video_count: 0,
 		cached_at: now,
@@ -367,6 +376,7 @@ pub(crate) fn update_user_video_stats_from_posts(posts: &[Post]) {
 
 		let entry = cache.entry(cache_key).or_insert_with(|| CachedUserVideoStats {
 			seen_keys: HashSet::new(),
+			seen_redgifs_users: HashSet::new(),
 			total_duration_seconds: 0,
 			video_count: 0,
 			cached_at: now,
@@ -407,13 +417,37 @@ fn cached_user_video_stats(username: &str) -> Option<UserVideoStats> {
 	})
 }
 
-pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
-	let stats = cached_user_video_stats(username)?;
-	let count_label = if stats.video_count == 1 { "video" } else { "videos" };
-	Some((
-		utils::format_video_duration(stats.average_duration_seconds),
-		format!("from {} seen {count_label}", stats.video_count),
-	))
+pub fn cached_avg_video_length(username: &str, profile_links: &[utils::ExternalLink]) -> Option<(String, String)> {
+	let cache_key = normalize_user_video_stats_cache_key(username);
+	if cache_key.is_empty() {
+		return None;
+	}
+
+	let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() else {
+		return None;
+	};
+	prune_user_video_stats_cache(&mut cache);
+
+	let entry = cache.get_mut(&cache_key)?;
+	entry.cached_at = Instant::now();
+
+	if entry.video_count == 0 {
+		return None;
+	}
+
+	let average = entry.total_duration_seconds / entry.video_count as i64;
+	let count_label = if entry.video_count == 1 { "video" } else { "videos" };
+	let mut identities: HashSet<String> = entry.seen_redgifs_users.clone();
+	for link in profile_links {
+		if let Some(slug) = utils::creator_identity_slug_from_profile_url(&link.url) {
+			identities.insert(slug);
+		}
+	}
+	let mut meta = format!("from {} seen {count_label}", entry.video_count);
+	if identities.len() >= 2 {
+		meta.push_str(" · multiple creator handles (often reposted clips)");
+	}
+	Some((utils::format_video_duration(average), meta))
 }
 
 #[cfg(test)]
@@ -708,7 +742,7 @@ mod tests {
 	use askama::Template;
 	use url::form_urlencoded;
 
-	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, Media, Post, Preferences};
+	use crate::utils::{Author, Awards, CollapsedDuplicate, ExternalLink, Flags, Flair, FlairPart, Media, Post, Preferences};
 
 	fn test_post(id: &str, title: &str, community: &str, body: &str, post_type: &str, media_url: &str, gallery_urls: &[&str]) -> Post {
 		Post {
@@ -1445,7 +1479,48 @@ mod tests {
 				video_count: 2,
 			})
 		);
-		assert_eq!(super::cached_avg_video_length(username), Some(("1:00".to_string(), "from 2 seen videos".to_string())));
+		assert_eq!(
+			super::cached_avg_video_length(username, &[]),
+			Some(("1:00".to_string(), "from 2 seen videos".to_string()))
+		);
+	}
+
+	#[test]
+	fn avg_video_length_flags_multiple_redgifs_uploaders() {
+		super::clear_test_caches();
+		let username = "demo_user_multi_redgifs";
+		let mut first = test_video_post("one", "One", "/redgifs/oneclip", 60);
+		first.media.redgifs_username = "alice".to_string();
+		let mut second = test_video_post("two", "Two", "/redgifs/twoclip", 60);
+		second.media.redgifs_username = "bob".to_string();
+
+		super::update_user_video_stats(username, &[first, second]);
+
+		let meta = super::cached_avg_video_length(username, &[]).unwrap().1;
+		assert!(
+			meta.contains("multiple creator handles"),
+			"expected repost hint in {meta:?}"
+		);
+	}
+
+	#[test]
+	fn avg_video_length_collapses_matching_profile_and_redgifs_slug() {
+		super::clear_test_caches();
+		let username = "demo_user_slug_align";
+		let mut post = test_video_post("one", "One", "/redgifs/oneclip", 60);
+		post.media.redgifs_username = "samehandle".to_string();
+		let links = vec![ExternalLink {
+			label: "Fansly".to_string(),
+			url: "https://fansly.com/samehandle/posts".to_string(),
+			host: "fansly.com".to_string(),
+			icon_path: "/icon/fansly.com".to_string(),
+			has_coomer: false,
+		}];
+
+		super::update_user_video_stats(username, &[post]);
+
+		let meta = super::cached_avg_video_length(username, &links).unwrap().1;
+		assert!(!meta.contains("multiple creator handles"), "unexpected hint in {meta:?}");
 	}
 
 	#[test]
@@ -1707,6 +1782,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		empty_video_mode_sidebar()
 	};
 
+	let avg_video_length = cached_avg_video_length(&username, &cached_user.external_links);
 	Ok(template(&UserTemplate {
 		user: cached_user,
 		username: username.clone(),
@@ -1722,7 +1798,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		is_filtered: false,
 		all_posts_filtered: false,
 		all_posts_hidden_nsfw: false,
-		avg_video_length: cached_avg_video_length(&username),
+		avg_video_length,
 		no_posts: false,
 		shell_mode: true,
 		fragment_url: user_fragment_path(&username, &listing, query),
@@ -1827,7 +1903,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
 			.filter(|post| video_mode::is_video_post(post))
 			.count();
-		let avg_video_length = cached_avg_video_length(&username);
+		let avg_video_length = cached_avg_video_length(&username, &user.external_links);
 		let mut posts = posts;
 		utils::hydrate_post_author_links_from_cache(&mut posts);
 		let video_mode_sidebar = build_video_mode_sidebar(&url, &listing_data, &posts, &normalized_query);
@@ -1993,7 +2069,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		};
 		let no_posts = posts.is_empty();
 		let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-		let avg_video_length = cached_avg_video_length(&username);
+		let avg_video_length = cached_avg_video_length(&username, &fragment_user.external_links);
 		UserFragmentTemplate {
 			user: fragment_user,
 			posts,
@@ -2140,7 +2216,7 @@ pub async fn author_links(req: Request<Body>) -> Result<Response<Body>, String> 
 		let author_name = author.to_string();
 		pending.spawn(async move {
 			let links = utils::external_links_with_coomer_flags(utils::author_external_links(&author_name).await).await;
-			let avg_video_length = cached_avg_video_length(&author_name);
+			let avg_video_length = cached_avg_video_length(&author_name, &links);
 			(author_name, links, avg_video_length)
 		});
 	}

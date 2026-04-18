@@ -476,7 +476,10 @@ fn build_comment(
 		},
 		distinguished: val(comment, "distinguished"),
 		external_links: Vec::new(),
-		avg_video_length: crate::user::cached_avg_video_length(&val(comment, "author")),
+			avg_video_length: crate::user::cached_avg_video_length(
+				&val(comment, "author"),
+				&crate::utils::cached_author_external_links(&val(comment, "author")),
+			),
 	};
 	let is_filtered = filters.contains(&["u_", author.name.as_str()].concat());
 

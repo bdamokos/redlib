@@ -11,6 +11,7 @@ static REDGIFS_ID_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-
 static REDGIFS_MEDIA_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\.(?:mp4|jpg|jpeg|png|webp)$").unwrap());
 static REDGIFS_META_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<meta\s+(?:property|name)="(?P<name>[^"]+)"\s+content="(?P<content>[^"]+)""#).unwrap());
 static REDGIFS_LINK_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<link\s+[^>]*rel="(?P<rel>[^"]+)"[^>]*href="(?P<href>[^"]+)""#).unwrap());
+static REDGIFS_USER_HTML_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)redgifs\.com/users/([a-z0-9_-]+)").unwrap());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RedgifsMediaPaths {
@@ -18,6 +19,25 @@ pub struct RedgifsMediaPaths {
 	poster_path: String,
 	duration_seconds: i64,
 	has_audio: bool,
+	username: String,
+}
+
+impl RedgifsMediaPaths {
+	pub(crate) fn video_path(&self) -> &str {
+		&self.video_path
+	}
+
+	pub(crate) fn poster_path(&self) -> &str {
+		&self.poster_path
+	}
+
+	pub(crate) fn duration_seconds(&self) -> i64 {
+		self.duration_seconds
+	}
+
+	pub(crate) fn username(&self) -> &str {
+		&self.username
+	}
 }
 
 pub fn is_redgifs_domain(domain: &str) -> bool {
@@ -144,7 +164,7 @@ pub async fn fetch_video_path(video_id: &str) -> Result<String, String> {
 }
 
 #[cached(size = 512, time = 10800, result = true)]
-async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String> {
+pub(crate) async fn fetch_media_paths(video_id: String) -> Result<RedgifsMediaPaths, String> {
 	match fetch_media_paths_from_api(&video_id).await {
 		Ok(paths) => Ok(paths),
 		Err(api_err) => {
@@ -192,6 +212,12 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 		.and_then(media_path_from_url)
 		.unwrap_or_default();
 	let duration_seconds = json["gif"]["duration"].as_f64().map(|value| value.round() as i64).unwrap_or_default();
+	let username = json["gif"]["userName"]
+		.as_str()
+		.or_else(|| json["gif"]["username"].as_str())
+		.unwrap_or_default()
+		.trim()
+		.to_string();
 	info!("Selected RedGifs API media for {}: has_audio={} path={}", video_id, has_audio, video_path);
 
 	Ok(RedgifsMediaPaths {
@@ -199,6 +225,7 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 		poster_path,
 		duration_seconds,
 		has_audio,
+		username,
 	})
 }
 
@@ -293,6 +320,11 @@ async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<Redg
 	let video_path = media_path_from_url(&selected_video_url).ok_or_else(|| "No video URL in RedGifs watch page".to_string())?;
 	let poster_path = twitter_image.as_deref().and_then(media_path_from_url).unwrap_or_default();
 	let duration_seconds = og_duration.map(|value| value.round() as i64).unwrap_or_default();
+	let username = REDGIFS_USER_HTML_REGEX
+		.captures(html)
+		.and_then(|captures| captures.get(1))
+		.map(|value| value.as_str().to_string())
+		.unwrap_or_default();
 	info!("Selected RedGifs watch-page media for {}: has_audio={} path={}", video_id, has_audio, video_path);
 
 	Ok(RedgifsMediaPaths {
@@ -300,6 +332,7 @@ async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<Redg
 		poster_path,
 		duration_seconds,
 		has_audio,
+		username,
 	})
 }
 
@@ -424,6 +457,7 @@ mod tests {
 					<meta property="og:video" content="https://media.redgifs.com/ImperturbableLumpyShihtzu-silent.mp4">
 					<meta name="twitter:image" content="https://media.redgifs.com/ImperturbableLumpyShihtzu-mobile.jpg">
 					<meta property="og:video:duration" content="31">
+					<a href="https://www.redgifs.com/users/imperturbablecreator">uploader</a>
 				</head>
 			</html>
 		"#;
@@ -435,6 +469,7 @@ mod tests {
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				duration_seconds: 31,
 				has_audio: false,
+				username: "imperturbablecreator".to_string(),
 			}
 		);
 	}
@@ -457,6 +492,7 @@ mod tests {
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				duration_seconds: 0,
 				has_audio: false,
+				username: String::new(),
 			}
 		);
 	}

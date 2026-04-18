@@ -296,6 +296,8 @@ pub struct Media {
 	pub embed_code: String,
 	pub video_preview_enabled: bool,
 	pub video_preview_job_hint: String,
+	/// RedGifs account that uploaded this clip (empty when unknown or not from RedGifs).
+	pub redgifs_username: String,
 }
 
 impl Media {
@@ -315,6 +317,7 @@ impl Media {
 			embed_code: String::new(),
 			video_preview_enabled: false,
 			video_preview_job_hint: String::new(),
+			redgifs_username: String::new(),
 		}
 	}
 
@@ -327,25 +330,18 @@ impl Media {
 		let crosspost_parent_media = &data["crosspost_parent_list"][0]["secure_media"]["reddit_video"];
 		let raw_embed_code = data["secure_media_embed"]["content"].as_str().unwrap_or_default().to_string();
 		let redgifs_id = redgifs::watch_path_from_url(data["url"].as_str().unwrap_or_default()).or_else(|| redgifs::watch_path_from_embed_code(&raw_embed_code));
-		let redgifs_poster = if let Some(video_id) = redgifs_id.as_ref() {
-			redgifs::fetch_poster_path(video_id).await.unwrap_or_default()
+		let redgifs_bundle = if let Some(video_id) = redgifs_id.as_ref() {
+			redgifs::fetch_media_paths(video_id.clone()).await.ok()
 		} else {
-			String::new()
+			None
 		};
-		let redgifs_duration_seconds = if let Some(video_id) = redgifs_id.as_ref() {
-			redgifs::fetch_duration_seconds(video_id).await.unwrap_or_default()
-		} else {
-			0
-		};
-		let redgifs_preview_media_url = if let Some(video_id) = redgifs_id.as_ref() {
-			redgifs::fetch_video_path(video_id)
-				.await
-				.ok()
-				.and_then(|path| redgifs::direct_media_url_from_path(&path))
-				.unwrap_or_default()
-		} else {
-			String::new()
-		};
+		let redgifs_poster = redgifs_bundle.as_ref().map(|paths| paths.poster_path().to_string()).unwrap_or_default();
+		let redgifs_duration_seconds = redgifs_bundle.as_ref().map(|paths| paths.duration_seconds()).unwrap_or_default();
+		let redgifs_username = redgifs_bundle.as_ref().map(|paths| paths.username().to_string()).unwrap_or_default();
+		let redgifs_preview_media_url = redgifs_bundle
+			.as_ref()
+			.and_then(|paths| redgifs::direct_media_url_from_path(paths.video_path()))
+			.unwrap_or_default();
 		let redgifs_url = redgifs_id.as_ref().map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
 
 		let embed_code = if redgifs_url.is_some() { String::new() } else { raw_embed_code };
@@ -471,6 +467,7 @@ impl Media {
 				embed_code,
 				video_preview_enabled,
 				video_preview_job_hint,
+				redgifs_username,
 			},
 			gallery,
 		)
@@ -491,6 +488,53 @@ pub fn format_video_duration(seconds: i64) -> String {
 	} else {
 		format!("{minutes}:{remaining_seconds:02}")
 	}
+}
+
+/// Normalized handle for comparing RedGifs uploaders, Reddit usernames, and profile link slugs.
+pub fn normalize_creator_identity_slug(raw: &str) -> String {
+	raw.trim().trim_start_matches('@').to_lowercase()
+}
+
+/// Returns the primary creator handle from supported profile URLs (Fansly, OnlyFans, etc.).
+pub fn creator_identity_slug_from_profile_url(raw_url: &str) -> Option<String> {
+	let trimmed = raw_url.trim();
+	if trimmed.is_empty() {
+		return None;
+	}
+	let parsed = Url::parse(trimmed)
+		.or_else(|_| Url::parse(&format!("https://{trimmed}")))
+		.ok()?;
+	let host = parsed.host_str()?.to_lowercase();
+	let segments: Vec<&str> = parsed.path().split('/').filter(|segment| !segment.is_empty()).collect();
+
+	let slug = match host.as_str() {
+		"onlyfans.com" | "www.onlyfans.com" => segments.first().copied(),
+		h if h.ends_with(".onlyfans.com") => segments.first().copied(),
+		"fansly.com" | "www.fansly.com" => segments.first().copied(),
+		h if h.ends_with(".fansly.com") => segments.first().copied(),
+		h if h.contains("manyvids.com") => {
+			let profile_index = segments.iter().position(|segment| segment.eq_ignore_ascii_case("profile"))?;
+			let after = segments.get(profile_index + 1)?;
+			if after.chars().all(|ch: char| ch.is_ascii_digit()) {
+				segments.get(profile_index + 2).copied()
+			} else {
+				Some(*after)
+			}
+		}
+		"loyalfans.com" | "www.loyalfans.com" => segments.first().copied(),
+		h if h.ends_with(".loyalfans.com") => segments.first().copied(),
+		"justfor.fans" | "www.justfor.fans" => segments.first().copied(),
+		_ => None,
+	}?;
+
+	let slug = slug.trim();
+	if slug.is_empty() || slug.eq_ignore_ascii_case("posts") || slug.eq_ignore_ascii_case("media") {
+		return None;
+	}
+	if slug.chars().all(|ch: char| ch.is_ascii_digit()) {
+		return None;
+	}
+	Some(normalize_creator_identity_slug(slug))
 }
 
 #[derive(Clone, Serialize, PartialEq)]
@@ -743,7 +787,7 @@ impl Post {
 					},
 					distinguished: val(post, "distinguished"),
 					external_links: Vec::new(),
-					avg_video_length: crate::user::cached_avg_video_length(&val(post, "author")),
+					avg_video_length: crate::user::cached_avg_video_length(&val(post, "author"), &[]),
 				},
 				permalink,
 				parent_kind,
@@ -798,6 +842,7 @@ impl Post {
 					embed_code: String::new(),
 					video_preview_enabled: false,
 					video_preview_job_hint: String::new(),
+					redgifs_username: String::new(),
 				},
 				media,
 				domain: val(post, "domain"),
@@ -816,6 +861,18 @@ impl Post {
 			});
 		}
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
+	}
+
+	/// CSS classes for the RedGifs uploader link next to the player (Askama).
+	pub fn redgifs_uploader_css_classes(&self) -> &'static str {
+		if self.media.redgifs_username.is_empty() {
+			return "";
+		}
+		if normalize_creator_identity_slug(&self.media.redgifs_username) == normalize_creator_identity_slug(&self.author.name) {
+			"redgifs_uploader redgifs_uploader_match"
+		} else {
+			"redgifs_uploader redgifs_uploader_mismatch"
+		}
 	}
 }
 
@@ -1073,7 +1130,8 @@ pub fn cached_author_external_links(name: &str) -> Vec<ExternalLink> {
 pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
 	for post in posts.iter_mut() {
 		post.author.external_links = cached_author_external_links(&post.author.name);
-		post.author.avg_video_length = crate::user::cached_avg_video_length(&post.author.name);
+		post.author.avg_video_length =
+			crate::user::cached_avg_video_length(&post.author.name, &post.author.external_links);
 	}
 }
 
@@ -1745,6 +1803,63 @@ static AVAILABLE_THEMES: LazyLock<Vec<String>> = LazyLock::new(|| {
 	themes
 });
 
+struct DeployGitFooter {
+	short: String,
+	title: String,
+}
+
+static DEPLOY_GIT_FOOTER: LazyLock<DeployGitFooter> = LazyLock::new(|| {
+	let full = env::var("REDLIB_DEPLOY_GIT_HASH")
+		.ok()
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.unwrap_or_default();
+	if full.is_empty() {
+		return DeployGitFooter { short: String::new(), title: String::new() };
+	}
+	let short = full.chars().take(7).collect::<String>();
+	let title = format!("Deployed from commit {full}");
+	DeployGitFooter { short, title }
+});
+
+/// Lowercase hex prefix of [`REDLIB_DEPLOY_GIT_HASH`] for a discreet footer marker; empty when unset.
+pub fn footer_deploy_revision_short() -> &'static str {
+	DEPLOY_GIT_FOOTER.short.as_str()
+}
+
+/// Tooltip for [`footer_deploy_revision_short`]; empty when unset.
+pub fn footer_deploy_revision_title() -> &'static str {
+	DEPLOY_GIT_FOOTER.title.as_str()
+}
+
+fn static_asset_revision_token_ok(s: &str) -> bool {
+	!s.is_empty()
+		&& !s.contains('/')
+		&& !s.contains("..")
+		&& s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+}
+
+static STATIC_ASSET_REVISION: LazyLock<String> = LazyLock::new(|| {
+	if let Ok(raw) = env::var("REDLIB_DEPLOY_GIT_HASH") {
+		let token = raw.trim();
+		if static_asset_revision_token_ok(token) {
+			return token.to_string();
+		}
+	}
+	env!("GIT_HASH").to_string()
+});
+
+/// Revision segment for [`static_asset_href`] (`REDLIB_DEPLOY_GIT_HASH` when set and safe, else compile-time `GIT_HASH`).
+pub fn static_asset_revision() -> &'static str {
+	STATIC_ASSET_REVISION.as_str()
+}
+
+/// Path under `/redlib-static/{revision}/…` for cache-friendly CSS/JS URLs (`rel` must be a single file name).
+pub fn static_asset_href(rel: &str) -> String {
+	debug_assert!(!rel.contains('/') && !rel.is_empty() && !rel.contains(".."));
+	format!("/redlib-static/{}/{}", static_asset_revision(), rel)
+}
+
 impl Preferences {
 	/// Build preferences from cookies
 	pub fn new(req: &Request<Body>) -> Self {
@@ -1926,21 +2041,24 @@ pub async fn parse_post(post: &Value) -> Post {
 		title: val(post, "title"),
 		community: val(post, "subreddit"),
 		body,
-		author: Author {
-			name: val(post, "author"),
-			flair: Flair {
-				flair_parts: FlairPart::parse(
-					post["data"]["author_flair_type"].as_str().unwrap_or_default(),
-					post["data"]["author_flair_richtext"].as_array(),
-					post["data"]["author_flair_text"].as_str(),
-				),
-				text: val(post, "link_flair_text"),
-				background_color: val(post, "author_flair_background_color"),
-				foreground_color: val(post, "author_flair_text_color"),
-			},
-			distinguished: val(post, "distinguished"),
-			external_links: author_external_links(&val(post, "author")).await,
-			avg_video_length: crate::user::cached_avg_video_length(&val(post, "author")),
+		author: {
+			let links = author_external_links(&val(post, "author")).await;
+			Author {
+				name: val(post, "author"),
+				flair: Flair {
+					flair_parts: FlairPart::parse(
+						post["data"]["author_flair_type"].as_str().unwrap_or_default(),
+						post["data"]["author_flair_richtext"].as_array(),
+						post["data"]["author_flair_text"].as_str(),
+					),
+					text: val(post, "link_flair_text"),
+					background_color: val(post, "author_flair_background_color"),
+					foreground_color: val(post, "author_flair_text_color"),
+				},
+				distinguished: val(post, "distinguished"),
+				external_links: links.clone(),
+				avg_video_length: crate::user::cached_avg_video_length(&val(post, "author"), &links),
+			}
 		},
 		permalink,
 		parent_kind: parent_kind(&val(post, "parent_id")),
@@ -1966,6 +2084,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			embed_code: String::new(),
 			video_preview_enabled: false,
 			video_preview_job_hint: String::new(),
+			redgifs_username: String::new(),
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(

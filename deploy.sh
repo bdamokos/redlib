@@ -122,6 +122,27 @@ get_password() {
 	fi
 }
 
+# Keep REDLIB_DEPLOY_GIT_HASH in .env in sync with the commit being deployed (upsert one line).
+upsert_redlib_deploy_git_hash_in_env() {
+	local env_file="$1"
+	local hash="$2"
+	local tmp
+	tmp="$(mktemp)"
+	local found=false
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		if [[ "$line" == REDLIB_DEPLOY_GIT_HASH=* ]]; then
+			printf '%s\n' "REDLIB_DEPLOY_GIT_HASH=$hash" >> "$tmp"
+			found=true
+		else
+			printf '%s\n' "$line" >> "$tmp"
+		fi
+	done < "$env_file"
+	if [[ "$found" == false ]]; then
+		printf '%s\n' "REDLIB_DEPLOY_GIT_HASH=$hash" >> "$tmp"
+	fi
+	mv "$tmp" "$env_file"
+}
+
 cleanup_ssh_multiplexing() {
 	if [[ -n "$SSH_CONTROL_PATH" ]]; then
 		ssh "${SSH_COMMON_OPTS[@]}" \
@@ -204,6 +225,7 @@ build_and_push() {
 
 deploy_remote() {
 	local remote_image_ref="$REGISTRY_HOST_PULL/$IMAGE_NAME:$IMAGE_TAG"
+	local deploy_git_hash
 
 	echo "Resolving remote deploy directory..."
 	resolve_remote_dir
@@ -225,6 +247,16 @@ deploy_remote() {
 
 	echo "Copying compose.pi.yaml to server..."
 	run_scp compose.pi.yaml "$SERVER_USER@$SERVER_HOST:$REMOTE_DEPLOY_DIR/compose.pi.yaml"
+
+	if [[ -f .env ]]; then
+		deploy_git_hash="$(git rev-parse HEAD 2>/dev/null || true)"
+		if [[ -n "$deploy_git_hash" ]]; then
+			echo "Recording REDLIB_DEPLOY_GIT_HASH in .env ($deploy_git_hash)..."
+			upsert_redlib_deploy_git_hash_in_env .env "$deploy_git_hash"
+		else
+			echo "Warning: could not read git HEAD; .env left unchanged for REDLIB_DEPLOY_GIT_HASH." >&2
+		fi
+	fi
 
 	if [[ -f .env ]]; then
 		echo "Copying .env to server..."

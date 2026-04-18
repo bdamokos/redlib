@@ -123,8 +123,8 @@
 		{% endfor %}
 	{% endif %}
 	{% if prefs.use_hls == "on" %}
-	<script src="/hls.min.js"></script>
-	<script src="/playHLSVideo.js"></script>
+	<script src="{{ crate::utils::static_asset_href("hls.min.js") }}"></script>
+	<script src="{{ crate::utils::static_asset_href("playHLSVideo.js") }}"></script>
 	{% endif %}
 
 	{% if !str_eq(params.before, "") %}

@@ -161,6 +161,49 @@ async fn style() -> Result<Response<Body>, String> {
 	)
 }
 
+fn static_asset_not_found() -> Result<Response<Body>, String> {
+	Response::builder()
+		.status(404)
+		.header("content-type", "text/plain; charset=utf-8")
+		.body(Body::from("Not found"))
+		.map_err(|e| e.to_string())
+}
+
+/// Serves bundled CSS/JS at `/redlib-static/:rev/:file`. The `rev` segment is ignored so stale HTML still loads.
+async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Body>, String> {
+	let Some(file) = req.param("file") else {
+		return static_asset_not_found();
+	};
+	if file.contains('/') || file.contains("..") {
+		return static_asset_not_found();
+	}
+	match file.as_str() {
+		"style.css" => style().await,
+		"playHLSVideo.js" => resource(include_str!("../static/playHLSVideo.js"), "text/javascript", false).await,
+		"hls.min.js" => resource(include_str!("../static/hls.min.js"), "text/javascript", false).await,
+		"highlighted.js" => resource(include_str!("../static/highlighted.js"), "text/javascript", false).await,
+		"dash.all.min.js" => resource(include_str!("../static/dash.all.min.js"), "text/javascript", false).await,
+		"dash.all.min.js.map" => resource(include_str!("../static/dash.all.min.js.map"), "application/json", false).await,
+		"dash-player.js" => resource(include_str!("../static/dash-player.js"), "text/javascript", false).await,
+		"check_update.js" => resource(include_str!("../static/check_update.js"), "text/javascript", false).await,
+		"copy.js" => resource(include_str!("../static/copy.js"), "text/javascript", false).await,
+		"space_scroll.js" => resource(include_str!("../static/space_scroll.js"), "text/javascript", false).await,
+		"network_image.js" => resource(include_str!("../static/network_image.js"), "text/javascript", false).await,
+		"post_preview.js" => resource(include_str!("../static/post_preview.js"), "text/javascript", false).await,
+		"browser_session.js" => resource(include_str!("../static/browser_session.js"), "text/javascript", false).await,
+		"author_links.js" => resource(include_str!("../static/author_links.js"), "text/javascript", false).await,
+		"subscription.js" => resource(include_str!("../static/subscription.js"), "text/javascript", false).await,
+		"feed_status.js" => resource(include_str!("../static/feed_status.js"), "text/javascript", false).await,
+		"page_fragment.js" => resource(include_str!("../static/page_fragment.js"), "text/javascript", false).await,
+		"dynamic_content.js" => resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).await,
+		"video_visibility.js" => resource(include_str!("../static/video_visibility.js"), "text/javascript", false).await,
+		"video_preview_gallery.js" => resource(include_str!("../static/video_preview_gallery.js"), "text/javascript", false).await,
+		"submitted_duplicates.js" => resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).await,
+		"video_mode_filters.js" => resource(include_str!("../static/video_mode_filters.js"), "text/javascript", false).await,
+		_ => static_asset_not_found(),
+	}
+}
+
 #[tokio::main]
 async fn main() {
 	// Load environment variables
@@ -280,6 +323,7 @@ async fn main() {
 	}
 
 	// Read static files
+	app.at("/redlib-static/:rev/:file").get(|r| redlib_versioned_static_asset(r).boxed());
 	app.at("/style.css").get(|_| style().boxed());
 	app
 		.at("/manifest.json")
