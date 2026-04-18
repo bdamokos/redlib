@@ -31,7 +31,6 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_NEAR_TERM_POLL_MS: u64 = 1_500;
 const DEFAULT_BACKPRESSURE_POLL_MS: u64 = 5_000;
 const FRAME_CACHE_SECONDS: u64 = 24 * 60 * 60;
-const PREVIEW_MAX_EDGE: i64 = 1280;
 const PREWARM_POST_LIMIT: usize = 5;
 const ANIMATED_PREVIEW_FPS: i64 = 8;
 
@@ -217,7 +216,6 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 				request.height,
 				image_format.codec_name()
 			);
-			let scale_filter = preview_scale_filter();
 			let mut command = Command::new("ffmpeg");
 			command
 				.arg("-hide_banner")
@@ -232,8 +230,6 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 				.arg(&request.media_url)
 				.arg("-frames:v")
 				.arg("1")
-				.arg("-vf")
-				.arg(scale_filter)
 				.arg("-f")
 				.arg("image2pipe")
 				.arg("-vcodec")
@@ -298,7 +294,6 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 			let animation_format = preferred_animation_format();
 			let start_seconds = animated_preview_start_seconds(request.duration_seconds);
 			let clip_duration_seconds = animated_preview_duration_seconds(request.duration_seconds);
-			let scale_filter = format!("fps={ANIMATED_PREVIEW_FPS},{}", preview_scale_filter());
 			let mut command = Command::new("ffmpeg");
 			command
 				.arg("-hide_banner")
@@ -315,7 +310,7 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 				.arg(format!("{clip_duration_seconds:.2}"))
 				.arg("-an")
 				.arg("-vf")
-				.arg(scale_filter);
+				.arg(format!("fps={ANIMATED_PREVIEW_FPS}"));
 
 			match animation_format {
 				PreviewAnimationFormat::Webp => {
@@ -698,10 +693,6 @@ fn animated_preview_duration_seconds(duration_seconds: i64) -> f64 {
 	}
 
 	((duration_seconds as f64) * 0.18).clamp(2.5, 6.0)
-}
-
-fn preview_scale_filter() -> String {
-	format!("scale='if(gte(iw,ih),min({PREVIEW_MAX_EDGE},iw),-2)':'if(gte(iw,ih),-2,min({PREVIEW_MAX_EDGE},ih))':flags=lanczos")
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -1571,15 +1562,6 @@ mod tests {
 		assert!(values.first().copied().unwrap_or_default() >= 0);
 		assert!(values.last().copied().unwrap_or_default() < 60);
 		assert_eq!(preview_timestamps(9), vec![1, 2, 4, 5, 7, 8]);
-	}
-
-	#[test]
-	fn preview_scale_filter_caps_the_long_edge() {
-		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-		assert_eq!(
-			preview_scale_filter(),
-			"scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))':flags=lanczos"
-		);
 	}
 
 	#[test]
