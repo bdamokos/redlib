@@ -1855,13 +1855,14 @@ a.redgifs_uploader_mismatch {
 }
 
 .video_preview_layer {
-    align-items: center;
+    display: grid;
     inset: 0;
+    min-height: 0;
+    min-width: 0;
     opacity: 0;
+    place-items: center;
     pointer-events: none;
     position: absolute;
-    display: flex;
-    justify-content: center;
     transition: opacity 120ms linear;
     z-index: 2;
 }
@@ -1871,23 +1872,31 @@ a.redgifs_uploader_mismatch {
 }
 
 .video_preview_image {
+    box-sizing: border-box;
     display: block;
-    height: 100%;
+    height: auto;
     margin: 0;
-    max-height: none;
-    max-width: none;
+    max-height: 100%;
+    max-width: 100%;
+    min-height: 0;
+    min-width: 0;
     object-fit: contain;
-    width: 100%;
+    object-position: center;
+    width: auto;
 }
 
 .video_preview_fallback_video {
+    box-sizing: border-box;
     display: block;
-    height: 100%;
+    height: auto;
     margin: 0;
-    max-height: none;
-    max-width: none;
+    max-height: 100%;
+    max-width: 100%;
+    min-height: 0;
+    min-width: 0;
     object-fit: contain;
-    width: 100%;
+    object-position: center;
+    width: auto;
 }
 
 .video_preview_loading {
