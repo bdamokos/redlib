@@ -439,6 +439,10 @@ Assign a default value for each instance-specific setting by passing environment
 | `BANNER`                  | String          | (empty)                | Allows the server to set a banner to be displayed. Currently this is displayed on the instance info page. |
 | `ROBOTS_DISABLE_INDEXING` | `["on", "off"]` | `off`                  | Disables indexing of the instance by search engines.                                                      |
 | `VIDEO_PREVIEW_ENABLED`   | `["on", "off"]` | `off`                  | Enables server-side asynchronous video preview gallery generation for video posts.                        |
+| `VIDEO_PREVIEW_ANIMATION_FPS` | Integer 1-30 | `8`               | Frames per second for generated animated previews. Lower values reduce Pi encode time and output size.    |
+| `VIDEO_PREVIEW_ANIMATION_WEBP_QUALITY` | Integer 1-100 | `70` | WebP quality for animated previews when `libwebp_anim` is used.                                           |
+| `VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL` | Integer 0-6 | `6` | WebP compression effort for animated previews. Lower values are much faster on small ARM boards.          |
+| `VIDEO_PREVIEW_ANIMATION_MAX_WIDTH` | Integer | `0`            | Optional width cap for animated previews. `0` keeps source width; positive values scale down without changing the rendered box size. |
 | `PUSHSHIFT_FRONTEND`      | String          | `undelete.pullpush.io` | Allows the server to set the Pushshift frontend to be used with "removed" links.                          |
 | `RUST_LOG`                | Log filter      | (unset)                | Sets the Rust logger filter for server logs, for example `error`, `warn`, `info`, `debug`, or `trace`.   |
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |

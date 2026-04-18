@@ -14,8 +14,12 @@ services:
     env_file: .env
     environment:
       REDLIB_DEPLOY_GIT_HASH: "${REDLIB_DEPLOY_GIT_HASH:-}"
-      # Pi: libwebp_anim + Lanczos is CPU-heavy; parallel ffmpeg jobs multiply latency.
+      # Pi: cap animated previews to a smaller WebP to avoid multi-minute libwebp_anim encodes.
       REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT: "${REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT:-1}"
+      REDLIB_VIDEO_PREVIEW_ANIMATION_FPS: "${REDLIB_VIDEO_PREVIEW_ANIMATION_FPS:-8}"
+      REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_QUALITY: "${REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_QUALITY:-65}"
+      REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL: "${REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL:-0}"
+      REDLIB_VIDEO_PREVIEW_ANIMATION_MAX_WIDTH: "${REDLIB_VIDEO_PREVIEW_ANIMATION_MAX_WIDTH:-360}"
       REDLIB_CACHE_DIR: "${REDLIB_CACHE_DIR:-/var/lib/redlib/cache}"
     volumes:
       - redlib-cache:/var/lib/redlib/cache

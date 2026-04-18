@@ -296,6 +296,7 @@ pub struct Media {
 	pub embed_code: String,
 	pub video_preview_enabled: bool,
 	pub video_preview_job_hint: String,
+	pub video_preview_fallback_url: String,
 	/// RedGifs account that uploaded this clip (empty when unknown or not from RedGifs).
 	pub redgifs_username: String,
 }
@@ -317,6 +318,7 @@ impl Media {
 			embed_code: String::new(),
 			video_preview_enabled: false,
 			video_preview_job_hint: String::new(),
+			video_preview_fallback_url: String::new(),
 			redgifs_username: String::new(),
 		}
 	}
@@ -349,6 +351,7 @@ impl Media {
 			.as_ref()
 			.and_then(|paths| redgifs::direct_media_url_from_path(paths.video_path()))
 			.unwrap_or_default();
+		let redgifs_preview_fallback_url = redgifs_bundle.as_ref().map(|paths| paths.mobile_video_path().to_string()).unwrap_or_default();
 		let redgifs_url = redgifs_id.as_ref().map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
 
 		let embed_code = if redgifs_url.is_some() { String::new() } else { raw_embed_code };
@@ -483,6 +486,7 @@ impl Media {
 				embed_code,
 				video_preview_enabled,
 				video_preview_job_hint,
+				video_preview_fallback_url: redgifs_preview_fallback_url,
 				redgifs_username,
 			},
 			gallery,
@@ -934,6 +938,7 @@ impl Post {
 					embed_code: String::new(),
 					video_preview_enabled: false,
 					video_preview_job_hint: String::new(),
+					video_preview_fallback_url: String::new(),
 					redgifs_username: String::new(),
 				},
 				media,
@@ -2195,6 +2200,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			embed_code: String::new(),
 			video_preview_enabled: false,
 			video_preview_job_hint: String::new(),
+			video_preview_fallback_url: String::new(),
 			redgifs_username: String::new(),
 		},
 		flair: Flair {

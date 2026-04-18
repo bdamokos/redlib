@@ -1880,6 +1880,16 @@ a.redgifs_uploader_mismatch {
     width: 100%;
 }
 
+.video_preview_fallback_video {
+    display: block;
+    height: 100%;
+    margin: 0;
+    max-height: none;
+    max-width: none;
+    object-fit: contain;
+    width: 100%;
+}
+
 .video_preview_loading {
     align-items: center;
     background: color-mix(in srgb, var(--bg) 72%, transparent);

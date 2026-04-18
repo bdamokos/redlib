@@ -16,6 +16,7 @@ static REDGIFS_USER_HTML_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RedgifsMediaPaths {
 	video_path: String,
+	mobile_video_path: String,
 	poster_path: String,
 	duration_seconds: i64,
 	has_audio: bool,
@@ -29,6 +30,10 @@ impl RedgifsMediaPaths {
 
 	pub(crate) fn poster_path(&self) -> &str {
 		&self.poster_path
+	}
+
+	pub(crate) fn mobile_video_path(&self) -> &str {
+		&self.mobile_video_path
 	}
 
 	pub(crate) fn duration_seconds(&self) -> i64 {
@@ -89,6 +94,19 @@ fn media_path_from_url(url: &str) -> Option<String> {
 	let filename = url.strip_prefix("https://media.redgifs.com/")?;
 	if is_valid_media_path(filename) {
 		Some(format!("/redgifs/{filename}"))
+	} else {
+		None
+	}
+}
+
+fn derive_mobile_video_path_from_media_path(path: &str) -> Option<String> {
+	let filename = path.strip_prefix("/redgifs/")?;
+	let stem = filename.strip_suffix(".mp4")?;
+	let stem = stem.strip_suffix("-silent").unwrap_or(stem);
+	let stem = stem.strip_suffix("-mobile").unwrap_or(stem);
+	let candidate = format!("{stem}-mobile.mp4");
+	if is_valid_media_path(&candidate) {
+		Some(format!("/redgifs/{candidate}"))
 	} else {
 		None
 	}
@@ -206,6 +224,11 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 	let video_path = selected_video_url
 		.and_then(media_path_from_url)
 		.ok_or_else(|| "No video URL in RedGifs response".to_string())?;
+	let mobile_video_path = urls["sd"]
+		.as_str()
+		.and_then(media_path_from_url)
+		.or_else(|| derive_mobile_video_path_from_media_path(&video_path))
+		.unwrap_or_default();
 	let poster_path = json["gif"]["urls"]["poster"]
 		.as_str()
 		.or_else(|| json["gif"]["urls"]["thumbnail"].as_str())
@@ -222,6 +245,7 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 
 	Ok(RedgifsMediaPaths {
 		video_path,
+		mobile_video_path,
 		poster_path,
 		duration_seconds,
 		has_audio,
@@ -318,6 +342,7 @@ async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<Redg
 		}
 	}
 	let video_path = media_path_from_url(&selected_video_url).ok_or_else(|| "No video URL in RedGifs watch page".to_string())?;
+	let mobile_video_path = derive_mobile_video_path_from_media_path(&video_path).unwrap_or_default();
 	let poster_path = twitter_image.as_deref().and_then(media_path_from_url).unwrap_or_default();
 	let duration_seconds = og_duration.map(|value| value.round() as i64).unwrap_or_default();
 	let username = REDGIFS_USER_HTML_REGEX
@@ -329,6 +354,7 @@ async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<Redg
 
 	Ok(RedgifsMediaPaths {
 		video_path,
+		mobile_video_path,
 		poster_path,
 		duration_seconds,
 		has_audio,
@@ -450,6 +476,18 @@ mod tests {
 	}
 
 	#[test]
+	fn derives_mobile_preview_path_from_full_or_silent_video_path() {
+		assert_eq!(
+			super::derive_mobile_video_path_from_media_path("/redgifs/FamiliarFrizzyChevrotain.mp4"),
+			Some("/redgifs/FamiliarFrizzyChevrotain-mobile.mp4".to_string())
+		);
+		assert_eq!(
+			super::derive_mobile_video_path_from_media_path("/redgifs/FamiliarFrizzyChevrotain-silent.mp4"),
+			Some("/redgifs/FamiliarFrizzyChevrotain-mobile.mp4".to_string())
+		);
+	}
+
+	#[test]
 	fn parses_redgifs_watch_page_metadata_as_fallback() {
 		let html = r#"
 			<html>
@@ -466,6 +504,7 @@ mod tests {
 			block_on(parse_watch_page_media_paths("imperturbablelumpyshihtzu", html)).unwrap(),
 			super::RedgifsMediaPaths {
 				video_path: "/redgifs/ImperturbableLumpyShihtzu-silent.mp4".to_string(),
+				mobile_video_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.mp4".to_string(),
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				duration_seconds: 31,
 				has_audio: false,
@@ -489,6 +528,7 @@ mod tests {
 			block_on(parse_watch_page_media_paths("imperturbablelumpyshihtzu", html)).unwrap(),
 			super::RedgifsMediaPaths {
 				video_path: "/redgifs/ImperturbableLumpyShihtzu.mp4".to_string(),
+				mobile_video_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.mp4".to_string(),
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				duration_seconds: 0,
 				has_audio: false,

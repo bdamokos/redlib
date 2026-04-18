@@ -32,7 +32,10 @@ const DEFAULT_NEAR_TERM_POLL_MS: u64 = 1_500;
 const DEFAULT_BACKPRESSURE_POLL_MS: u64 = 5_000;
 const FRAME_CACHE_SECONDS: u64 = 24 * 60 * 60;
 const PREWARM_POST_LIMIT: usize = 5;
-const ANIMATED_PREVIEW_FPS: i64 = 8;
+const DEFAULT_ANIMATED_PREVIEW_FPS: usize = 8;
+const DEFAULT_ANIMATED_PREVIEW_WEBP_QUALITY: usize = 70;
+const DEFAULT_ANIMATED_PREVIEW_WEBP_COMPRESSION_LEVEL: usize = 6;
+const DEFAULT_ANIMATED_PREVIEW_MAX_WIDTH: i64 = 0;
 
 type FrameFuture<'a> = Pin<Box<dyn Future<Output = Result<FrameBlob, String>> + Send + 'a>>;
 type AssetFuture<'a> = Pin<Box<dyn Future<Output = Result<FrameBlob, String>> + Send + 'a>>;
@@ -155,6 +158,43 @@ pub struct AnimationRequest {
 	pub duration_seconds: i64,
 	pub width: i64,
 	pub height: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnimationEncodingSettings {
+	fps: usize,
+	webp_quality: usize,
+	webp_compression_level: usize,
+	max_width: Option<i64>,
+}
+
+impl AnimationEncodingSettings {
+	fn from_env() -> Self {
+		let max_width = env_i64("REDLIB_VIDEO_PREVIEW_ANIMATION_MAX_WIDTH", DEFAULT_ANIMATED_PREVIEW_MAX_WIDTH);
+		Self {
+			fps: env_usize_clamped("REDLIB_VIDEO_PREVIEW_ANIMATION_FPS", DEFAULT_ANIMATED_PREVIEW_FPS, 1, 30),
+			webp_quality: env_usize_clamped("REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_QUALITY", DEFAULT_ANIMATED_PREVIEW_WEBP_QUALITY, 1, 100),
+			webp_compression_level: env_usize_clamped(
+				"REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL",
+				DEFAULT_ANIMATED_PREVIEW_WEBP_COMPRESSION_LEVEL,
+				0,
+				6,
+			),
+			max_width: (max_width > 0).then_some(max_width),
+		}
+	}
+
+	fn filter_graph(self, request: &AnimationRequest) -> String {
+		let mut filters = vec![format!("fps={}", self.fps)];
+
+		// Animated previews are rendered into a stretched overlay, so the
+		// encoded asset can be capped without changing the displayed box size.
+		if let Some(max_width) = self.max_width.filter(|max_width| request.width > *max_width) {
+			filters.push(format!("scale={max_width}:-2:flags=fast_bilinear"));
+		}
+
+		filters.join(",")
+	}
 }
 
 struct FfmpegPreviewGenerator;
@@ -292,6 +332,7 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 		Box::pin(async move {
 			let started_at = Instant::now();
 			let animation_format = preferred_animation_format();
+			let animation_settings = animation_encoding_settings();
 			let start_seconds = animated_preview_start_seconds(request.duration_seconds);
 			let clip_duration_seconds = animated_preview_duration_seconds(request.duration_seconds);
 			let mut command = Command::new("ffmpeg");
@@ -310,7 +351,7 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 				.arg(format!("{clip_duration_seconds:.2}"))
 				.arg("-an")
 				.arg("-vf")
-				.arg(format!("fps={ANIMATED_PREVIEW_FPS}"));
+				.arg(animation_settings.filter_graph(request));
 
 			match animation_format {
 				PreviewAnimationFormat::Webp => {
@@ -322,9 +363,9 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 						.arg("-vcodec")
 						.arg(animation_format.codec_name())
 						.arg("-q:v")
-						.arg("70")
+						.arg(animation_settings.webp_quality.to_string())
 						.arg("-compression_level")
-						.arg("6");
+						.arg(animation_settings.webp_compression_level.to_string());
 				}
 				PreviewAnimationFormat::Gif => {
 					command.arg("-loop").arg("0").arg("-f").arg("gif");
@@ -390,6 +431,17 @@ static INIT_ONCE: OnceLock<()> = OnceLock::new();
 static GENERATOR: LazyLock<Mutex<Arc<dyn PreviewMediaGenerator>>> = LazyLock::new(|| Mutex::new(Arc::new(FfmpegPreviewGenerator) as Arc<dyn PreviewMediaGenerator>));
 static PREFERRED_IMAGE_FORMAT: OnceLock<PreviewImageFormat> = OnceLock::new();
 static PREFERRED_ANIMATION_FORMAT: OnceLock<PreviewAnimationFormat> = OnceLock::new();
+static ANIMATION_ENCODING_SETTINGS: LazyLock<AnimationEncodingSettings> = LazyLock::new(|| {
+	let settings = AnimationEncodingSettings::from_env();
+	info!(
+		"Video preview animation settings: fps={} webp_quality={} webp_compression_level={} max_width={}",
+		settings.fps,
+		settings.webp_quality,
+		settings.webp_compression_level,
+		settings.max_width.map_or_else(|| "original".to_string(), |width| width.to_string()),
+	);
+	settings
+});
 static MAX_CONCURRENT: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT));
 static MAX_READY_JOBS: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PREVIEW_MAX_JOBS", DEFAULT_MAX_READY_JOBS));
 static MAX_BYTES: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PREVIEW_MAX_BYTES", DEFAULT_MAX_BYTES));
@@ -697,6 +749,18 @@ fn animated_preview_duration_seconds(duration_seconds: i64) -> f64 {
 
 fn env_usize(name: &str, default: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(default)
+}
+
+fn env_usize_clamped(name: &str, default: usize, min: usize, max: usize) -> usize {
+	env_usize(name, default).clamp(min, max)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+	std::env::var(name).ok().and_then(|value| value.parse::<i64>().ok()).unwrap_or(default)
+}
+
+fn animation_encoding_settings() -> &'static AnimationEncodingSettings {
+	&ANIMATION_ENCODING_SETTINGS
 }
 
 fn current_generator() -> Arc<dyn PreviewMediaGenerator> {
@@ -1579,6 +1643,44 @@ mod tests {
 		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		assert!(ffmpeg_supports_webp_animation(" V....D libwebp_anim          WebP image"));
 		assert!(!ffmpeg_supports_webp_animation(" V....D libwebp               WebP image"));
+	}
+
+	#[test]
+	fn animation_filter_graph_skips_scaling_when_width_is_within_cap() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let settings = AnimationEncodingSettings {
+			fps: 6,
+			webp_quality: 60,
+			webp_compression_level: 0,
+			max_width: Some(360),
+		};
+		let request = AnimationRequest {
+			media_url: "/vid/demo".to_string(),
+			duration_seconds: 10,
+			width: 320,
+			height: 180,
+		};
+
+		assert_eq!(settings.filter_graph(&request), "fps=6");
+	}
+
+	#[test]
+	fn animation_filter_graph_scales_when_width_exceeds_cap() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let settings = AnimationEncodingSettings {
+			fps: 6,
+			webp_quality: 60,
+			webp_compression_level: 0,
+			max_width: Some(360),
+		};
+		let request = AnimationRequest {
+			media_url: "/vid/demo".to_string(),
+			duration_seconds: 10,
+			width: 480,
+			height: 854,
+		};
+
+		assert_eq!(settings.filter_graph(&request), "fps=6,scale=360:-2:flags=fast_bilinear");
 	}
 
 	#[test]

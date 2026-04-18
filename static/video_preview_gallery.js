@@ -4,10 +4,19 @@
         return;
     }
 
+    var PAGE_SETTLED_DELAY_MS = 1200;
+    var PREVIEW_FALLBACK_DELAY_MS = 4000;
+    var PREVIEW_FALLBACK_POLL_MS = 500;
+    var DESKTOP_PREVIEW_FALLBACK_QUERY = "(min-width: 1000px) and (hover: hover) and (pointer: fine)";
+
     var pageSessionId = window.crypto.randomUUID();
     var activeHosts = new Map();
     var heartbeatTimer = null;
     var pendingRenderTimer = null;
+    var previewFallbackSweepTimer = null;
+    var previewFallbackLoadingHost = null;
+    var pageSettled = false;
+    var pageSettledTimer = null;
 
     function jsonHeaders() {
         return {
@@ -42,6 +51,15 @@
         return layer ? layer.querySelector(".video_preview_image") : null;
     }
 
+    function previewFallbackVideo(host) {
+        var layer = previewLayer(host);
+        return layer ? layer.querySelector(".video_preview_fallback_video") : null;
+    }
+
+    function layerHasPreviewContent(layer) {
+        return Boolean(layer.dataset.previewSrc || layer.dataset.previewFallbackActive === "true");
+    }
+
     function hideAnimatedPreview(host) {
         var layer = previewLayer(host);
         if (!layer) {
@@ -58,8 +76,86 @@
             return;
         }
 
-        var shouldShow = Boolean(layer.dataset.previewSrc) && video.paused && video.currentTime <= 0.05;
+        var shouldShow = layerHasPreviewContent(layer) && video.paused && video.currentTime <= 0.05;
         layer.classList.toggle("is-visible", shouldShow);
+    }
+
+    function desktopPreviewFallbackAllowed() {
+        if (!window.matchMedia || !window.matchMedia(DESKTOP_PREVIEW_FALLBACK_QUERY).matches) {
+            return false;
+        }
+
+        var connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        return !(connection && connection.saveData);
+    }
+
+    function stopPreviewFallback(host, unloadSource) {
+        var layer = previewLayer(host);
+        var image = previewImage(host);
+        var fallback = previewFallbackVideo(host);
+        var state = activeHosts.get(host);
+
+        if (layer) {
+            delete layer.dataset.previewFallbackActive;
+        }
+        if (image) {
+            image.hidden = false;
+        }
+        if (fallback) {
+            fallback.pause();
+            fallback.hidden = true;
+            if (unloadSource && fallback.getAttribute("src")) {
+                fallback.removeAttribute("src");
+                fallback.load();
+            }
+        }
+        if (state) {
+            state.previewFallbackActive = false;
+            state.previewFallbackLoading = false;
+        }
+        if (previewFallbackLoadingHost === host) {
+            previewFallbackLoadingHost = null;
+        }
+    }
+
+    function onPreviewFallbackReady(host) {
+        var current = activeHosts.get(host);
+        var layer = previewLayer(host);
+        var image = previewImage(host);
+        var fallback = previewFallbackVideo(host);
+        if (!current || !current.previewFallbackLoading || !layer || !fallback) {
+            return;
+        }
+
+        current.previewFallbackLoading = false;
+        current.previewFallbackActive = true;
+        current.rendered = true;
+        layer.dataset.previewFallbackActive = "true";
+        if (image) {
+            image.hidden = true;
+        }
+        fallback.hidden = false;
+        setLoadingState(host, "ready");
+        syncAnimatedPreviewVisibility(host);
+
+        var playPromise = fallback.play();
+        if (playPromise && typeof playPromise.catch === "function") {
+            playPromise.catch(function () {});
+        }
+
+        if (previewFallbackLoadingHost === host) {
+            previewFallbackLoadingHost = null;
+        }
+        schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
+    }
+
+    function onPreviewFallbackFailed(host) {
+        var current = activeHosts.get(host);
+        stopPreviewFallback(host, true);
+        if (current) {
+            current.previewFallbackFailed = true;
+        }
+        schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
     }
 
     function stopPreviewGenerationForPlayback(host) {
@@ -73,6 +169,8 @@
             window.clearTimeout(state.pollTimer);
             state.pollTimer = null;
         }
+
+        stopPreviewFallback(host, true);
 
         if (state.jobId) {
             postJson("/api/video-previews/release", {
@@ -108,6 +206,24 @@
                 syncAnimatedPreviewVisibility(host);
             });
         });
+
+        var fallback = previewFallbackVideo(host);
+        if (fallback) {
+            fallback.addEventListener("loadeddata", function () {
+                onPreviewFallbackReady(host);
+            });
+            fallback.addEventListener("canplay", function () {
+                onPreviewFallbackReady(host);
+            });
+            fallback.addEventListener("error", function () {
+                onPreviewFallbackFailed(host);
+            });
+            ["playing", "pause", "ended", "emptied"].forEach(function (eventName) {
+                fallback.addEventListener(eventName, function () {
+                    syncAnimatedPreviewVisibility(host);
+                });
+            });
+        }
 
         syncAnimatedPreviewVisibility(host);
     }
@@ -150,9 +266,17 @@
         return rect.top <= window.innerHeight;
     }
 
+    function hostDocumentTop(host) {
+        return host.getBoundingClientRect().top + window.scrollY;
+    }
+
     function renderAnimatedPreview(host, state) {
         if (!state || !state.preview || !state.preview.image_path) {
             state.rendered = true;
+            return;
+        }
+
+        if (state.previewFallbackActive || state.previewFallbackLoading) {
             return;
         }
 
@@ -181,12 +305,17 @@
         preload.decoding = "async";
         preload.onload = function () {
             var current = activeHosts.get(host);
-            if (!current || !current.preview || current.preview.image_path !== nextPath) {
+            if (!current || !current.preview || current.preview.image_path !== nextPath || current.previewFallbackActive || current.previewFallbackLoading) {
                 return;
             }
 
+            var fallback = previewFallbackVideo(host);
             layer.dataset.previewSrc = nextPath;
+            image.hidden = false;
             image.src = nextPath;
+            if (fallback) {
+                fallback.hidden = true;
+            }
             video.removeAttribute("poster");
             current.rendered = true;
             current.renderingPreviewPath = "";
@@ -231,6 +360,122 @@
         pendingRenderTimer = window.requestAnimationFrame(flushPendingRenders);
     }
 
+    function schedulePreviewFallbackSweep(delayMs) {
+        if (previewFallbackSweepTimer) {
+            return;
+        }
+
+        previewFallbackSweepTimer = window.setTimeout(function () {
+            previewFallbackSweepTimer = null;
+            processPreviewFallbackQueue();
+        }, delayMs || PREVIEW_FALLBACK_POLL_MS);
+    }
+
+    function hostSupportsPreviewFallback(host, state) {
+        var video = previewVideo(host);
+        return Boolean(
+            state &&
+            host.dataset.previewFallbackVideoUrl &&
+            !state.ready &&
+            !state.failed &&
+            !state.rendered &&
+            !state.previewFallbackActive &&
+            !state.previewFallbackLoading &&
+            !state.suppressPreviewLease &&
+            video &&
+            !video.autoplay
+        );
+    }
+
+    function hasWaitingPreviewFallbackHosts() {
+        var waiting = false;
+        activeHosts.forEach(function (state, host) {
+            if (hostSupportsPreviewFallback(host, state)) {
+                waiting = true;
+            }
+        });
+        return waiting;
+    }
+
+    function eligiblePreviewFallbackHosts() {
+        var now = performance.now();
+        var candidates = [];
+
+        activeHosts.forEach(function (state, host) {
+            if (!hostSupportsPreviewFallback(host, state)) {
+                return;
+            }
+            if (!shouldRenderHost(host)) {
+                return;
+            }
+            if (!state.previewGenerationStartedAt || now - state.previewGenerationStartedAt < PREVIEW_FALLBACK_DELAY_MS) {
+                return;
+            }
+
+            candidates.push({
+                host: host,
+                state: state,
+                top: hostDocumentTop(host)
+            });
+        });
+
+        candidates.sort(function (left, right) {
+            return right.top - left.top;
+        });
+
+        return candidates;
+    }
+
+    function activatePreviewFallback(host, state) {
+        var layer = previewLayer(host);
+        var fallback = previewFallbackVideo(host);
+        var nextPath = host.dataset.previewFallbackVideoUrl || "";
+        if (!layer || !fallback || !nextPath || state.previewFallbackLoading || state.previewFallbackActive) {
+            return;
+        }
+
+        previewFallbackLoadingHost = host;
+        state.previewFallbackLoading = true;
+        state.previewFallbackFailed = false;
+        fallback.hidden = true;
+
+        if (fallback.getAttribute("src") !== nextPath) {
+            fallback.setAttribute("src", nextPath);
+            fallback.load();
+        } else {
+            onPreviewFallbackReady(host);
+        }
+    }
+
+    function processPreviewFallbackQueue() {
+        if (!pageSettled || document.visibilityState === "hidden" || !desktopPreviewFallbackAllowed()) {
+            if (hasWaitingPreviewFallbackHosts()) {
+                schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
+            }
+            return;
+        }
+
+        if (previewFallbackLoadingHost) {
+            return;
+        }
+
+        var candidates = eligiblePreviewFallbackHosts();
+        if (!candidates.length) {
+            if (hasWaitingPreviewFallbackHosts()) {
+                schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
+            }
+            return;
+        }
+
+        activatePreviewFallback(candidates[0].host, candidates[0].state);
+    }
+
+    function markPreviewGenerationStart(state) {
+        if (!state.previewGenerationStartedAt) {
+            state.previewGenerationStartedAt = performance.now();
+        }
+    }
+
     function setLoadingState(host, state) {
         var loading = host.querySelector(".video_preview_loading");
         if (!loading) {
@@ -244,7 +489,7 @@
         var spinner = loading.querySelector(".video_preview_spinner");
         var statusText = loading.querySelector(".video_preview_status_text");
         if (statusText) {
-            statusText.textContent = state === "queued" ? "Queued for animated preview generation…" : "Generating animated preview…";
+            statusText.textContent = state === "queued" ? "Queued for animated preview generation..." : "Generating animated preview...";
         }
         if (spinner) {
             spinner.hidden = state === "queued";
@@ -278,7 +523,9 @@
                     current.preview = payload.preview || null;
                     current.frames = payload.frames || [];
                     setLoadingState(host, "ready");
-                    flushReadyHost(host, current);
+                    if (!current.previewFallbackActive) {
+                        flushReadyHost(host, current);
+                    }
                     return;
                 }
 
@@ -288,11 +535,13 @@
                     return;
                 }
 
+                markPreviewGenerationStart(current);
                 if (payload.state && payload.state.status === "pending") {
                     setLoadingState(host, "queued");
                 } else {
                     setLoadingState(host, "loading");
                 }
+                schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
 
                 var delay = payload.poll_after_ms || 1500;
                 current.pollTimer = window.setTimeout(function () {
@@ -305,6 +554,8 @@
                     return;
                 }
 
+                markPreviewGenerationStart(current);
+                schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
                 current.pollTimer = window.setTimeout(function () {
                     pollStatus(host, current);
                 }, 5000);
@@ -327,7 +578,9 @@
         }
 
         state.leasing = true;
+        state.previewGenerationStartedAt = performance.now();
         setLoadingState(host, "queued");
+        schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
 
         fetch("/api/video-previews/lease", {
             method: "POST",
@@ -379,18 +632,21 @@
                     return;
                 }
 
+                markPreviewGenerationStart(current);
                 if (payload.state && payload.state.status === "pending") {
                     setLoadingState(host, "queued");
                 } else {
                     setLoadingState(host, "loading");
                 }
 
+                schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
                 pollStatus(host, current);
             })
             .catch(function () {
                 var current = activeHosts.get(host);
                 if (current) {
                     current.leasing = false;
+                    current.failed = true;
                     setLoadingState(host, "failed");
                 }
             });
@@ -405,12 +661,20 @@
             return state.jobId;
         }).filter(Boolean);
 
-        Array.from(activeHosts.values()).forEach(function (state) {
+        Array.from(activeHosts.entries()).forEach(function (entry) {
+            var host = entry[0];
+            var state = entry[1];
             if (state.pollTimer) {
                 window.clearTimeout(state.pollTimer);
                 state.pollTimer = null;
             }
+            stopPreviewFallback(host, true);
         });
+
+        if (previewFallbackSweepTimer) {
+            window.clearTimeout(previewFallbackSweepTimer);
+            previewFallbackSweepTimer = null;
+        }
 
         postJson("/api/video-previews/release", {
             page_session_id: pageSessionId,
@@ -432,6 +696,18 @@
         });
     }
 
+    function armPageSettledState() {
+        if (pageSettled || pageSettledTimer) {
+            return;
+        }
+
+        pageSettledTimer = window.setTimeout(function () {
+            pageSettledTimer = null;
+            pageSettled = true;
+            schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
+        }, PAGE_SETTLED_DELAY_MS);
+    }
+
     document.addEventListener("visibilitychange", function () {
         if (document.visibilityState === "hidden") {
             releaseAll(true);
@@ -441,14 +717,27 @@
         observeHosts(document);
         ensureHeartbeat();
         schedulePendingRenderCheck();
+        schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
     });
 
     window.addEventListener("pagehide", function () {
         releaseAll(true);
     });
 
-    window.addEventListener("scroll", schedulePendingRenderCheck, { passive: true });
-    window.addEventListener("resize", schedulePendingRenderCheck);
+    window.addEventListener("scroll", function () {
+        schedulePendingRenderCheck();
+        schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
+    }, { passive: true });
+    window.addEventListener("resize", function () {
+        schedulePendingRenderCheck();
+        schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
+    });
+
+    if (document.readyState === "complete") {
+        armPageSettledState();
+    } else {
+        window.addEventListener("load", armPageSettledState, { once: true });
+    }
 
     window.observeVideoPreviewHosts = observeHosts;
     observeHosts(document);

@@ -608,6 +608,9 @@
 			data-width="{{ post.media.width }}"
 			data-height="{{ post.media.height }}"
 			data-page-path="{{ post.permalink }}"
+			{% if !post.media.video_preview_fallback_url.is_empty() %}
+			data-preview-fallback-video-url="{{ post.media.video_preview_fallback_url }}"
+			{% endif %}
 			{% endif %}
 		>
 			<div
@@ -648,6 +651,7 @@
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
 			<div class="video_preview_layer" aria-hidden="true">
 				<img class="video_preview_image" alt="" />
+				<video class="video_preview_fallback_video" muted loop playsinline preload="none" disablepictureinpicture hidden aria-hidden="true"></video>
 			</div>
 			{% endif %}
 			</div>
