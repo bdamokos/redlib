@@ -5,7 +5,9 @@ use crate::client::json;
 use crate::instance_scrape;
 use crate::redgifs;
 use crate::server::RequestExt;
-use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, FollowingComment, Post, Preferences, User};
+use crate::utils::{
+	error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, FollowingComment, ParentComment, Post, Preferences, User,
+};
 use crate::{config, utils, video_mode};
 use askama::Template;
 use chrono::DateTime;
@@ -27,6 +29,8 @@ const USER_METADATA_CACHE_SIZE: usize = 1000;
 const USER_METADATA_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
 const USER_VIDEO_STATS_CACHE_SIZE: usize = 1000;
 const USER_VIDEO_STATS_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
+const FOLLOWING_PARENT_COMMENT_BATCH_SIZE: usize = 100;
+const FOLLOWING_PARENT_COMMENT_EXPAND_THRESHOLD: usize = 320;
 
 #[derive(Clone)]
 struct CachedUserMetadata {
@@ -139,12 +143,96 @@ pub(crate) fn following_comment_from_listing_post(post: Post) -> FollowingCommen
 		rel_time: post.rel_time,
 		community: post.community,
 		score: post.score,
+		parent_id: post.parent_id,
 		parent_kind: post.parent_kind,
+		parent_comment: post.parent_comment,
 		link_title: post.link_title,
 		link_permalink: post.link_permalink,
 		thread_comments: post.comments,
 		thread_nsfw: post.flags.nsfw,
 	}
+}
+
+fn removed_parent_comment_html() -> String {
+	"<div class=\"md\"><p>[removed]</p></div>".to_string()
+}
+
+fn parent_comment_preview(parent: &serde_json::Value) -> Option<ParentComment> {
+	if parent["kind"].as_str().unwrap_or_default() != "t1" {
+		return None;
+	}
+
+	let data = &parent["data"];
+	let body_text = crate::utils::val(parent, "body");
+	let body = if (crate::utils::val(parent, "author") == "[deleted]" && body_text == "[removed]") || body_text == "[ Removed by Reddit ]" {
+		removed_parent_comment_html()
+	} else {
+		crate::utils::rewrite_emotes(&data["media_metadata"], crate::utils::val(parent, "body_html"))
+	};
+
+	Some(ParentComment {
+		id: crate::utils::val(parent, "id"),
+		body: if body.is_empty() { removed_parent_comment_html() } else { body },
+		permalink: crate::utils::val(parent, "permalink"),
+		author: crate::utils::val(parent, "author"),
+		rel_time: crate::utils::time(data["created_utc"].as_f64().unwrap_or_default()).0,
+		expand: false,
+	})
+}
+
+async fn fetch_parent_comment_lookup(parent_ids: &[String]) -> HashMap<String, ParentComment> {
+	let mut parents = HashMap::new();
+
+	for chunk in parent_ids.chunks(FOLLOWING_PARENT_COMMENT_BATCH_SIZE) {
+		let ids = chunk.iter().map(|id| format!("t1_{id}")).collect::<Vec<_>>().join(",");
+		let path = format!("/api/info.json?raw_json=1&id={ids}");
+		let Ok(response) = json(path, false).await else {
+			continue;
+		};
+		let Some(children) = response["data"]["children"].as_array() else {
+			continue;
+		};
+		for parent in children {
+			let Some(mut preview) = parent_comment_preview(parent) else {
+				continue;
+			};
+			preview.expand = preview.body.len() > FOLLOWING_PARENT_COMMENT_EXPAND_THRESHOLD;
+			parents.insert(preview.id.clone(), preview);
+		}
+	}
+
+	parents
+}
+
+pub(crate) async fn hydrate_following_comment_context(mut posts: Vec<Post>) -> Vec<Post> {
+	let parent_ids = posts
+		.iter()
+		.filter(|post| post.kind == "t1" && post.parent_kind == "t1" && !post.parent_id.is_empty())
+		.map(|post| post.parent_id.clone())
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.collect::<Vec<_>>();
+
+	if parent_ids.is_empty() {
+		return posts;
+	}
+
+	let parent_lookup = fetch_parent_comment_lookup(&parent_ids).await;
+	if parent_lookup.is_empty() {
+		return posts;
+	}
+
+	for post in &mut posts {
+		if post.kind != "t1" || post.parent_kind != "t1" {
+			continue;
+		}
+		let Some(parent) = parent_lookup.get(&post.parent_id) else {
+			continue;
+		};
+		post.parent_comment = parent.clone();
+	}
+
+	posts
 }
 
 pub(crate) fn dedupe_and_sort_following_comments(comments: &mut Vec<FollowingComment>) {
@@ -840,7 +928,7 @@ mod tests {
 	use askama::Template;
 	use url::form_urlencoded;
 
-	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, FollowingComment, Media, Post, Preferences};
+	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, FollowingComment, Media, ParentComment, Post, Preferences};
 
 	fn test_post(id: &str, title: &str, community: &str, body: &str, post_type: &str, media_url: &str, gallery_urls: &[&str]) -> Post {
 		Post {
@@ -862,7 +950,9 @@ mod tests {
 				avg_video_length: None,
 			},
 			permalink: format!("/r/{community}/comments/{id}/"),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
@@ -975,7 +1065,9 @@ mod tests {
 			rel_time: String::new(),
 			community: "s1".to_string(),
 			score: ("1".to_string(), "1".to_string()),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			thread_comments: ("0".to_string(), "0".to_string()),
@@ -990,7 +1082,9 @@ mod tests {
 			rel_time: String::new(),
 			community: "s2".to_string(),
 			score: ("1".to_string(), "1".to_string()),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			thread_comments: ("0".to_string(), "0".to_string()),
@@ -1556,6 +1650,70 @@ mod tests {
 		assert!(html.contains("<span class=\"user_subreddit_meta\">2</span>"));
 		assert!(html.contains("<a class=\"user_subreddit_link\" href=\"/r/other_sub\">r/other_sub</a>"));
 		assert!(html.contains("<span class=\"user_subreddit_meta\">1</span>"));
+	}
+
+	#[test]
+	fn renders_following_comment_original_and_parent_links() {
+		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
+		post.following_comments.push(FollowingComment {
+			id: "comment_one".to_string(),
+			body: "<p>This is the child comment.</p>".to_string(),
+			permalink: "/r/demo_sub/comments/thread/comment_one/".to_string(),
+			created_ts: 1,
+			rel_time: "1h ago".to_string(),
+			community: "demo_sub".to_string(),
+			score: ("1".to_string(), "1".to_string()),
+			parent_id: "parent_one".to_string(),
+			parent_kind: "t1".to_string(),
+			parent_comment: ParentComment {
+				id: "parent_one".to_string(),
+				body: "<p>This is the parent comment.</p>".to_string(),
+				permalink: "/r/demo_sub/comments/thread/parent_one/".to_string(),
+				author: "demo_parent".to_string(),
+				rel_time: "2h ago".to_string(),
+				expand: false,
+			},
+			link_title: "Thread title".to_string(),
+			link_permalink: "/r/demo_sub/comments/thread/".to_string(),
+			thread_comments: ("32".to_string(), "32".to_string()),
+			thread_nsfw: false,
+		});
+
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![post],
+			user_subreddits: Vec::new(),
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("original comment"));
+		assert!(html.contains("view parent"));
+		assert!(html.contains("This is the parent comment."));
 	}
 
 	#[test]

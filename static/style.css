@@ -1588,6 +1588,38 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     margin-bottom: 4px;
 }
 
+.post_following_comment_parent {
+    margin: 0 0 8px;
+    padding: 7px 9px;
+    border-left: 2px solid var(--highlighted);
+    background: var(--post);
+    border-radius: var(--radius);
+}
+
+.post_following_comment_parent_collapsed {
+    padding: 0;
+    background: transparent;
+    border-left: none;
+}
+
+.post_following_comment_parent_collapsed > summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-size: 11px;
+    margin-bottom: 6px;
+}
+
+.post_following_comment_parent_meta {
+    font-size: 11px;
+    opacity: 0.75;
+    margin-bottom: 4px;
+}
+
+.post_following_comment_parent_body {
+    font-size: 12px;
+    opacity: 0.9;
+}
+
 .post_following_comment_body {
     font-size: 13px;
 }

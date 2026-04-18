@@ -621,6 +621,16 @@ impl GalleryMedia {
 	}
 }
 
+#[derive(Clone, Default, Serialize, PartialEq)]
+pub struct ParentComment {
+	pub id: String,
+	pub body: String,
+	pub permalink: String,
+	pub author: String,
+	pub rel_time: String,
+	pub expand: bool,
+}
+
 /// Bundled comment row for `/following` (and similar) aggregate feeds.
 #[derive(Clone, Serialize, PartialEq)]
 pub struct FollowingComment {
@@ -631,7 +641,9 @@ pub struct FollowingComment {
 	pub rel_time: String,
 	pub community: String,
 	pub score: (String, String),
+	pub parent_id: String,
 	pub parent_kind: String,
+	pub parent_comment: ParentComment,
 	pub link_title: String,
 	pub link_permalink: String,
 	pub thread_comments: (String, String),
@@ -648,7 +660,9 @@ pub struct Post {
 	pub body: String,
 	pub author: Author,
 	pub permalink: String,
+	pub parent_id: String,
 	pub parent_kind: String,
+	pub parent_comment: ParentComment,
 	pub link_id: String,
 	pub link_title: String,
 	pub link_permalink: String,
@@ -698,7 +712,9 @@ impl Clone for Post {
 			body: self.body.clone(),
 			author: self.author.clone(),
 			permalink: self.permalink.clone(),
+			parent_id: self.parent_id.clone(),
 			parent_kind: self.parent_kind.clone(),
+			parent_comment: self.parent_comment.clone(),
 			link_id: self.link_id.clone(),
 			link_title: self.link_title.clone(),
 			link_permalink: self.link_permalink.clone(),
@@ -749,7 +765,9 @@ impl Default for Post {
 				avg_video_length: None,
 			},
 			permalink: String::new(),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
@@ -807,12 +825,13 @@ impl Post {
 			let data = &post["data"];
 			let kind = post["kind"].as_str().unwrap_or_default().to_string();
 			let permalink = val(post, "permalink");
-			let parent_kind = parent_kind(&val(post, "parent_id"));
+			let parent_fullname = val(post, "parent_id");
+			let parent_id = parent_fullname.split_once('_').map_or(String::new(), |(_, id)| id.to_string());
+			let parent_kind = parent_kind(&parent_fullname);
 			let mut link_id = val(post, "link_id");
 			if link_id.is_empty() && kind == "t1" {
-				let pid = val(post, "parent_id");
-				if pid.starts_with("t3_") {
-					link_id = pid;
+				if parent_fullname.starts_with("t3_") {
+					link_id = parent_fullname.clone();
 				}
 			}
 			let link_permalink = listing_link_permalink(data["link_permalink"].as_str().unwrap_or_default(), &permalink);
@@ -860,7 +879,9 @@ impl Post {
 					avg_video_length: crate::user::cached_avg_video_length(&val(post, "author")),
 				},
 				permalink,
+				parent_id,
 				parent_kind,
+				parent_comment: ParentComment::default(),
 				link_id,
 				link_title: val(post, "link_title"),
 				link_permalink,
@@ -2148,7 +2169,9 @@ pub async fn parse_post(post: &Value) -> Post {
 			}
 		},
 		permalink,
+		parent_id: val(post, "parent_id").split_once('_').map_or(String::new(), |(_, id)| id.to_string()),
 		parent_kind: parent_kind(&val(post, "parent_id")),
+		parent_comment: ParentComment::default(),
 		link_id: val(post, "link_id"),
 		link_title: val(post, "link_title"),
 		link_permalink: listing_link_permalink(post["data"]["link_permalink"].as_str().unwrap_or_default(), &val(post, "permalink")),
@@ -3407,6 +3430,7 @@ mod tests {
 		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, rewrite_urls, time, user_profile_details,
 		write_sharded_cookie, Author, Awards, ExternalLink, Flags, Flair, FlairSubscription, Media, Post, Preferences,
 	};
+	use crate::utils::ParentComment;
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
 	use serde_json::json;
@@ -3477,7 +3501,9 @@ mod tests {
 				avg_video_length: None,
 			},
 			permalink: "/r/demo_sub/comments/demo/".to_string(),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
@@ -3555,7 +3581,9 @@ mod tests {
 				avg_video_length: None,
 			},
 			permalink: "/r/demo_sub/comments/demo/".to_string(),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),

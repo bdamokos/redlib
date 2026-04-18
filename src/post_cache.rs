@@ -1276,7 +1276,10 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 			return Err(error);
 		}
 	};
-	let posts = source.filter_posts(posts);
+	let mut posts = source.filter_posts(posts);
+	if matches!(&source, FeedSource::UserComments { .. }) {
+		posts = crate::user::hydrate_following_comment_context(posts).await;
+	}
 	if remembered_feed_key_for_source(&source).is_some() {
 		publish_remembered_source_refresh(&source, posts.clone(), after.clone(), refresh_origin);
 	} else {
@@ -2504,7 +2507,9 @@ mod tests {
 				avg_video_length: None,
 			},
 			permalink: format!("/r/{community}/comments/{id}/"),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: crate::utils::ParentComment::default(),
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),

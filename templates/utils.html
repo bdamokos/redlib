@@ -421,10 +421,41 @@
 					{% if !str_eq(prefs.hide_score, "on") %}
 					&middot; {{ c.score.0 }}
 					{% endif %}
+					&middot; <a href="{{ c.permalink }}">original comment</a>
 					{% if str_eq(c.parent_kind, "t1") %}
 					&middot; <span class="post_following_comment_reply">reply</span>
 					{% endif %}
 				</div>
+				{% if !c.parent_comment.body.is_empty() %}
+				{% if c.parent_comment.expand %}
+				<details class="post_following_comment_parent post_following_comment_parent_collapsed">
+					<summary>Show parent comment{% if !c.parent_comment.author.is_empty() %} from u/{{ c.parent_comment.author }}{% endif %}</summary>
+					<div class="post_following_comment_parent_meta">
+						{% if !c.parent_comment.author.is_empty() %}
+						<a href="/u/{{ c.parent_comment.author }}">u/{{ c.parent_comment.author }}</a>
+						{% endif %}
+						{% if !c.parent_comment.rel_time.is_empty() %}
+						&middot; <a href="{{ c.parent_comment.permalink }}">{{ c.parent_comment.rel_time }}</a>
+						{% endif %}
+						&middot; <a href="{{ c.parent_comment.permalink }}">view parent</a>
+					</div>
+					<div class="post_following_comment_parent_body md">{{ c.parent_comment.body|safe }}</div>
+				</details>
+				{% else %}
+				<div class="post_following_comment_parent">
+					<div class="post_following_comment_parent_meta">
+						{% if !c.parent_comment.author.is_empty() %}
+						<a href="/u/{{ c.parent_comment.author }}">u/{{ c.parent_comment.author }}</a>
+						{% endif %}
+						{% if !c.parent_comment.rel_time.is_empty() %}
+						&middot; <a href="{{ c.parent_comment.permalink }}">{{ c.parent_comment.rel_time }}</a>
+						{% endif %}
+						&middot; <a href="{{ c.parent_comment.permalink }}">view parent</a>
+					</div>
+					<div class="post_following_comment_parent_body md">{{ c.parent_comment.body|safe }}</div>
+				</div>
+				{% endif %}
+				{% endif %}
 				<div class="post_following_comment_body md">{{ c.body|safe }}</div>
 			</li>
 			{% endfor %}

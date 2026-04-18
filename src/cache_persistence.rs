@@ -128,6 +128,16 @@ pub(crate) struct PersistedCollapsedDuplicate {
 	pub flair: PersistedFlair,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct PersistedParentComment {
+	pub id: String,
+	pub body: String,
+	pub permalink: String,
+	pub author: String,
+	pub rel_time: String,
+	pub expand: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedFollowingComment {
 	pub id: String,
@@ -137,7 +147,11 @@ pub(crate) struct PersistedFollowingComment {
 	pub rel_time: String,
 	pub community: String,
 	pub score: (String, String),
+	#[serde(default)]
+	pub parent_id: String,
 	pub parent_kind: String,
+	#[serde(default)]
+	pub parent_comment: PersistedParentComment,
 	pub link_title: String,
 	pub link_permalink: String,
 	pub thread_comments: (String, String),
@@ -153,7 +167,11 @@ pub(crate) struct PersistedPost {
 	pub body: String,
 	pub author: PersistedAuthor,
 	pub permalink: String,
+	#[serde(default)]
+	pub parent_id: String,
 	pub parent_kind: String,
+	#[serde(default)]
+	pub parent_comment: PersistedParentComment,
 	#[serde(default)]
 	pub link_id: String,
 	pub link_title: String,
@@ -652,6 +670,30 @@ impl PersistedAward {
 	}
 }
 
+impl PersistedParentComment {
+	pub(crate) fn from_runtime(value: &utils::ParentComment) -> Self {
+		Self {
+			id: value.id.clone(),
+			body: value.body.clone(),
+			permalink: value.permalink.clone(),
+			author: value.author.clone(),
+			rel_time: value.rel_time.clone(),
+			expand: value.expand,
+		}
+	}
+
+	pub(crate) fn into_runtime(self) -> utils::ParentComment {
+		utils::ParentComment {
+			id: self.id,
+			body: self.body,
+			permalink: self.permalink,
+			author: self.author,
+			rel_time: self.rel_time,
+			expand: self.expand,
+		}
+	}
+}
+
 impl PersistedFollowingComment {
 	pub(crate) fn from_runtime(value: &utils::FollowingComment) -> Self {
 		Self {
@@ -662,7 +704,9 @@ impl PersistedFollowingComment {
 			rel_time: value.rel_time.clone(),
 			community: value.community.clone(),
 			score: value.score.clone(),
+			parent_id: value.parent_id.clone(),
 			parent_kind: value.parent_kind.clone(),
+			parent_comment: PersistedParentComment::from_runtime(&value.parent_comment),
 			link_title: value.link_title.clone(),
 			link_permalink: value.link_permalink.clone(),
 			thread_comments: value.thread_comments.clone(),
@@ -679,7 +723,9 @@ impl PersistedFollowingComment {
 			rel_time: self.rel_time,
 			community: self.community,
 			score: self.score,
+			parent_id: self.parent_id,
 			parent_kind: self.parent_kind,
+			parent_comment: self.parent_comment.into_runtime(),
 			link_title: self.link_title,
 			link_permalink: self.link_permalink,
 			thread_comments: self.thread_comments,
@@ -726,7 +772,9 @@ impl PersistedPost {
 			body: value.body.clone(),
 			author: PersistedAuthor::from_runtime(&value.author),
 			permalink: value.permalink.clone(),
+			parent_id: value.parent_id.clone(),
 			parent_kind: value.parent_kind.clone(),
+			parent_comment: PersistedParentComment::from_runtime(&value.parent_comment),
 			link_id: value.link_id.clone(),
 			link_title: value.link_title.clone(),
 			link_permalink: value.link_permalink.clone(),
@@ -764,7 +812,9 @@ impl PersistedPost {
 			body: self.body,
 			author: self.author.into_runtime(),
 			permalink: self.permalink,
+			parent_id: self.parent_id,
 			parent_kind: self.parent_kind,
+			parent_comment: self.parent_comment.into_runtime(),
 			link_id: self.link_id,
 			link_title: self.link_title,
 			link_permalink: self.link_permalink,

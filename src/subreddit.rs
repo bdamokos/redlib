@@ -1178,9 +1178,7 @@ fn contextual_listing_posts_from_feed_page(
 ) -> (Vec<Post>, bool) {
 	let per_page = crate::post_cache::POSTS_PER_PAGE;
 	match feed_seen {
-		Some(ctx) if ctx.hide_seen_on && cache_page == 0 => {
-			seen_posts::page_and_record_seen_contextual_first_page(&ctx.session_id, &page.posts, merged_posts, per_page)
-		}
+		Some(ctx) if ctx.hide_seen_on && cache_page == 0 => seen_posts::page_and_record_seen_contextual_first_page(&ctx.session_id, &page.posts, merged_posts, per_page),
 		Some(ctx) if ctx.hide_seen_on => seen_posts::page_and_record_seen(&ctx.session_id, true, merged_posts, cache_page, per_page),
 		Some(ctx) => {
 			let posts = std::mem::take(&mut page.posts);
@@ -2807,7 +2805,9 @@ mod tests {
 				avg_video_length: None,
 			},
 			permalink: "/r/demo_sub/comments/demo/".to_string(),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: crate::utils::ParentComment::default(),
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),

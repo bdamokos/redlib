@@ -170,12 +170,7 @@ pub fn page_and_record_seen(session_id: &str, hide_seen: bool, posts: &[Post], p
 /// Hide-seen mode for contextual aggregate **page 0** after the listing is sealed: prefer unseen
 /// posts in `sealed_posts` order (stable first paint), then fill remaining slots from
 /// `merged_posts` in merge order. Records only returned posts as seen.
-pub fn page_and_record_seen_contextual_first_page(
-	session_id: &str,
-	sealed_posts: &[Post],
-	merged_posts: &[Post],
-	per_page: usize,
-) -> (Vec<Post>, bool) {
+pub fn page_and_record_seen_contextual_first_page(session_id: &str, sealed_posts: &[Post], merged_posts: &[Post], per_page: usize) -> (Vec<Post>, bool) {
 	if session_id.trim().is_empty() || per_page == 0 {
 		return (Vec::new(), false);
 	}
@@ -317,7 +312,9 @@ mod tests {
 				avg_video_length: None,
 			},
 			permalink: String::new(),
+			parent_id: String::new(),
 			parent_kind: String::new(),
+			parent_comment: crate::utils::ParentComment::default(),
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
