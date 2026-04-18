@@ -304,7 +304,7 @@ async fn main() {
 	spawn_oauth_maintenance();
 	video_preview::init();
 	cache_persistence::init();
-	post_cache::spawn_remembered_subreddit_daemon();
+	post_cache::spawn_remembered_feed_daemon();
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
