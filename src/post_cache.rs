@@ -525,11 +525,12 @@ fn ensure_remembered_feeds_seeded_for_preferences(preferences: &Preferences) {
 	let mut inserted = false;
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	for subreddit in &preferences.subscriptions {
-		let Some(normalized) = normalize_remembered_feed_name(subreddit) else {
+		let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
 			continue;
 		};
-		if !remembered.contains_key(&normalized) {
-			remembered.insert(normalized.clone(), new_remembered_subreddit_entry(normalized));
+		let key = remembered_feed_key_for_source(&source).expect("normalized remembered subreddit source must have key");
+		if !remembered.contains_key(&key) {
+			remembered.insert(key.clone(), new_remembered_subreddit_entry(key));
 			inserted = true;
 		}
 	}
@@ -892,7 +893,7 @@ pub(crate) fn snapshot_persisted_remembered_subreddits(now_unix: u64) -> Vec<Per
 
 	remembered
 		.values()
-		.filter(|entry| normalize_remembered_feed_name(&entry.name).is_some())
+		.filter(|entry| remembered_feed_source_from_key(&entry.name).is_some())
 		.map(|entry| PersistedRememberedSubredditEntry {
 			name: entry.name.clone(),
 			last_requested_at_unix: instant_to_unix(entry.last_requested_at, now_unix),
@@ -1501,8 +1502,44 @@ fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, mut posts: Ve
 	}
 }
 
+/// `/following` uses two session sources per person (submitted + comments). For status text and
+/// [`FeedSessionStatus`] tallies, count each followed user once; `ready` requires both arms Ready.
+fn bundled_followed_account_progress(session: &FeedSession) -> Option<(usize, usize)> {
+	if !session.request.bundle_followed_user_comments {
+		return None;
+	}
+	#[derive(Default)]
+	struct Arms {
+		submitted: Option<SessionSourceState>,
+		comments: Option<SessionSourceState>,
+	}
+	let mut by_user: HashMap<String, Arms> = HashMap::new();
+	for entry in &session.sources {
+		match &entry.source {
+			FeedSource::Subreddit { name, .. } if name.starts_with("u_") => {
+				by_user.entry(name.to_lowercase()).or_default().submitted = Some(entry.state);
+			}
+			FeedSource::UserComments { name, .. } if name.starts_with("u_") => {
+				by_user.entry(name.to_lowercase()).or_default().comments = Some(entry.state);
+			}
+			_ => {}
+		}
+	}
+	if by_user.is_empty() {
+		return None;
+	}
+	let total = by_user.len();
+	let ready = by_user
+		.values()
+		.filter(|arms| {
+			matches!(arms.submitted, Some(SessionSourceState::Ready)) && matches!(arms.comments, Some(SessionSourceState::Ready))
+		})
+		.count();
+	Some((total, ready))
+}
+
 fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> FeedSessionStatus {
-	let ready_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Ready).count();
+	let raw_ready_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Ready).count();
 	let daemon_cached_sources = session
 		.sources
 		.iter()
@@ -1526,6 +1563,18 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 				|| matches!(&entry.source, FeedSource::UserComments { name, .. } if name.starts_with("u_"))
 		})
 		.count();
+	let bundle_accounts = bundled_followed_account_progress(session);
+	let (status_total, status_ready) = if let Some((total, ready)) = bundle_accounts {
+		(total, ready)
+	} else {
+		(session.sources.len(), raw_ready_sources)
+	};
+	let feed_word = if bundle_accounts.is_some() { "followed accounts" } else { "feeds" };
+	let user_feeds_still_loading = if let Some((total, ready)) = bundle_accounts {
+		ready < total
+	} else {
+		ready_user_sources < total_user_sources
+	};
 	let current_page_ready = current_page_is_ready(session, posts, page, per_page);
 	let tail_next = merged_tail_excluding_frozen_prior_pages(session, page.saturating_add(1), posts);
 	let next_page_ready = tail_next.len() >= per_page || session.background_complete;
@@ -1536,52 +1585,45 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 		String::new()
 	};
 	let status_message = if warming {
-		if ready_user_sources < total_user_sources {
+		if user_feeds_still_loading {
 			format!(
-				"Loading followed feeds in the background. Warmed {} of {} feeds{}.",
-				ready_sources,
-				session.sources.len(),
-				daemon_cache_suffix
+				"Loading followed feeds in the background. Warmed {} of {} {}{}.",
+				status_ready, status_total, feed_word, daemon_cache_suffix
 			)
 		} else if !current_page_ready {
 			format!(
-				"Warmed {} of {} feeds{}. Filling this page with newer posts.",
-				ready_sources,
-				session.sources.len(),
-				daemon_cache_suffix
+				"Warmed {} of {} {}{}. Filling this page with newer posts.",
+				status_ready, status_total, feed_word, daemon_cache_suffix
 			)
 		} else if next_page_ready {
-			format!("Warmed {} of {} feeds{}. Next page is ready.", ready_sources, session.sources.len(), daemon_cache_suffix)
+			format!(
+				"Warmed {} of {} {}{}. Next page is ready.",
+				status_ready, status_total, feed_word, daemon_cache_suffix
+			)
 		} else {
 			format!(
-				"Warmed {} of {} feeds{}. Preparing the next page in the background.",
-				ready_sources,
-				session.sources.len(),
-				daemon_cache_suffix
+				"Warmed {} of {} {}{}. Preparing the next page in the background.",
+				status_ready, status_total, feed_word, daemon_cache_suffix
 			)
 		}
 	} else if session.background_complete {
-		format!("Warmed all {} feeds{}.", session.sources.len(), daemon_cache_suffix)
+		format!("Warmed all {} {}{}.", status_total, feed_word, daemon_cache_suffix)
 	} else if next_page_ready {
 		format!(
-			"Warmed {} of {} feeds{}. More feeds will load as you paginate.",
-			ready_sources,
-			session.sources.len(),
-			daemon_cache_suffix
+			"Warmed {} of {} {}{}. More feeds will load as you paginate.",
+			status_ready, status_total, feed_word, daemon_cache_suffix
 		)
 	} else {
 		format!(
-			"Warmed {} of {} feeds{} for now. More feeds will load as needed.",
-			ready_sources,
-			session.sources.len(),
-			daemon_cache_suffix
+			"Warmed {} of {} {}{} for now. More feeds will load as needed.",
+			status_ready, status_total, feed_word, daemon_cache_suffix
 		)
 	};
 
 	FeedSessionStatus {
 		session_id: session.id.clone(),
-		total_sources: session.sources.len(),
-		ready_sources,
+		total_sources: status_total,
+		ready_sources: status_ready,
 		daemon_cached_sources,
 		failed_sources,
 		warming,
@@ -1589,7 +1631,7 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 		next_page_ready,
 		posts_merged: posts.len(),
 		status_message,
-		refresh_token: session.revision ^ ((posts.len() as u64) << 16) ^ (ready_sources as u64) ^ ((daemon_cached_sources as u64) << 8),
+		refresh_token: session.revision ^ ((posts.len() as u64) << 16) ^ (status_ready as u64) ^ ((daemon_cached_sources as u64) << 8),
 	}
 }
 
@@ -1639,10 +1681,7 @@ fn session_has_remaining_sources(session: &FeedSession) -> bool {
 }
 
 fn remembered_entry_for_source<'a>(remembered: &'a HashMap<String, RememberedSubredditEntry>, source: &FeedSource) -> Option<&'a RememberedSubredditEntry> {
-	match source {
-		FeedSource::Subreddit { name, .. } => normalize_remembered_feed_name(name).and_then(|key| remembered.get(&key)),
-		_ => None,
-	}
+	remembered_feed_key_for_source(source).and_then(|key| remembered.get(&key))
 }
 
 fn compare_optional_instants_desc(left: Option<Instant>, right: Option<Instant>) -> Ordering {
@@ -2266,11 +2305,8 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 	for source in visible_sources {
 		let cache_key = source.cache_key();
 		let cache_entry = cache.get(&cache_key);
-		let remembered_entry = match &source {
-			FeedSource::Subreddit { name, .. } => normalize_remembered_feed_name(name).and_then(|key| remembered.get(&key)),
-			_ => None,
-		};
-		let daemon_managed = matches!(&source, FeedSource::Subreddit { .. });
+		let remembered_entry = remembered_feed_key_for_source(&source).and_then(|key| remembered.get(&key));
+		let daemon_managed = remembered_feed_key_for_source(&source).is_some();
 		let cached = cache_entry.is_some();
 		let cached_posts = cache_entry.map(|entry| entry.posts.len()).unwrap_or_default();
 		let cached_age_secs = cache_entry.map(|entry| entry.fetched_at.elapsed().as_secs());
@@ -2365,7 +2401,8 @@ mod tests {
 		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, build_session_id, cache_status_for_preferences,
 		count_sources_in_state, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
 		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
-		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_frontpage_subreddits, remember_subreddit_request,
+		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_flair_request, remember_frontpage_subreddits,
+		remember_subreddit_request,
 		remembered_refresh_priority, restore_persisted_state, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries,
 		sort_sources, source_budget_target, source_cache_is_servable, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets,
 		ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState,
@@ -2753,6 +2790,24 @@ mod tests {
 		SOURCE_CACHE.lock().unwrap().get_mut(&source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
 
 		let cache = SOURCE_CACHE.lock().unwrap();
+		let entry = cache.get(&source.cache_key()).unwrap();
+		assert!(source_cache_is_servable(&source, entry));
+		drop(cache);
+		assert!(get_cached_source_page(&source, 0, 25).is_some());
+	}
+
+	#[test]
+	fn remembered_flair_cache_remains_servable_beyond_short_ttl() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_flair_source("rust", "News");
+		remember_flair_request("rust", "News");
+		store_source_posts_with_origin(&source, vec![test_post("one", "rust", 100)], String::new(), Some(RefreshOrigin::Daemon));
+		SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&source.cache_key()).unwrap().fetched_at =
+			Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		let cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
 		let entry = cache.get(&source.cache_key()).unwrap();
 		assert!(source_cache_is_servable(&source, entry));
 		drop(cache);
@@ -3782,6 +3837,47 @@ mod tests {
 	}
 
 	#[test]
+	fn feed_status_counts_followed_accounts_when_bundling_user_comments() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let s1a = FeedSource::subreddit("u_alpha".to_string(), FeedSort::New);
+		let s1b = FeedSource::user_comments("u_alpha".to_string(), FeedSort::New);
+		let s2a = FeedSource::subreddit("u_beta".to_string(), FeedSort::New);
+		let s2b = FeedSource::user_comments("u_beta".to_string(), FeedSort::New);
+
+		FEED_SESSIONS.lock().unwrap().insert(
+			"demo".to_string(),
+			FeedSession {
+				id: "demo".to_string(),
+				request: FeedSessionRequest {
+					sources: vec![s1a.clone(), s1b.clone(), s2a.clone(), s2b.clone()],
+					filters: HashSet::new(),
+					quarantine: false,
+					query_fingerprint: "demo".to_string(),
+					bundle_followed_user_comments: true,
+				},
+				sources: vec![
+					session_entry(s1a, SessionSourceState::Ready),
+					session_entry(s1b, SessionSourceState::Ready),
+					session_entry(s2a, SessionSourceState::Ready),
+					session_entry(s2b, SessionSourceState::Unstarted),
+				],
+				frozen_pages: HashMap::new(),
+				background_active: true,
+				background_complete: false,
+				requested_page: 0,
+				last_updated: Instant::now(),
+				revision: 0,
+			},
+		);
+
+		let status = feed_status("demo", 0, POSTS_PER_PAGE).expect("session status");
+		assert_eq!(status.ready_sources, 1);
+		assert_eq!(status.total_sources, 2);
+		assert!(status.status_message.contains("1 of 2 followed accounts"));
+	}
+
+	#[test]
 	fn feed_status_counts_daemon_cached_sources_and_servable_remembered_entries() {
 		let _guard = test_lock();
 		reset_test_caches();
@@ -3862,6 +3958,32 @@ mod tests {
 		let user_row = status.sources.iter().find(|s| s.display_name == "u_follows").expect("user row");
 		assert_eq!(user_row.source_type, "user");
 		assert_eq!(user_row.schedule_state, "scheduled");
+	}
+
+	#[test]
+	fn cache_status_marks_flair_only_subscription_as_daemon_managed() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let prefs = Preferences {
+			flair_subscriptions: vec![FlairSubscription {
+				subreddit: "programming".to_string(),
+				flair: "News".to_string(),
+			}],
+			..Preferences::default()
+		};
+
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+		let status = cache_status_for_preferences(&prefs);
+		let flair_key = format!("flair:programming:{}", URL_SAFE_NO_PAD.encode("News".as_bytes()));
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		assert!(remembered.contains_key(&flair_key));
+		drop(remembered);
+
+		let flair_row = status.sources.iter().find(|s| s.display_name == "programming#News").expect("flair row");
+		assert_eq!(flair_row.source_type, "flair");
+		assert!(flair_row.daemon_managed);
+		assert_eq!(flair_row.schedule_state, "scheduled");
 	}
 
 	#[test]
