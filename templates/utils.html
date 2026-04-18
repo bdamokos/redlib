@@ -555,15 +555,12 @@
 			data-page-path="{{ post.permalink }}"
 			{% endif %}
 		>
-			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
-			<img
-				class="video_preview_image"
-				src="{{ post.media.poster }}"
-				alt=""
-				aria-hidden="true"
-				decoding="async"
-				{% if post.media.poster.is_empty() %}hidden{% endif %}>
-			{% endif %}
+			<div
+				class="video_preview_stage{% if post.media.width > 0 && post.media.height > 0 %} video_preview_stage_sized{% endif %}"
+				{% if post.media.width > 0 && post.media.height > 0 -%}
+				style="--video-preview-width: {{ post.media.width }}; --video-preview-height: {{ post.media.height }};"
+				{% endif -%}
+			>
 			<video
 				id="vid_{{ post.id }}"
 				class="post_media_video short{% if use_dash %} video-dash{% endif %}{% if str_eq(prefs.autoplay_videos, "on") %} autoplay{% endif -%}"
@@ -594,12 +591,14 @@
 				<a href="{{ post.media.url }}">Video</a>
 			</video>
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
+			<div class="video_preview_layer" aria-hidden="true"></div>
+			{% endif %}
+			</div>
+			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
 			<div class="video_preview_loading" hidden aria-live="polite">
 				<span class="video_preview_spinner" aria-hidden="true"></span>
 				<span class="video_preview_status_text">Generating animated preview…</span>
 			</div>
-			{# Deprecated legacy gallery preview container. Retained for rollback/debugging. #}
-			<div class="video_preview_gallery" hidden></div>
 			{% endif %}
 		</div>
 	</div>

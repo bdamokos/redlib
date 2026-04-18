@@ -33,6 +33,7 @@ const DEFAULT_BACKPRESSURE_POLL_MS: u64 = 5_000;
 const FRAME_CACHE_SECONDS: u64 = 24 * 60 * 60;
 const PREVIEW_MAX_WIDTH: i64 = 640;
 const PREWARM_POST_LIMIT: usize = 5;
+const ANIMATED_PREVIEW_FPS: i64 = 8;
 
 type FrameFuture<'a> = Pin<Box<dyn Future<Output = Result<FrameBlob, String>> + Send + 'a>>;
 type AssetFuture<'a> = Pin<Box<dyn Future<Output = Result<FrameBlob, String>> + Send + 'a>>;
@@ -72,13 +73,19 @@ pub struct VideoPreviewAsset {
 #[derive(Clone, Debug)]
 pub enum VideoPreviewJobState {
 	Pending,
-	Running { completed_frames: usize, total_frames: usize },
+	Running {
+		completed_frames: usize,
+		total_frames: usize,
+	},
 	Ready {
 		preview: Option<VideoPreviewAsset>,
 		frames: Vec<VideoPreviewFrame>,
 		expires_at: Instant,
 	},
-	Failed { message: String, retry_after: Instant },
+	Failed {
+		message: String,
+		retry_after: Instant,
+	},
 }
 
 #[derive(Clone)]
@@ -291,7 +298,7 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 			let animation_format = preferred_animation_format();
 			let start_seconds = animated_preview_start_seconds(request.duration_seconds);
 			let clip_duration_seconds = animated_preview_duration_seconds(request.duration_seconds);
-			let scale_filter = format!("fps=4,scale='min({PREVIEW_MAX_WIDTH},iw)':-2:flags=lanczos");
+			let scale_filter = format!("fps={ANIMATED_PREVIEW_FPS},scale='min({PREVIEW_MAX_WIDTH},iw)':-2:flags=lanczos");
 			let mut command = Command::new("ffmpeg");
 			command
 				.arg("-hide_banner")
@@ -330,6 +337,8 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 			}
 
 			let output = command
+				.arg("-vsync")
+				.arg("0")
 				.arg("-")
 				.stdin(Stdio::null())
 				.stdout(Stdio::piped())
@@ -358,11 +367,7 @@ impl PreviewMediaGenerator for FfmpegPreviewGenerator {
 			}
 
 			if output.stdout.is_empty() {
-				warn!(
-					"ffmpeg returned an empty animated preview after {:?} for url={}",
-					started_at.elapsed(),
-					request.media_url
-				);
+				warn!("ffmpeg returned an empty animated preview after {:?} for url={}", started_at.elapsed(), request.media_url);
 				return Err("ffmpeg returned an empty animated preview".to_string());
 			}
 
@@ -387,8 +392,7 @@ static VIDEO_PREVIEW_LEASES: LazyLock<Mutex<HashMap<String, LeaseEntry>>> = Lazy
 static VIDEO_PREVIEW_FRAMES: LazyLock<Mutex<FrameCache>> = LazyLock::new(|| Mutex::new(FrameCache::default()));
 static JOB_QUEUE_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
 static INIT_ONCE: OnceLock<()> = OnceLock::new();
-static GENERATOR: LazyLock<Mutex<Arc<dyn PreviewMediaGenerator>>> =
-	LazyLock::new(|| Mutex::new(Arc::new(FfmpegPreviewGenerator) as Arc<dyn PreviewMediaGenerator>));
+static GENERATOR: LazyLock<Mutex<Arc<dyn PreviewMediaGenerator>>> = LazyLock::new(|| Mutex::new(Arc::new(FfmpegPreviewGenerator) as Arc<dyn PreviewMediaGenerator>));
 static PREFERRED_IMAGE_FORMAT: OnceLock<PreviewImageFormat> = OnceLock::new();
 static PREFERRED_ANIMATION_FORMAT: OnceLock<PreviewAnimationFormat> = OnceLock::new();
 static MAX_CONCURRENT: LazyLock<usize> = LazyLock::new(|| env_usize("REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT));
@@ -517,6 +521,10 @@ pub async fn lease(req: Request<Body>) -> Result<Response<Body>, String> {
 			}),
 		);
 	}
+
+	// Ensure the async job queue is initialized within a Tokio runtime.
+	// `main` may call `init()` before the runtime is available.
+	init();
 
 	let request: LeaseRequest = parse_json_body(req).await?;
 	let key = VideoPreviewJobKey {
@@ -721,6 +729,10 @@ fn preferred_animation_format() -> PreviewAnimationFormat {
 	*PREFERRED_ANIMATION_FORMAT.get_or_init(detect_preferred_animation_format)
 }
 
+fn ffmpeg_supports_webp_animation(encoders: &str) -> bool {
+	encoders.contains(" libwebp_anim ")
+}
+
 fn detect_preferred_image_format() -> PreviewImageFormat {
 	let output = std::process::Command::new("ffmpeg")
 		.arg("-hide_banner")
@@ -756,6 +768,19 @@ fn detect_preferred_image_format() -> PreviewImageFormat {
 }
 
 fn detect_preferred_animation_format() -> PreviewAnimationFormat {
+	let forced_format = match std::env::var("REDLIB_VIDEO_PREVIEW_ANIMATION_FORMAT").ok() {
+		Some(value) if value == "gif" => {
+			info!("Video preview animation encoder selected: gif (forced by env)");
+			return PreviewAnimationFormat::Gif;
+		}
+		Some(value) if value == "webp" => Some(value),
+		Some(other) => {
+			warn!("Unknown REDLIB_VIDEO_PREVIEW_ANIMATION_FORMAT={other}; falling back to auto detection");
+			None
+		}
+		None => None,
+	};
+
 	let output = std::process::Command::new("ffmpeg")
 		.arg("-hide_banner")
 		.arg("-encoders")
@@ -766,9 +791,14 @@ fn detect_preferred_animation_format() -> PreviewAnimationFormat {
 	let format = match output {
 		Ok(output) => {
 			let encoders = String::from_utf8_lossy(&output.stdout);
-			if encoders.contains(" libwebp_anim ") {
+			// Animated previews must use the dedicated encoder; `libwebp` alone
+			// can silently collapse the output into a single still frame.
+			if ffmpeg_supports_webp_animation(&encoders) {
 				PreviewAnimationFormat::Webp
 			} else {
+				if forced_format.is_some() {
+					warn!("REDLIB_VIDEO_PREVIEW_ANIMATION_FORMAT=webp requested, but ffmpeg lacks libwebp_anim; falling back to gif");
+				}
 				PreviewAnimationFormat::Gif
 			}
 		}
@@ -781,7 +811,7 @@ fn detect_preferred_animation_format() -> PreviewAnimationFormat {
 	info!(
 		"Video preview animation encoder selected: {}",
 		match format {
-			PreviewAnimationFormat::Webp => "libwebp_anim",
+			PreviewAnimationFormat::Webp => "libwebp",
 			PreviewAnimationFormat::Gif => "gif",
 		}
 	);
@@ -1029,65 +1059,65 @@ fn snapshot_job(job_id: &str) -> (ApiJobState, Option<VideoPreviewAsset>, Vec<Vi
 			job.last_accessed = now;
 
 			return match &job.state {
-					VideoPreviewJobState::Pending => (
-						ApiJobState {
-							status: "pending",
+				VideoPreviewJobState::Pending => (
+					ApiJobState {
+						status: "pending",
 						completed_frames: 0,
 						total_frames: computed_frame_count(job.key.duration_seconds),
-							message: String::new(),
-						},
-						None,
-						Vec::new(),
-						if job.queued { DEFAULT_NEAR_TERM_POLL_MS } else { DEFAULT_BACKPRESSURE_POLL_MS },
-					),
+						message: String::new(),
+					},
+					None,
+					Vec::new(),
+					if job.queued { DEFAULT_NEAR_TERM_POLL_MS } else { DEFAULT_BACKPRESSURE_POLL_MS },
+				),
 				VideoPreviewJobState::Running { completed_frames, total_frames } => (
 					ApiJobState {
 						status: "running",
 						completed_frames: *completed_frames,
 						total_frames: *total_frames,
-							message: String::new(),
-						},
-						None,
-						Vec::new(),
-						DEFAULT_NEAR_TERM_POLL_MS,
-					),
-					VideoPreviewJobState::Ready { preview, frames, .. } => (
-						ApiJobState {
-							status: "ready",
-							completed_frames: frames.len(),
-							total_frames: frames.len(),
-							message: String::new(),
-						},
-						preview.clone(),
-						frames.clone(),
-						0,
-					),
+						message: String::new(),
+					},
+					None,
+					Vec::new(),
+					DEFAULT_NEAR_TERM_POLL_MS,
+				),
+				VideoPreviewJobState::Ready { preview, frames, .. } => (
+					ApiJobState {
+						status: "ready",
+						completed_frames: frames.len(),
+						total_frames: frames.len(),
+						message: String::new(),
+					},
+					preview.clone(),
+					frames.clone(),
+					0,
+				),
 				VideoPreviewJobState::Failed { message, .. } => (
 					ApiJobState {
 						status: "failed",
 						completed_frames: 0,
 						total_frames: computed_frame_count(job.key.duration_seconds),
-							message: message.clone(),
-						},
-						None,
-						Vec::new(),
-						DEFAULT_BACKPRESSURE_POLL_MS,
-					),
+						message: message.clone(),
+					},
+					None,
+					Vec::new(),
+					DEFAULT_BACKPRESSURE_POLL_MS,
+				),
 			};
 		}
 	}
 
-		(
-			ApiJobState {
+	(
+		ApiJobState {
 			status: "missing",
 			completed_frames: 0,
 			total_frames: 0,
-				message: String::new(),
-			},
-			None,
-			Vec::new(),
-			DEFAULT_BACKPRESSURE_POLL_MS,
-		)
+			message: String::new(),
+		},
+		None,
+		Vec::new(),
+		DEFAULT_BACKPRESSURE_POLL_MS,
+	)
 }
 
 fn has_execution_authorization(job_id: &str) -> bool {
@@ -1236,13 +1266,7 @@ async fn process_job(job_id: String) {
 	info!("Completed video preview job {job_id} in {:?} with {} frames", job_started_at.elapsed(), timestamps.len());
 }
 
-fn publish_ready_job(
-	job_id: &str,
-	preview: Option<VideoPreviewAsset>,
-	preview_blob: Option<FrameBlob>,
-	frames: Vec<VideoPreviewFrame>,
-	blobs: Vec<(usize, FrameBlob)>,
-) {
+fn publish_ready_job(job_id: &str, preview: Option<VideoPreviewAsset>, preview_blob: Option<FrameBlob>, frames: Vec<VideoPreviewFrame>, blobs: Vec<(usize, FrameBlob)>) {
 	let now = Instant::now();
 
 	let mut jobs = match VIDEO_PREVIEW_JOBS.lock() {
@@ -1266,14 +1290,14 @@ fn publish_ready_job(
 		cache.blobs.insert(frame_cache_key(job_id, index), blob);
 	}
 
-		if let Some(job) = jobs.get_mut(job_id) {
-			job.queued = false;
-			job.last_accessed = now;
-			job.state = VideoPreviewJobState::Ready {
-				preview,
-				frames,
-				expires_at: now + DEFAULT_READY_TTL,
-			};
+	if let Some(job) = jobs.get_mut(job_id) {
+		job.queued = false;
+		job.last_accessed = now;
+		job.state = VideoPreviewJobState::Ready {
+			preview,
+			frames,
+			expires_at: now + DEFAULT_READY_TTL,
+		};
 	}
 
 	evict_ready_jobs_locked(&mut jobs, &mut cache);
@@ -1567,6 +1591,13 @@ mod tests {
 		assert_eq!(effective_duration_seconds(46, Some(30)), 46);
 		assert_eq!(effective_duration_seconds(0, Some(46)), 46);
 		assert_eq!(effective_duration_seconds(0, None), 0);
+	}
+
+	#[test]
+	fn requires_libwebp_anim_for_animated_webp_previews() {
+		let _guard = TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		assert!(ffmpeg_supports_webp_animation(" V....D libwebp_anim          WebP image"));
+		assert!(!ffmpeg_supports_webp_animation(" V....D libwebp               WebP image"));
 	}
 
 	#[test]
@@ -1997,11 +2028,11 @@ mod tests {
 							width: 320,
 							height: 180,
 						},
-					state: VideoPreviewJobState::Ready {
-						preview: None,
-						frames: vec![VideoPreviewFrame {
-							index: 0,
-							timestamp_seconds: 1,
+						state: VideoPreviewJobState::Ready {
+							preview: None,
+							frames: vec![VideoPreviewFrame {
+								index: 0,
+								timestamp_seconds: 1,
 								image_path: format!("/api/video-previews/{job_id}/frame/0"),
 								width: 320,
 								height: 180,

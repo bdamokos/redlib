@@ -4,10 +4,6 @@
         return;
     }
 
-    var DEFAULT_RENDER_MODE = "animation";
-    // Deprecated legacy gallery mode. Retained for rollback/debugging.
-    var LEGACY_GALLERY_MODE = "gallery";
-
     var pageSessionId = window.crypto.randomUUID();
     var activeHosts = new Map();
     var heartbeatTimer = null;
@@ -33,38 +29,40 @@
         });
     }
 
-    function renderModeForHost(host) {
-        return host.dataset.previewRenderMode || DEFAULT_RENDER_MODE;
-    }
-
-    function previewImage(host) {
-        return host.querySelector(".video_preview_image");
-    }
-
     function previewVideo(host) {
         return host.querySelector("video.post_media_video");
     }
 
-    function hidePreviewImage(host) {
-        var image = previewImage(host);
-        if (!image) {
-            return;
-        }
-
-        image.hidden = true;
-        image.classList.add("is-hidden");
+    function previewLayer(host) {
+        return host.querySelector(".video_preview_layer");
     }
 
-    function syncPreviewImageVisibility(host) {
-        var image = previewImage(host);
-        var video = previewVideo(host);
-        if (!image || !video) {
+    function cssUrl(path) {
+        if (!path) {
+            return "none";
+        }
+
+        return "url(" + JSON.stringify(String(path)) + ")";
+    }
+
+    function hideAnimatedPreview(host) {
+        var layer = previewLayer(host);
+        if (!layer) {
             return;
         }
 
-        var shouldShow = video.paused && video.currentTime <= 0.05;
-        image.hidden = !shouldShow;
-        image.classList.toggle("is-hidden", !shouldShow);
+        layer.classList.remove("is-visible");
+    }
+
+    function syncAnimatedPreviewVisibility(host) {
+        var layer = previewLayer(host);
+        var video = previewVideo(host);
+        if (!layer || !video) {
+            return;
+        }
+
+        var shouldShow = Boolean(layer.dataset.previewSrc) && video.paused && video.currentTime <= 0.05;
+        layer.classList.toggle("is-visible", shouldShow);
     }
 
     function bindPreviewLifecycle(host) {
@@ -79,18 +77,18 @@
         }
 
         video.addEventListener("play", function () {
-            hidePreviewImage(host);
+            hideAnimatedPreview(host);
         });
         video.addEventListener("playing", function () {
-            hidePreviewImage(host);
+            hideAnimatedPreview(host);
         });
-        ["pause", "emptied", "loadstart", "loadeddata", "loadedmetadata", "seeked"].forEach(function (eventName) {
+        ["pause", "emptied", "loadstart", "loadeddata", "loadedmetadata", "seeked", "ended"].forEach(function (eventName) {
             video.addEventListener(eventName, function () {
-                syncPreviewImageVisibility(host);
+                syncAnimatedPreviewVisibility(host);
             });
         });
 
-        syncPreviewImageVisibility(host);
+        syncAnimatedPreviewVisibility(host);
     }
 
     function ensureHeartbeat() {
@@ -120,53 +118,6 @@
         }
     }
 
-    // Deprecated legacy gallery renderer. Retained for rollback/debugging only.
-    function renderLegacyGallery(host, frames) {
-        var gallery = host.querySelector(".video_preview_gallery");
-        if (!gallery) {
-            return;
-        }
-
-        gallery.innerHTML = "";
-
-        frames.forEach(function (frame) {
-            var anchor = document.createElement("a");
-            anchor.href = frame.image_path;
-            anchor.className = "video_preview_frame_link";
-
-            var image = document.createElement("img");
-            image.loading = "lazy";
-            image.decoding = "async";
-            image.alt = "Video preview frame";
-            image.src = frame.image_path;
-            if (frame.width > 0) {
-                image.width = frame.width;
-            }
-            if (frame.height > 0) {
-                image.height = frame.height;
-            }
-
-            var label = document.createElement("span");
-            label.className = "video_preview_frame_time";
-            label.textContent = formatTimestamp(frame.timestamp_seconds);
-
-            anchor.appendChild(image);
-            anchor.appendChild(label);
-            gallery.appendChild(anchor);
-        });
-
-        gallery.hidden = frames.length === 0;
-    }
-
-    function preloadFrames(state, frames) {
-        state.preloadedFrames = (frames || []).map(function (frame) {
-            var image = new Image();
-            image.decoding = "async";
-            image.src = frame.image_path;
-            return image;
-        });
-    }
-
     function shouldRenderHost(host) {
         var post = host.closest(".post");
         var target = post || host;
@@ -180,16 +131,17 @@
             return;
         }
 
-        var image = previewImage(host);
-        if (!image) {
+        var layer = previewLayer(host);
+        var video = previewVideo(host);
+        if (!layer || !video) {
             state.rendered = true;
             return;
         }
 
         var nextPath = state.preview.image_path;
-        if (image.dataset.previewSrc === nextPath) {
+        if (layer.dataset.previewSrc === nextPath) {
             state.rendered = true;
-            syncPreviewImageVisibility(host);
+            syncAnimatedPreviewVisibility(host);
             return;
         }
 
@@ -207,11 +159,12 @@
                 return;
             }
 
-            image.src = nextPath;
-            image.dataset.previewSrc = nextPath;
+            layer.dataset.previewSrc = nextPath;
+            layer.style.backgroundImage = cssUrl(nextPath);
+            video.removeAttribute("poster");
             current.rendered = true;
             current.renderingPreviewPath = "";
-            syncPreviewImageVisibility(host);
+            syncAnimatedPreviewVisibility(host);
         };
         preload.onerror = function () {
             var current = activeHosts.get(host);
@@ -227,13 +180,6 @@
             return;
         }
 
-        if (renderModeForHost(host) === LEGACY_GALLERY_MODE) {
-            renderLegacyGallery(host, state.frames || []);
-            state.rendered = true;
-            state.preloadedFrames = [];
-            return;
-        }
-
         renderAnimatedPreview(host, state);
     }
 
@@ -245,7 +191,7 @@
                 return;
             }
 
-            if (renderModeForHost(host) !== LEGACY_GALLERY_MODE || shouldRenderHost(host)) {
+            if (shouldRenderHost(host)) {
                 flushReadyHost(host, state);
             }
         });
@@ -279,19 +225,6 @@
         }
     }
 
-    function formatTimestamp(seconds) {
-        var total = Math.max(0, parseInt(seconds, 10) || 0);
-        var hours = Math.floor(total / 3600);
-        var minutes = Math.floor((total % 3600) / 60);
-        var remainder = total % 60;
-
-        if (hours > 0) {
-            return hours + ":" + String(minutes).padStart(2, "0") + ":" + String(remainder).padStart(2, "0");
-        }
-
-        return minutes + ":" + String(remainder).padStart(2, "0");
-    }
-
     function pollStatus(host, state) {
         if (!state.jobId || document.visibilityState === "hidden") {
             return;
@@ -318,9 +251,6 @@
                     current.ready = true;
                     current.preview = payload.preview || null;
                     current.frames = payload.frames || [];
-                    if (renderModeForHost(host) === LEGACY_GALLERY_MODE) {
-                        preloadFrames(current, current.frames);
-                    }
                     setLoadingState(host, "ready");
                     flushReadyHost(host, current);
                     return;
@@ -408,9 +338,6 @@
                     current.ready = true;
                     current.preview = payload.preview || null;
                     current.frames = payload.frames || [];
-                    if (renderModeForHost(host) === LEGACY_GALLERY_MODE) {
-                        preloadFrames(current, current.frames);
-                    }
                     setLoadingState(host, "ready");
                     flushReadyHost(host, current);
                     return;
