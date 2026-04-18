@@ -1477,6 +1477,22 @@ pub(crate) fn restore_persisted_state(flair_entries: Vec<PersistedSubredditFlair
 	}
 }
 
+#[cfg(test)]
+pub(crate) fn clear_test_caches() {
+	if let Ok(mut cache) = AUTHOR_LINKS_CACHE.lock() {
+		cache.clear();
+	}
+	if let Ok(mut cache) = SUBREDDIT_FLAIR_CACHE.lock() {
+		cache.clear();
+	}
+	if let Ok(mut cache) = USER_SUBREDDIT_CACHE.lock() {
+		cache.clear();
+	}
+	if let Ok(mut cache) = SUBREDDIT_USER_CACHE.lock() {
+		cache.clear();
+	}
+}
+
 #[derive(Clone, Default, PartialEq)]
 /// Subreddit struct containing metadata about community
 pub struct Subreddit {

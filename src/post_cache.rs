@@ -622,6 +622,7 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 		return;
 	};
 
+	crate::utils::store_subreddit_flairs(&normalized, &posts);
 	crate::utils::store_post_flairs(&posts);
 	store_source_posts_with_origin(
 		&FeedSource::subreddit(normalized.clone(), FeedSort::New),
@@ -2176,6 +2177,7 @@ mod tests {
 		FEED_SESSIONS.lock().unwrap().clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap().clear();
+		crate::utils::clear_test_caches();
 		crate::user::clear_test_caches();
 	}
 
@@ -2597,6 +2599,34 @@ mod tests {
 		assert_eq!(entry.consecutive_failures, 0);
 		assert!(!entry.refresh_in_flight);
 		assert_eq!(entry.estimated_post_interval_secs, 120);
+	}
+
+	#[test]
+	fn publish_plain_subreddit_refresh_seeds_subreddit_flair_cache() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+
+		let mut news = test_post("one", "rust", 600);
+		news.flair = Flair {
+			flair_parts: Vec::new(),
+			text: "News".to_string(),
+			background_color: "#ffffff".to_string(),
+			foreground_color: "#000000".to_string(),
+		};
+		let mut discussion = test_post("two", "rust", 480);
+		discussion.flair = Flair {
+			flair_parts: Vec::new(),
+			text: "Discussion".to_string(),
+			background_color: "#000000".to_string(),
+			foreground_color: "#ffffff".to_string(),
+		};
+
+		publish_plain_subreddit_refresh("rust", vec![news, discussion], String::new(), RefreshOrigin::Daemon);
+
+		let flair_names = crate::utils::cached_subreddit_flairs("rust").into_iter().map(|flair| flair.text).collect::<Vec<_>>();
+		assert_eq!(flair_names, vec!["Discussion".to_string(), "News".to_string()]);
 	}
 
 	#[test]
@@ -3596,8 +3626,7 @@ mod tests {
 		remember_subreddit_request("u_followeduser");
 		let user_source = new_source("u_followeduser");
 		store_source_posts_with_origin(&user_source, vec![test_post("uf", "somewhere", 400)], String::new(), None);
-		SOURCE_CACHE.lock().unwrap().get_mut(&user_source.cache_key()).unwrap().fetched_at =
-			Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+		SOURCE_CACHE.lock().unwrap().get_mut(&user_source.cache_key()).unwrap().fetched_at = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
 
 		let posts_snapshot = snapshot_persisted_source_entries(3_000_000);
 		let remembered_snapshot = snapshot_persisted_remembered_subreddits(3_000_000);
