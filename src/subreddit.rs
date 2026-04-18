@@ -1168,6 +1168,30 @@ fn build_front_page_session_sources(
 	sources
 }
 
+/// Uses [`post_cache::feed_page`] output for plain paging so frozen/sealed pages stay stable while
+/// hide-seen mode still walks the full merged feed.
+fn contextual_listing_posts_from_feed_page(
+	feed_seen: Option<&seen_posts::FeedSeenCookieCtx>,
+	cache_page: usize,
+	page: &mut crate::post_cache::FeedPage,
+	merged_posts: &[Post],
+) -> (Vec<Post>, bool) {
+	let per_page = crate::post_cache::POSTS_PER_PAGE;
+	match feed_seen {
+		Some(ctx) if ctx.hide_seen_on => seen_posts::page_and_record_seen(&ctx.session_id, true, merged_posts, cache_page, per_page),
+		Some(ctx) => {
+			let posts = std::mem::take(&mut page.posts);
+			seen_posts::record_seen(&ctx.session_id, &posts);
+			(posts, false)
+		}
+		None => {
+			let posts = std::mem::take(&mut page.posts);
+			seen_posts::record_seen("anon", &posts);
+			(posts, false)
+		}
+	}
+}
+
 async fn live_feed_shell_loading_message(
 	req: &Request<Body>,
 	preferences: &Preferences,
@@ -1779,13 +1803,13 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		)
 		.await;
 
+		if cache_page == 0 {
+			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
+		}
+
 		if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
 			let merged_posts = crate::post_cache::feed_merged_posts(&feed_session_id).unwrap_or_else(|| std::mem::take(&mut page.posts));
-			let (page_posts, has_next_unseen) = if let Some(ref ctx) = feed_seen_shell {
-				seen_posts::page_and_record_seen(&ctx.session_id, ctx.hide_seen_on, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
-			} else {
-				seen_posts::page_and_record_seen("anon", false, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
-			};
+			let (page_posts, has_next_unseen) = contextual_listing_posts_from_feed_page(feed_seen_shell.as_ref(), cache_page, &mut page, &merged_posts);
 			let mut page_posts = page_posts;
 			page.has_next = page.has_next || has_next_unseen;
 
@@ -2254,6 +2278,10 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		)
 		.await;
 
+		if cache_page == 0 {
+			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
+		}
+
 		if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
 			let feed_status = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
 			let page_ready = feed_status.as_ref().map(|status| status.current_page_ready).unwrap_or(false);
@@ -2267,11 +2295,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			// Instead of serving a short page when many posts are seen, page over the full merged feed
 			// and pick a full window of unseen posts.
 			let merged_posts = crate::post_cache::feed_merged_posts(&feed_session_id).unwrap_or_else(|| std::mem::take(&mut page.posts));
-			let (page_posts, has_next_unseen) = if let Some(ref ctx) = feed_seen_ctx {
-				seen_posts::page_and_record_seen(&ctx.session_id, ctx.hide_seen_on, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
-			} else {
-				seen_posts::page_and_record_seen("anon", false, &merged_posts, cache_page, crate::post_cache::POSTS_PER_PAGE)
-			};
+			let (page_posts, has_next_unseen) = contextual_listing_posts_from_feed_page(feed_seen_ctx.as_ref(), cache_page, &mut page, &merged_posts);
 			let mut page_posts = page_posts;
 			page.has_next = page.has_next || has_next_unseen;
 
@@ -4155,6 +4179,9 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
 		.and_then(|value| value.parse::<usize>().ok())
 		.unwrap_or(0);
+	if page == 0 {
+		crate::post_cache::wait_and_seal_contextual_feed_paint(&session_id, page, crate::post_cache::POSTS_PER_PAGE).await;
+	}
 	let Some(mut feed_page) = crate::post_cache::feed_page(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
 		return error(req, "Feed session not found or expired").await;
 	};
@@ -4169,11 +4196,18 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	};
 	let (hide_seen_on, hide_seen_cookie_override) = seen_posts::hide_seen_effective_for_request(&req, feed_seen_scope);
 	let merged_posts = crate::post_cache::feed_merged_posts(&session_id).unwrap_or_else(|| std::mem::take(&mut feed_page.posts));
-	let (mut posts, has_next_unseen) = if feed_seen_scope {
-		seen_posts::page_and_record_seen(&rl_session_id, hide_seen_on, &merged_posts, page, crate::post_cache::POSTS_PER_PAGE)
+	let feed_seen_for_posts = if feed_seen_scope {
+		Some(seen_posts::FeedSeenCookieCtx {
+			session_id: rl_session_id.clone(),
+			hide_seen_on,
+			applies: true,
+			needs_session_cookie: needs_rl_session_cookie,
+			hide_seen_cookie_override: hide_seen_cookie_override.clone(),
+		})
 	} else {
-		seen_posts::page_and_record_seen("anon", false, &merged_posts, page, crate::post_cache::POSTS_PER_PAGE)
+		None
 	};
+	let (mut posts, has_next_unseen) = contextual_listing_posts_from_feed_page(feed_seen_for_posts.as_ref(), page, &mut feed_page, &merged_posts);
 	utils::hydrate_post_author_links_from_cache(&mut posts);
 
 	let prev_page_url = if page > 0 {

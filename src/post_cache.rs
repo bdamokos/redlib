@@ -35,6 +35,10 @@ const MAX_SYNC_FILL_BATCHES: usize = 2;
 const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
 pub const POSTS_PER_PAGE: usize = 25;
 
+/// Max time the server waits for a full first contextual page (or background complete) before
+/// sealing whatever merged posts exist so the HTML/fragment response does not keep changing.
+const CONTEXTUAL_FEED_PAINT_WAIT: Duration = Duration::from_secs(12);
+
 pub const fn per_source_limit() -> usize {
 	PER_SOURCE_LIMIT
 }
@@ -1458,8 +1462,29 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 	merged
 }
 
+fn frozen_post_ids_before_page(session: &FeedSession, page: usize) -> HashSet<String> {
+	session
+		.frozen_pages
+		.iter()
+		.filter(|(p, _)| **p < page)
+		.flat_map(|(_, posts)| posts.iter().map(|post| post.id.clone()))
+		.collect()
+}
+
+fn merged_tail_excluding_frozen_prior_pages(session: &FeedSession, page: usize, merged: &[Post]) -> Vec<Post> {
+	let exclude = frozen_post_ids_before_page(session, page);
+	if exclude.is_empty() {
+		return merged.to_vec();
+	}
+	merged.iter().filter(|post| !exclude.contains(&post.id)).cloned().collect()
+}
+
 fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> bool {
-	posts.len() >= ((page + 1) * per_page) || session.background_complete || session.frozen_pages.contains_key(&page)
+	if session.frozen_pages.contains_key(&page) {
+		return true;
+	}
+	let tail = merged_tail_excluding_frozen_prior_pages(session, page, posts);
+	tail.len() >= per_page || session.background_complete
 }
 
 fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, mut posts: Vec<Post>) -> Vec<Post> {
@@ -1502,7 +1527,8 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 		})
 		.count();
 	let current_page_ready = current_page_is_ready(session, posts, page, per_page);
-	let next_page_ready = posts.len() >= ((page + 2) * per_page);
+	let tail_next = merged_tail_excluding_frozen_prior_pages(session, page.saturating_add(1), posts);
+	let next_page_ready = tail_next.len() >= per_page || session.background_complete;
 	let warming = session.background_active;
 	let daemon_cache_suffix = if daemon_cached_sources > 0 {
 		format!(" ({daemon_cached_sources} from daemon cache)")
@@ -2009,40 +2035,79 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	reconcile_session_with_source_cache(session);
 
 	let merged_posts = merged_posts_for_session(session);
-	let merged_len = merged_posts.len();
 	let page_ready = current_page_is_ready(session, &merged_posts, page, per_page);
 	let sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
 	let bundle_activity = session.request.bundle_followed_user_comments;
+	let tail_for_page = merged_tail_excluding_frozen_prior_pages(session, page, &merged_posts);
 	let posts = if let Some(frozen_posts) = session.frozen_pages.get(&page) {
 		frozen_posts.clone()
 	} else {
+		let chunk: Vec<Post> = tail_for_page.iter().take(per_page).cloned().collect();
+		let finalized = finalize_page_posts(sort, bundle_activity, chunk);
 		if page_ready {
-			let start = page * per_page;
-			let end = (start + per_page).min(merged_posts.len());
-			let frozen = if start < merged_posts.len() {
-				finalize_page_posts(sort, bundle_activity, merged_posts[start..end].to_vec())
-			} else {
-				Vec::new()
-			};
-			session.frozen_pages.insert(page, frozen.clone());
-			frozen
-		} else {
-			let start = page * per_page;
-			let end = (start + per_page).min(merged_posts.len());
-			if start < merged_posts.len() {
-				finalize_page_posts(sort, bundle_activity, merged_posts[start..end].to_vec())
-			} else {
-				Vec::new()
-			}
+			session.frozen_pages.insert(page, finalized.clone());
 		}
+		finalized
 	};
+	let shown_ids: HashSet<String> = posts.iter().map(|post| post.id.clone()).collect();
+	let has_next_from_feed = tail_for_page.iter().any(|post| !shown_ids.contains(&post.id));
 	let has_more_available = session.background_active || page < session.requested_page || session_has_remaining_sources(session);
 	Some(FeedPage {
 		posts,
 		has_prev: page > 0,
-		has_next: ((page + 1) * per_page) < merged_len || has_more_available,
+		has_next: has_next_from_feed || has_more_available,
 		ready: page_ready,
 	})
+}
+
+fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: usize) {
+	let Ok(mut sessions) = FEED_SESSIONS.lock() else {
+		return;
+	};
+	let Some(session) = sessions.get_mut(session_id) else {
+		return;
+	};
+	if session_is_expired(session) || session.frozen_pages.contains_key(&page) {
+		return;
+	}
+	reconcile_session_with_source_cache(session);
+	let sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
+	let bundle_activity = session.request.bundle_followed_user_comments;
+	let merged_posts = merged_posts_for_session(session);
+	let tail_for_page = merged_tail_excluding_frozen_prior_pages(session, page, &merged_posts);
+	let chunk: Vec<Post> = tail_for_page.into_iter().take(per_page).collect();
+	if chunk.is_empty() {
+		return;
+	}
+	let finalized = finalize_page_posts(sort, bundle_activity, chunk);
+	session.frozen_pages.insert(page, finalized);
+	touch_session(session);
+}
+
+/// Blocks the response until the contextual feed page is ready (full window or background
+/// finished) or [`CONTEXTUAL_FEED_PAINT_WAIT`] elapses, then seals page `page` if it is still
+/// unfrozen so later merges do not reshuffle that page.
+pub async fn wait_and_seal_contextual_feed_paint(session_id: &str, page: usize, per_page: usize) {
+	let deadline = tokio::time::Instant::now() + CONTEXTUAL_FEED_PAINT_WAIT;
+	loop {
+		let ready = {
+			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+			let Some(session) = sessions.get_mut(session_id) else {
+				return;
+			};
+			if session_is_expired(session) {
+				return;
+			}
+			reconcile_session_with_source_cache(session);
+			let merged_posts = merged_posts_for_session(session);
+			current_page_is_ready(session, &merged_posts, page, per_page)
+		};
+		if ready || tokio::time::Instant::now() >= deadline {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	seal_feed_page_for_paint_if_needed(session_id, page, per_page);
 }
 
 pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<FeedSessionStatus> {
