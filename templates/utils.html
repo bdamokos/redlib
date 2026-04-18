@@ -554,7 +554,6 @@
 {%- endmacro %}
 
 {% macro render_video_html(post, view_type) -%}
-<br/>
 	{% if post.post_type == "video" || post.post_type == "gif" %}
 	{% if !post.media.embed_code.is_empty() %}
 	<div class="post_media_content">
@@ -565,6 +564,7 @@
 	{% else %}
 	{% set use_dash = str_eq(prefs.use_dash, "on") && !post.media.dash_url.is_empty() %}
 	{% set use_hls = !use_dash && str_eq(prefs.use_hls, "on") && !post.media.hls_url.is_empty() %}
+	<div class="post_media_column">
 	<div class="post_media_content">
 		<div
 			class="video_preview_host"
@@ -638,6 +638,7 @@
 		{% endif %}
 	</div>
 	{% endif %}
+	</div>
 
 	{% if !use_dash && !use_hls && !str_eq(prefs.hide_hls_notification, "on") %}
 	{% if view_type == "list" %}

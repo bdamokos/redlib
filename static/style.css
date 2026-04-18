@@ -1713,6 +1713,26 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     overflow: hidden;
 }
 
+/* Wraps video + duration/RedGifs meta so grid auto-placement cannot pull meta beside the title */
+.post_media_column {
+    grid-area: post_media;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    max-width: calc(100% - 40px);
+    margin: 15px auto 5px auto;
+    width: auto;
+    min-width: 0;
+    box-sizing: border-box;
+}
+
+.post_media_column > .post_media_content {
+    grid-area: unset;
+    margin: 0;
+    max-width: 100%;
+    width: 100%;
+}
+
 .post_media_content + .post_media_content {
     margin-top: 30px;  /* Add extra space between consecutive media content divs */
 }
@@ -1983,6 +2003,7 @@ a.redgifs_uploader_mismatch {
         / minmax(40px, auto) minmax(0, 1fr);
 }
 
+.post_page .post.highlighted .post_media_column,
 .post_page .post.highlighted .post_media_content {
     max-width: calc(100% - 32px);
 }
