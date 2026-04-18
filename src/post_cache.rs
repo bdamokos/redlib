@@ -125,10 +125,7 @@ impl FeedSource {
 			Self::Subreddit { name, sort } => {
 				let lower = name.to_lowercase();
 				if let Some(username) = lower.strip_prefix("u_").filter(|rest| !rest.is_empty()) {
-					format!(
-						"/user/{username}/submitted.json?sort={}&limit={PER_SOURCE_LIMIT}&raw_json=1",
-						sort.as_str()
-					)
+					format!("/user/{username}/submitted.json?sort={}&limit={PER_SOURCE_LIMIT}&raw_json=1", sort.as_str())
 				} else {
 					format!("/r/{}/{}.json?limit={PER_SOURCE_LIMIT}&raw_json=1", name.replace('+', "%2B"), sort.as_str())
 				}
@@ -368,13 +365,7 @@ fn normalize_plain_subreddit_name(subreddit: &str) -> Option<String> {
 /// Normalized key for remembered feeds: plain subreddits and `u_username` pseudo-feeds (subscriptions / user listing cache).
 fn normalize_remembered_feed_name(name: &str) -> Option<String> {
 	let normalized = name.trim().to_lowercase();
-	if normalized.is_empty()
-		|| normalized == "popular"
-		|| normalized == "all"
-		|| normalized == "random"
-		|| normalized == "randnsfw"
-		|| normalized.contains('+')
-	{
+	if normalized.is_empty() || normalized == "popular" || normalized == "all" || normalized == "random" || normalized == "randnsfw" || normalized.contains('+') {
 		return None;
 	}
 	if let Some(rest) = normalized.strip_prefix("u_") {
@@ -437,6 +428,36 @@ pub fn remember_frontpage_subreddits(preferences: &Preferences) {
 
 	for subscription in &preferences.flair_subscriptions {
 		remember_subreddit_request(&subscription.subreddit);
+	}
+}
+
+/// Ensures subscription-derived feeds exist in `REMEMBERED_SUBREDDITS` without touching
+/// `last_requested_at` on existing rows (unlike [`remember_frontpage_subreddits`], which refreshes TTL).
+/// Used so `/cache-status` shows daemon schedule after restart or cold memory before any feed request runs.
+fn ensure_remembered_feeds_seeded_for_preferences(preferences: &Preferences) {
+	let mut inserted = false;
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	for subreddit in &preferences.subscriptions {
+		let Some(normalized) = normalize_remembered_feed_name(subreddit) else {
+			continue;
+		};
+		if !remembered.contains_key(&normalized) {
+			remembered.insert(normalized.clone(), new_remembered_subreddit_entry(normalized));
+			inserted = true;
+		}
+	}
+	for subscription in &preferences.flair_subscriptions {
+		let Some(normalized) = normalize_remembered_feed_name(&subscription.subreddit) else {
+			continue;
+		};
+		if !remembered.contains_key(&normalized) {
+			remembered.insert(normalized.clone(), new_remembered_subreddit_entry(normalized));
+			inserted = true;
+		}
+	}
+	drop(remembered);
+	if inserted {
+		crate::cache_persistence::mark_dirty();
 	}
 }
 
@@ -917,8 +938,7 @@ async fn refresh_remembered_subreddit(subreddit: &str) {
 	mark_plain_subreddit_refresh_started(subreddit);
 	let lower = subreddit.to_lowercase();
 	let listing_result = if let Some(username) = lower.strip_prefix("u_").filter(|rest| !rest.is_empty()) {
-		let listing_path =
-			format!("/user/{username}/submitted.json?sort=new&limit={PER_SOURCE_LIMIT}&raw_json=1");
+		let listing_path = format!("/user/{username}/submitted.json?sort=new&limit={PER_SOURCE_LIMIT}&raw_json=1");
 		Post::fetch(&listing_path, false).await
 	} else {
 		let listing_path = format!("/r/{}/new.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"));
@@ -2019,6 +2039,7 @@ fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
 }
 
 pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusResponse {
+	ensure_remembered_feeds_seeded_for_preferences(preferences);
 	let now = Instant::now();
 	let generated_at_unix = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -2301,14 +2322,8 @@ mod tests {
 		assert_eq!(user_new.cache_key(), "subreddit:u_someone:new");
 		assert_eq!(source_new.build_path(), "/r/rust/new.json?limit=40&raw_json=1");
 		assert_eq!(source_hot.build_path(), "/r/rust/hot.json?limit=40&raw_json=1");
-		assert_eq!(
-			user_new.build_path(),
-			"/user/someone/submitted.json?sort=new&limit=40&raw_json=1"
-		);
-		assert_eq!(
-			user_mixed.build_path(),
-			"/user/someone/submitted.json?sort=new&limit=40&raw_json=1"
-		);
+		assert_eq!(user_new.build_path(), "/user/someone/submitted.json?sort=new&limit=40&raw_json=1");
+		assert_eq!(user_mixed.build_path(), "/user/someone/submitted.json?sort=new&limit=40&raw_json=1");
 	}
 
 	#[test]
@@ -3505,6 +3520,31 @@ mod tests {
 	}
 
 	#[test]
+	fn cache_status_seeds_remembered_rows_without_prior_feed_hit() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let prefs = Preferences {
+			subscriptions: vec!["rust".to_string(), "u_follows".to_string()],
+			..Preferences::default()
+		};
+
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().is_empty());
+		let status = cache_status_for_preferences(&prefs);
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		assert!(remembered.contains_key("rust"));
+		assert!(remembered.contains_key("u_follows"));
+		drop(remembered);
+
+		let rust_row = status.sources.iter().find(|s| s.display_name == "rust").expect("rust row");
+		assert!(rust_row.daemon_managed);
+		assert_eq!(rust_row.schedule_state, "scheduled");
+		let user_row = status.sources.iter().find(|s| s.display_name == "u_follows").expect("user row");
+		assert_eq!(user_row.source_type, "user");
+		assert_eq!(user_row.schedule_state, "scheduled");
+	}
+
+	#[test]
 	fn banned_refreshes_are_deprioritized_until_backoff_expires() {
 		let _guard = test_lock();
 		reset_test_caches();
@@ -3546,5 +3586,26 @@ mod tests {
 		restore_persisted_state(remembered_snapshot, remembered_state, 1_000_100, 1_000_100);
 		assert!(SOURCE_CACHE.lock().unwrap().contains_key(&remembered_source.cache_key()));
 		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().contains_key("remembered"));
+	}
+
+	#[test]
+	fn persisted_restore_keeps_stale_followed_user_feed_when_remembered() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("u_followeduser");
+		let user_source = new_source("u_followeduser");
+		store_source_posts_with_origin(&user_source, vec![test_post("uf", "somewhere", 400)], String::new(), None);
+		SOURCE_CACHE.lock().unwrap().get_mut(&user_source.cache_key()).unwrap().fetched_at =
+			Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 60);
+
+		let posts_snapshot = snapshot_persisted_source_entries(3_000_000);
+		let remembered_snapshot = snapshot_persisted_remembered_subreddits(3_000_000);
+		SOURCE_CACHE.lock().unwrap().clear();
+		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
+		restore_persisted_state(posts_snapshot, remembered_snapshot, 3_000_000, 3_000_000);
+
+		assert!(SOURCE_CACHE.lock().unwrap().contains_key(&user_source.cache_key()));
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().contains_key("u_followeduser"));
 	}
 }

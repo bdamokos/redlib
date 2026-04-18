@@ -1474,10 +1474,7 @@ mod tests {
 				video_count: 2,
 			})
 		);
-		assert_eq!(
-			super::cached_avg_video_length(username),
-			Some(("1:00".to_string(), "from 2 seen videos".to_string()))
-		);
+		assert_eq!(super::cached_avg_video_length(username), Some(("1:00".to_string(), "from 2 seen videos".to_string())));
 	}
 
 	#[test]
@@ -1814,11 +1811,6 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let sort = param(&path, "sort").unwrap_or_default();
 	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
 	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
-	if video_listing
-		|| (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty())
-	{
-		crate::post_cache::remember_subreddit_request(&format!("u_{username}"));
-	}
 	let cached_listing_page = cached_user_listing_posts(&username, &listing, &sort, query);
 	let pre_scraped = if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
 		info!("user: using scrape fallback for {} because Reddit is currently rate limited", current_url);
@@ -1846,9 +1838,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 	}
 
-	if video_listing
-		|| (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty())
-	{
+	if video_listing || (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty()) {
 		crate::post_cache::remember_subreddit_request(&format!("u_{username}"));
 	}
 
