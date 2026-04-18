@@ -1067,7 +1067,7 @@ fn snapshot_job(job_id: &str) -> (ApiJobState, Option<VideoPreviewAsset>, Vec<Vi
 					ApiJobState {
 						status: "pending",
 						completed_frames: 0,
-						total_frames: computed_frame_count(job.key.duration_seconds),
+						total_frames: 1,
 						message: String::new(),
 					},
 					None,
@@ -1085,22 +1085,31 @@ fn snapshot_job(job_id: &str) -> (ApiJobState, Option<VideoPreviewAsset>, Vec<Vi
 					Vec::new(),
 					DEFAULT_NEAR_TERM_POLL_MS,
 				),
-				VideoPreviewJobState::Ready { preview, frames, .. } => (
-					ApiJobState {
-						status: "ready",
-						completed_frames: frames.len(),
-						total_frames: frames.len(),
-						message: String::new(),
-					},
-					preview.clone(),
-					frames.clone(),
-					0,
-				),
+				VideoPreviewJobState::Ready { preview, frames, .. } => {
+					let (completed_frames, total_frames) = if preview.is_some() {
+						(1, 1)
+					} else if !frames.is_empty() {
+						(frames.len(), frames.len())
+					} else {
+						(0, 0)
+					};
+					(
+						ApiJobState {
+							status: "ready",
+							completed_frames,
+							total_frames,
+							message: String::new(),
+						},
+						preview.clone(),
+						frames.clone(),
+						0,
+					)
+				}
 				VideoPreviewJobState::Failed { message, .. } => (
 					ApiJobState {
 						status: "failed",
 						completed_frames: 0,
-						total_frames: computed_frame_count(job.key.duration_seconds),
+						total_frames: 1,
 						message: message.clone(),
 					},
 					None,
@@ -1156,12 +1165,10 @@ async fn process_job(job_id: String) {
 			return;
 		}
 
-		let timestamps = preview_timestamps(job.key.duration_seconds);
-		let total_frames = timestamps.len();
 		job.queued = false;
 		job.state = VideoPreviewJobState::Running {
 			completed_frames: 0,
-			total_frames,
+			total_frames: 1,
 		};
 		job.key.clone()
 	};
@@ -1184,7 +1191,7 @@ async fn process_job(job_id: String) {
 					job.key.duration_seconds = resolved_duration_seconds;
 					job.state = VideoPreviewJobState::Running {
 						completed_frames: 0,
-						total_frames: computed_frame_count(resolved_duration_seconds),
+						total_frames: 1,
 					};
 				}
 			}
@@ -1193,6 +1200,12 @@ async fn process_job(job_id: String) {
 
 	info!("Starting video preview job {job_id}");
 
+	if !has_execution_authorization(&job_id) {
+		cancel_job(&job_id);
+		info!("Cancelled video preview job {job_id} because its page is no longer live");
+		return;
+	}
+
 	let generator = current_generator();
 	let animation_request = AnimationRequest {
 		media_url: materialized_media.input_path().to_string(),
@@ -1200,57 +1213,22 @@ async fn process_job(job_id: String) {
 		width: key.width,
 		height: key.height,
 	};
+
 	let preview_blob = match generator.extract_animation(&animation_request).await {
-		Ok(blob) => Some(blob),
+		Ok(blob) => blob,
 		Err(err) => {
 			warn!("Animated preview generation failed for job {job_id}: {err}");
-			None
+			fail_job(&job_id, err);
+			return;
 		}
 	};
 
-	let timestamps = preview_timestamps(key.duration_seconds);
-	let mut produced_blobs = Vec::with_capacity(timestamps.len());
-	let mut produced_frames = Vec::with_capacity(timestamps.len());
-
-	for (index, timestamp_seconds) in timestamps.iter().copied().enumerate() {
-		if !has_execution_authorization(&job_id) {
-			cancel_job(&job_id);
-			info!("Cancelled video preview job {job_id} because its page is no longer live");
-			return;
-		}
-
-		let request = FrameRequest {
-			media_url: materialized_media.input_path().to_string(),
-			timestamp_seconds,
-			width: key.width,
-			height: key.height,
-		};
-
-		let blob = match generator.extract_frame(&request).await {
-			Ok(blob) => blob,
-			Err(err) => {
-				fail_job(&job_id, err);
-				return;
-			}
-		};
-
-		let image_path = format!("/api/video-previews/{job_id}/frame/{index}");
-		produced_frames.push(VideoPreviewFrame {
-			index,
-			timestamp_seconds,
-			image_path,
-			width: key.width,
-			height: key.height,
-		});
-		produced_blobs.push((index, blob));
-
-		if let Ok(mut jobs) = VIDEO_PREVIEW_JOBS.lock() {
-			if let Some(job) = jobs.get_mut(&job_id) {
-				job.state = VideoPreviewJobState::Running {
-					completed_frames: index + 1,
-					total_frames: timestamps.len(),
-				};
-			}
+	if let Ok(mut jobs) = VIDEO_PREVIEW_JOBS.lock() {
+		if let Some(job) = jobs.get_mut(&job_id) {
+			job.state = VideoPreviewJobState::Running {
+				completed_frames: 1,
+				total_frames: 1,
+			};
 		}
 	}
 
@@ -1260,14 +1238,14 @@ async fn process_job(job_id: String) {
 		return;
 	}
 
-	let preview = preview_blob.as_ref().map(|blob| VideoPreviewAsset {
+	let preview = VideoPreviewAsset {
 		image_path: format!("/api/video-previews/{job_id}/animation"),
-		content_type: blob.content_type.to_string(),
+		content_type: preview_blob.content_type.to_string(),
 		width: key.width,
 		height: key.height,
-	});
-	publish_ready_job(&job_id, preview, preview_blob, produced_frames, produced_blobs);
-	info!("Completed video preview job {job_id} in {:?} with {} frames", job_started_at.elapsed(), timestamps.len());
+	};
+	publish_ready_job(&job_id, Some(preview), Some(preview_blob), Vec::new(), Vec::new());
+	info!("Completed video preview job {job_id} in {:?}", job_started_at.elapsed());
 }
 
 fn publish_ready_job(job_id: &str, preview: Option<VideoPreviewAsset>, preview_blob: Option<FrameBlob>, frames: Vec<VideoPreviewFrame>, blobs: Vec<(usize, FrameBlob)>) {
@@ -1497,6 +1475,10 @@ mod tests {
 
 		fn extract_animation<'a>(&'a self, request: &'a AnimationRequest) -> AssetFuture<'a> {
 			Box::pin(async move {
+				let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+				if self.fail_after.is_some_and(|value| call_index >= value) {
+					return Err("forced failure".to_string());
+				}
 				Ok(FrameBlob {
 					content_type: "image/webp",
 					bytes: format!("animation-{}", request.duration_seconds).into_bytes(),
@@ -1953,13 +1935,7 @@ mod tests {
 						width: 320,
 						height: 180,
 					}),
-					frames: vec![VideoPreviewFrame {
-						index: 0,
-						timestamp_seconds: 1,
-						image_path: format!("/api/video-previews/{job_id}/frame/0"),
-						width: 320,
-						height: 180,
-					}],
+					frames: Vec::new(),
 					expires_at: Instant::now() + DEFAULT_READY_TTL,
 				},
 				queued: false,
@@ -1979,8 +1955,10 @@ mod tests {
 		let body = to_bytes(response.into_body()).await.unwrap();
 		let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
 		assert_eq!(value["state"]["status"], "ready");
+		assert_eq!(value["state"]["completed_frames"], 1);
+		assert_eq!(value["state"]["total_frames"], 1);
 		assert_eq!(value["preview"]["image_path"], format!("/api/video-previews/{job_id}/animation"));
-		assert_eq!(value["frames"][0]["image_path"], format!("/api/video-previews/{job_id}/frame/0"));
+		assert_eq!(value["frames"], serde_json::json!([]));
 	}
 
 	#[tokio::test]
