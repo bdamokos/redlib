@@ -62,6 +62,29 @@
         layer.classList.toggle("is-visible", shouldShow);
     }
 
+    function stopPreviewGenerationForPlayback(host) {
+        var state = activeHosts.get(host);
+        if (!state) {
+            return;
+        }
+
+        state.suppressPreviewLease = true;
+        if (state.pollTimer) {
+            window.clearTimeout(state.pollTimer);
+            state.pollTimer = null;
+        }
+
+        if (state.jobId) {
+            postJson("/api/video-previews/release", {
+                page_session_id: pageSessionId,
+                job_ids: [state.jobId]
+            });
+        }
+
+        setLoadingState(host, "ready");
+        hideAnimatedPreview(host);
+    }
+
     function bindPreviewLifecycle(host) {
         if (host.dataset.previewLifecycleBound === "true") {
             return;
@@ -73,12 +96,13 @@
             return;
         }
 
-        video.addEventListener("play", function () {
+        function onPlaybackStarted() {
             hideAnimatedPreview(host);
-        });
-        video.addEventListener("playing", function () {
-            hideAnimatedPreview(host);
-        });
+            stopPreviewGenerationForPlayback(host);
+        }
+
+        video.addEventListener("play", onPlaybackStarted);
+        video.addEventListener("playing", onPlaybackStarted);
         ["pause", "emptied", "loadstart", "loadeddata", "loadedmetadata", "seeked", "ended"].forEach(function (eventName) {
             video.addEventListener(eventName, function () {
                 syncAnimatedPreviewVisibility(host);
@@ -101,9 +125,13 @@
 
             postJson("/api/video-previews/heartbeat", {
                 page_session_id: pageSessionId,
-                job_ids: Array.from(activeHosts.values()).map(function (state) {
-                    return state.jobId;
-                }).filter(Boolean)
+                job_ids: Array.from(activeHosts.values())
+                    .filter(function (state) {
+                        return state.jobId && !state.suppressPreviewLease;
+                    })
+                    .map(function (state) {
+                        return state.jobId;
+                    })
             });
         }, 10000);
     }
@@ -224,7 +252,7 @@
     }
 
     function pollStatus(host, state) {
-        if (!state.jobId || document.visibilityState === "hidden") {
+        if (!state.jobId || document.visibilityState === "hidden" || state.suppressPreviewLease) {
             return;
         }
 
@@ -241,7 +269,7 @@
             })
             .then(function (payload) {
                 var current = activeHosts.get(host);
-                if (!current || current.jobId !== state.jobId) {
+                if (!current || current.jobId !== state.jobId || current.suppressPreviewLease) {
                     return;
                 }
 
@@ -273,7 +301,7 @@
             })
             .catch(function () {
                 var current = activeHosts.get(host);
-                if (!current) {
+                if (!current || current.suppressPreviewLease) {
                     return;
                 }
 
@@ -294,7 +322,7 @@
             activeHosts.set(host, state);
         }
 
-        if (state.ready || state.leasing) {
+        if (state.ready || state.leasing || state.suppressPreviewLease) {
             return;
         }
 
@@ -330,6 +358,16 @@
 
                 current.leasing = false;
                 current.jobId = payload.job_id;
+
+                if (current.suppressPreviewLease) {
+                    postJson("/api/video-previews/release", {
+                        page_session_id: pageSessionId,
+                        job_ids: [current.jobId]
+                    });
+                    setLoadingState(host, "ready");
+                    return;
+                }
+
                 ensureHeartbeat();
 
                 if (payload.state && payload.state.status === "ready") {
