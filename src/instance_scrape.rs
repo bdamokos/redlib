@@ -844,6 +844,7 @@ fn parse_post_card(element: ElementRef<'_>, context: ListingContext) -> Option<P
 		},
 		permalink,
 		parent_kind: String::new(),
+		link_id: String::new(),
 		link_title,
 		link_permalink,
 		poll: None,
@@ -867,6 +868,7 @@ fn parse_post_card(element: ElementRef<'_>, context: ListingContext) -> Option<P
 		ws_url: String::new(),
 		preview_body: if matches!(context, ListingContext::PostPage) { String::new() } else { preview_html },
 		collapsed_duplicates: Vec::new(),
+		following_comments: Vec::new(),
 	})
 }
 
@@ -1020,6 +1022,7 @@ fn parse_user_comment_card(element: ElementRef<'_>, user: &User) -> Option<Post>
 		},
 		permalink: permalink.clone(),
 		parent_kind: "t3".to_string(),
+		link_id: String::new(),
 		link_title: title,
 		link_permalink: permalink,
 		poll: None,
@@ -1043,6 +1046,7 @@ fn parse_user_comment_card(element: ElementRef<'_>, user: &User) -> Option<Post>
 		ws_url: String::new(),
 		preview_body: String::new(),
 		collapsed_duplicates: Vec::new(),
+		following_comments: Vec::new(),
 	})
 }
 
@@ -1424,6 +1428,7 @@ mod tests {
 			},
 			permalink: "/r/rust/comments/demo/example/".to_string(),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: title.to_string(),
 			link_permalink: "/r/rust/comments/demo/example/".to_string(),
 			poll: None,
@@ -1447,6 +1452,7 @@ mod tests {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}
 	}
 }

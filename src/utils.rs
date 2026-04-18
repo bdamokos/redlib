@@ -621,6 +621,23 @@ impl GalleryMedia {
 	}
 }
 
+/// Bundled comment row for `/following` (and similar) aggregate feeds.
+#[derive(Clone, Serialize, PartialEq)]
+pub struct FollowingComment {
+	pub id: String,
+	pub body: String,
+	pub permalink: String,
+	pub created_ts: u64,
+	pub rel_time: String,
+	pub community: String,
+	pub score: (String, String),
+	pub parent_kind: String,
+	pub link_title: String,
+	pub link_permalink: String,
+	pub thread_comments: (String, String),
+	pub thread_nsfw: bool,
+}
+
 /// Post containing content, metadata and media
 #[derive(Serialize, PartialEq)]
 pub struct Post {
@@ -632,6 +649,7 @@ pub struct Post {
 	pub author: Author,
 	pub permalink: String,
 	pub parent_kind: String,
+	pub link_id: String,
 	pub link_title: String,
 	pub link_permalink: String,
 	pub poll: Option<Poll>,
@@ -655,6 +673,7 @@ pub struct Post {
 	pub ws_url: String,
 	pub preview_body: String,
 	pub collapsed_duplicates: Vec<CollapsedDuplicate>,
+	pub following_comments: Vec<FollowingComment>,
 }
 
 #[derive(Clone, Serialize, PartialEq)]
@@ -680,6 +699,7 @@ impl Clone for Post {
 			author: self.author.clone(),
 			permalink: self.permalink.clone(),
 			parent_kind: self.parent_kind.clone(),
+			link_id: self.link_id.clone(),
 			link_title: self.link_title.clone(),
 			link_permalink: self.link_permalink.clone(),
 			poll: self.poll.clone(),
@@ -703,6 +723,7 @@ impl Clone for Post {
 			ws_url: self.ws_url.clone(),
 			preview_body: self.preview_body.clone(),
 			collapsed_duplicates: self.collapsed_duplicates.clone(),
+			following_comments: self.following_comments.clone(),
 		}
 	}
 }
@@ -729,6 +750,7 @@ impl Default for Post {
 			},
 			permalink: String::new(),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None,
@@ -757,6 +779,7 @@ impl Default for Post {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}
 	}
 }
@@ -785,6 +808,13 @@ impl Post {
 			let kind = post["kind"].as_str().unwrap_or_default().to_string();
 			let permalink = val(post, "permalink");
 			let parent_kind = parent_kind(&val(post, "parent_id"));
+			let mut link_id = val(post, "link_id");
+			if link_id.is_empty() && kind == "t1" {
+				let pid = val(post, "parent_id");
+				if pid.starts_with("t3_") {
+					link_id = pid;
+				}
+			}
 			let link_permalink = listing_link_permalink(data["link_permalink"].as_str().unwrap_or_default(), &permalink);
 
 			let (rel_time, created) = time(data["created_utc"].as_f64().unwrap_or_default());
@@ -831,6 +861,7 @@ impl Post {
 				},
 				permalink,
 				parent_kind,
+				link_id,
 				link_title: val(post, "link_title"),
 				link_permalink,
 				poll: Poll::parse(&data["poll_data"]),
@@ -898,6 +929,7 @@ impl Post {
 				out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 				preview_body: String::new(),
 				collapsed_duplicates: Vec::new(),
+				following_comments: Vec::new(),
 			});
 		}
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
@@ -2117,6 +2149,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		},
 		permalink,
 		parent_kind: parent_kind(&val(post, "parent_id")),
+		link_id: val(post, "link_id"),
 		link_title: val(post, "link_title"),
 		link_permalink: listing_link_permalink(post["data"]["link_permalink"].as_str().unwrap_or_default(), &val(post, "permalink")),
 		poll,
@@ -2180,6 +2213,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 		preview_body: String::new(),
 		collapsed_duplicates: Vec::new(),
+		following_comments: Vec::new(),
 	}
 }
 
@@ -2187,7 +2221,7 @@ fn parent_kind(parent_id: &str) -> String {
 	parent_id.split_once('_').map_or(String::new(), |(kind, _)| kind.to_string())
 }
 
-fn listing_link_permalink(link_permalink: &str, permalink: &str) -> String {
+pub(crate) fn listing_link_permalink(link_permalink: &str, permalink: &str) -> String {
 	if link_permalink.starts_with('/') {
 		return link_permalink.to_string();
 	}
@@ -3444,6 +3478,7 @@ mod tests {
 			},
 			permalink: "/r/demo_sub/comments/demo/".to_string(),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None,
@@ -3472,6 +3507,7 @@ mod tests {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}];
 
 		refresh_post_times(&mut posts);
@@ -3520,6 +3556,7 @@ mod tests {
 			},
 			permalink: "/r/demo_sub/comments/demo/".to_string(),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None,
@@ -3553,6 +3590,7 @@ mod tests {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}];
 
 		assert_eq!(posts[0].author.avg_video_length, None);

@@ -82,13 +82,29 @@ impl FeedSort {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FeedSource {
-	Subreddit { name: String, sort: FeedSort },
-	Flair { subreddit: String, flair: String, sort: FeedSort },
+	Subreddit {
+		name: String,
+		sort: FeedSort,
+	},
+	/// `/user/{name}/comments.json` for the same `u_{name}` subscription pseudo-feed.
+	UserComments {
+		name: String,
+		sort: FeedSort,
+	},
+	Flair {
+		subreddit: String,
+		flair: String,
+		sort: FeedSort,
+	},
 }
 
 impl FeedSource {
 	pub fn subreddit(name: impl Into<String>, sort: FeedSort) -> Self {
 		Self::Subreddit { name: name.into(), sort }
+	}
+
+	pub fn user_comments(name: impl Into<String>, sort: FeedSort) -> Self {
+		Self::UserComments { name: name.into(), sort }
 	}
 
 	pub fn flair(subreddit: impl Into<String>, flair: impl Into<String>, sort: FeedSort) -> Self {
@@ -101,13 +117,14 @@ impl FeedSource {
 
 	pub fn sort(&self) -> FeedSort {
 		match self {
-			Self::Subreddit { sort, .. } | Self::Flair { sort, .. } => *sort,
+			Self::Subreddit { sort, .. } | Self::UserComments { sort, .. } | Self::Flair { sort, .. } => *sort,
 		}
 	}
 
 	pub fn display_name(&self) -> String {
 		match self {
 			Self::Subreddit { name, .. } => name.clone(),
+			Self::UserComments { name, .. } => format!("{name} (comments)"),
 			Self::Flair { subreddit, flair, .. } => format!("{subreddit}#{flair}"),
 		}
 	}
@@ -115,6 +132,7 @@ impl FeedSource {
 	fn cache_key(&self) -> String {
 		match self {
 			Self::Subreddit { name, sort } => format!("subreddit:{}:{}", name.to_lowercase(), sort.as_str()),
+			Self::UserComments { name, sort } => format!("user_comments:{}:{}", name.to_lowercase(), sort.as_str()),
 			Self::Flair { subreddit, flair, sort } => {
 				format!("flair:{}:{}:{}", subreddit.to_lowercase(), flair.to_lowercase(), sort.as_str())
 			}
@@ -131,6 +149,11 @@ impl FeedSource {
 					format!("/r/{}/{}.json?limit={PER_SOURCE_LIMIT}&raw_json=1", name.replace('+', "%2B"), sort.as_str())
 				}
 			}
+			Self::UserComments { name, sort } => {
+				let lower = name.to_lowercase();
+				let username = lower.strip_prefix("u_").filter(|rest| !rest.is_empty()).unwrap_or(lower.as_str());
+				format!("/user/{username}/comments.json?sort={}&limit={PER_SOURCE_LIMIT}&raw_json=1", sort.as_str())
+			}
 			Self::Flair { subreddit, sort, .. } => {
 				format!("/r/{}/{}.json?limit={PER_SOURCE_LIMIT}&raw_json=1", subreddit.replace('+', "%2B"), sort.as_str())
 			}
@@ -139,7 +162,7 @@ impl FeedSource {
 
 	fn filter_posts(&self, mut posts: Vec<Post>) -> Vec<Post> {
 		match self {
-			Self::Subreddit { .. } => posts,
+			Self::Subreddit { .. } | Self::UserComments { .. } => posts,
 			Self::Flair { flair, .. } => {
 				let flair = flair.trim().to_string();
 				posts.retain(|post| post.flair.text.trim() == flair);
@@ -285,6 +308,19 @@ pub struct FeedSessionRequest {
 	pub filters: HashSet<String>,
 	pub quarantine: bool,
 	pub query_fingerprint: String,
+	pub bundle_followed_user_comments: bool,
+}
+
+impl Default for FeedSessionRequest {
+	fn default() -> Self {
+		Self {
+			sources: Vec::new(),
+			filters: HashSet::new(),
+			quarantine: false,
+			query_fingerprint: String::new(),
+			bundle_followed_user_comments: false,
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -379,9 +415,8 @@ fn normalize_remembered_feed_name(name: &str) -> Option<String> {
 
 fn normalize_remembered_source(source: &FeedSource) -> Option<FeedSource> {
 	match source {
-		FeedSource::Subreddit { name, sort } if *sort == FeedSort::New => {
-			Some(FeedSource::subreddit(normalize_remembered_feed_name(name)?, FeedSort::New))
-		}
+		FeedSource::UserComments { .. } => None,
+		FeedSource::Subreddit { name, sort } if *sort == FeedSort::New => Some(FeedSource::subreddit(normalize_remembered_feed_name(name)?, FeedSort::New)),
 		FeedSource::Flair { subreddit, flair, sort } if *sort == FeedSort::New => {
 			let subreddit = normalize_plain_subreddit_name(subreddit)?;
 			let flair = flair.trim();
@@ -395,6 +430,7 @@ fn remembered_feed_key_for_source(source: &FeedSource) -> Option<String> {
 	match normalize_remembered_source(source)? {
 		FeedSource::Subreddit { name, .. } => Some(name),
 		FeedSource::Flair { subreddit, flair, .. } => Some(format!("flair:{subreddit}:{}", URL_SAFE_NO_PAD.encode(flair.as_bytes()))),
+		FeedSource::UserComments { .. } => None,
 	}
 }
 
@@ -690,6 +726,7 @@ fn publish_remembered_source_refresh(source: &FeedSource, posts: Vec<Post>, afte
 
 	match &source {
 		FeedSource::Subreddit { name, .. } | FeedSource::Flair { subreddit: name, .. } => crate::utils::store_subreddit_flairs(name, &posts),
+		FeedSource::UserComments { .. } => {}
 	}
 	crate::utils::store_post_flairs(&posts);
 	store_source_posts_with_origin(&source, posts.clone(), after.clone(), Some(refresh_origin));
@@ -1112,8 +1149,10 @@ fn session_is_expired(entry: &FeedSession) -> bool {
 
 fn source_priority(source: &FeedSource) -> (u8, String, String) {
 	match source {
-		FeedSource::Subreddit { name, sort } if name.starts_with("u_") => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new()),
+		FeedSource::Subreddit { name, sort } if name.starts_with("u_") => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), "0".to_string()),
+		FeedSource::UserComments { name, sort } if name.starts_with("u_") => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), "1".to_string()),
 		FeedSource::Subreddit { name, sort } => (1, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new()),
+		FeedSource::UserComments { name, sort } => (1, format!("{}:{}", sort.as_str(), name.to_lowercase()), "1".to_string()),
 		FeedSource::Flair { subreddit, flair, sort } => (2, format!("{}:{}", sort.as_str(), subreddit.to_lowercase()), flair.to_lowercase()),
 	}
 }
@@ -1200,11 +1239,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 	if let Some(key) = remembered_feed_key_for_source(&source) {
 		if !matches!(refresh_origin, RefreshOrigin::DirectLiveFetch) {
 			let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-			if remembered
-				.get(&key)
-				.and_then(|entry| entry.banned_until)
-				.is_some_and(|until| until > Instant::now())
-			{
+			if remembered.get(&key).and_then(|entry| entry.banned_until).is_some_and(|until| until > Instant::now()) {
 				return Err("banned".to_string());
 			}
 		}
@@ -1250,6 +1285,7 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	let mut hasher = DefaultHasher::new();
 	request.quarantine.hash(&mut hasher);
 	request.query_fingerprint.hash(&mut hasher);
+	request.bundle_followed_user_comments.hash(&mut hasher);
 
 	let mut filter_values = request.filters.iter().cloned().collect::<Vec<_>>();
 	filter_values.sort();
@@ -1407,17 +1443,33 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 		}
 	}
 
-	collapse_duplicate_submissions(all_posts)
+	let mut merged = if session.request.bundle_followed_user_comments {
+		crate::user::bundle_followed_user_comments(all_posts)
+	} else {
+		all_posts
+	};
+	merged = collapse_duplicate_submissions(merged);
+	if session.request.bundle_followed_user_comments {
+		let listing_sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
+		if listing_sort == FeedSort::New {
+			merged.sort_by(|a, b| crate::user::post_feed_activity_ts(b).cmp(&crate::user::post_feed_activity_ts(a)));
+		}
+	}
+	merged
 }
 
 fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> bool {
 	posts.len() >= ((page + 1) * per_page) || session.background_complete || session.frozen_pages.contains_key(&page)
 }
 
-fn finalize_page_posts(sort: FeedSort, mut posts: Vec<Post>) -> Vec<Post> {
+fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, mut posts: Vec<Post>) -> Vec<Post> {
 	match sort {
 		FeedSort::New => {
-			posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+			if bundle_activity_sort {
+				posts.sort_by(|a, b| crate::user::post_feed_activity_ts(b).cmp(&crate::user::post_feed_activity_ts(a)));
+			} else {
+				posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+			}
 			posts
 		}
 		FeedSort::Hot => posts,
@@ -1435,13 +1487,19 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 	let total_user_sources = session
 		.sources
 		.iter()
-		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name, .. } if name.starts_with("u_")))
+		.filter(|entry| {
+			matches!(&entry.source, FeedSource::Subreddit { name, .. } if name.starts_with("u_"))
+				|| matches!(&entry.source, FeedSource::UserComments { name, .. } if name.starts_with("u_"))
+		})
 		.count();
 	let ready_user_sources = session
 		.sources
 		.iter()
 		.filter(|entry| entry.state == SessionSourceState::Ready)
-		.filter(|entry| matches!(&entry.source, FeedSource::Subreddit { name, .. } if name.starts_with("u_")))
+		.filter(|entry| {
+			matches!(&entry.source, FeedSource::Subreddit { name, .. } if name.starts_with("u_"))
+				|| matches!(&entry.source, FeedSource::UserComments { name, .. } if name.starts_with("u_"))
+		})
 		.count();
 	let current_page_ready = current_page_is_ready(session, posts, page, per_page);
 	let next_page_ready = posts.len() >= ((page + 2) * per_page);
@@ -1954,6 +2012,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	let merged_len = merged_posts.len();
 	let page_ready = current_page_is_ready(session, &merged_posts, page, per_page);
 	let sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
+	let bundle_activity = session.request.bundle_followed_user_comments;
 	let posts = if let Some(frozen_posts) = session.frozen_pages.get(&page) {
 		frozen_posts.clone()
 	} else {
@@ -1961,7 +2020,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 			let start = page * per_page;
 			let end = (start + per_page).min(merged_posts.len());
 			let frozen = if start < merged_posts.len() {
-				finalize_page_posts(sort, merged_posts[start..end].to_vec())
+				finalize_page_posts(sort, bundle_activity, merged_posts[start..end].to_vec())
 			} else {
 				Vec::new()
 			};
@@ -1971,7 +2030,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 			let start = page * per_page;
 			let end = (start + per_page).min(merged_posts.len());
 			if start < merged_posts.len() {
-				finalize_page_posts(sort, merged_posts[start..end].to_vec())
+				finalize_page_posts(sort, bundle_activity, merged_posts[start..end].to_vec())
 			} else {
 				Vec::new()
 			}
@@ -2049,6 +2108,9 @@ pub fn cache_stats() -> (usize, usize) {
 		if let Some(name) = key.strip_prefix("subreddit:") {
 			let (name, sort) = name.rsplit_once(':').map_or((name, FeedSort::New), |(name, sort)| (name, FeedSort::from_listing(sort)));
 			Some(FeedSource::subreddit(name.to_string(), sort))
+		} else if let Some(name) = key.strip_prefix("user_comments:") {
+			let (name, sort) = name.rsplit_once(':').map_or((name, FeedSort::New), |(name, sort)| (name, FeedSort::from_listing(sort)));
+			Some(FeedSource::user_comments(name.to_string(), sort))
 		} else if let Some(rest) = key.strip_prefix("flair:") {
 			let mut parts = rest.splitn(3, ':');
 			let subreddit = parts.next().unwrap_or_default().to_string();
@@ -2192,6 +2254,7 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			display_name: source.display_name(),
 			source_type: match &source {
 				FeedSource::Subreddit { name, .. } if name.to_lowercase().starts_with("u_") => "user".to_string(),
+				FeedSource::UserComments { .. } => "user_comments".to_string(),
 				FeedSource::Subreddit { .. } => "subreddit".to_string(),
 				FeedSource::Flair { .. } => "flair".to_string(),
 			},
@@ -2245,6 +2308,7 @@ mod tests {
 		POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
+	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 	use std::cmp::Ordering;
 	use std::collections::{HashMap, HashSet};
 	use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -2253,14 +2317,14 @@ mod tests {
 	static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 	fn test_lock() -> MutexGuard<'static, ()> {
-		TEST_LOCK.lock().unwrap()
+		TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner())
 	}
 
 	fn reset_test_caches() {
-		SOURCE_CACHE.lock().unwrap().clear();
-		FEED_SESSIONS.lock().unwrap().clear();
-		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
-		ACTIVE_BROWSER_SESSIONS.lock().unwrap().clear();
+		SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		ACTIVE_BROWSER_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		crate::utils::clear_test_caches();
 		crate::user::clear_test_caches();
 	}
@@ -2335,6 +2399,7 @@ mod tests {
 			},
 			permalink: format!("/r/{community}/comments/{id}/"),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None,
@@ -2358,6 +2423,7 @@ mod tests {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}
 	}
 
@@ -2410,6 +2476,9 @@ mod tests {
 		assert_eq!(source_hot.build_path(), "/r/rust/hot.json?limit=40&raw_json=1");
 		assert_eq!(user_new.build_path(), "/user/someone/submitted.json?sort=new&limit=40&raw_json=1");
 		assert_eq!(user_mixed.build_path(), "/user/someone/submitted.json?sort=new&limit=40&raw_json=1");
+		let uc = FeedSource::user_comments("u_someone", FeedSort::New);
+		assert_eq!(uc.cache_key(), "user_comments:u_someone:new");
+		assert_eq!(uc.build_path(), "/user/someone/comments.json?sort=new&limit=40&raw_json=1");
 	}
 
 	#[test]
@@ -2419,12 +2488,14 @@ mod tests {
 			filters: HashSet::new(),
 			quarantine: false,
 			query_fingerprint: "sort=new".to_string(),
+			..Default::default()
 		};
 		let request_hot = FeedSessionRequest {
 			sources: vec![hot_source("rust")],
 			filters: HashSet::new(),
 			quarantine: false,
 			query_fingerprint: "sort=hot".to_string(),
+			..Default::default()
 		};
 
 		assert_ne!(build_session_id(&request_new), build_session_id(&request_hot));
@@ -2456,6 +2527,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "sort=hot".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(left, SessionSourceState::Ready),
@@ -2472,6 +2544,53 @@ mod tests {
 
 		let ids = merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
 		assert_eq!(ids, vec!["top", "mid", "low"]);
+	}
+
+	#[test]
+	fn merged_following_feed_bundles_t1_under_t3() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let mut submission = test_post("abc", "rust", 200);
+		submission.media.url = "https://i.redd.it/x.jpg".to_string();
+		submission.post_type = "image".to_string();
+
+		let mut comment = test_post("c1", "rust", 100);
+		comment.kind = "t1".to_string();
+		comment.post_type = "comment".to_string();
+		comment.link_id = "t3_abc".to_string();
+		comment.body = "<div class=\"md\"><p>hi</p></div>".to_string();
+		comment.id = "c1".to_string();
+
+		let submitted = FeedSource::subreddit("u_followed".to_string(), FeedSort::New);
+		let comments = FeedSource::user_comments("u_followed".to_string(), FeedSort::New);
+		seed_source(&submitted, vec![submission]);
+		seed_source(&comments, vec![comment]);
+
+		let session = FeedSession {
+			id: "bundle-merged".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![submitted.clone(), comments.clone()],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "bundle".to_string(),
+				bundle_followed_user_comments: true,
+				..Default::default()
+			},
+			sources: vec![session_entry(submitted, SessionSourceState::Ready), session_entry(comments, SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let merged = merged_posts_for_session(&session);
+		assert!(merged.iter().all(|post| post.kind != "t1"));
+		let primary = merged.iter().find(|post| post.id == "abc").expect("t3 row");
+		assert_eq!(primary.following_comments.len(), 1);
+		assert_eq!(primary.following_comments[0].id, "c1");
 	}
 
 	#[test]
@@ -2550,9 +2669,10 @@ mod tests {
 
 		remember_frontpage_subreddits(&test_prefs_with_saved_feeds());
 
-		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let programming_flair_key = format!("flair:programming:{}", URL_SAFE_NO_PAD.encode("News".as_bytes()));
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 		assert!(remembered.contains_key("rust"));
-		assert!(remembered.contains_key("programming"));
+		assert!(remembered.contains_key(&programming_flair_key));
 		assert!(remembered.contains_key("u_demo"));
 		assert_eq!(remembered.len(), 3);
 	}
@@ -2859,6 +2979,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(fresh_source, SessionSourceState::Ready),
@@ -2890,6 +3011,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(new_source("u_demo"), SessionSourceState::Unstarted),
@@ -2925,6 +3047,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![session_entry(rust_source, SessionSourceState::Ready)],
 			frozen_pages: HashMap::new(),
@@ -2962,6 +3085,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: (0..120)
 				.map(|index| session_entry(new_source(&format!("subreddit{index}")), SessionSourceState::Unstarted))
@@ -2988,6 +3112,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: (0..40)
 				.map(|index| {
@@ -3020,6 +3145,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: (0..32)
 				.map(|index| {
@@ -3057,6 +3183,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: (0..30)
 				.map(|index| {
@@ -3097,6 +3224,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: (0..20)
 				.map(|index| {
@@ -3136,6 +3264,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: (0..200)
 				.map(|index| {
@@ -3172,6 +3301,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(fresh_source, SessionSourceState::Ready),
@@ -3204,6 +3334,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![session_entry(rust_source, SessionSourceState::Ready)],
 			frozen_pages: HashMap::new(),
@@ -3233,6 +3364,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(ready_source, SessionSourceState::Ready),
@@ -3270,6 +3402,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: (0..40)
 				.map(|index| {
@@ -3333,6 +3466,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(new_source("older_refreshed"), SessionSourceState::Unstarted),
@@ -3362,6 +3496,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(new_flair_source("rust", "News"), SessionSourceState::Unstarted),
@@ -3396,6 +3531,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![session_entry(freshest, SessionSourceState::Ready), session_entry(duplicate, SessionSourceState::Ready)],
 			frozen_pages: HashMap::new(),
@@ -3434,6 +3570,7 @@ mod tests {
 					filters: HashSet::new(),
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
+					..Default::default()
 				},
 				sources: vec![
 					session_entry(older_source.clone(), SessionSourceState::Ready),
@@ -3482,6 +3619,7 @@ mod tests {
 					filters: HashSet::new(),
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
+					..Default::default()
 				},
 				sources: vec![session_entry(source_a, SessionSourceState::Ready), session_entry(source_b, SessionSourceState::Ready)],
 				frozen_pages: HashMap::new(),
@@ -3516,6 +3654,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "demo".to_string(),
+				..Default::default()
 			},
 			sources: vec![
 				session_entry(rust_source, SessionSourceState::Unstarted),
@@ -3555,6 +3694,7 @@ mod tests {
 					filters: HashSet::new(),
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
+					..Default::default()
 				},
 				sources: vec![
 					session_entry(rust_source, SessionSourceState::Unstarted),
@@ -3595,6 +3735,7 @@ mod tests {
 					filters: HashSet::new(),
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
+					..Default::default()
 				},
 				sources: vec![session_entry(rust_source, SessionSourceState::Unstarted)],
 				frozen_pages: HashMap::new(),

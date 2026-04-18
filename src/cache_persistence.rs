@@ -129,6 +129,22 @@ pub(crate) struct PersistedCollapsedDuplicate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedFollowingComment {
+	pub id: String,
+	pub body: String,
+	pub permalink: String,
+	pub created_ts: u64,
+	pub rel_time: String,
+	pub community: String,
+	pub score: (String, String),
+	pub parent_kind: String,
+	pub link_title: String,
+	pub link_permalink: String,
+	pub thread_comments: (String, String),
+	pub thread_nsfw: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedPost {
 	pub id: String,
 	pub kind: String,
@@ -138,6 +154,8 @@ pub(crate) struct PersistedPost {
 	pub author: PersistedAuthor,
 	pub permalink: String,
 	pub parent_kind: String,
+	#[serde(default)]
+	pub link_id: String,
 	pub link_title: String,
 	pub link_permalink: String,
 	pub poll: Option<PersistedPoll>,
@@ -161,6 +179,8 @@ pub(crate) struct PersistedPost {
 	pub ws_url: String,
 	pub preview_body: String,
 	pub collapsed_duplicates: Vec<PersistedCollapsedDuplicate>,
+	#[serde(default)]
+	pub following_comments: Vec<PersistedFollowingComment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -632,6 +652,42 @@ impl PersistedAward {
 	}
 }
 
+impl PersistedFollowingComment {
+	pub(crate) fn from_runtime(value: &utils::FollowingComment) -> Self {
+		Self {
+			id: value.id.clone(),
+			body: value.body.clone(),
+			permalink: value.permalink.clone(),
+			created_ts: value.created_ts,
+			rel_time: value.rel_time.clone(),
+			community: value.community.clone(),
+			score: value.score.clone(),
+			parent_kind: value.parent_kind.clone(),
+			link_title: value.link_title.clone(),
+			link_permalink: value.link_permalink.clone(),
+			thread_comments: value.thread_comments.clone(),
+			thread_nsfw: value.thread_nsfw,
+		}
+	}
+
+	pub(crate) fn into_runtime(self) -> utils::FollowingComment {
+		utils::FollowingComment {
+			id: self.id,
+			body: self.body,
+			permalink: self.permalink,
+			created_ts: self.created_ts,
+			rel_time: self.rel_time,
+			community: self.community,
+			score: self.score,
+			parent_kind: self.parent_kind,
+			link_title: self.link_title,
+			link_permalink: self.link_permalink,
+			thread_comments: self.thread_comments,
+			thread_nsfw: self.thread_nsfw,
+		}
+	}
+}
+
 impl PersistedCollapsedDuplicate {
 	pub(crate) fn from_runtime(value: &utils::CollapsedDuplicate) -> Self {
 		Self {
@@ -671,6 +727,7 @@ impl PersistedPost {
 			author: PersistedAuthor::from_runtime(&value.author),
 			permalink: value.permalink.clone(),
 			parent_kind: value.parent_kind.clone(),
+			link_id: value.link_id.clone(),
 			link_title: value.link_title.clone(),
 			link_permalink: value.link_permalink.clone(),
 			poll: value.poll.as_ref().map(PersistedPoll::from_runtime),
@@ -694,6 +751,7 @@ impl PersistedPost {
 			ws_url: value.ws_url.clone(),
 			preview_body: value.preview_body.clone(),
 			collapsed_duplicates: value.collapsed_duplicates.iter().map(PersistedCollapsedDuplicate::from_runtime).collect(),
+			following_comments: value.following_comments.iter().map(PersistedFollowingComment::from_runtime).collect(),
 		}
 	}
 
@@ -707,6 +765,7 @@ impl PersistedPost {
 			author: self.author.into_runtime(),
 			permalink: self.permalink,
 			parent_kind: self.parent_kind,
+			link_id: self.link_id,
 			link_title: self.link_title,
 			link_permalink: self.link_permalink,
 			poll: self.poll.map(PersistedPoll::into_runtime),
@@ -730,6 +789,7 @@ impl PersistedPost {
 			ws_url: self.ws_url,
 			preview_body: self.preview_body,
 			collapsed_duplicates: self.collapsed_duplicates.into_iter().map(PersistedCollapsedDuplicate::into_runtime).collect(),
+			following_comments: self.following_comments.into_iter().map(PersistedFollowingComment::into_runtime).collect(),
 		}
 	}
 }

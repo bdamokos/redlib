@@ -1530,6 +1530,7 @@ mod tests {
 			},
 			permalink: format!("/r/demo/comments/{id}/"),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None,
@@ -1563,6 +1564,7 @@ mod tests {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}
 	}
 

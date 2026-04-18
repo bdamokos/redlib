@@ -157,7 +157,7 @@ struct SubredditFragmentTemplate {
 
 crate::impl_template_str_eq!(SubredditFragmentTemplate);
 
-const CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET: usize = 8;
+const CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET: usize = 24;
 
 #[derive(Template)]
 #[template(path = "feed_fragment.html")]
@@ -1153,7 +1153,12 @@ fn build_front_page_session_sources(
 	let mut sources = if front_page_is_default && has_saved_feeds {
 		build_feed_sources(preferences, listing_sort)
 	} else if is_following_front_page(front_page) && has_saved_feeds {
-		build_subscription_sources(&followed_user_subscriptions(preferences), listing_sort)
+		let mut sources = Vec::new();
+		for name in followed_user_subscriptions(preferences) {
+			sources.push(FeedSource::subreddit(name.clone(), listing_sort));
+			sources.push(FeedSource::user_comments(name, listing_sort));
+		}
+		sources
 	} else if sub_name.is_empty() {
 		Vec::new()
 	} else {
@@ -1185,6 +1190,8 @@ async fn live_feed_shell_loading_message(
 			filters,
 			quarantine: true,
 			query_fingerprint: listing_query_fingerprint(&query),
+			bundle_followed_user_comments: is_following_front_page(front_page),
+			..Default::default()
 		},
 		cache_page,
 		crate::post_cache::POSTS_PER_PAGE,
@@ -1763,6 +1770,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				filters: get_filters(&req),
 				quarantine: true,
 				query_fingerprint,
+				bundle_followed_user_comments: is_following_front_page(&front_page),
+				..Default::default()
 			},
 			cache_page,
 			crate::post_cache::POSTS_PER_PAGE,
@@ -2236,6 +2245,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				filters: filters.clone(),
 				quarantine: quarantined,
 				query_fingerprint,
+				bundle_followed_user_comments: is_following_front_page(&front_page),
+				..Default::default()
 			},
 			cache_page,
 			crate::post_cache::POSTS_PER_PAGE,
@@ -2770,6 +2781,7 @@ mod tests {
 			},
 			permalink: "/r/demo_sub/comments/demo/".to_string(),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None,
@@ -2796,6 +2808,7 @@ mod tests {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}
 	}
 
@@ -2820,6 +2833,7 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: fingerprint.to_string(),
+				..Default::default()
 			},
 			0,
 			post_cache::POSTS_PER_PAGE,

@@ -416,6 +416,7 @@ mod tests {
 			},
 			permalink: format!("/r/{subreddit}/comments/{id}/"),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None::<Poll>,
@@ -444,6 +445,7 @@ mod tests {
 			out_url: None,
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}
 	}
 

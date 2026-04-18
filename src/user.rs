@@ -5,7 +5,7 @@ use crate::client::json;
 use crate::instance_scrape;
 use crate::redgifs;
 use crate::server::RequestExt;
-use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
+use crate::utils::{error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, FollowingComment, Post, Preferences, User};
 use crate::{config, utils, video_mode};
 use askama::Template;
 use chrono::DateTime;
@@ -125,6 +125,107 @@ struct UserSubredditEntry {
 	count: u32,
 }
 
+fn link_post_id_from_listing(post: &Post) -> Option<String> {
+	let lid = post.link_id.trim();
+	lid.strip_prefix("t3_").map(|id| id.to_string())
+}
+
+pub(crate) fn following_comment_from_listing_post(post: Post) -> FollowingComment {
+	FollowingComment {
+		id: post.id,
+		body: post.body,
+		permalink: post.permalink,
+		created_ts: post.created_ts,
+		rel_time: post.rel_time,
+		community: post.community,
+		score: post.score,
+		parent_kind: post.parent_kind,
+		link_title: post.link_title,
+		link_permalink: post.link_permalink,
+		thread_comments: post.comments,
+		thread_nsfw: post.flags.nsfw,
+	}
+}
+
+pub(crate) fn dedupe_and_sort_following_comments(comments: &mut Vec<FollowingComment>) {
+	let mut seen = HashSet::new();
+	comments.retain(|c| seen.insert(c.id.clone()));
+	comments.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
+}
+
+pub(crate) fn merge_following_comments_into(primary: &mut Post, mut extra: Vec<FollowingComment>) {
+	if extra.is_empty() {
+		return;
+	}
+	primary.following_comments.append(&mut extra);
+	dedupe_and_sort_following_comments(&mut primary.following_comments);
+}
+
+pub fn post_feed_activity_ts(post: &Post) -> u64 {
+	let mut ts = post.created_ts;
+	for c in &post.following_comments {
+		ts = ts.max(c.created_ts);
+	}
+	ts
+}
+
+fn synthetic_post_from_orphan_bundle(post_id: String, mut comments: Vec<FollowingComment>) -> Option<Post> {
+	if comments.is_empty() {
+		return None;
+	}
+	dedupe_and_sort_following_comments(&mut comments);
+	let first = comments.first()?;
+	let nsfw = first.thread_nsfw;
+	let mut post = Post::default();
+	post.id = post_id;
+	post.kind = "t3".into();
+	post.title = first.link_title.clone();
+	post.community = first.community.clone();
+	post.permalink = crate::utils::listing_link_permalink(&first.link_permalink, &first.permalink);
+	post.link_permalink = first.link_permalink.clone();
+	post.link_title = first.link_title.clone();
+	post.comments = first.thread_comments.clone();
+	post.nsfw = nsfw;
+	post.flags.nsfw = nsfw;
+	post.flags.nsfw_str = if nsfw { "true" } else { "false" }.into();
+	post.following_comments = comments;
+	Some(post)
+}
+
+pub(crate) fn bundle_followed_user_comments(posts: Vec<Post>) -> Vec<Post> {
+	let mut comment_rows: Vec<Post> = Vec::new();
+	let mut t3_rows: Vec<Post> = Vec::new();
+	for p in posts {
+		if p.kind == "t1" && p.post_type == "comment" {
+			comment_rows.push(p);
+		} else {
+			t3_rows.push(p);
+		}
+	}
+	let mut by_post: HashMap<String, Vec<FollowingComment>> = HashMap::new();
+	for c in comment_rows {
+		let Some(pid) = link_post_id_from_listing(&c) else {
+			continue;
+		};
+		by_post.entry(pid).or_default().push(following_comment_from_listing_post(c));
+	}
+	for v in by_post.values_mut() {
+		dedupe_and_sort_following_comments(v);
+	}
+	for post in &mut t3_rows {
+		if let Some(list) = by_post.remove(&post.id) {
+			post.following_comments = list;
+		}
+	}
+	let mut out = t3_rows;
+	for (pid, comments) in by_post {
+		if let Some(synth) = synthetic_post_from_orphan_bundle(pid, comments) {
+			out.push(synth);
+		}
+	}
+	out
+}
+
 pub(crate) fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
 	let mut collapsed: Vec<Post> = Vec::new();
 	let mut seen = HashMap::new();
@@ -140,7 +241,9 @@ pub(crate) fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
 			if primary.body.is_empty() && primary.preview_body.is_empty() && !post.body.is_empty() {
 				primary.preview_body = post.body.clone();
 			}
-			primary.collapsed_duplicates.push(collapsed_duplicate(post));
+			let mut merged = post;
+			merge_following_comments_into(primary, std::mem::take(&mut merged.following_comments));
+			primary.collapsed_duplicates.push(collapsed_duplicate(merged));
 			continue;
 		}
 
@@ -737,7 +840,7 @@ mod tests {
 	use askama::Template;
 	use url::form_urlencoded;
 
-	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, Media, Post, Preferences};
+	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, FollowingComment, Media, Post, Preferences};
 
 	fn test_post(id: &str, title: &str, community: &str, body: &str, post_type: &str, media_url: &str, gallery_urls: &[&str]) -> Post {
 		Post {
@@ -760,6 +863,7 @@ mod tests {
 			},
 			permalink: format!("/r/{community}/comments/{id}/"),
 			parent_kind: String::new(),
+			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
 			poll: None,
@@ -805,6 +909,7 @@ mod tests {
 			ws_url: String::new(),
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
 		}
 	}
 
@@ -857,6 +962,44 @@ mod tests {
 		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
 		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "Second title");
 		assert_eq!(collapsed[0].collapsed_duplicates[0].display_community, "r/sub_two");
+	}
+
+	#[test]
+	fn collapse_merges_following_comments_for_duplicate_media() {
+		let mut a = test_post("one", "A", "s1", "", "image", "https://i.redd.it/x.jpg", &[]);
+		a.following_comments.push(FollowingComment {
+			id: "c1".to_string(),
+			body: String::new(),
+			permalink: String::new(),
+			created_ts: 1,
+			rel_time: String::new(),
+			community: "s1".to_string(),
+			score: ("1".to_string(), "1".to_string()),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			thread_comments: ("0".to_string(), "0".to_string()),
+			thread_nsfw: false,
+		});
+		let mut b = test_post("two", "B", "s2", "", "image", "https://i.redd.it/x.jpg?w=1", &[]);
+		b.following_comments.push(FollowingComment {
+			id: "c2".to_string(),
+			body: String::new(),
+			permalink: String::new(),
+			created_ts: 2,
+			rel_time: String::new(),
+			community: "s2".to_string(),
+			score: ("1".to_string(), "1".to_string()),
+			parent_kind: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			thread_comments: ("0".to_string(), "0".to_string()),
+			thread_nsfw: false,
+		});
+		let collapsed = collapse_duplicate_submissions(vec![a, b]);
+		assert_eq!(collapsed.len(), 1);
+		let ids: Vec<_> = collapsed[0].following_comments.iter().map(|c| c.id.as_str()).collect();
+		assert!(ids.contains(&"c1") && ids.contains(&"c2"));
 	}
 
 	#[test]
