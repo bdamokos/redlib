@@ -13,6 +13,7 @@ services:
       - ALL
     env_file: .env
     environment:
+      REDLIB_DEPLOY_GIT_HASH: "${REDLIB_DEPLOY_GIT_HASH:-}"
       REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT: "${REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT:-3}"
       REDLIB_CACHE_DIR: "${REDLIB_CACHE_DIR:-/var/lib/redlib/cache}"
     volumes:

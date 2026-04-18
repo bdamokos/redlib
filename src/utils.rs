@@ -495,6 +495,32 @@ pub fn normalize_creator_identity_slug(raw: &str) -> String {
 	raw.trim().trim_start_matches('@').to_lowercase()
 }
 
+/// Lowercase letters and digits only — for matching across punctuation, spaces, and casing.
+pub fn creator_identity_fingerprint(raw: &str) -> String {
+	raw.to_lowercase().chars().filter(|ch| ch.is_alphanumeric()).collect()
+}
+
+/// Whether the RedGifs uploader is likely the same person as the Reddit author: same fingerprint as
+/// Reddit name or as any supported profile URL slug on the author's links.
+pub fn redgifs_uploader_matches_author(redgifs_username: &str, reddit_author: &str, profile_links: &[ExternalLink]) -> bool {
+	let g = creator_identity_fingerprint(redgifs_username);
+	if g.is_empty() {
+		return false;
+	}
+	let r = creator_identity_fingerprint(reddit_author);
+	if !r.is_empty() && g == r {
+		return true;
+	}
+	for link in profile_links {
+		if let Some(slug) = creator_identity_slug_from_profile_url(&link.url) {
+			if g == creator_identity_fingerprint(&slug) {
+				return true;
+			}
+		}
+	}
+	false
+}
+
 /// Returns the primary creator handle from supported profile URLs (Fansly, OnlyFans, etc.).
 pub fn creator_identity_slug_from_profile_url(raw_url: &str) -> Option<String> {
 	let trimmed = raw_url.trim();
@@ -787,7 +813,7 @@ impl Post {
 					},
 					distinguished: val(post, "distinguished"),
 					external_links: Vec::new(),
-					avg_video_length: crate::user::cached_avg_video_length(&val(post, "author"), &[]),
+					avg_video_length: crate::user::cached_avg_video_length(&val(post, "author")),
 				},
 				permalink,
 				parent_kind,
@@ -868,7 +894,7 @@ impl Post {
 		if self.media.redgifs_username.is_empty() {
 			return "";
 		}
-		if normalize_creator_identity_slug(&self.media.redgifs_username) == normalize_creator_identity_slug(&self.author.name) {
+		if redgifs_uploader_matches_author(&self.media.redgifs_username, &self.author.name, &self.author.external_links) {
 			"redgifs_uploader redgifs_uploader_match"
 		} else {
 			"redgifs_uploader redgifs_uploader_mismatch"
@@ -1130,8 +1156,7 @@ pub fn cached_author_external_links(name: &str) -> Vec<ExternalLink> {
 pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
 	for post in posts.iter_mut() {
 		post.author.external_links = cached_author_external_links(&post.author.name);
-		post.author.avg_video_length =
-			crate::user::cached_avg_video_length(&post.author.name, &post.author.external_links);
+		post.author.avg_video_length = crate::user::cached_avg_video_length(&post.author.name);
 	}
 }
 
@@ -2057,7 +2082,7 @@ pub async fn parse_post(post: &Value) -> Post {
 				},
 				distinguished: val(post, "distinguished"),
 				external_links: links.clone(),
-				avg_video_length: crate::user::cached_avg_video_length(&val(post, "author"), &links),
+				avg_video_length: crate::user::cached_avg_video_length(&val(post, "author")),
 			}
 		},
 		permalink,
@@ -3315,8 +3340,8 @@ mod tests {
 	use super::{
 		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
 		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
-		hydrate_post_author_links_from_cache, read_sharded_cookie, refresh_post_times, rewrite_urls, time, user_profile_details, write_sharded_cookie, Author, Awards,
-		ExternalLink, Flags, Flair, FlairSubscription, Media, Post, Preferences,
+		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, rewrite_urls, time, user_profile_details,
+		write_sharded_cookie, Author, Awards, ExternalLink, Flags, Flair, FlairSubscription, Media, Post, Preferences,
 	};
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
@@ -3325,6 +3350,36 @@ mod tests {
 
 	async fn always_exists(_: String) -> bool {
 		true
+	}
+
+	#[test]
+	fn redgifs_uploader_matches_reddit_ignoring_punctuation_and_case() {
+		assert!(redgifs_uploader_matches_author("Foo_Bar", "foo-bar", &[]));
+		assert!(redgifs_uploader_matches_author("  Alice  ", "@alice", &[]));
+	}
+
+	#[test]
+	fn redgifs_uploader_matches_profile_slug_when_reddit_name_differs() {
+		let links = vec![ExternalLink {
+			label: "OF".to_string(),
+			url: "https://onlyfans.com/myrealname".to_string(),
+			host: "onlyfans.com".to_string(),
+			icon_path: "/icon/of".to_string(),
+			has_coomer: false,
+		}];
+		assert!(redgifs_uploader_matches_author("my-real-name", "otherreddit", &links));
+	}
+
+	#[test]
+	fn redgifs_uploader_mismatch_when_no_overlap() {
+		let links = vec![ExternalLink {
+			label: "OF".to_string(),
+			url: "https://onlyfans.com/alice".to_string(),
+			host: "onlyfans.com".to_string(),
+			icon_path: "/icon/of".to_string(),
+			has_coomer: false,
+		}];
+		assert!(!redgifs_uploader_matches_author("bob", "charlie", &links));
 	}
 
 	#[test]
