@@ -48,7 +48,8 @@
 		{% if !str_eq(prefs.layout, "") %}{{ prefs.layout }}{% endif %}
 		{% if str_eq(prefs.wide, "on") %} wide{% endif %}
 		{% if !str_eq(prefs.theme, "system") %} {{ prefs.theme }}{% endif %}
-		{% if str_eq(prefs.fixed_navbar, "on") %} fixed_navbar{% endif %}">
+		{% if str_eq(prefs.fixed_navbar, "on") %} fixed_navbar{% endif %}
+		{% if url == "/following" || url.starts_with("/following?") || url.starts_with("/following/") %} following_feed{% endif %}">
 		<!-- NAVIGATION BAR -->
 		<nav class="
 			{% if str_eq(prefs.fixed_navbar, "on") %} fixed_navbar{% endif %}">

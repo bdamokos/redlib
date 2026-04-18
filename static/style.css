@@ -1479,6 +1479,15 @@ a.search_subreddit_link:hover {
     font-weight: bold;
 }
 
+/* Following feed: emphasize author (why the post surfaced), not subreddit */
+body.following_feed .post_subreddit {
+    font-weight: normal;
+}
+
+body.following_feed .post_author {
+    font-weight: bold;
+}
+
 .inline_subscription_form {
     display: inline;
     margin-left: 4px;
