@@ -1814,6 +1814,11 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let sort = param(&path, "sort").unwrap_or_default();
 	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
 	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
+	if video_listing
+		|| (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty())
+	{
+		crate::post_cache::remember_subreddit_request(&format!("u_{username}"));
+	}
 	let cached_listing_page = cached_user_listing_posts(&username, &listing, &sort, query);
 	let pre_scraped = if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
 		info!("user: using scrape fallback for {} because Reddit is currently rate limited", current_url);
