@@ -167,6 +167,61 @@ pub fn page_and_record_seen(session_id: &str, hide_seen: bool, posts: &[Post], p
 	(page_posts, has_more_unseen)
 }
 
+/// Hide-seen mode for contextual aggregate **page 0** after the listing is sealed: prefer unseen
+/// posts in `sealed_posts` order (stable first paint), then fill remaining slots from
+/// `merged_posts` in merge order. Records only returned posts as seen.
+pub fn page_and_record_seen_contextual_first_page(
+	session_id: &str,
+	sealed_posts: &[Post],
+	merged_posts: &[Post],
+	per_page: usize,
+) -> (Vec<Post>, bool) {
+	if session_id.trim().is_empty() || per_page == 0 {
+		return (Vec::new(), false);
+	}
+
+	let mut map = SEEN_BY_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+	prune_seen_locked(&mut map);
+	let seen_before: HashSet<String> = map.get(session_id).map(|s| s.ids.clone()).unwrap_or_default();
+
+	let mut picked_ids: HashSet<String> = HashSet::new();
+	let mut page_posts: Vec<Post> = Vec::new();
+
+	for post in sealed_posts {
+		if page_posts.len() >= per_page {
+			break;
+		}
+		if seen_before.contains(&post.id) || picked_ids.contains(&post.id) {
+			continue;
+		}
+		picked_ids.insert(post.id.clone());
+		page_posts.push(post.clone());
+	}
+
+	for post in merged_posts {
+		if page_posts.len() >= per_page {
+			break;
+		}
+		if seen_before.contains(&post.id) || picked_ids.contains(&post.id) {
+			continue;
+		}
+		picked_ids.insert(post.id.clone());
+		page_posts.push(post.clone());
+	}
+
+	let page_ids: Vec<String> = page_posts.iter().map(|p| p.id.clone()).collect();
+	let entry = map.entry(session_id.to_string()).or_insert(SeenState {
+		ids: HashSet::new(),
+		last_touch: Instant::now(),
+	});
+	entry.ids.extend(page_ids);
+	entry.last_touch = Instant::now();
+	let seen_after = &entry.ids;
+	let has_next = merged_posts.iter().any(|p| !seen_after.contains(&p.id));
+
+	(page_posts, has_next)
+}
+
 pub fn ensure_rl_session_id(req: &Request<Body>) -> (String, bool) {
 	if let Some(c) = req.cookie(RL_SESSION_COOKIE) {
 		let v = c.value().trim();
@@ -314,5 +369,25 @@ mod tests {
 		assert!(public_page_is_feed_seen_scope("/following"));
 		assert!(public_page_is_feed_seen_scope("/following/new"));
 		assert!(!public_page_is_feed_seen_scope("/r/rust"));
+	}
+
+	#[test]
+	fn contextual_first_page_hide_seen_prefers_sealed_order_then_merge() {
+		let sid = "ctx-first-page-sealed-order";
+		let sealed = vec![dummy_post("b"), dummy_post("a")];
+		let merged = vec![dummy_post("a"), dummy_post("b"), dummy_post("c")];
+		let (page, has_next) = page_and_record_seen_contextual_first_page(sid, &sealed, &merged, 2);
+		assert_eq!(page.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["b", "a"]);
+		assert!(has_next);
+	}
+
+	#[test]
+	fn contextual_first_page_hide_seen_skips_seen_in_sealed_then_fills_from_merge() {
+		let sid = "ctx-first-page-skip-seen";
+		record_seen(sid, &[dummy_post("b")]);
+		let sealed = vec![dummy_post("b"), dummy_post("a")];
+		let merged = vec![dummy_post("a"), dummy_post("b"), dummy_post("c")];
+		let (page, _) = page_and_record_seen_contextual_first_page(sid, &sealed, &merged, 2);
+		assert_eq!(page.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["a", "c"]);
 	}
 }
