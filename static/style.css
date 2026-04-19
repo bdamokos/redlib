@@ -1511,6 +1511,10 @@ body.following_feed .post_author {
     opacity: 1;
 }
 
+.inline_bookmark_form {
+    margin-left: auto;
+}
+
 form[data-subscription-form][data-subscription-pending="true"] button {
     opacity: 0.75;
     cursor: progress;
@@ -2206,6 +2210,16 @@ a.redgifs_uploader_mismatch {
     font-weight: bold;
 }
 
+.post_bookmark_activity {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.post_bookmark_activity.unread {
+    color: var(--accent);
+}
+
 #comment_count {
     font-weight: 500;
     opacity: 0.9;
@@ -2676,6 +2690,19 @@ input[type="submit"] {
 
 #settings_filters a {
     color: var(--accent);
+}
+
+.bookmarks_header {
+    margin: 0 0 20px;
+}
+
+.bookmarks_header h1 {
+    margin-bottom: 6px;
+}
+
+.bookmarks_header p {
+    margin: 0;
+    opacity: 0.8;
 }
 
 .helper {

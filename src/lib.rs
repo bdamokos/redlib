@@ -1,3 +1,4 @@
+pub mod bookmarks;
 pub mod cache_persistence;
 pub mod client;
 pub mod config;

@@ -2535,6 +2535,8 @@ mod tests {
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
 			following_comments: Vec::new(),
+			bookmarked: false,
+			bookmark_new_comments: None,
 		}
 	}
 

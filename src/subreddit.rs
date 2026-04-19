@@ -1645,6 +1645,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let path = req.uri().path().to_string();
 	let has_default_saved_feeds = !saved_feeds(&prefs).is_empty();
 	let front_page = front_page_override(&path).map(str::to_string).unwrap_or_else(|| setting(&req, "front_page"));
+	if path == "/" && front_page == "bookmarks" {
+		return Ok(redirect("/bookmarks"));
+	}
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
 	let front_page_is_following = is_following_front_page(&front_page);
@@ -2836,6 +2839,8 @@ mod tests {
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
 			following_comments: Vec::new(),
+			bookmarked: false,
+			bookmark_new_comments: None,
 		}
 	}
 

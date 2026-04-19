@@ -871,6 +871,8 @@ fn parse_post_card(element: ElementRef<'_>, context: ListingContext) -> Option<P
 		preview_body: if matches!(context, ListingContext::PostPage) { String::new() } else { preview_html },
 		collapsed_duplicates: Vec::new(),
 		following_comments: Vec::new(),
+		bookmarked: false,
+		bookmark_new_comments: None,
 	})
 }
 
@@ -1051,6 +1053,8 @@ fn parse_user_comment_card(element: ElementRef<'_>, user: &User) -> Option<Post>
 		preview_body: String::new(),
 		collapsed_duplicates: Vec::new(),
 		following_comments: Vec::new(),
+		bookmarked: false,
+		bookmark_new_comments: None,
 	})
 }
 
@@ -1459,6 +1463,8 @@ mod tests {
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
 			following_comments: Vec::new(),
+			bookmarked: false,
+			bookmark_new_comments: None,
 		}
 	}
 }

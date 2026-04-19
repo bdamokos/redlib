@@ -844,6 +844,8 @@ impl PersistedPost {
 			preview_body: self.preview_body,
 			collapsed_duplicates: self.collapsed_duplicates.into_iter().map(PersistedCollapsedDuplicate::into_runtime).collect(),
 			following_comments: self.following_comments.into_iter().map(PersistedFollowingComment::into_runtime).collect(),
+			bookmarked: false,
+			bookmark_new_comments: None,
 		}
 	}
 }

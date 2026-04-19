@@ -1,6 +1,7 @@
 #![allow(clippy::cmp_owned)]
 
 // CRATES
+use crate::bookmarks;
 use crate::client::json;
 use crate::config::get_setting;
 use crate::instance_scrape;
@@ -110,6 +111,8 @@ fn empty_post_for_shell(community: &str, permalink: &str) -> Post {
 		preview_body: String::new(),
 		collapsed_duplicates: Vec::new(),
 		following_comments: Vec::new(),
+		bookmarked: false,
+		bookmark_new_comments: None,
 	}
 }
 
@@ -196,10 +199,15 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		info!("post: using scrape fallback for {} because Reddit is currently rate limited", url);
 		if let Ok(mut scraped) = instance_scrape::scrape_post_page(&url, highlighted_comment).await {
 			let prefs = Preferences::new(&req);
+			bookmarks::decorate_post(&req, &mut scraped.post);
+			if scraped.post.bookmarked {
+				scraped.post.bookmark_new_comments = Some(0);
+			}
+			let rendered_post = scraped.post.clone();
 			instance_scrape::apply_comment_prefs(&mut scraped.comments, &prefs);
 			let body = PostFragmentTemplate {
 				comments: scraped.comments,
-				post: scraped.post,
+				post: rendered_post.clone(),
 				fallback_notice: instance_scrape::scrape_notice().to_string(),
 				sort,
 				prefs,
@@ -210,12 +218,14 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 			}
 			.render()
 			.map_err(|error| error.to_string())?;
-			return Response::builder()
+			let mut response = Response::builder()
 				.status(200)
 				.header("content-type", "text/html; charset=utf-8")
 				.header("cache-control", "no-store")
 				.body(Body::from(body))
-				.map_err(|error| error.to_string());
+				.map_err(|error| error.to_string())?;
+			bookmarks::update_visit_baseline(&mut response, &req, &rendered_post)?;
+			return Ok(response);
 		}
 		warn!("post: scrape fallback failed for {} while Reddit was already rate limited", url);
 	}
@@ -227,6 +237,10 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 			// Parse the JSON into Post and Comment structs
 			let mut post = parse_post(&response[0]["data"]["children"][0]).await;
 			post.author.external_links = crate::utils::cached_author_external_links(&post.author.name);
+			bookmarks::decorate_post(&req, &mut post);
+			if post.bookmarked {
+				post.bookmark_new_comments = Some(0);
+			}
 
 			let req_url = req.uri().to_string();
 			// Return landing page if this post if this Reddit deems this post
@@ -252,7 +266,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 			// Use the Post and Comment structs to generate a website to show users
 			let body = PostFragmentTemplate {
 				comments,
-				post,
+				post: post.clone(),
 				fallback_notice: String::new(),
 				sort,
 				prefs: Preferences::new(&req),
@@ -263,12 +277,14 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 			}
 			.render()
 			.map_err(|error| error.to_string())?;
-			Response::builder()
+			let mut response = Response::builder()
 				.status(200)
 				.header("content-type", "text/html; charset=utf-8")
 				.header("cache-control", "no-store")
 				.body(Body::from(body))
-				.map_err(|error| error.to_string())
+				.map_err(|error| error.to_string())?;
+			bookmarks::update_visit_baseline(&mut response, &req, &post)?;
+			Ok(response)
 		}
 		// If the Reddit API returns an error, exit and send error page to user
 		Err(msg) => {
@@ -277,10 +293,15 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				match instance_scrape::scrape_post_page(&url, highlighted_comment).await {
 					Ok(mut scraped) => {
 						let prefs = Preferences::new(&req);
+						bookmarks::decorate_post(&req, &mut scraped.post);
+						if scraped.post.bookmarked {
+							scraped.post.bookmark_new_comments = Some(0);
+						}
+						let rendered_post = scraped.post.clone();
 						instance_scrape::apply_comment_prefs(&mut scraped.comments, &prefs);
 						let body = PostFragmentTemplate {
 							comments: scraped.comments,
-							post: scraped.post,
+							post: rendered_post.clone(),
 							fallback_notice: instance_scrape::scrape_notice().to_string(),
 							sort,
 							prefs,
@@ -291,12 +312,14 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 						}
 						.render()
 						.map_err(|error| error.to_string())?;
-						return Response::builder()
+						let mut response = Response::builder()
 							.status(200)
 							.header("content-type", "text/html; charset=utf-8")
 							.header("cache-control", "no-store")
 							.body(Body::from(body))
-							.map_err(|error| error.to_string());
+							.map_err(|error| error.to_string())?;
+						bookmarks::update_visit_baseline(&mut response, &req, &rendered_post)?;
+						return Ok(response);
 					}
 					Err(scrape_error) => {
 						warn!("post: scrape fallback failed for {} after Reddit error {}: {}", url, msg, scrape_error);

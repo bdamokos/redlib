@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% import "utils.html" as utils %}
+
+{% block title %}Bookmarks - Redlib{% endblock %}
+
+{% block subscriptions %}
+{% call utils::sub_list("__bookmarks__", "") %}
+{% endblock %}
+
+{% block search %}
+{% call utils::search("".to_owned(), "") %}
+{% endblock %}
+
+{% block content %}
+<main>
+	<div id="column_one">
+		<div class="bookmarks_header">
+			<h1>Bookmarks</h1>
+			<p>
+				{{ total_bookmarks }} saved {% if total_bookmarks == 1 %}post{% else %}posts{% endif %}
+				&middot; {{ unread_posts }} with new comments
+				&middot; {{ total_new_comments }} new {% if total_new_comments.to_string() == "1" %}comment{% else %}comments{% endif %}
+			</p>
+		</div>
+
+		{% if posts.is_empty() %}
+		<div class="prefs">
+			<p>No bookmarked posts yet.</p>
+			<p>Use the Bookmark button on any post card or post page to keep a thread on hand and track new replies.</p>
+		</div>
+		{% else %}
+		<div id="posts">
+			{% for post in posts %}
+			<hr class="sep" />
+			{% call utils::post_in_list(post, false, "") %}
+			{% endfor %}
+		</div>
+		<footer>
+			{% if !prev_page_url.is_empty() %}
+			<a href="{{ prev_page_url }}" accesskey="P">PREV</a>
+			{% endif %}
+			{% if !next_page_url.is_empty() %}
+			<a href="{{ next_page_url }}" accesskey="N">NEXT</a>
+			{% endif %}
+		</footer>
+		{% endif %}
+	</div>
+</main>
+{% endblock %}

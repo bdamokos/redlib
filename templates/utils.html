@@ -64,6 +64,7 @@
 		<div class="feed_list">
 			<p>MAIN FEEDS</p>
 			<a href="/">Home</a>
+			<a href="/bookmarks" {% if current == "__bookmarks__" %}class="selected"{% endif %}>Bookmarks</a>
 			{% if prefs.has_followed_users() %}
 				<a href="/following" {% if current == "__following__" %}class="selected"{% endif %}>Following</a>
 			{% endif %}
@@ -222,7 +223,19 @@
 				</a>
 			</li>
 			{% endif %}
+			{% if post.kind == "t3" %}
+			<li>{% call bookmark_form(post, "") %}</li>
+			{% endif %}
 		</ul>
+		{% if let Some(new_comments) = post.bookmark_new_comments %}
+		<p class="post_bookmark_activity{% if new_comments.to_string() != "0" %} unread{% endif %}">
+			{% if new_comments.to_string() != "0" %}
+			{{ new_comments }} new {% if new_comments.to_string() == "1" %}comment{% else %}comments{% endif %}
+			{% else %}
+			Up to date
+			{% endif %}
+		</p>
+		{% endif %}
 		<p>{{ post.upvote_ratio }}%<span id="upvoted"> Upvoted</span></p>
 	</div>
 </div>
@@ -244,6 +257,43 @@
 	{% endif %}
 </li>
 {% endmacro %}
+
+{% macro bookmark_form(post, redirect_url) -%}
+{% if post.kind == "t3" %}
+<form
+	class="inline_subscription_form inline_bookmark_form"
+	action="{% if post.bookmarked %}/bookmarks/remove{% else %}/bookmarks/add{% endif %}"
+	method="POST"
+	data-subscription-form
+	data-subscription-target="bookmark:{{ post.id }}"
+	data-subscription-state="{% if post.bookmarked %}bookmarked{% else %}unbookmarked{% endif %}"
+	data-state-on="bookmarked"
+	data-state-off="unbookmarked"
+	data-subscribe-action="/bookmarks/add"
+	data-unsubscribe-action="/bookmarks/remove"
+	data-subscribe-label="Bookmark"
+	data-unsubscribe-label="Bookmarked"
+	data-subscribe-class="subscribe"
+	data-unsubscribe-class="unsubscribe"
+	data-cookie-mode="bookmarks"
+	data-cookie-name="bookmarks"
+	data-bookmark-id="{{ post.id }}"
+	data-bookmark-title="{{ post.title }}"
+	data-bookmark-permalink="{{ post.permalink }}"
+	data-bookmark-community="{{ post.community }}"
+	data-bookmark-comment-count="{{ post.comments.1 }}">
+	<input type="hidden" name="id" value="{{ post.id }}">
+	<input type="hidden" name="title" value="{{ post.title }}">
+	<input type="hidden" name="permalink" value="{{ post.permalink }}">
+	<input type="hidden" name="community" value="{{ post.community }}">
+	<input type="hidden" name="comment_count" value="{{ post.comments.1 }}">
+	<input type="hidden" name="redirect" value="{% if redirect_url.is_empty() %}{{ self.url }}{% else %}{{ redirect_url }}{% endif %}">
+	<button class="{% if post.bookmarked %}unsubscribe{% else %}subscribe{% endif %}" type="submit">
+		{% if post.bookmarked %}Bookmarked{% else %}Bookmark{% endif %}
+	</button>
+</form>
+{% endif %}
+{%- endmacro %}
 
 {% macro post_in_list(post, show_subscription_button, redirect_url) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
@@ -406,6 +456,16 @@
 		{% else %}
 		<a href="{{ post.permalink }}" class="post_comments" title="{{ post.comments.1 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}">{{ post.comments.0 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}</a>
 		{% endif %}
+		{% if let Some(new_comments) = post.bookmark_new_comments %}
+		<span class="post_bookmark_activity{% if new_comments.to_string() != "0" %} unread{% endif %}">
+			{% if new_comments.to_string() != "0" %}
+			{{ new_comments }} new {% if new_comments.to_string() == "1" %}comment{% else %}comments{% endif %}
+			{% else %}
+			Up to date
+			{% endif %}
+		</span>
+		{% endif %}
+		{% call bookmark_form(post, redirect_url) %}
 	</div>
 	{% if post.following_comments.len() > 0 %}
 	<div class="post_following_comments">

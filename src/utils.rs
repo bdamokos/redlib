@@ -692,6 +692,8 @@ pub struct Post {
 	pub preview_body: String,
 	pub collapsed_duplicates: Vec<CollapsedDuplicate>,
 	pub following_comments: Vec<FollowingComment>,
+	pub bookmarked: bool,
+	pub bookmark_new_comments: Option<u64>,
 }
 
 #[derive(Clone, Serialize, PartialEq)]
@@ -744,6 +746,8 @@ impl Clone for Post {
 			preview_body: self.preview_body.clone(),
 			collapsed_duplicates: self.collapsed_duplicates.clone(),
 			following_comments: self.following_comments.clone(),
+			bookmarked: self.bookmarked,
+			bookmark_new_comments: self.bookmark_new_comments,
 		}
 	}
 }
@@ -802,6 +806,8 @@ impl Default for Post {
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
 			following_comments: Vec::new(),
+			bookmarked: false,
+			bookmark_new_comments: None,
 		}
 	}
 }
@@ -956,6 +962,8 @@ impl Post {
 				preview_body: String::new(),
 				collapsed_duplicates: Vec::new(),
 				following_comments: Vec::new(),
+				bookmarked: false,
+				bookmark_new_comments: None,
 			});
 		}
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
@@ -2243,6 +2251,8 @@ pub async fn parse_post(post: &Value) -> Post {
 		preview_body: String::new(),
 		collapsed_duplicates: Vec::new(),
 		following_comments: Vec::new(),
+		bookmarked: false,
+		bookmark_new_comments: None,
 	}
 }
 
@@ -3540,6 +3550,8 @@ mod tests {
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
 			following_comments: Vec::new(),
+			bookmarked: false,
+			bookmark_new_comments: None,
 		}];
 
 		refresh_post_times(&mut posts);
@@ -3625,6 +3637,8 @@ mod tests {
 			preview_body: String::new(),
 			collapsed_duplicates: Vec::new(),
 			following_comments: Vec::new(),
+			bookmarked: false,
+			bookmark_new_comments: None,
 		}];
 
 		assert_eq!(posts[0].author.avg_video_length, None);

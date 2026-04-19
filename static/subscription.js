@@ -1,6 +1,7 @@
 (() => {
     const nativeSubmit = HTMLFormElement.prototype.submit;
     const maxCookieShards = 16;
+    const maxBookmarks = 200;
     const oneYearFromNow = () => new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString();
     const getForms = () => Array.from(document.querySelectorAll("form[data-subscription-form]"));
 
@@ -103,6 +104,32 @@
         writeShardedCookie("flair_subscriptions", base64UrlEncode(JSON.stringify(normalized)));
     };
 
+    const readBookmarksCookie = () => {
+        const encoded = readShardedCookie("bookmarks");
+        if (!encoded) {
+            return [];
+        }
+        try {
+            return JSON.parse(base64UrlDecode(encoded));
+        } catch (_error) {
+            return [];
+        }
+    };
+
+    const writeBookmarksCookie = (entries) => {
+        if (!entries.length) {
+            writeShardedCookie("bookmarks", "");
+            return;
+        }
+
+        const normalized = entries
+            .filter((entry) => entry && entry.i && entry.p)
+            .sort((left, right) => (right.b || 0) - (left.b || 0) || right.i.localeCompare(left.i))
+            .slice(0, maxBookmarks);
+
+        writeShardedCookie("bookmarks", base64UrlEncode(JSON.stringify(normalized)));
+    };
+
     const updateFormState = (form, nextState) => {
         const button = form.querySelector("button");
         if (!button) {
@@ -187,6 +214,12 @@
             return enabled ? stateOn : stateOff;
         }
 
+        if (cookieMode === "bookmarks") {
+            const bookmarkId = form.dataset.bookmarkId;
+            const enabled = readBookmarksCookie().some((entry) => entry.i === bookmarkId);
+            return enabled ? stateOn : stateOff;
+        }
+
         const cookieValues = (form.dataset.cookieValues || "")
             .split(/[|+]/)
             .map((item) => item.trim())
@@ -228,6 +261,35 @@
                 entries.push({ subreddit, flair });
             }
             writeFlairCookie(entries);
+            return;
+        }
+
+        if (cookieMode === "bookmarks") {
+            const bookmarkId = form.dataset.bookmarkId;
+            const bookmarkTitle = form.dataset.bookmarkTitle;
+            const bookmarkPermalink = form.dataset.bookmarkPermalink;
+            const bookmarkCommunity = form.dataset.bookmarkCommunity;
+            const bookmarkCommentCount = Number.parseInt(form.dataset.bookmarkCommentCount || "0", 10);
+
+            if (!bookmarkId || !bookmarkTitle || !bookmarkPermalink || !bookmarkCommunity) {
+                throw new Error("Missing bookmark metadata");
+            }
+
+            const now = Math.floor(Date.now() / 1000);
+            let entries = readBookmarksCookie().filter((entry) => entry.i !== bookmarkId);
+            if (isEnabling) {
+                entries.push({
+                    i: bookmarkId,
+                    t: bookmarkTitle,
+                    c: bookmarkCommunity,
+                    p: bookmarkPermalink,
+                    k: Number.isFinite(bookmarkCommentCount) ? bookmarkCommentCount : 0,
+                    v: Number.isFinite(bookmarkCommentCount) ? bookmarkCommentCount : 0,
+                    b: now,
+                    l: now,
+                });
+            }
+            writeBookmarksCookie(entries);
             return;
         }
 
@@ -280,9 +342,14 @@
 
                 const response = await fetch(requestAction, {
                     method: form.method || "POST",
+                    body:
+                        (form.method || "POST").toUpperCase() === "GET"
+                            ? undefined
+                            : new URLSearchParams(new FormData(form)).toString(),
                     credentials: "same-origin",
                     headers: {
                         "X-Redlib-Ajax": "1",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     },
                 });
 
