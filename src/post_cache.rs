@@ -313,6 +313,9 @@ pub struct FeedSessionRequest {
 	pub quarantine: bool,
 	pub query_fingerprint: String,
 	pub bundle_followed_user_comments: bool,
+	/// When set, merge / finalize use this sort while [`FeedSource::sort`] may differ (e.g. `/following/hot`
+	/// loads `New` listings to match daemon-cached `u_` keys).
+	pub merge_sort: Option<FeedSort>,
 }
 
 impl Default for FeedSessionRequest {
@@ -323,6 +326,7 @@ impl Default for FeedSessionRequest {
 			quarantine: false,
 			query_fingerprint: String::new(),
 			bundle_followed_user_comments: false,
+			merge_sort: None,
 		}
 	}
 }
@@ -563,7 +567,14 @@ pub fn is_subreddit_remembered(subreddit: &str) -> bool {
 }
 
 fn is_source_remembered(source: &FeedSource) -> bool {
-	let Some(key) = remembered_feed_key_for_source(source) else {
+	let key = remembered_feed_key_for_source(source).or_else(|| {
+		if let FeedSource::UserComments { name, .. } = source {
+			normalize_remembered_feed_name(name)
+		} else {
+			None
+		}
+	});
+	let Some(key) = key else {
 		return false;
 	};
 
@@ -1304,6 +1315,7 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	request.quarantine.hash(&mut hasher);
 	request.query_fingerprint.hash(&mut hasher);
 	request.bundle_followed_user_comments.hash(&mut hasher);
+	request.merge_sort.hash(&mut hasher);
 
 	let mut filter_values = request.filters.iter().cloned().collect::<Vec<_>>();
 	filter_values.sort();
@@ -1314,6 +1326,14 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	}
 
 	format!("{:x}", hasher.finish())
+}
+
+fn session_merge_sort(session: &FeedSession) -> FeedSort {
+	session
+		.request
+		.merge_sort
+		.or_else(|| session.sources.first().map(|entry| entry.source.sort()))
+		.unwrap_or(FeedSort::New)
 }
 
 fn make_session(request: FeedSessionRequest) -> FeedSession {
@@ -1417,9 +1437,9 @@ fn representative_score(posts: &[Post]) -> Option<i64> {
 	Some(scores[scores.len() / 2])
 }
 
-fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue) -> Option<ReadyQueueHead> {
+fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue, merge_sort: FeedSort) -> Option<ReadyQueueHead> {
 	let post = queue.posts.front()?;
-	let (primary_metric, secondary_metric) = match queue.source.sort() {
+	let (primary_metric, secondary_metric) = match merge_sort {
 		FeedSort::New => (post.created_ts as i64, post.created_ts),
 		FeedSort::Hot => (parse_numeric_score(post).unwrap_or(i64::MIN), post.created_ts),
 	};
@@ -1434,6 +1454,7 @@ fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue) -> Option<Read
 }
 
 fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
+	let merge_sort = session_merge_sort(session);
 	let mut queues = filtered_source_queues(session);
 
 	let mut all_posts = Vec::new();
@@ -1441,7 +1462,7 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 	let mut queue_heads = BinaryHeap::new();
 
 	for (queue_index, queue) in queues.iter().enumerate() {
-		if let Some(head) = ready_queue_head(queue_index, queue) {
+		if let Some(head) = ready_queue_head(queue_index, queue, merge_sort) {
 			queue_heads.push(head);
 		}
 	}
@@ -1456,7 +1477,7 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 			all_posts.push(post);
 		}
 
-		if let Some(next_head) = ready_queue_head(head.queue_index, queue) {
+		if let Some(next_head) = ready_queue_head(head.queue_index, queue, merge_sort) {
 			queue_heads.push(next_head);
 		}
 	}
@@ -1468,8 +1489,7 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 	};
 	merged = collapse_duplicate_submissions(merged);
 	if session.request.bundle_followed_user_comments {
-		let listing_sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
-		if listing_sort == FeedSort::New {
+		if merge_sort == FeedSort::New {
 			merged.sort_by(|a, b| crate::user::post_feed_activity_ts(b).cmp(&crate::user::post_feed_activity_ts(a)));
 		}
 	}
@@ -2083,7 +2103,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 
 	let merged_posts = merged_posts_for_session(session);
 	let page_ready = current_page_is_ready(session, &merged_posts, page, per_page);
-	let sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
+	let sort = session_merge_sort(session);
 	let bundle_activity = session.request.bundle_followed_user_comments;
 	let tail_for_page = merged_tail_excluding_frozen_prior_pages(session, page, &merged_posts);
 	let posts = if let Some(frozen_posts) = session.frozen_pages.get(&page) {
@@ -2118,7 +2138,7 @@ fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: u
 		return;
 	}
 	reconcile_session_with_source_cache(session);
-	let sort = session.sources.first().map(|entry| entry.source.sort()).unwrap_or(FeedSort::New);
+	let sort = session_merge_sort(session);
 	let bundle_activity = session.request.bundle_followed_user_comments;
 	let merged_posts = merged_posts_for_session(session);
 	let tail_for_page = merged_tail_excluding_frozen_prior_pages(session, page, &merged_posts);
@@ -2212,7 +2232,7 @@ pub fn feed_session_sort(session_id: &str) -> Option<FeedSort> {
 	if session_is_expired(session) {
 		return None;
 	}
-	session.sources.first().map(|entry| entry.source.sort())
+	Some(session_merge_sort(session))
 }
 
 pub fn cache_stats() -> (usize, usize) {
@@ -2612,6 +2632,28 @@ mod tests {
 		};
 
 		assert_ne!(build_session_id(&request_new), build_session_id(&request_hot));
+	}
+
+	#[test]
+	fn session_identity_differs_when_merge_sort_differs_for_same_sources() {
+		let sources = vec![
+			FeedSource::subreddit("u_demo".to_string(), FeedSort::New),
+			FeedSource::user_comments("u_demo".to_string(), FeedSort::New),
+		];
+		let new_merge = FeedSessionRequest {
+			sources: sources.clone(),
+			filters: HashSet::new(),
+			quarantine: false,
+			query_fingerprint: "fp".to_string(),
+			bundle_followed_user_comments: true,
+			merge_sort: Some(FeedSort::New),
+			..Default::default()
+		};
+		let hot_merge = FeedSessionRequest {
+			merge_sort: Some(FeedSort::Hot),
+			..new_merge.clone()
+		};
+		assert_ne!(build_session_id(&new_merge), build_session_id(&hot_merge));
 	}
 
 	#[test]
@@ -3878,6 +3920,7 @@ mod tests {
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
 					bundle_followed_user_comments: true,
+					merge_sort: None,
 				},
 				sources: vec![
 					session_entry(s1a, SessionSourceState::Ready),

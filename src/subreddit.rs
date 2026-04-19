@@ -1109,6 +1109,11 @@ fn is_following_front_page(front_page: &str) -> bool {
 	front_page == FOLLOWING_FRONT_PAGE
 }
 
+/// Listing sort for merge/finalize on `/following` (sources may use [`FeedSort::New`] to match daemon cache).
+fn following_feed_merge_sort(front_page: &str, sort: &str) -> Option<FeedSort> {
+	is_following_front_page(front_page).then(|| FeedSort::from_listing(sort))
+}
+
 fn build_subscription_sources(subscriptions: &[String], sort: FeedSort) -> Vec<FeedSource> {
 	let mut sources = subscriptions.iter().cloned().map(|name| FeedSource::subreddit(name, sort)).collect::<Vec<_>>();
 	crate::post_cache::sort_sources(&mut sources);
@@ -1156,9 +1161,12 @@ fn build_front_page_session_sources(
 		build_feed_sources(preferences, listing_sort)
 	} else if is_following_front_page(front_page) && has_saved_feeds {
 		let mut sources = Vec::new();
+		// Remembered-feed daemon only refreshes `New` user listings; match that cache key so
+		// `/following` reuses daemon-filled `u_` pages instead of warming hot-specific keys.
+		let fetch_sort = FeedSort::New;
 		for name in followed_user_subscriptions(preferences) {
-			sources.push(FeedSource::subreddit(name.clone(), listing_sort));
-			sources.push(FeedSource::user_comments(name, listing_sort));
+			sources.push(FeedSource::subreddit(name.clone(), fetch_sort));
+			sources.push(FeedSource::user_comments(name, fetch_sort));
 		}
 		sources
 	} else if sub_name.is_empty() {
@@ -1218,6 +1226,7 @@ async fn live_feed_shell_loading_message(
 			quarantine: true,
 			query_fingerprint: listing_query_fingerprint(&query),
 			bundle_followed_user_comments: is_following_front_page(front_page),
+			merge_sort: following_feed_merge_sort(front_page, sort),
 			..Default::default()
 		},
 		cache_page,
@@ -1813,6 +1822,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				quarantine: true,
 				query_fingerprint,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
+				merge_sort: following_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
 			cache_page,
@@ -2309,6 +2319,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				quarantine: quarantined,
 				query_fingerprint,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
+				merge_sort: following_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
 			cache_page,
