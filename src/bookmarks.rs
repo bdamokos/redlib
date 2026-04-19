@@ -3,6 +3,7 @@ use crate::utils::{clear_sharded_cookie, format_num, parse_post, read_sharded_co
 use askama::Template;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyper::body::to_bytes;
+use hyper::StatusCode;
 use hyper::{Body, Request, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -188,32 +189,84 @@ fn add_entry(entries: &mut Vec<BookmarkEntry>, entry: BookmarkEntry) {
 	normalize_entries(entries);
 }
 
-pub async fn add(req: Request<Body>) -> Result<Response<Body>, String> {
-	let (parts, form) = parse_form(req).await?;
-	let id = form.get("id").cloned().unwrap_or_default();
-	let permalink = form.get("permalink").cloned().unwrap_or_default();
-	let title = form.get("title").cloned().unwrap_or_default();
-	let community = form.get("community").cloned().unwrap_or_default();
-	let comment_count = form.get("comment_count").and_then(|value| value.parse::<u64>().ok()).unwrap_or_default();
-	let redirect_to = redirect_target(&parts, &form);
-
-	if id.is_empty() || permalink.is_empty() || title.is_empty() || community.is_empty() {
-		return Err("Missing bookmark metadata".to_string());
-	}
-
+async fn fetch_bookmark_entry(id: &str) -> Result<BookmarkEntry, String> {
+	let response = json(format!("/api/info.json?raw_json=1&id=t3_{id}"), false).await?;
+	let child = response["data"]["children"]
+		.as_array()
+		.and_then(|children| children.first())
+		.ok_or_else(|| "Bookmark post not found".to_string())?;
+	let post = parse_post(child).await;
+	let comment_count = comment_count_from_post(&post);
 	let now = now_unix();
-	let new_entry = BookmarkEntry {
-		id,
-		title,
-		community,
-		permalink,
+	Ok(BookmarkEntry {
+		id: post.id,
+		title: post.title,
+		community: post.community,
+		permalink: post.permalink,
 		last_known_comments: comment_count,
 		last_visited_comments: comment_count,
 		bookmarked_at: now,
 		last_visited_at: now,
-	};
+	})
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response<Body> {
+	Response::builder()
+		.status(status)
+		.header("Cache-Control", "no-store")
+		.body(Body::from(message.to_string()))
+		.unwrap_or_default()
+}
+
+fn entry_from_form(id: &str, form: &HashMap<String, String>) -> Option<BookmarkEntry> {
+	let title = form.get("title")?.trim();
+	let community = form.get("community")?.trim();
+	let permalink = form.get("permalink")?.trim();
+	let comments = form.get("comments").map(|v| v.trim()).unwrap_or_default();
+	if title.is_empty() || community.is_empty() || permalink.is_empty() {
+		return None;
+	}
+
+	let comment_count = comments.parse::<u64>().unwrap_or_default();
+	let now = now_unix();
+	Some(BookmarkEntry {
+		id: id.to_string(),
+		title: title.to_string(),
+		community: community.to_string(),
+		permalink: permalink.to_string(),
+		last_known_comments: comment_count,
+		last_visited_comments: comment_count,
+		bookmarked_at: now,
+		last_visited_at: now,
+	})
+}
+
+pub async fn add(req: Request<Body>) -> Result<Response<Body>, String> {
+	let (parts, form) = parse_form(req).await?;
+	let id = form.get("id").cloned().unwrap_or_default();
+	let redirect_to = redirect_target(&parts, &form);
+
+	if id.is_empty() {
+		return Ok(error_response(StatusCode::BAD_REQUEST, "Missing bookmark id"));
+	}
 
 	let is_ajax = request_is_ajax(&parts);
+	let new_entry = if let Some(entry) = entry_from_form(&id, &form) {
+		entry
+	} else {
+		match fetch_bookmark_entry(&id).await {
+			Ok(entry) => entry,
+			Err(message) => {
+				let status = if message.to_lowercase().contains("not found") {
+					StatusCode::NOT_FOUND
+				} else {
+					StatusCode::BAD_GATEWAY
+				};
+				return Ok(error_response(status, &message));
+			}
+		}
+	};
+
 	let req = Request::from_parts(parts, Body::empty());
 	let mut entries = read_bookmarks(&req);
 	add_entry(&mut entries, new_entry);
@@ -232,6 +285,9 @@ pub async fn remove(req: Request<Body>) -> Result<Response<Body>, String> {
 	let id = form.get("id").cloned().unwrap_or_default();
 	let redirect_to = redirect_target(&parts, &form);
 	let is_ajax = request_is_ajax(&parts);
+	if id.is_empty() {
+		return Ok(error_response(StatusCode::BAD_REQUEST, "Missing bookmark id"));
+	}
 	let req = Request::from_parts(parts, Body::empty());
 	let mut entries = read_bookmarks(&req);
 	entries.retain(|entry| entry.id != id);

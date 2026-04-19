@@ -85,6 +85,8 @@ pub struct SubredditTemplate {
 	feed_session_id: String,
 	feed_status_url: String,
 	feed_fragment_url: String,
+	feed_status_message: String,
+	feed_status_warming: bool,
 	show_contextual_pagination: bool,
 	contextual_pagination: Vec<ContextualPageLink>,
 	video_mode_enabled: bool,
@@ -1782,10 +1784,22 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		None
 	};
+	let user_agent = req.headers().get("user-agent").and_then(|value| value.to_str().ok()).unwrap_or_default();
+	let safari_contextual_front_page = contextual_front_page
+		&& user_agent.contains("Safari/")
+		&& !user_agent.contains("Chrome/")
+		&& !user_agent.contains("Chromium/")
+		&& !user_agent.contains("CriOS/")
+		&& !user_agent.contains("Edg/")
+		&& !user_agent.contains("OPR/");
 
 	// Avoid post-load DOM fragment replacement on /following by rendering the full page server-side.
-	// The shell->fragment swap causes large CLS when the fragment arrives seconds after first paint.
-	if is_following_route(&url) && contextual_front_page {
+	// The shell->fragment swap causes large CLS when the fragment arrives seconds after first paint,
+	// and Safari has been observed receiving rendered fragment HTML without painting the swapped posts.
+	if (is_following_route(&url) || safari_contextual_front_page) && contextual_front_page {
+		if safari_contextual_front_page && !is_following_route(&url) {
+			info!("post_cache: using server-side contextual front page render for Safari ua={}", user_agent);
+		}
 		let query = req.uri().query().unwrap_or_default().to_string();
 		let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
 		let timeframe = param(&format!("?{}", query), "t").unwrap_or_default();
@@ -1807,11 +1821,20 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		)
 		.await;
 
-		if cache_page == 0 {
+		if cache_page == 0 && !safari_contextual_front_page {
 			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
 		}
 
-		if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
+		let mut page = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
+		if page.is_none() && cache_page == 0 && safari_contextual_front_page {
+			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
+			page = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
+		}
+
+		if let Some(mut page) = page {
+			let feed_status = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
+			let feed_status_message = feed_status.as_ref().map(|status| status.status_message.clone()).unwrap_or_default();
+			let feed_status_warming = feed_status.as_ref().map(|status| status.warming).unwrap_or(false);
 			let merged_posts = crate::post_cache::feed_merged_posts(&feed_session_id).unwrap_or_else(|| std::mem::take(&mut page.posts));
 			let (page_posts, has_next_unseen) = contextual_listing_posts_from_feed_page(feed_seen_shell.as_ref(), cache_page, &mut page, &merged_posts);
 			let mut page_posts = page_posts;
@@ -1820,6 +1843,16 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			let no_posts = page_posts.is_empty();
 			let all_posts_hidden_nsfw = !no_posts && (page_posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 			utils::hydrate_post_author_links_from_cache(&mut page_posts);
+			info!(
+				"post_cache: community-full-page url={} cache_page={} session={} rendered_posts={} no_posts={} has_next={} ua={}",
+				url,
+				cache_page,
+				feed_session_id,
+				page_posts.len(),
+				no_posts,
+				page.has_next,
+				user_agent
+			);
 
 			let prev_page_url = if cache_page > 0 {
 				feed_page_url(&url, &feed_session_id, cache_page - 1)
@@ -1860,6 +1893,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				feed_session_id: feed_session_id.clone(),
 				feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
 				feed_fragment_url: feed_fragment_url(&url, &feed_session_id, cache_page),
+				feed_status_message,
+				feed_status_warming,
 				show_contextual_pagination: !contextual_pagination.is_empty(),
 				contextual_pagination,
 				video_mode_enabled: false,
@@ -2306,6 +2341,18 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			let no_posts = page_ready && page_posts.is_empty();
 			let all_posts_hidden_nsfw = !no_posts && (page_posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 			utils::hydrate_post_author_links_from_cache(&mut page_posts);
+			let user_agent = req.headers().get("user-agent").and_then(|value| value.to_str().ok()).unwrap_or_default();
+			info!(
+				"post_cache: subreddit-fragment url={} cache_page={} session={} rendered_posts={} page_ready={} no_posts={} has_next={} ua={}",
+				url,
+				cache_page,
+				feed_session_id,
+				page_posts.len(),
+				page_ready,
+				no_posts,
+				page.has_next,
+				user_agent
+			);
 
 			let prev_page_url = if cache_page > 0 {
 				feed_page_url(&url, &feed_session_id, cache_page - 1)
@@ -2902,6 +2949,8 @@ mod tests {
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
 			feed_fragment_url: String::new(),
+			feed_status_message: String::new(),
+			feed_status_warming: false,
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
 			video_mode_enabled: false,
@@ -2949,6 +2998,8 @@ mod tests {
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
 			feed_fragment_url: String::new(),
+			feed_status_message: String::new(),
+			feed_status_warming: false,
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
 			video_mode_enabled: false,
@@ -3286,6 +3337,8 @@ mod tests {
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
 			feed_fragment_url: String::new(),
+			feed_status_message: String::new(),
+			feed_status_warming: false,
 			show_contextual_pagination: false,
 			contextual_pagination: Vec::new(),
 			video_mode_enabled: false,
@@ -4264,6 +4317,18 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 	let session_sort = crate::post_cache::feed_session_sort(&session_id).map(|sort| sort.as_str().to_string()).unwrap_or_default();
 	let contextual_pagination = build_contextual_pagination(&current_url, &session_id, page, &session_sort);
+	let user_agent = req.headers().get("user-agent").and_then(|value| value.to_str().ok()).unwrap_or_default();
+	info!(
+		"post_cache: feed-fragment current_url={} page={} session={} rendered_posts={} page_ready={} no_posts={} has_next={} ua={}",
+		current_url,
+		page,
+		session_id,
+		posts.len(),
+		page_ready,
+		no_posts,
+		feed_page.has_next || has_next_unseen,
+		user_agent
+	);
 
 	let mut response = render_feed_fragment(FeedFragmentTemplate {
 		posts,

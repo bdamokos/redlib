@@ -265,31 +265,9 @@
         }
 
         if (cookieMode === "bookmarks") {
-            const bookmarkId = form.dataset.bookmarkId;
-            const bookmarkTitle = form.dataset.bookmarkTitle;
-            const bookmarkPermalink = form.dataset.bookmarkPermalink;
-            const bookmarkCommunity = form.dataset.bookmarkCommunity;
-            const bookmarkCommentCount = Number.parseInt(form.dataset.bookmarkCommentCount || "0", 10);
-
-            if (!bookmarkId || !bookmarkTitle || !bookmarkPermalink || !bookmarkCommunity) {
+            if (!form.dataset.bookmarkId) {
                 throw new Error("Missing bookmark metadata");
             }
-
-            const now = Math.floor(Date.now() / 1000);
-            let entries = readBookmarksCookie().filter((entry) => entry.i !== bookmarkId);
-            if (isEnabling) {
-                entries.push({
-                    i: bookmarkId,
-                    t: bookmarkTitle,
-                    c: bookmarkCommunity,
-                    p: bookmarkPermalink,
-                    k: Number.isFinite(bookmarkCommentCount) ? bookmarkCommentCount : 0,
-                    v: Number.isFinite(bookmarkCommentCount) ? bookmarkCommentCount : 0,
-                    b: now,
-                    l: now,
-                });
-            }
-            writeBookmarksCookie(entries);
             return;
         }
 
@@ -336,9 +314,11 @@
             const requestAction = form.action;
 
             try {
-                syncTargetStateFromCookies(target);
-                mutateCookies(form);
-                toggleTarget(target);
+                if (form.dataset.cookieMode !== "bookmarks") {
+                    syncTargetStateFromCookies(target);
+                    mutateCookies(form);
+                    toggleTarget(target);
+                }
 
                 const response = await fetch(requestAction, {
                     method: form.method || "POST",
@@ -356,9 +336,16 @@
                 if (!response.ok) {
                     throw new Error(`Subscription request failed: ${response.status}`);
                 }
+
+                if (form.dataset.cookieMode === "bookmarks") {
+                    syncTargetStateFromCookies(target);
+                }
             } catch (_error) {
                 form.action = requestAction;
                 setPending(target, false);
+                if (form.dataset.cookieMode === "bookmarks") {
+                    return;
+                }
                 nativeSubmit.call(form);
                 return;
             }

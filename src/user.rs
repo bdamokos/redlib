@@ -5,9 +5,7 @@ use crate::client::json;
 use crate::instance_scrape;
 use crate::redgifs;
 use crate::server::RequestExt;
-use crate::utils::{
-	error, filter_posts, format_num, format_url, get_filters, nsfw_landing, param, setting, template, FollowingComment, ParentComment, Post, Preferences, User,
-};
+use crate::utils::{error, filter_posts, format_num, format_url, get_filters, param, setting, template, FollowingComment, ParentComment, Post, Preferences, User};
 use crate::{config, utils, video_mode};
 use askama::Template;
 use chrono::DateTime;
@@ -636,6 +634,42 @@ pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
 		meta.push_str(&format!(" · {rg_profiles} rg profiles"));
 	}
 	Some((utils::format_video_duration(average), meta))
+}
+
+pub fn hydrate_posts_avg_video_length_from_cache(posts: &mut [Post]) {
+	let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() else {
+		return;
+	};
+	prune_user_video_stats_cache(&mut cache);
+
+	let now = Instant::now();
+	for post in posts.iter_mut() {
+		let cache_key = normalize_user_video_stats_cache_key(&post.author.name);
+		if cache_key.is_empty() {
+			post.author.avg_video_length = None;
+			continue;
+		}
+
+		let Some(entry) = cache.get_mut(&cache_key) else {
+			post.author.avg_video_length = None;
+			continue;
+		};
+		entry.cached_at = now;
+
+		if entry.video_count == 0 {
+			post.author.avg_video_length = None;
+			continue;
+		}
+
+		let average = entry.total_duration_seconds / entry.video_count as i64;
+		let count_label = if entry.video_count == 1 { "video" } else { "videos" };
+		let mut meta = format!("from {} seen {count_label}", entry.video_count);
+		let rg_profiles = entry.seen_redgifs_users.len();
+		if rg_profiles > 1 {
+			meta.push_str(&format!(" · {rg_profiles} rg profiles"));
+		}
+		post.author.avg_video_length = Some((utils::format_video_duration(average), meta));
+	}
 }
 
 #[cfg(test)]
@@ -1989,6 +2023,58 @@ mod tests {
 	}
 
 	#[test]
+	fn renders_recent_coomer_posts_even_when_reddit_posts_are_hidden_for_nsfw() {
+		let mut prefs = test_prefs();
+		prefs.show_nsfw = "off".to_string();
+
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			user_subreddits: Vec::new(),
+			coomer_recent_posts: Some(crate::utils::CoomerRecentPostsPanel {
+				filtered_to_video: true,
+				items: vec![crate::utils::CoomerRecentPostItem {
+					title: "Visible from coomer".to_string(),
+					truncated_title: "Visible from coomer".to_string(),
+					url: "https://coomer.st/onlyfans/user/demo/post/1".to_string(),
+					published: "2025-09-10".to_string(),
+					has_video: true,
+				}],
+			}),
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs,
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: true,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("All posts are hidden because they are NSFW"));
+		assert!(html.contains("Recent Coomer videos"));
+		assert!(html.contains("Visible from coomer"));
+	}
+
+	#[test]
 	fn renders_cached_author_avg_video_length_next_to_external_links() {
 		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
 		post.author.external_links = vec![crate::utils::ExternalLink {
@@ -2043,6 +2129,8 @@ mod tests {
 		let mut prefs = test_prefs();
 		prefs.subscriptions = vec!["u_demouser".to_string(), "demosub".to_string()];
 		prefs.filters = vec!["u_demouser".to_string()];
+		prefs.subscriptions_lc = prefs.subscriptions.iter().map(|s| s.to_ascii_lowercase()).collect();
+		prefs.filters_lc = prefs.filters.iter().map(|s| s.to_ascii_lowercase()).collect();
 
 		let html = super::UserTemplate {
 			user: crate::utils::User {
@@ -2110,10 +2198,16 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	// Retrieve other variables from Redlib request
 	let sort = param(&path, "sort").unwrap_or_default();
-	let cached_user = cached_user_metadata(&username).unwrap_or_else(|| User {
-		name: username.clone(),
-		..Default::default()
-	});
+	// Shell sidebar is not replaced when the listing fragment loads (only `#column_one`), so load
+	// full profile metadata here—including Coomer link expansion and recent-post panel data.
+	let shell_user = match user(&username).await {
+		Ok(user) => user,
+		Err(_) => cached_user_metadata(&username).unwrap_or_else(|| User {
+			name: username.clone(),
+			..Default::default()
+		}),
+	};
+	let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
 	let user_subreddits = utils::cached_user_subreddits(&username)
 		.into_iter()
 		.map(|(name, count)| UserSubredditEntry { name, count })
@@ -2133,11 +2227,11 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	let avg_video_length = cached_avg_video_length(&username);
 	Ok(template(&UserTemplate {
-		user: cached_user,
+		user: shell_user,
 		username: username.clone(),
 		posts: Vec::new(),
 		user_subreddits,
-		coomer_recent_posts: None,
+		coomer_recent_posts,
 		fallback_notice: String::new(),
 		sort: (sort, param(&path, "t").unwrap_or_default()),
 		ends: (param(&path, "after").unwrap_or_default(), String::new()),
@@ -2200,11 +2294,6 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let metadata_error = user_result.as_ref().err().cloned();
 	let metadata_rate_limited = metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback);
 	let user = user_result.unwrap_or_default();
-	let req_url = req.uri().to_string();
-
-	if user.nsfw && crate::utils::should_be_nsfw_gated(&req, &req_url) {
-		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
-	}
 
 	let coomer_recent_posts = utils::coomer_recent_posts_panel(&user.external_links).await;
 

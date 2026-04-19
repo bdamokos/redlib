@@ -277,16 +277,12 @@
 	data-unsubscribe-class="unsubscribe"
 	data-cookie-mode="bookmarks"
 	data-cookie-name="bookmarks"
-	data-bookmark-id="{{ post.id }}"
-	data-bookmark-title="{{ post.title }}"
-	data-bookmark-permalink="{{ post.permalink }}"
-	data-bookmark-community="{{ post.community }}"
-	data-bookmark-comment-count="{{ post.comments.1 }}">
+	data-bookmark-id="{{ post.id }}">
 	<input type="hidden" name="id" value="{{ post.id }}">
 	<input type="hidden" name="title" value="{{ post.title }}">
-	<input type="hidden" name="permalink" value="{{ post.permalink }}">
 	<input type="hidden" name="community" value="{{ post.community }}">
-	<input type="hidden" name="comment_count" value="{{ post.comments.1 }}">
+	<input type="hidden" name="permalink" value="{{ post.permalink }}">
+	<input type="hidden" name="comments" value="{{ post.comments.1 }}">
 	<input type="hidden" name="redirect" value="{% if redirect_url.is_empty() %}{{ self.url }}{% else %}{{ redirect_url }}{% endif %}">
 	<button class="{% if post.bookmarked %}unsubscribe{% else %}subscribe{% endif %}" type="submit">
 		{% if post.bookmarked %}Bookmarked{% else %}Bookmark{% endif %}

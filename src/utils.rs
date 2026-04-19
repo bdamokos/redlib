@@ -13,13 +13,15 @@ use crate::{
 };
 use askama::Template;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use brotli::Decompressor as BrotliDecompressor;
 use cached::proc_macro::cached;
 use cookie::Cookie;
 use htmlescape::decode_html;
 use hyper::body::to_bytes;
-use hyper::header::LOCATION;
+use hyper::header::{CONTENT_ENCODING, LOCATION};
 use hyper::{Body, Request, Response, Uri};
 use libflate::deflate::{Decoder, Encoder};
+use libflate::gzip::Decoder as GzipDecoder;
 use log::error;
 use percent_encoding::percent_decode_str;
 use regex::Regex;
@@ -1249,9 +1251,16 @@ pub fn cached_author_external_links(name: &str) -> Vec<ExternalLink> {
 }
 
 pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
+	let Ok(mut links_cache) = AUTHOR_LINKS_CACHE.lock() else {
+		return;
+	};
+	prune_author_links_cache(&mut links_cache);
+
+	crate::user::hydrate_posts_avg_video_length_from_cache(posts);
+
 	for post in posts.iter_mut() {
-		post.author.external_links = cached_author_external_links(&post.author.name);
-		post.author.avg_video_length = crate::user::cached_avg_video_length(&post.author.name);
+		let author = post.author.name.trim();
+		post.author.external_links = links_cache.get(author).map(|entry| entry.links.clone()).unwrap_or_default();
 	}
 }
 
@@ -1660,9 +1669,15 @@ pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(serialize_with = "serialize_vec_with_plus", deserialize_with = "deserialize_vec_with_plus")]
 	pub subscriptions: Vec<String>,
+	#[revision(start = 4)]
+	#[serde(default, skip_serializing, skip_deserializing)]
+	pub subscriptions_lc: HashSet<String>,
 	#[revision(start = 1)]
 	#[serde(serialize_with = "serialize_vec_with_plus", deserialize_with = "deserialize_vec_with_plus")]
 	pub filters: Vec<String>,
+	#[revision(start = 4)]
+	#[serde(default, skip_serializing, skip_deserializing)]
+	pub filters_lc: HashSet<String>,
 	#[revision(start = 3)]
 	#[serde(default, serialize_with = "serialize_flair_subscriptions", deserialize_with = "deserialize_flair_subscriptions")]
 	pub flair_subscriptions: Vec<FlairSubscription>,
@@ -1704,7 +1719,7 @@ struct LegacyPreferencesV1 {
 
 impl From<LegacyPreferencesV1> for Preferences {
 	fn from(value: LegacyPreferencesV1) -> Self {
-		Self {
+		let mut prefs = Self {
 			available_themes: Vec::new(),
 			theme: value.theme,
 			front_page: value.front_page,
@@ -1726,12 +1741,16 @@ impl From<LegacyPreferencesV1> for Preferences {
 			comment_sort: value.comment_sort,
 			post_sort: value.post_sort,
 			subscriptions: value.subscriptions,
+			subscriptions_lc: HashSet::new(),
 			filters: value.filters,
+			filters_lc: HashSet::new(),
 			flair_subscriptions: Vec::new(),
 			hide_awards: value.hide_awards,
 			hide_score: value.hide_score,
 			remove_default_feeds: value.remove_default_feeds,
-		}
+		};
+		prefs.rebuild_indexes();
+		prefs
 	}
 }
 
@@ -1764,7 +1783,7 @@ struct LegacyPreferencesV0 {
 
 impl From<LegacyPreferencesV0> for Preferences {
 	fn from(value: LegacyPreferencesV0) -> Self {
-		Self {
+		let mut prefs = Self {
 			available_themes: Vec::new(),
 			theme: value.theme,
 			front_page: value.front_page,
@@ -1786,12 +1805,16 @@ impl From<LegacyPreferencesV0> for Preferences {
 			comment_sort: value.comment_sort,
 			post_sort: value.post_sort,
 			subscriptions: value.subscriptions,
+			subscriptions_lc: HashSet::new(),
 			filters: value.filters,
+			filters_lc: HashSet::new(),
 			flair_subscriptions: Vec::new(),
 			hide_awards: value.hide_awards,
 			hide_score: value.hide_score,
 			remove_default_feeds: value.remove_default_feeds,
-		}
+		};
+		prefs.rebuild_indexes();
+		prefs
 	}
 }
 
@@ -1997,9 +2020,14 @@ pub fn static_asset_href(rel: &str) -> String {
 }
 
 impl Preferences {
+	fn rebuild_indexes(&mut self) {
+		self.subscriptions_lc = self.subscriptions.iter().map(|v| v.to_ascii_lowercase()).collect();
+		self.filters_lc = self.filters.iter().map(|v| v.to_ascii_lowercase()).collect();
+	}
+
 	/// Build preferences from cookies
 	pub fn new(req: &Request<Body>) -> Self {
-		Self {
+		let mut prefs = Self {
 			available_themes: AVAILABLE_THEMES.clone(),
 			theme: setting(req, "theme"),
 			front_page: setting(req, "front_page"),
@@ -2021,12 +2049,16 @@ impl Preferences {
 			comment_sort: setting(req, "comment_sort"),
 			post_sort: setting(req, "post_sort"),
 			subscriptions: setting(req, "subscriptions").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+			subscriptions_lc: HashSet::new(),
 			filters: setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+			filters_lc: HashSet::new(),
 			flair_subscriptions: decode_flair_subscriptions(&setting(req, "flair_subscriptions")).unwrap_or_default(),
 			hide_awards: setting(req, "hide_awards"),
 			hide_score: setting(req, "hide_score"),
 			remove_default_feeds: setting(req, "remove_default_feeds"),
-		}
+		};
+		prefs.rebuild_indexes();
+		prefs
 	}
 
 	pub fn to_urlencoded(&self) -> Result<String, String> {
@@ -2034,7 +2066,7 @@ impl Preferences {
 	}
 
 	pub fn has_subscription(&self, value: &str) -> bool {
-		self.subscriptions.iter().any(|subscription| subscription.eq_ignore_ascii_case(value))
+		self.subscriptions_lc.contains(&value.to_ascii_lowercase())
 	}
 
 	pub fn has_followed_users(&self) -> bool {
@@ -2046,7 +2078,7 @@ impl Preferences {
 	}
 
 	pub fn has_filter(&self, value: &str) -> bool {
-		self.filters.iter().any(|filter| filter.eq_ignore_ascii_case(value))
+		self.filters_lc.contains(&value.to_ascii_lowercase())
 	}
 
 	pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
@@ -2065,10 +2097,17 @@ impl Preferences {
 pub fn preferences_from_bincode(bytes: &[u8]) -> Result<Preferences, String> {
 	let mut reader = bytes;
 	match Preferences::deserialize_revisioned(&mut reader) {
-		Ok(preferences) => Ok(preferences),
+		Ok(mut preferences) => {
+			preferences.rebuild_indexes();
+			Ok(preferences)
+		}
 		Err(_) => bincode::deserialize::<Preferences>(bytes)
 			.or_else(|_| bincode::deserialize::<LegacyPreferencesV1>(bytes).map(Preferences::from))
 			.or_else(|_| bincode::deserialize::<LegacyPreferencesV0>(bytes).map(Preferences::from))
+			.map(|mut preferences| {
+				preferences.rebuild_indexes();
+				preferences
+			})
 			.map_err(|e| e.to_string()),
 	}
 }
@@ -2084,6 +2123,45 @@ pub fn deflate_decompress(i: Vec<u8>) -> Result<Vec<u8>, String> {
 	let mut out = Vec::new();
 	decoder.read_to_end(&mut out).map_err(|e| format!("Failed to read from gzip decoder: {e}"))?;
 	Ok(out)
+}
+
+fn response_content_encoding(response: &Response<Body>) -> Option<String> {
+	response
+		.headers()
+		.get(CONTENT_ENCODING)
+		.and_then(|value| value.to_str().ok())
+		.map(|value| value.split(',').next().unwrap_or(value).trim().to_ascii_lowercase())
+		.filter(|value| !value.is_empty())
+}
+
+fn decode_response_body_bytes(body: Vec<u8>, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+	match encoding.unwrap_or("identity") {
+		"identity" => Ok(body),
+		"gzip" => {
+			let mut decoder = GzipDecoder::new(&body[..]).map_err(|error| error.to_string())?;
+			let mut out = Vec::new();
+			decoder.read_to_end(&mut out).map_err(|error| error.to_string())?;
+			Ok(out)
+		}
+		"br" => {
+			let mut decoder = BrotliDecompressor::new(&body[..], 4096);
+			let mut out = Vec::new();
+			decoder.read_to_end(&mut out).map_err(|error| error.to_string())?;
+			Ok(out)
+		}
+		other => Err(format!("Unsupported content encoding: {other}")),
+	}
+}
+
+async fn read_response_bytes(response: Response<Body>) -> Result<Vec<u8>, String> {
+	let encoding = response_content_encoding(&response);
+	let body = to_bytes(response.into_body()).await.map_err(|error| error.to_string())?;
+	decode_response_body_bytes(body.to_vec(), encoding.as_deref())
+}
+
+async fn read_response_text(response: Response<Body>) -> Result<String, String> {
+	let body = read_response_bytes(response).await?;
+	String::from_utf8(body).map_err(|error| error.to_string())
 }
 
 /// Gets a `HashSet` of filters from the cookie in the given `Request`.
@@ -2940,8 +3018,7 @@ async fn fetch_external_page_html(url: String, redirects_left: usize) -> Result<
 			return Err(format!("external page request failed with status {}", response.status()));
 		}
 
-		let body = to_bytes(response.into_body()).await.map_err(|err| err.to_string())?;
-		return String::from_utf8(body.to_vec()).map_err(|err| err.to_string());
+		return read_response_text(response).await;
 	}
 }
 
@@ -3116,7 +3193,7 @@ async fn resolve_fansly_account_id(username: String) -> Option<String> {
 		return None;
 	}
 
-	let body = hyper::body::to_bytes(response.into_body()).await.ok()?;
+	let body = read_response_bytes(response).await.ok()?;
 	let parsed: Value = serde_json::from_slice(&body).ok()?;
 	parsed["response"]
 		.as_array()
@@ -3185,7 +3262,7 @@ async fn fetch_coomer_profile_recent_posts(profile_url: String) -> Result<Vec<Co
 		return Err(format!("coomer posts request failed with status {}", response.status()));
 	}
 
-	let body = to_bytes(response.into_body()).await.map_err(|err| err.to_string())?;
+	let body = read_response_bytes(response).await?;
 	let posts: Vec<CoomerListingPost> = serde_json::from_slice(&body).map_err(|err| err.to_string())?;
 	Ok(posts.into_iter().map(coomer_listing_post_to_recent_post).collect())
 }
@@ -3327,8 +3404,7 @@ async fn fetch_user_profile_page_html(name: &str) -> Result<String, String> {
 		return Err(format!("profile html request failed with status {}", response.status()));
 	}
 
-	let body = hyper::body::to_bytes(response.into_body()).await.map_err(|err| err.to_string())?;
-	String::from_utf8(body.to_vec()).map_err(|err| err.to_string())
+	read_response_text(response).await
 }
 
 fn extract_profile_social_links(source: &str) -> Vec<ExternalLink> {
@@ -3679,7 +3755,10 @@ mod tests {
 	use crate::utils::ParentComment;
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
+	use libflate::gzip::Encoder as GzipEncoder;
 	use serde_json::json;
+	use std::collections::HashSet;
+	use std::io::Write;
 	use time::OffsetDateTime;
 
 	async fn always_exists(_: String) -> bool {
@@ -4215,6 +4294,17 @@ mod tests {
 	}
 
 	#[test]
+	fn decodes_gzip_encoded_response_bodies() {
+		let mut encoder = GzipEncoder::new(Vec::new()).expect("gzip encoder");
+		encoder.write_all(br#"{"ok":true}"#).expect("gzip write");
+		let compressed = encoder.finish().into_result().expect("gzip finish");
+
+		let decoded = super::decode_response_body_bytes(compressed, Some("gzip")).expect("gzip decode");
+
+		assert_eq!(decoded, br#"{"ok":true}"#);
+	}
+
+	#[test]
 	fn test_format_url() {
 		assert_eq!(format_url("https://a.thumbs.redditmedia.com/XYZ.jpg"), "/thumb/a/XYZ.jpg");
 		assert_eq!(format_url("https://emoji.redditmedia.com/a/b"), "/emoji/a/b");
@@ -4297,7 +4387,9 @@ mod tests {
 			comment_sort: "confidence".to_owned(),
 			post_sort: "top".to_owned(),
 			subscriptions: vec!["memes".to_owned(), "mildlyinteresting".to_owned()],
+			subscriptions_lc: ["memes".to_owned(), "mildlyinteresting".to_owned()].into_iter().collect(),
 			filters: vec![],
+			filters_lc: HashSet::new(),
 			flair_subscriptions: vec![],
 			hide_awards: "off".to_owned(),
 			hide_score: "off".to_owned(),

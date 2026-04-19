@@ -25,5 +25,8 @@
 {% endblock %}
 
 {% block body %}
+	{% if !feed_status_message.is_empty() %}
+	<div class="feed_status_banner{% if feed_status_warming %} warming{% endif %}">{{ feed_status_message }}</div>
+	{% endif %}
 	{% include "subreddit_content.html" %}
 {% endblock %}
