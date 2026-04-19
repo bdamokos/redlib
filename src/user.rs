@@ -64,6 +64,7 @@ pub struct UserTemplate {
 	username: String,
 	posts: Vec<Post>,
 	user_subreddits: Vec<UserSubredditEntry>,
+	coomer_recent_posts: Option<utils::CoomerRecentPostsPanel>,
 	fallback_notice: String,
 	sort: (String, String),
 	ends: (String, String),
@@ -99,6 +100,7 @@ struct UserFragmentTemplate {
 	user: User,
 	posts: Vec<Post>,
 	user_subreddits: Vec<UserSubredditEntry>,
+	coomer_recent_posts: Option<utils::CoomerRecentPostsPanel>,
 	fallback_notice: String,
 	sort: (String, String),
 	ends: (String, String),
@@ -1239,6 +1241,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![post],
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1289,6 +1292,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1326,6 +1330,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: Vec::new(),
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1375,6 +1380,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "video", "https://v.redd.it/example", &[])],
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1448,6 +1454,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: Vec::new(),
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1528,6 +1535,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: Vec::new(),
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1620,6 +1628,7 @@ mod tests {
 					count: 1,
 				},
 			],
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1689,6 +1698,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![post],
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1860,6 +1870,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1899,6 +1910,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1927,6 +1939,56 @@ mod tests {
 	}
 
 	#[test]
+	fn renders_recent_coomer_posts_in_user_sidebar() {
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			user_subreddits: Vec::new(),
+			coomer_recent_posts: Some(crate::utils::CoomerRecentPostsPanel {
+				filtered_to_video: true,
+				items: vec![crate::utils::CoomerRecentPostItem {
+					title: "A much longer Coomer title".to_string(),
+					truncated_title: "A much longer Coomer title".to_string(),
+					url: "https://coomer.st/onlyfans/user/demo/post/1".to_string(),
+					published: "2025-09-10".to_string(),
+					has_video: true,
+				}],
+			}),
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("Recent Coomer videos"));
+		assert!(html.contains("A much longer Coomer title"));
+		assert!(html.contains("2025-09-10"));
+		assert!(html.contains("user_coomer_post_badge"));
+	}
+
+	#[test]
 	fn renders_cached_author_avg_video_length_next_to_external_links() {
 		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
 		post.author.external_links = vec![crate::utils::ExternalLink {
@@ -1946,6 +2008,7 @@ mod tests {
 			username: "demo_user".to_string(),
 			posts: vec![post],
 			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -1998,6 +2061,7 @@ mod tests {
 				name: "DemoSub".to_string(),
 				count: 1,
 			}],
+			coomer_recent_posts: None,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -2073,6 +2137,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		username: username.clone(),
 		posts: Vec::new(),
 		user_subreddits,
+		coomer_recent_posts: None,
 		fallback_notice: String::new(),
 		sort: (sort, param(&path, "t").unwrap_or_default()),
 		ends: (param(&path, "after").unwrap_or_default(), String::new()),
@@ -2141,6 +2206,8 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 	}
 
+	let coomer_recent_posts = utils::coomer_recent_posts_panel(&user.external_links).await;
+
 	if video_listing || (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty()) {
 		crate::post_cache::remember_subreddit_request(&format!("u_{username}"));
 	}
@@ -2154,6 +2221,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				.into_iter()
 				.map(|(name, count)| UserSubredditEntry { name, count })
 				.collect(),
+			coomer_recent_posts,
 			fallback_notice: String::new(),
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			ends: (param(&path, "after").unwrap_or_default(), String::new()),
@@ -2206,6 +2274,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				.into_iter()
 				.map(|(name, count)| UserSubredditEntry { name, count })
 				.collect(),
+			coomer_recent_posts,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
@@ -2368,6 +2437,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				.into_iter()
 				.map(|(name, count)| UserSubredditEntry { name, count })
 				.collect(),
+			coomer_recent_posts,
 			fallback_notice,
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			ends,

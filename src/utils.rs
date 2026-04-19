@@ -154,6 +154,21 @@ pub struct ExternalLink {
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
+pub struct CoomerRecentPostItem {
+	pub title: String,
+	pub truncated_title: String,
+	pub url: String,
+	pub published: String,
+	pub has_video: bool,
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct CoomerRecentPostsPanel {
+	pub items: Vec<CoomerRecentPostItem>,
+	pub filtered_to_video: bool,
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct UserProfileDetails {
 	pub blurb: String,
 	pub bio_html: String,
@@ -2746,6 +2761,28 @@ pub async fn external_links_with_coomer_flags(links: Vec<ExternalLink>) -> Vec<E
 	flagged_links
 }
 
+pub async fn coomer_recent_posts_panel(links: &[ExternalLink]) -> Option<CoomerRecentPostsPanel> {
+	let profile_urls = coomer_profile_urls_from_links(links);
+	if profile_urls.is_empty() {
+		return None;
+	}
+
+	let mut pending = JoinSet::new();
+	for profile_url in profile_urls {
+		pending.spawn(async move { fetch_coomer_profile_recent_posts(profile_url).await.unwrap_or_default() });
+	}
+
+	let mut merged = Vec::new();
+	while let Some(result) = pending.join_next().await {
+		let Ok(posts) = result else {
+			continue;
+		};
+		merged.extend(posts);
+	}
+
+	select_coomer_recent_posts(merged)
+}
+
 fn dedupe_external_links_by_host(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
 	let mut seen = HashSet::new();
 	let mut deduped = Vec::new();
@@ -2765,6 +2802,43 @@ fn external_link_key(link: &ExternalLink) -> String {
 
 async fn coomer_lookup_links(link: &ExternalLink) -> Vec<ExternalLink> {
 	coomer_lookup_links_with_checker(link, coomer_lookup_exists).await
+}
+
+#[derive(Default, Clone, Deserialize)]
+struct CoomerListingFile {
+	#[serde(default)]
+	name: String,
+	#[serde(default)]
+	path: String,
+}
+
+#[derive(Default, Deserialize)]
+struct CoomerListingPost {
+	#[serde(default)]
+	id: String,
+	#[serde(default)]
+	user: String,
+	#[serde(default)]
+	service: String,
+	#[serde(default)]
+	title: String,
+	#[serde(default)]
+	substring: String,
+	#[serde(default)]
+	published: String,
+	#[serde(default)]
+	file: CoomerListingFile,
+	#[serde(default)]
+	attachments: Vec<CoomerListingFile>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CoomerMergedPost {
+	title: String,
+	url: String,
+	published: String,
+	sort_key: String,
+	has_video: bool,
 }
 
 async fn coomer_lookup_links_with_checker<F, Fut>(link: &ExternalLink, exists: F) -> Vec<ExternalLink>
@@ -2922,6 +2996,22 @@ fn is_creator_link_host(host: &str) -> bool {
 	matches!(host, "onlyfans.com" | "www.onlyfans.com" | "fansly.com" | "www.fansly.com")
 }
 
+fn coomer_profile_urls_from_links(links: &[ExternalLink]) -> Vec<String> {
+	let mut seen = HashSet::new();
+	let mut urls = Vec::new();
+
+	for link in links {
+		let Some(profile_url) = canonical_coomer_profile_url(&link.url) else {
+			continue;
+		};
+		if seen.insert(profile_url.clone()) {
+			urls.push(profile_url);
+		}
+	}
+
+	urls
+}
+
 async fn direct_coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
 	let parsed = Url::parse(&link.url).ok()?;
 	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
@@ -2968,6 +3058,36 @@ async fn coomer_profile_id(parsed: &Url, is_fansly: bool) -> Option<String> {
 	}
 
 	Some(profile_id.to_string())
+}
+
+fn canonical_coomer_profile_url(url: &str) -> Option<String> {
+	let parsed = Url::parse(url).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host != "coomer.st" && host != "www.coomer.st" {
+		return None;
+	}
+
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+	let [service, "user", profile_id, ..] = segments.as_slice() else {
+		return None;
+	};
+
+	Some(format!("https://coomer.st/{service}/user/{profile_id}"))
+}
+
+fn coomer_posts_api_url(url: &str) -> Option<String> {
+	let parsed = Url::parse(url).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host != "coomer.st" && host != "www.coomer.st" {
+		return None;
+	}
+
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+	let [service, "user", profile_id, ..] = segments.as_slice() else {
+		return None;
+	};
+
+	Some(format!("https://coomer.st/api/v1/{service}/user/{profile_id}/posts"))
 }
 
 fn is_numeric_identifier(value: &str) -> bool {
@@ -3042,6 +3162,116 @@ fn coomer_profile_api_url(url: &str) -> Option<String> {
 	};
 
 	Some(format!("https://coomer.st/api/v1/{service}/user/{profile_id}/profile"))
+}
+
+#[cached(size = 2048, time = 86400, result = true)]
+async fn fetch_coomer_profile_recent_posts(profile_url: String) -> Result<Vec<CoomerMergedPost>, String> {
+	let Some(api_url) = coomer_posts_api_url(&profile_url) else {
+		return Ok(Vec::new());
+	};
+
+	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
+	let request = Request::builder()
+		.method("GET")
+		.uri(&api_url)
+		.header("Accept", "text/css")
+		.header("Accept-Encoding", "identity")
+		.header("User-Agent", user_agent)
+		.body(Body::empty())
+		.map_err(|err| err.to_string())?;
+
+	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+	if !response.status().is_success() {
+		return Err(format!("coomer posts request failed with status {}", response.status()));
+	}
+
+	let body = to_bytes(response.into_body()).await.map_err(|err| err.to_string())?;
+	let posts: Vec<CoomerListingPost> = serde_json::from_slice(&body).map_err(|err| err.to_string())?;
+	Ok(posts.into_iter().map(coomer_listing_post_to_recent_post).collect())
+}
+
+fn coomer_listing_post_to_recent_post(post: CoomerListingPost) -> CoomerMergedPost {
+	let mut title = coomer_clean_text(&post.title);
+	if title.is_empty() {
+		title = coomer_clean_text(&post.substring);
+	}
+	if title.is_empty() {
+		title = "Untitled post".to_string();
+	}
+
+	let published = coomer_date_label(&post.published);
+	let sort_key = coomer_sort_key(&post.published);
+	let has_video = coomer_listing_file_is_video(&post.file) || post.attachments.iter().any(coomer_listing_file_is_video);
+	let url = format!("https://coomer.st/{}/user/{}/post/{}", post.service, post.user, post.id);
+
+	CoomerMergedPost {
+		title,
+		url,
+		published,
+		sort_key,
+		has_video,
+	}
+}
+
+fn select_coomer_recent_posts(mut merged: Vec<CoomerMergedPost>) -> Option<CoomerRecentPostsPanel> {
+	let mut seen = HashSet::new();
+	merged.retain(|post| seen.insert(post.url.clone()));
+	merged.sort_by(|a, b| b.sort_key.cmp(&a.sort_key).then_with(|| b.url.cmp(&a.url)));
+
+	let mut items = merged.iter().filter(|post| post.has_video).take(5).cloned().collect::<Vec<_>>();
+	let filtered_to_video = !items.is_empty();
+	if !filtered_to_video {
+		items = merged.into_iter().take(5).collect();
+	}
+
+	if items.is_empty() {
+		return None;
+	}
+
+	Some(CoomerRecentPostsPanel {
+		items: items
+			.into_iter()
+			.map(|post| CoomerRecentPostItem {
+				title: post.title.clone(),
+				truncated_title: truncate_text(&post.title, 64),
+				url: post.url,
+				published: post.published,
+				has_video: post.has_video,
+			})
+			.collect(),
+		filtered_to_video,
+	})
+}
+
+fn coomer_listing_file_is_video(file: &CoomerListingFile) -> bool {
+	let name = file.name.to_ascii_lowercase();
+	let path = file.path.to_ascii_lowercase();
+	[".mp4", ".mov", ".m4v", ".webm"].iter().any(|ext| name.ends_with(ext) || path.ends_with(ext))
+}
+
+fn coomer_clean_text(value: &str) -> String {
+	let decoded = decode_html(value).unwrap_or_else(|_| value.to_string());
+	let plain = scraper::Html::parse_fragment(&decoded).root_element().text().collect::<Vec<_>>().join(" ");
+
+	plain.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
+}
+
+fn coomer_date_label(published: &str) -> String {
+	published.get(..10).filter(|value| value.chars().nth(4) == Some('-')).unwrap_or_default().to_string()
+}
+
+fn coomer_sort_key(published: &str) -> String {
+	published.trim().to_string()
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+	let mut chars = value.chars();
+	let truncated = chars.by_ref().take(max_chars).collect::<String>();
+	if chars.next().is_some() {
+		format!("{truncated}...")
+	} else {
+		truncated
+	}
 }
 
 fn cached_author_links(name: &str) -> Option<Vec<ExternalLink>> {
@@ -3444,7 +3674,7 @@ mod tests {
 		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
 		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
 		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, rewrite_urls, time, user_profile_details,
-		write_sharded_cookie, Author, Awards, ExternalLink, Flags, Flair, FlairSubscription, Media, Post, Preferences,
+		write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, Media, Post, Preferences,
 	};
 	use crate::utils::ParentComment;
 	use futures_lite::future::block_on;
@@ -3883,6 +4113,105 @@ mod tests {
 		assert_eq!(coomer_links.len(), 2);
 		assert_eq!(coomer_links[0].url, "https://coomer.st/onlyfans/user/lady-katarina");
 		assert_eq!(coomer_links[1].url, "https://coomer.st/fansly/user/640681284019953664");
+	}
+
+	#[test]
+	fn builds_canonical_coomer_profile_and_posts_api_urls() {
+		assert_eq!(
+			super::canonical_coomer_profile_url("https://www.coomer.st/onlyfans/user/demo?foo=bar"),
+			Some("https://coomer.st/onlyfans/user/demo".to_string())
+		);
+		assert_eq!(
+			super::coomer_posts_api_url("https://coomer.st/fansly/user/12345"),
+			Some("https://coomer.st/api/v1/fansly/user/12345/posts".to_string())
+		);
+	}
+
+	#[test]
+	fn coomer_recent_selection_prefers_video_posts_and_merges_multiple_profiles() {
+		let panel = super::select_coomer_recent_posts(vec![
+			super::CoomerMergedPost {
+				title: "Older image".to_string(),
+				url: "https://coomer.st/onlyfans/user/a/post/1".to_string(),
+				published: "2024-01-01".to_string(),
+				sort_key: "2024-01-01T00:00:00".to_string(),
+				has_video: false,
+			},
+			super::CoomerMergedPost {
+				title: "Newest video".to_string(),
+				url: "https://coomer.st/onlyfans/user/a/post/2".to_string(),
+				published: "2024-02-01".to_string(),
+				sort_key: "2024-02-01T00:00:00".to_string(),
+				has_video: true,
+			},
+			super::CoomerMergedPost {
+				title: "Second video".to_string(),
+				url: "https://coomer.st/fansly/user/b/post/3".to_string(),
+				published: "2024-01-15".to_string(),
+				sort_key: "2024-01-15T00:00:00".to_string(),
+				has_video: true,
+			},
+			super::CoomerMergedPost {
+				title: "Duplicate URL".to_string(),
+				url: "https://coomer.st/fansly/user/b/post/3".to_string(),
+				published: "2024-01-16".to_string(),
+				sort_key: "2024-01-16T00:00:00".to_string(),
+				has_video: true,
+			},
+		])
+		.expect("expected coomer panel");
+
+		assert!(panel.filtered_to_video);
+		assert_eq!(panel.items.len(), 2);
+		assert_eq!(panel.items[0].title, "Newest video");
+		assert_eq!(panel.items[1].title, "Second video");
+	}
+
+	#[test]
+	fn coomer_recent_selection_falls_back_to_all_posts_when_no_videos_exist() {
+		let panel = super::select_coomer_recent_posts(vec![
+			super::CoomerMergedPost {
+				title: "Newest".to_string(),
+				url: "https://coomer.st/onlyfans/user/a/post/2".to_string(),
+				published: "2024-02-01".to_string(),
+				sort_key: "2024-02-01T00:00:00".to_string(),
+				has_video: false,
+			},
+			super::CoomerMergedPost {
+				title: "Older".to_string(),
+				url: "https://coomer.st/onlyfans/user/a/post/1".to_string(),
+				published: "2024-01-01".to_string(),
+				sort_key: "2024-01-01T00:00:00".to_string(),
+				has_video: false,
+			},
+		])
+		.expect("expected coomer panel");
+
+		assert!(!panel.filtered_to_video);
+		assert_eq!(panel.items[0].title, "Newest");
+		assert_eq!(panel.items[1].title, "Older");
+	}
+
+	#[test]
+	fn coomer_listing_post_normalization_uses_html_fallbacks_and_video_detection() {
+		let normalized = super::coomer_listing_post_to_recent_post(CoomerListingPost {
+			id: "42".to_string(),
+			user: "creator".to_string(),
+			service: "onlyfans".to_string(),
+			title: String::new(),
+			substring: "<p>Hello <strong>there</strong></p>".to_string(),
+			published: "2025-09-10T10:25:45".to_string(),
+			file: CoomerListingFile {
+				name: "clip_source.mp4".to_string(),
+				path: "/clip.mp4".to_string(),
+			},
+			attachments: Vec::new(),
+		});
+
+		assert_eq!(normalized.title, "Hello there");
+		assert_eq!(normalized.published, "2025-09-10");
+		assert!(normalized.has_video);
+		assert_eq!(normalized.url, "https://coomer.st/onlyfans/user/creator/post/42");
 	}
 
 	#[test]

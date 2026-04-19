@@ -25,7 +25,7 @@
                 </div>
                 {% endif %}
             </div>
-            {% if !user.description.is_empty() || !user.bio_html.is_empty() || user.external_links.len() > 0 %}
+            {% if !user.description.is_empty() || !user.bio_html.is_empty() || user.external_links.len() > 0 || coomer_recent_posts.is_some() %}
             <div id="user_profile">
                 {% if !user.description.is_empty() %}
                 <p id="user_blurb">{{ user.description }}</p>
@@ -44,6 +44,30 @@
                         </a>
                         {% endfor %}
                     </div>
+                </div>
+                {% endif %}
+                {% if let Some(coomer_recent_posts) = coomer_recent_posts %}
+                <div id="user_coomer_posts">
+                    <span class="user_section_label">
+                        {% if coomer_recent_posts.filtered_to_video %}
+                        Recent Coomer videos
+                        {% else %}
+                        Recent Coomer posts
+                        {% endif %}
+                    </span>
+                    <ul class="user_coomer_post_list">
+                        {% for post in coomer_recent_posts.items %}
+                        <li class="user_coomer_post_item">
+                            <a class="user_coomer_post_link" href="{{ post.url }}" rel="nofollow noopener noreferrer" title="{{ post.title }}">
+                                <span>{{ post.truncated_title }}</span>
+                                {% if post.has_video %}
+                                <span class="user_coomer_post_badge">video</span>
+                                {% endif %}
+                            </a>
+                            <span class="user_coomer_post_meta">{{ post.published }}</span>
+                        </li>
+                        {% endfor %}
+                    </ul>
                 </div>
                 {% endif %}
             </div>
