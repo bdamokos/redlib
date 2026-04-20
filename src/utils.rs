@@ -465,12 +465,20 @@ impl Media {
 		let duration = format_video_duration(duration_seconds);
 		let video_preview_enabled =
 			crate::video_preview::feature_enabled() && (post_type == "video" || post_type == "gif") && embed_code.is_empty() && !url_val.as_str().unwrap_or_default().is_empty();
-		let video_preview_job_hint = if redgifs_url.is_some() {
-			// RedGifs posts should use their small mobile MP4 directly as the
-			// preview layer instead of generating server-side animated previews.
+		let video_preview_job_hint = if redgifs_url.is_some() || post_type == "gif" {
+			// RedGifs clips and Reddit-hosted GIF posts can use a direct looping
+			// MP4 fallback in the preview layer instead of generating server-side
+			// animated previews with ffmpeg.
 			String::new()
-		} else if post_type == "video" || post_type == "gif" {
+		} else if post_type == "video" {
 			url_val.as_str().unwrap_or_default().to_string()
+		} else {
+			String::new()
+		};
+		let video_preview_fallback_url = if redgifs_url.is_some() {
+			redgifs_preview_fallback_url
+		} else if post_type == "gif" {
+			format_url(url_val.as_str().unwrap_or_default())
 		} else {
 			String::new()
 		};
@@ -501,7 +509,7 @@ impl Media {
 				embed_code,
 				video_preview_enabled,
 				video_preview_job_hint,
-				video_preview_fallback_url: redgifs_preview_fallback_url,
+				video_preview_fallback_url,
 				redgifs_username,
 			},
 			gallery,

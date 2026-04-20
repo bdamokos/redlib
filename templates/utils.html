@@ -717,7 +717,7 @@
 			</div>
 			{% endif %}
 			</div>
-			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
+			{% if post.media.video_preview_enabled && prefs.video_previews == "on" && !post.media.video_preview_job_hint.is_empty() %}
 			<div class="video_preview_loading" hidden aria-live="polite">
 				<span class="video_preview_spinner" aria-hidden="true"></span>
 				<span class="video_preview_status_text">Generating animated preview…</span>
