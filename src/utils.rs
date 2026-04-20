@@ -656,6 +656,9 @@ pub struct ParentComment {
 #[derive(Clone, Serialize, PartialEq)]
 pub struct FollowingComment {
 	pub id: String,
+	/// Author of the followed-user comment that caused this thread to surface.
+	/// Used for `/following` synthetic rows where the submission author may be unavailable.
+	pub author: String,
 	pub body: String,
 	pub permalink: String,
 	pub created_ts: u64,

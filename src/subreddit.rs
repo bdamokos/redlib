@@ -920,6 +920,10 @@ fn collect_cached_source_posts(sources: &[FeedSource]) -> Vec<Post> {
 	posts
 }
 
+fn collect_front_page_video_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
+	crate::post_cache::catalog_source_candidates(sources, filters).unwrap_or_else(|| collect_cached_source_posts(sources))
+}
+
 async fn cached_or_live_new_subreddit_posts(subreddit: &str, quarantined: bool) -> Result<Vec<Post>, String> {
 	let source = FeedSource::subreddit(subreddit.to_string(), FeedSort::New);
 	if let Some(posts) = crate::post_cache::servable_cached_source_posts(&source) {
@@ -1765,7 +1769,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			filter_posts_by_flair(&mut cached_posts, &active_flair_filter);
 			cached_posts
 		} else {
-			collect_cached_source_posts(&build_video_mode_front_page_sources(&prefs, &front_page))
+			collect_front_page_video_candidates(&build_video_mode_front_page_sources(&prefs, &front_page), &get_filters(&req))
 		};
 		let parsed_vm = video_mode::parse_query_or_cookie(
 			req.uri().query().unwrap_or_default(),
@@ -2285,7 +2289,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			filter_posts_by_flair(&mut posts, &active_flair_filter);
 			posts
 		} else if !is_subreddit_route {
-			collect_cached_source_posts(&build_video_mode_front_page_sources(&prefs, &front_page))
+			collect_front_page_video_candidates(&build_video_mode_front_page_sources(&prefs, &front_page), &filters)
 		} else {
 			Vec::new()
 		};

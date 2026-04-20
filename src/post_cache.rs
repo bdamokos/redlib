@@ -1,6 +1,7 @@
 use crate::cache_persistence::{
 	instant_to_unix, option_instant_to_unix, option_unix_to_instant, unix_to_instant, PersistedRefreshOrigin, PersistedRememberedSubredditEntry, PersistedSourceCacheEntry,
 };
+use crate::materialized_catalog;
 use crate::oauth::oauth_is_available;
 use crate::user::{collapse_duplicate_submissions, update_user_video_stats_from_posts};
 use crate::utils::{Post, Preferences};
@@ -213,7 +214,7 @@ enum RememberedFailureDisposition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionSourceState {
+pub(crate) enum SessionSourceState {
 	Unstarted,
 	Fetching,
 	Ready,
@@ -266,10 +267,10 @@ pub struct CacheStatusResponse {
 }
 
 #[derive(Clone)]
-struct SessionSourceEntry {
-	source: FeedSource,
-	state: SessionSourceState,
-	last_error: Option<String>,
+pub(crate) struct SessionSourceEntry {
+	pub(crate) source: FeedSource,
+	pub(crate) state: SessionSourceState,
+	pub(crate) last_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -332,16 +333,16 @@ impl Default for FeedSessionRequest {
 }
 
 #[derive(Clone)]
-struct FeedSession {
-	id: String,
-	request: FeedSessionRequest,
-	sources: Vec<SessionSourceEntry>,
-	frozen_pages: HashMap<usize, Vec<Post>>,
-	background_active: bool,
-	background_complete: bool,
-	requested_page: usize,
-	last_updated: Instant,
-	revision: u64,
+pub(crate) struct FeedSession {
+	pub(crate) id: String,
+	pub(crate) request: FeedSessionRequest,
+	pub(crate) sources: Vec<SessionSourceEntry>,
+	pub(crate) frozen_pages: HashMap<usize, Vec<Post>>,
+	pub(crate) background_active: bool,
+	pub(crate) background_complete: bool,
+	pub(crate) requested_page: usize,
+	pub(crate) last_updated: Instant,
+	pub(crate) revision: u64,
 }
 
 #[derive(Clone)]
@@ -423,8 +424,8 @@ fn normalize_remembered_feed_name(name: &str) -> Option<String> {
 
 fn normalize_remembered_source(source: &FeedSource) -> Option<FeedSource> {
 	match source {
-		FeedSource::UserComments { .. } => None,
 		FeedSource::Subreddit { name, sort } if *sort == FeedSort::New => Some(FeedSource::subreddit(normalize_remembered_feed_name(name)?, FeedSort::New)),
+		FeedSource::UserComments { name, sort } if *sort == FeedSort::New => Some(FeedSource::user_comments(normalize_remembered_feed_name(name)?, FeedSort::New)),
 		FeedSource::Flair { subreddit, flair, sort } if *sort == FeedSort::New => {
 			let subreddit = normalize_plain_subreddit_name(subreddit)?;
 			let flair = flair.trim();
@@ -437,12 +438,16 @@ fn normalize_remembered_source(source: &FeedSource) -> Option<FeedSource> {
 fn remembered_feed_key_for_source(source: &FeedSource) -> Option<String> {
 	match normalize_remembered_source(source)? {
 		FeedSource::Subreddit { name, .. } => Some(name),
+		FeedSource::UserComments { name, .. } => Some(format!("user_comments:{name}")),
 		FeedSource::Flair { subreddit, flair, .. } => Some(format!("flair:{subreddit}:{}", URL_SAFE_NO_PAD.encode(flair.as_bytes()))),
-		FeedSource::UserComments { .. } => None,
 	}
 }
 
 fn remembered_feed_source_from_key(key: &str) -> Option<FeedSource> {
+	if let Some(name) = key.strip_prefix("user_comments:") {
+		return normalize_remembered_source(&FeedSource::user_comments(name.to_string(), FeedSort::New));
+	}
+
 	if let Some(rest) = key.strip_prefix("flair:") {
 		let (subreddit, encoded_flair) = rest.split_once(':')?;
 		let flair = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded_flair).ok()?).ok()?;
@@ -512,9 +517,19 @@ fn remember_source_request(source: &FeedSource) {
 	crate::cache_persistence::mark_dirty();
 }
 
+fn remember_followed_user_comment_source(name: &str) {
+	let Some(source) = normalize_remembered_source(&FeedSource::user_comments(name.to_string(), FeedSort::New)) else {
+		return;
+	};
+	remember_source_request(&source);
+}
+
 pub fn remember_frontpage_subreddits(preferences: &Preferences) {
 	for subreddit in &preferences.subscriptions {
 		remember_subreddit_request(subreddit);
+		if subreddit.starts_with("u_") {
+			remember_followed_user_comment_source(subreddit);
+		}
 	}
 
 	for subscription in &preferences.flair_subscriptions {
@@ -536,6 +551,16 @@ fn ensure_remembered_feeds_seeded_for_preferences(preferences: &Preferences) {
 		if !remembered.contains_key(&key) {
 			remembered.insert(key.clone(), new_remembered_subreddit_entry(key));
 			inserted = true;
+		}
+		if subreddit.starts_with("u_") {
+			let Some(comment_source) = normalize_remembered_source(&FeedSource::user_comments(subreddit.to_string(), FeedSort::New)) else {
+				continue;
+			};
+			let comment_key = remembered_feed_key_for_source(&comment_source).expect("normalized remembered user comments source must have key");
+			if !remembered.contains_key(&comment_key) {
+				remembered.insert(comment_key.clone(), new_remembered_subreddit_entry(comment_key));
+				inserted = true;
+			}
 		}
 	}
 	for subscription in &preferences.flair_subscriptions {
@@ -567,13 +592,7 @@ pub fn is_subreddit_remembered(subreddit: &str) -> bool {
 }
 
 fn is_source_remembered(source: &FeedSource) -> bool {
-	let key = remembered_feed_key_for_source(source).or_else(|| {
-		if let FeedSource::UserComments { name, .. } = source {
-			normalize_remembered_feed_name(name)
-		} else {
-			None
-		}
-	});
+	let key = remembered_feed_key_for_source(source);
 	let Some(key) = key else {
 		return false;
 	};
@@ -718,6 +737,9 @@ fn mark_remembered_source_refresh_started(source: &FeedSource) {
 
 fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) {
 	update_user_video_stats_from_posts(&posts);
+	if materialized_catalog::source_is_supported(source) {
+		materialized_catalog::apply_source_refresh(source, &posts);
+	}
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
 		cache.insert(
 			source.cache_key(),
@@ -730,7 +752,7 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 			},
 		);
 	}
-	if is_persisted_subreddit_feed_source(source) {
+	if is_persisted_subreddit_feed_source(source) || materialized_catalog::source_is_supported(source) {
 		crate::cache_persistence::mark_dirty();
 	}
 }
@@ -866,6 +888,7 @@ pub fn cleanup_decayed_remembered_subreddits() {
 			continue;
 		};
 		cache.remove(&source.cache_key());
+		materialized_catalog::apply_source_refresh(&source, &[]);
 		if let FeedSource::Subreddit { name, .. } = &source {
 			crate::subreddit::remove_subreddit_metadata_cache(name);
 		}
@@ -981,6 +1004,22 @@ pub(crate) fn restore_persisted_state(
 
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
 		cache.extend(restored_sources);
+	}
+	rebuild_materialized_catalog_from_source_cache();
+}
+
+pub(crate) fn rebuild_materialized_catalog_from_source_cache() {
+	let sources = SOURCE_CACHE
+		.lock()
+		.unwrap_or_else(|err| err.into_inner())
+		.values()
+		.filter(|entry| materialized_catalog::source_is_supported(&entry.source))
+		.map(|entry| (entry.source.clone(), entry.posts.clone()))
+		.collect::<Vec<_>>();
+
+	materialized_catalog::reset_catalog();
+	for (source, posts) in sources {
+		materialized_catalog::apply_source_refresh(&source, &posts);
 	}
 }
 
@@ -1415,6 +1454,10 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 	queues
 }
 
+fn session_uses_materialized_catalog(session: &FeedSession) -> bool {
+	session_merge_sort(session) == FeedSort::New && session.sources.iter().all(|entry| materialized_catalog::source_is_supported(&entry.source))
+}
+
 fn parse_numeric_score(post: &Post) -> Option<i64> {
 	post.score.1.parse::<i64>().ok()
 }
@@ -1453,7 +1496,7 @@ fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue, merge_sort: Fe
 	})
 }
 
-fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
+fn merged_posts_for_session_live(session: &FeedSession) -> Vec<Post> {
 	let merge_sort = session_merge_sort(session);
 	let mut queues = filtered_source_queues(session);
 
@@ -1482,18 +1525,36 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 		}
 	}
 
+	finalize_session_posts(session, all_posts)
+}
+
+fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Post> {
+	let merge_sort = session_merge_sort(session);
 	let mut merged = if session.request.bundle_followed_user_comments {
 		crate::user::bundle_followed_user_comments(all_posts)
 	} else {
 		all_posts
 	};
 	merged = collapse_duplicate_submissions(merged);
-	if session.request.bundle_followed_user_comments {
-		if merge_sort == FeedSort::New {
-			merged.sort_by(|a, b| crate::user::post_feed_activity_ts(b).cmp(&crate::user::post_feed_activity_ts(a)));
-		}
+	if session.request.bundle_followed_user_comments && merge_sort == FeedSort::New {
+		merged.sort_by(|a, b| crate::user::post_feed_activity_ts(b).cmp(&crate::user::post_feed_activity_ts(a)));
 	}
 	merged
+}
+
+fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
+	if session_uses_materialized_catalog(session) {
+		// The materialized catalog is ordered, but it still requires scanning candidates.
+		// Bound the scan by the session's existing background target so request-time work
+		// scales with page depth rather than total catalog size.
+		const CATALOG_OVERFETCH_FACTOR: usize = 3;
+		const CATALOG_MAX_CANDIDATES: usize = 5_000;
+		let target = background_target_posts(session);
+		let limit = target.saturating_mul(CATALOG_OVERFETCH_FACTOR).min(CATALOG_MAX_CANDIDATES);
+		return finalize_session_posts(session, materialized_catalog::query_session_stream_limited(session, limit));
+	}
+
+	merged_posts_for_session_live(session)
 }
 
 fn frozen_post_ids_before_page(session: &FeedSession, page: usize) -> HashSet<String> {
@@ -2226,6 +2287,17 @@ pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Ve
 	Some(metrics)
 }
 
+pub fn catalog_source_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Option<Vec<Post>> {
+	if sources.iter().all(materialized_catalog::source_is_supported) {
+		// Video-mode and other aggregate listings only need a bounded candidate pool.
+		// Avoid scanning the full catalog for pages with many subscriptions.
+		const CATALOG_MAX_CANDIDATES: usize = 8_000;
+		Some(materialized_catalog::query_source_candidates_limited(sources, filters, CATALOG_MAX_CANDIDATES))
+	} else {
+		None
+	}
+}
+
 pub fn feed_session_sort(session_id: &str) -> Option<FeedSort> {
 	let sessions = FEED_SESSIONS.lock().ok()?;
 	let session = sessions.get(session_id)?;
@@ -2427,14 +2499,15 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 mod tests {
 	use super::{
 		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, build_session_id, cache_status_for_preferences,
-		count_sources_in_state, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
-		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh,
-		plan_session_warm_mode, publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_flair_request,
-		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, session_status_from_posts,
-		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, store_source_posts,
-		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
-		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
-		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		catalog_source_candidates, count_sources_in_state, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions,
+		initial_source_budget_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
+		pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh,
+		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request,
+		remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
+		snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, store_source_posts, store_source_posts_with_origin,
+		sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedSubredditEntry,
+		SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS,
+		FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -2454,6 +2527,7 @@ mod tests {
 		FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		crate::materialized_catalog::reset_catalog();
 		crate::utils::clear_test_caches();
 		crate::user::clear_test_caches();
 	}
@@ -2464,6 +2538,18 @@ mod tests {
 
 	fn seed_source(source: &FeedSource, posts: Vec<Post>) {
 		store_source_posts(source, posts, String::new());
+	}
+
+	fn test_comment_post(id: &str, username: &str, community: &str, link_post_id: &str, created_ts: u64) -> Post {
+		let mut post = test_post(id, community, created_ts);
+		post.kind = "t1".to_string();
+		post.post_type = "comment".to_string();
+		post.author.name = username.to_string();
+		post.link_id = format!("t3_{link_post_id}");
+		post.link_title = format!("link-{link_post_id}");
+		post.link_permalink = format!("/r/{community}/comments/{link_post_id}/");
+		post.permalink = format!("/r/{community}/comments/{link_post_id}/comment/{id}/");
+		post
 	}
 
 	fn remembered_entry(name: &str) -> RememberedSubredditEntry {
@@ -2593,6 +2679,157 @@ mod tests {
 		assert!(matches!(&sources[0], FeedSource::Subreddit { name, .. } if name == "u_demo"));
 		assert!(matches!(&sources[1], FeedSource::Subreddit { name, .. } if name == "rust"));
 		assert!(matches!(&sources[2], FeedSource::Flair { subreddit, .. } if subreddit == "zeta"));
+	}
+
+	#[test]
+	fn catalog_backed_home_new_matches_live_merge() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let rust = new_source("rust");
+		let news = new_flair_source("programming", "News");
+		let mut flair_post = test_post("p2", "programming", 180);
+		flair_post.flair.text = "News".to_string();
+		seed_source(&rust, vec![test_post("p1", "rust", 200), test_post("shared", "rust", 150)]);
+		seed_source(&news, vec![flair_post, test_post("shared", "rust", 150)]);
+
+		let session = FeedSession {
+			id: "catalog-home".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![rust.clone(), news.clone()],
+				..Default::default()
+			},
+			sources: vec![session_entry(rust, SessionSourceState::Ready), session_entry(news, SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let live_ids = merged_posts_for_session_live(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
+		let catalog_ids = merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
+		assert_eq!(catalog_ids, live_ids);
+	}
+
+	#[test]
+	fn catalog_backed_following_new_matches_live_merge() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let submitted_source = FeedSource::subreddit("u_demo".to_string(), FeedSort::New);
+		let comments_source = FeedSource::user_comments("u_demo".to_string(), FeedSort::New);
+		let submitted = test_post("link-1", "rust", 100);
+		let comment = test_comment_post("comment-1", "demo", "rust", "link-1", 140);
+
+		seed_source(&submitted_source, vec![submitted]);
+		seed_source(&comments_source, vec![comment]);
+
+		let session = FeedSession {
+			id: "catalog-following".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![submitted_source.clone(), comments_source.clone()],
+				bundle_followed_user_comments: true,
+				..Default::default()
+			},
+			sources: vec![
+				session_entry(submitted_source, SessionSourceState::Ready),
+				session_entry(comments_source, SessionSourceState::Ready),
+			],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let live = merged_posts_for_session_live(&session);
+		let catalog = merged_posts_for_session(&session);
+		assert_eq!(
+			catalog.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(),
+			live.iter().map(|post| post.id.as_str()).collect::<Vec<_>>()
+		);
+		assert_eq!(catalog.first().map(|post| post.following_comments.len()), Some(1));
+	}
+
+	#[test]
+	fn catalog_video_candidates_match_listing_output_from_cached_union() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let rust = new_source("rust");
+		let programming = new_source("programming");
+		seed_source(
+			&rust,
+			vec![
+				test_video_post("v1", "rust", "alice", 200, "https://v.redd.it/one/DASH_720.mp4", 40),
+				test_video_post("shared-video", "rust", "alice", 180, "https://v.redd.it/shared/DASH_720.mp4", 15),
+			],
+		);
+		seed_source(
+			&programming,
+			vec![
+				test_video_post("v2", "programming", "bob", 220, "https://v.redd.it/two/DASH_720.mp4", 50),
+				test_video_post("shared-video", "rust", "alice", 180, "https://v.redd.it/shared/DASH_720.mp4", 15),
+			],
+		);
+
+		let filters = HashSet::new();
+		let query = crate::video_mode::VideoModeQuery::default();
+		let listing_from_cache = crate::video_mode::build_listing(
+			&[servable_cached_source_posts(&rust).unwrap(), servable_cached_source_posts(&programming).unwrap()].concat(),
+			&filters,
+			&query,
+			1_000,
+		);
+		let listing_from_catalog = crate::video_mode::build_listing(
+			&catalog_source_candidates(&[rust, programming], &filters).expect("catalog candidates"),
+			&filters,
+			&query,
+			1_000,
+		);
+
+		assert_eq!(
+			listing_from_catalog.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(),
+			listing_from_cache.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>()
+		);
+	}
+
+	#[test]
+	fn restore_persisted_state_rebuilds_catalog_query_results() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		store_source_posts_with_origin(&source, vec![test_post("persisted", "rust", 100)], String::new(), Some(RefreshOrigin::Daemon));
+		let source_entries = snapshot_persisted_source_entries(1_000_100);
+		let remembered_entries = snapshot_persisted_remembered_subreddits(1_000_100);
+
+		reset_test_caches();
+		restore_persisted_state(source_entries, remembered_entries, 1_000_100, 1_000_100);
+
+		let session = FeedSession {
+			id: "catalog-restore".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![new_source("rust")],
+				..Default::default()
+			},
+			sources: vec![session_entry(new_source("rust"), SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		assert_eq!(
+			merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>(),
+			vec!["persisted".to_string()]
+		);
 	}
 
 	#[test]
@@ -2829,7 +3066,8 @@ mod tests {
 		assert!(remembered.contains_key("rust"));
 		assert!(remembered.contains_key(&programming_flair_key));
 		assert!(remembered.contains_key("u_demo"));
-		assert_eq!(remembered.len(), 3);
+		assert!(remembered.contains_key("user_comments:u_demo"));
+		assert_eq!(remembered.len(), 4);
 	}
 
 	#[test]

@@ -129,6 +129,15 @@ struct UserSubredditEntry {
 	count: u32,
 }
 
+fn user_sidebar_subreddits(username: &str) -> Vec<UserSubredditEntry> {
+	crate::materialized_catalog::catalog_user_sidebar_stats(username)
+		.map(|stats| stats.subreddit_counts)
+		.unwrap_or_else(|| utils::cached_user_subreddits(username))
+		.into_iter()
+		.map(|(name, count)| UserSubredditEntry { name, count })
+		.collect()
+}
+
 fn link_post_id_from_listing(post: &Post) -> Option<String> {
 	let lid = post.link_id.trim();
 	lid.strip_prefix("t3_").map(|id| id.to_string())
@@ -137,6 +146,7 @@ fn link_post_id_from_listing(post: &Post) -> Option<String> {
 pub(crate) fn following_comment_from_listing_post(post: Post) -> FollowingComment {
 	FollowingComment {
 		id: post.id,
+		author: post.author.name,
 		body: post.body,
 		permalink: post.permalink,
 		created_ts: post.created_ts,
@@ -269,6 +279,9 @@ fn synthetic_post_from_orphan_bundle(post_id: String, mut comments: Vec<Followin
 	post.kind = "t3".into();
 	post.title = first.link_title.clone();
 	post.community = first.community.clone();
+	// Orphan bundles don't include the submission listing row, so use the followed comment author
+	// to keep `/following` consistent and avoid blank usernames in the UI.
+	post.author.name = first.author.clone();
 	post.permalink = crate::utils::listing_link_permalink(&first.link_permalink, &first.permalink);
 	post.link_permalink = first.link_permalink.clone();
 	post.link_title = first.link_title.clone();
@@ -1097,6 +1110,7 @@ mod tests {
 		let mut a = test_post("one", "A", "s1", "", "image", "https://i.redd.it/x.jpg", &[]);
 		a.following_comments.push(FollowingComment {
 			id: "c1".to_string(),
+			author: "demo_author".to_string(),
 			body: String::new(),
 			permalink: String::new(),
 			created_ts: 1,
@@ -1114,6 +1128,7 @@ mod tests {
 		let mut b = test_post("two", "B", "s2", "", "image", "https://i.redd.it/x.jpg?w=1", &[]);
 		b.following_comments.push(FollowingComment {
 			id: "c2".to_string(),
+			author: "demo_author".to_string(),
 			body: String::new(),
 			permalink: String::new(),
 			created_ts: 2,
@@ -1702,6 +1717,7 @@ mod tests {
 		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
 		post.following_comments.push(FollowingComment {
 			id: "comment_one".to_string(),
+			author: "demo_author".to_string(),
 			body: "<p>This is the child comment.</p>".to_string(),
 			permalink: "/r/demo_sub/comments/thread/comment_one/".to_string(),
 			created_ts: 1,
@@ -1787,6 +1803,34 @@ mod tests {
 
 		assert!(tallies.contains(&("demo_sub".to_string(), 1)));
 		assert!(tallies.contains(&("other_sub".to_string(), 1)));
+	}
+
+	#[test]
+	fn user_sidebar_subreddits_prefer_materialized_catalog_stats() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		super::clear_test_caches();
+		crate::utils::clear_test_caches();
+		crate::materialized_catalog::reset_catalog();
+
+		let username = "catalog_sidebar_user";
+		let mut first = test_post("one", "First", "rust", "", "self", "", &[]);
+		first.author.name = username.to_string();
+		let mut second = test_post("two", "Second", "programming", "", "self", "", &[]);
+		second.author.name = username.to_string();
+		let mut third = test_post("three", "Third", "rust", "", "self", "", &[]);
+		third.author.name = username.to_string();
+
+		crate::materialized_catalog::apply_source_refresh(
+			&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
+			&[first, second, third],
+		);
+		crate::utils::store_user_subreddits(username, &[]);
+
+		let subreddits = super::user_sidebar_subreddits(username);
+		assert_eq!(
+			subreddits.into_iter().map(|entry| (entry.name, entry.count)).collect::<Vec<_>>(),
+			vec![("rust".to_string(), 2), ("programming".to_string(), 1)]
+		);
 	}
 
 	#[test]
@@ -2208,10 +2252,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		}),
 	};
 	let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
-	let user_subreddits = utils::cached_user_subreddits(&username)
-		.into_iter()
-		.map(|(name, count)| UserSubredditEntry { name, count })
-		.collect();
+	let user_subreddits = user_sidebar_subreddits(&username);
 	let video_mode_sidebar = if video_listing {
 		let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
 		let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
@@ -2306,10 +2347,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		UserFragmentTemplate {
 			user,
 			posts: Vec::new(),
-			user_subreddits: utils::cached_user_subreddits(&username)
-				.into_iter()
-				.map(|(name, count)| UserSubredditEntry { name, count })
-				.collect(),
+			user_subreddits: user_sidebar_subreddits(&username),
 			coomer_recent_posts,
 			fallback_notice: String::new(),
 			sort: (sort, param(&path, "t").unwrap_or_default()),
@@ -2359,10 +2397,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		UserFragmentTemplate {
 			user: user.clone(),
 			posts,
-			user_subreddits: utils::cached_user_subreddits(&username)
-				.into_iter()
-				.map(|(name, count)| UserSubredditEntry { name, count })
-				.collect(),
+			user_subreddits: user_sidebar_subreddits(&username),
 			coomer_recent_posts,
 			fallback_notice: String::new(),
 			sort: (String::new(), String::new()),
@@ -2522,10 +2557,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		UserFragmentTemplate {
 			user: fragment_user,
 			posts,
-			user_subreddits: utils::cached_user_subreddits(&username)
-				.into_iter()
-				.map(|(name, count)| UserSubredditEntry { name, count })
-				.collect(),
+			user_subreddits: user_sidebar_subreddits(&username),
 			coomer_recent_posts,
 			fallback_notice,
 			sort: (sort, param(&path, "t").unwrap_or_default()),

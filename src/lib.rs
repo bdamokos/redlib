@@ -5,6 +5,7 @@ pub mod config;
 pub mod duplicates;
 pub mod instance_info;
 pub mod instance_scrape;
+pub mod materialized_catalog;
 pub mod oauth;
 pub mod oauth_resources;
 pub mod post;

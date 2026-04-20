@@ -105,8 +105,12 @@
 	<p class="post_header">
 		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
 		<span class="dot">&bull;</span>
-		<a class="post_author {{ post.author.distinguished }}" href="/user/{{ post.author.name }}">u/{{ post.author.name }}</a>
-		{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
+		{% if !post.author.name.is_empty() %}
+			<a class="post_author {{ post.author.distinguished }}" href="/user/{{ post.author.name }}">u/{{ post.author.name }}</a>
+			{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
+		{% else if post.following_comments.len() > 0 && !post.following_comments[0].author.is_empty() %}
+			<a class="post_author" href="/user/{{ post.following_comments[0].author }}">u/{{ post.following_comments[0].author }}</a>
+		{% endif %}
 		{% if post.author.flair.flair_parts.len() > 0 %}
 			<small class="author_flair">{% call render_flair(post.author.flair.flair_parts) %}</small>
 		{% endif %}
