@@ -202,6 +202,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"video_preview_gallery.js" => resource(include_str!("../static/video_preview_gallery.js"), "text/javascript", false).await,
 		"submitted_duplicates.js" => resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).await,
 		"video_mode_filters.js" => resource(include_str!("../static/video_mode_filters.js"), "text/javascript", false).await,
+		"cache_status.js" => resource(include_str!("../static/cache_status.js"), "text/javascript", false).await,
 		_ => static_asset_not_found(),
 	}
 }

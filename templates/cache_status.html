@@ -2,6 +2,11 @@
 
 {% block title %}Cache Status{% endblock %}
 
+{% block head %}
+	{% call super() %}
+	<script src="{{ crate::utils::static_asset_href("cache_status.js") }}" defer></script>
+{% endblock %}
+
 {% block body %}
 <main class="cache_status_page">
 	<h1>Cache Status</h1>
@@ -45,117 +50,44 @@
 	{% if sources.is_empty() %}
 	<p>No saved subscriptions or flair subscriptions are available for this client.</p>
 	{% else %}
-	<table class="sortable_table" data-sortable-table>
-		<thead>
-			<tr>
-				<th data-sort-type="text"><button type="button" class="sort_button">Source</button></th>
-				<th data-sort-type="text"><button type="button" class="sort_button">Type</button></th>
-				<th data-sort-type="text"><button type="button" class="sort_button">Cached</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Posts</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Head Post Age</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Cache Expires In</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Last Fetched</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Refresh Frequency</button></th>
-				<th data-sort-type="text"><button type="button" class="sort_button">Schedule State</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Queue</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Next Fetch</button></th>
-				<th data-sort-type="number"><button type="button" class="sort_button">Failures</button></th>
-			</tr>
-		</thead>
-		<tbody>
-			{% for source in sources %}
-			<tr>
-				<td data-sort-value="{{ source.display_name.to_lowercase() }}"><a href="{{ source.feed_url }}">{{ source.display_name }}</a></td>
-				<td data-sort-value="{{ source.source_type.to_lowercase() }}">{{ source.source_type }}</td>
-				<td data-sort-value="{% if source.cached %}1{% else %}0{% endif %}">{% if source.cached %}yes{% else %}no{% endif %}</td>
-				<td data-sort-value="{{ source.cached_posts }}">{{ source.cached_posts }}</td>
-				<td{% match source.head_post_age_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.head_post_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
-				<td{% match source.cache_expires_in_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.cache_expires_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
-				<td{% match source.cached_age_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.cached_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
-				<td{% match source.refresh_frequency_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.refresh_frequency_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
-				<td data-sort-value="{{ source.schedule_state.to_lowercase() }}">{{ self.schedule_state_label(source.schedule_state.as_str()) }}</td>
-				<td{% match source.queue_position %}{% when Some with (position) %} data-sort-value="{{ position + 1 }}"{% when None %}{% endmatch %}>{% match source.queue_position %}{% when Some with (position) %}#{{ position + 1 }}{% when None %}-{% endmatch %}</td>
-				<td{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
-				<td data-sort-value="{{ source.consecutive_failures }}">{{ source.consecutive_failures }}</td>
-			</tr>
-			{% endfor %}
-		</tbody>
-	</table>
-	<script>
-		document.addEventListener("DOMContentLoaded", function () {
-			const table = document.querySelector("[data-sortable-table]");
-			if (!table) {
-				return;
-			}
-
-			const tbody = table.tBodies[0];
-			const headers = Array.from(table.querySelectorAll("thead th"));
-
-			const getCellValue = (row, index, type) => {
-				const cell = row.cells[index];
-				if (!cell) {
-					return null;
-				}
-				const rawValue = cell.dataset.sortValue ?? cell.textContent.trim();
-				if (!rawValue || rawValue === "-") {
-					return null;
-				}
-				if (type === "number") {
-					const number = Number(rawValue);
-					return Number.isNaN(number) ? null : number;
-				}
-				return rawValue.toLocaleLowerCase();
-			};
-
-			const compareValues = (left, right, direction) => {
-				if (left === null && right === null) {
-					return 0;
-				}
-				if (left === null) {
-					return 1;
-				}
-				if (right === null) {
-					return -1;
-				}
-				if (left < right) {
-					return direction === "asc" ? -1 : 1;
-				}
-				if (left > right) {
-					return direction === "asc" ? 1 : -1;
-				}
-				return 0;
-			};
-
-			headers.forEach((header, index) => {
-				const button = header.querySelector(".sort_button");
-				if (!button) {
-					return;
-				}
-
-				button.addEventListener("click", function () {
-					const type = header.dataset.sortType || "text";
-					const currentDirection = header.dataset.sortDirection;
-					const nextDirection = currentDirection === "asc" ? "desc" : "asc";
-					const rows = Array.from(tbody.rows).map((row, originalIndex) => ({ row, originalIndex }));
-
-					rows.sort((left, right) => {
-						const leftValue = getCellValue(left.row, index, type);
-						const rightValue = getCellValue(right.row, index, type);
-						return compareValues(leftValue, rightValue, nextDirection) || (left.originalIndex - right.originalIndex);
-					});
-
-					headers.forEach((otherHeader) => {
-						delete otherHeader.dataset.sortDirection;
-						otherHeader.removeAttribute("aria-sort");
-					});
-
-					header.dataset.sortDirection = nextDirection;
-					header.setAttribute("aria-sort", nextDirection === "asc" ? "ascending" : "descending");
-					rows.forEach(({ row }) => tbody.appendChild(row));
-				});
-			});
-		});
-	</script>
+	<div class="table_scroll_x">
+		<table class="sortable_table" data-sortable-table>
+			<thead>
+				<tr>
+					<th data-sort-type="text"><button type="button" class="sort_button">Source</button></th>
+					<th data-sort-type="text"><button type="button" class="sort_button">Type</button></th>
+					<th data-sort-type="text"><button type="button" class="sort_button">Cached</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Posts</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Head Post Age</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Cache Expires In</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Last Fetched</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Refresh Frequency</button></th>
+					<th data-sort-type="text"><button type="button" class="sort_button">Schedule State</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Queue</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Next Fetch</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Failures</button></th>
+				</tr>
+			</thead>
+			<tbody>
+				{% for source in sources %}
+				<tr>
+					<td data-sort-value="{{ source.display_name.to_lowercase() }}"><a href="{{ source.feed_url }}">{{ source.display_name }}</a></td>
+					<td data-sort-value="{{ source.source_type.to_lowercase() }}">{{ source.source_type }}</td>
+					<td data-sort-value="{% if source.cached %}1{% else %}0{% endif %}">{% if source.cached %}yes{% else %}no{% endif %}</td>
+					<td data-sort-value="{{ source.cached_posts }}">{{ source.cached_posts }}</td>
+					<td{% match source.head_post_age_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.head_post_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
+					<td{% match source.cache_expires_in_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.cache_expires_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
+					<td{% match source.cached_age_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.cached_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
+					<td{% match source.refresh_frequency_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.refresh_frequency_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
+					<td data-sort-value="{{ source.schedule_state.to_lowercase() }}">{{ self.schedule_state_label(source.schedule_state.as_str()) }}</td>
+					<td{% match source.queue_position %}{% when Some with (position) %} data-sort-value="{{ position + 1 }}"{% when None %}{% endmatch %}>{% match source.queue_position %}{% when Some with (position) %}#{{ position + 1 }}{% when None %}-{% endmatch %}</td>
+					<td{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
+					<td data-sort-value="{{ source.consecutive_failures }}">{{ source.consecutive_failures }}</td>
+				</tr>
+				{% endfor %}
+			</tbody>
+		</table>
+	</div>
 	{% endif %}
 </main>
 {% endblock %}

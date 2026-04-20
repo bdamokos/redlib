@@ -2896,6 +2896,7 @@ th .sort_button {
     font: inherit;
     gap: 0.35rem;
     padding: 0;
+    width: 100%;
 }
 
 th .sort_button::after {
@@ -2921,6 +2922,21 @@ td {
 td,
 th {
     padding: 10px;
+}
+
+.cache_status_page .table_scroll_x {
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+.cache_status_page .sortable_table {
+    width: 100%;
+}
+
+.cache_status_page .sortable_table th,
+.cache_status_page .sortable_table td {
+    font-size: 0.95rem;
+    padding: 0.6rem 0.75rem;
 }
 
 /* Errors */
