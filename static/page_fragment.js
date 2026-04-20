@@ -30,10 +30,20 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     };
 
+    const applyDocumentMetadata = (root) => {
+        const metadataNode = root?.querySelector?.("[data-document-title]");
+        const documentTitle = metadataNode?.dataset?.documentTitle;
+        if (documentTitle) {
+            document.title = documentTitle;
+        }
+    };
+
     const replaceFragment = (html) => {
+        const template = document.createElement("template");
+        template.innerHTML = html.trim();
+        applyDocumentMetadata(template.content);
+
         if (replaceSelector) {
-            const template = document.createElement("template");
-            template.innerHTML = html.trim();
             const nextNode = template.content.querySelector(replaceSelector);
             const currentNode = document.querySelector(replaceSelector);
             if (nextNode && currentNode) {
