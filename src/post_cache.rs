@@ -2272,7 +2272,17 @@ pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Ve
 	}
 	reconcile_session_with_source_cache(session);
 
-	let posts = merged_posts_for_session(session);
+	let posts = if session_uses_materialized_catalog(session) {
+		// Contextual pagination needs enough pages to build age/score buckets, but does not require the full stream.
+		const METRICS_TARGET_PAGES: usize = 40;
+		const METRICS_OVERFETCH_FACTOR: usize = 3;
+		const METRICS_MAX_CANDIDATES: usize = 25_000;
+		let target_posts = METRICS_TARGET_PAGES.saturating_mul(per_page).max(background_target_posts(session));
+		let limit = target_posts.saturating_mul(METRICS_OVERFETCH_FACTOR).min(METRICS_MAX_CANDIDATES);
+		finalize_session_posts(session, materialized_catalog::query_session_stream_limited(session, limit))
+	} else {
+		merged_posts_for_session(session)
+	};
 	let mut metrics = Vec::new();
 	for (page, chunk) in posts.chunks(per_page).enumerate() {
 		metrics.push(FeedSessionPageMetric {

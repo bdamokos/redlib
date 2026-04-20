@@ -380,7 +380,7 @@ fn duplicate_gif_key(post: &Post) -> Option<String> {
 	None
 }
 
-fn video_aggregate_key(post: &Post) -> Option<String> {
+pub(crate) fn video_aggregate_key(post: &Post) -> Option<String> {
 	if post.media.duration_seconds <= 0 {
 		return None;
 	}
@@ -632,7 +632,13 @@ pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
 	};
 	prune_user_video_stats_cache(&mut cache);
 
-	let entry = cache.get_mut(&cache_key)?;
+	let entry = match cache.get_mut(&cache_key) {
+		Some(entry) => entry,
+		None => {
+			drop(cache);
+			return crate::materialized_catalog::catalog_avg_video_length(&cache_key);
+		}
+	};
 	entry.cached_at = Instant::now();
 
 	if entry.video_count == 0 {
