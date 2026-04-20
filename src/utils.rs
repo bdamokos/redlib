@@ -527,6 +527,11 @@ pub fn format_video_duration(seconds: i64) -> String {
 	}
 }
 
+/// Askama templates frequently pass numeric fields by reference.
+pub fn format_video_duration_ref(seconds: &i64) -> String {
+	format_video_duration(*seconds)
+}
+
 /// Normalized handle for comparing RedGifs uploaders, Reddit usernames, and profile link slugs.
 pub fn normalize_creator_identity_slug(raw: &str) -> String {
 	raw.trim().trim_start_matches('@').to_lowercase()
