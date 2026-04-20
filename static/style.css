@@ -395,6 +395,16 @@ main:has(#column_one.post_page) {
     max-width: calc(100% - 40px);
 }
 
+main.post_page_main {
+    display: block;
+    width: min(1120px, calc(100% - 40px));
+    max-width: 1120px;
+}
+
+main.post_page_main #page_fragment {
+    width: 100%;
+}
+
 .wide main {
     max-width: calc(100% - 40px);
 }
@@ -432,7 +442,9 @@ main:has(#column_one.post_page) {
 }
 
 #column_one.post_page {
+    width: 100%;
     max-width: 1120px;
+    margin: 0 auto;
 }
 @media screen and (max-width: 800px) {
     #column_one { max-width: unset; }
@@ -2953,6 +2965,11 @@ th {
         flex-direction: column-reverse;
         padding: 10px;
         margin: 0 0 10px 0;
+        max-width: 100%;
+    }
+
+    main.post_page_main {
+        width: 100%;
         max-width: 100%;
     }
 
