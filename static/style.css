@@ -2886,6 +2886,34 @@ th {
     white-space: nowrap;
 }
 
+th .sort_button {
+    align-items: center;
+    background: none;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    display: inline-flex;
+    font: inherit;
+    gap: 0.35rem;
+    padding: 0;
+}
+
+th .sort_button::after {
+    content: "↕";
+    font-size: 0.9em;
+    opacity: 0.6;
+}
+
+th[aria-sort="ascending"] .sort_button::after {
+    content: "↑";
+    opacity: 1;
+}
+
+th[aria-sort="descending"] .sort_button::after {
+    content: "↓";
+    opacity: 1;
+}
+
 td {
     word-wrap: break-word;
 }
