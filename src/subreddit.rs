@@ -300,13 +300,15 @@ pub struct CacheStatusTemplate {
 	generated_at_unix: u64,
 	summary: crate::post_cache::CacheStatusSummary,
 	sources: Vec<crate::post_cache::CacheStatusSource>,
+	seconds_until_daemon_tick: u64,
+	upcoming_sources: Vec<crate::post_cache::CacheStatusSource>,
 }
 
 crate::impl_template_str_eq!(CacheStatusTemplate);
 
 impl CacheStatusTemplate {
-	fn human_duration(&self, seconds: &&u64) -> String {
-		let seconds = **seconds;
+	fn human_duration(&self, seconds: &u64) -> String {
+		let seconds = *seconds;
 		let days = seconds / 86_400;
 		let hours = (seconds % 86_400) / 3_600;
 		let minutes = (seconds % 3_600) / 60;
@@ -320,6 +322,18 @@ impl CacheStatusTemplate {
 			format!("{minutes}m {secs}s")
 		} else {
 			format!("{secs}s")
+		}
+	}
+
+	fn schedule_state_label(&self, state: &str) -> &'static str {
+		match state {
+			"in_flight" => "refreshing now",
+			"scheduled" => "queued for daemon refresh",
+			"blocked" => "temporarily backed off after failures",
+			"idle" => "remembered, but not currently queued",
+			"not_cached" => "not cached yet",
+			"session_only" => "only fetched while you browse",
+			_ => "unknown",
 		}
 	}
 }
@@ -863,7 +877,7 @@ fn build_flair_filters(current_url: &str, active_flair_filter: &str, flairs: Vec
 		.collect()
 }
 
-fn encode_query_value(value: &str) -> String {
+pub(crate) fn encode_query_value(value: &str) -> String {
 	form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
@@ -4229,12 +4243,30 @@ pub async fn feed_status_api(req: Request<Body>) -> Result<Response<Body>, Strin
 pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, String> {
 	let prefs = Preferences::new(&req);
 	let status = crate::post_cache::cache_status_for_preferences(&prefs);
+	let seconds_until_daemon_tick = crate::post_cache::cache_status_seconds_until_daemon_tick();
+	let mut upcoming_sources = status
+		.sources
+		.iter()
+		.filter(|source| source.schedule_state == "scheduled" || source.schedule_state == "in_flight")
+		.cloned()
+		.collect::<Vec<_>>();
+	upcoming_sources.sort_by(|left, right| {
+		left
+			.predicted_next_fetch_in_secs
+			.unwrap_or(u64::MAX)
+			.cmp(&right.predicted_next_fetch_in_secs.unwrap_or(u64::MAX))
+			.then_with(|| left.queue_position.unwrap_or(usize::MAX).cmp(&right.queue_position.unwrap_or(usize::MAX)))
+			.then_with(|| left.display_name.to_lowercase().cmp(&right.display_name.to_lowercase()))
+	});
+	upcoming_sources.truncate(5);
 	Ok(template(&CacheStatusTemplate {
 		prefs,
 		url: req.uri().path().to_string(),
 		generated_at_unix: status.generated_at_unix,
 		summary: status.summary,
 		sources: status.sources,
+		seconds_until_daemon_tick,
+		upcoming_sources,
 	}))
 }
 

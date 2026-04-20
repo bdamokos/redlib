@@ -165,6 +165,30 @@ impl FeedSource {
 		}
 	}
 
+	fn public_path(&self) -> String {
+		match self {
+			Self::Subreddit { name, sort } => {
+				let lower = name.to_lowercase();
+				if let Some(username) = lower.strip_prefix("u_").filter(|rest| !rest.is_empty()) {
+					format!("/user/{username}/{}", sort.as_str())
+				} else {
+					format!("/r/{}/{}", name.replace('+', "%2B"), sort.as_str())
+				}
+			}
+			Self::UserComments { name, sort } => {
+				let lower = name.to_lowercase();
+				let username = lower.strip_prefix("u_").filter(|rest| !rest.is_empty()).unwrap_or(lower.as_str());
+				format!("/user/{username}/comments/{}", sort.as_str())
+			}
+			Self::Flair { subreddit, flair, sort } => format!(
+				"/r/{}/{}?flair={}",
+				subreddit.replace('+', "%2B"),
+				sort.as_str(),
+				crate::subreddit::encode_query_value(flair)
+			),
+		}
+	}
+
 	fn filter_posts(&self, mut posts: Vec<Post>) -> Vec<Post> {
 		match self {
 			Self::Subreddit { .. } | Self::UserComments { .. } => posts,
@@ -242,6 +266,7 @@ pub struct CacheStatusSource {
 	pub source_key: String,
 	pub display_name: String,
 	pub source_type: String,
+	pub feed_url: String,
 	pub daemon_managed: bool,
 	pub cached: bool,
 	pub cached_posts: usize,
@@ -254,6 +279,7 @@ pub struct CacheStatusSource {
 	pub last_refresh_failed_secs_ago: Option<u64>,
 	pub refresh_frequency_secs: Option<u64>,
 	pub schedule_state: String,
+	pub queue_position: Option<usize>,
 	pub predicted_next_fetch_in_secs: Option<u64>,
 	pub blocked_until_secs: Option<u64>,
 	pub consecutive_failures: u32,
@@ -2378,6 +2404,15 @@ fn visible_sources_from_preferences(preferences: &Preferences) -> Vec<FeedSource
 	sources
 }
 
+pub fn cache_status_seconds_until_daemon_tick() -> u64 {
+	REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT
+		.lock()
+		.ok()
+		.and_then(|next_tick| *next_tick)
+		.map(|next_tick| next_tick.saturating_duration_since(Instant::now()).as_secs())
+		.unwrap_or(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS)
+}
+
 fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let mut entries = remembered
@@ -2387,12 +2422,7 @@ fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
 		.collect::<Vec<_>>();
 	entries.sort_by(remembered_refresh_priority);
 
-	let seconds_until_tick = REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT
-		.lock()
-		.ok()
-		.and_then(|next_tick| *next_tick)
-		.map(|next_tick| next_tick.saturating_duration_since(Instant::now()).as_secs())
-		.unwrap_or(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS);
+	let seconds_until_tick = cache_status_seconds_until_daemon_tick();
 
 	let positions = entries.into_iter().enumerate().map(|(index, entry)| (entry.name, index)).collect::<HashMap<_, _>>();
 
@@ -2431,15 +2461,14 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			.and_then(|entry| entry.banned_until)
 			.map(|until| until.saturating_duration_since(now).as_secs())
 			.filter(|seconds| *seconds > 0);
+		let queue_position = remembered_entry.and_then(|entry| queue_positions.get(&entry.name).copied());
 		let predicted_next_fetch_in_secs = if let Some(entry) = remembered_entry {
 			if entry.refresh_in_flight {
 				Some(0)
 			} else if let Some(blocked) = blocked_until_secs {
 				Some(blocked)
 			} else {
-				queue_positions
-					.get(&entry.name)
-					.map(|position| seconds_until_tick + (*position as u64 * REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS))
+				queue_position.map(|position| seconds_until_tick + (position as u64 * REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS))
 			}
 		} else {
 			None
@@ -2469,6 +2498,7 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 				FeedSource::Subreddit { .. } => "subreddit".to_string(),
 				FeedSource::Flair { .. } => "flair".to_string(),
 			},
+			feed_url: source.public_path(),
 			daemon_managed,
 			cached,
 			cached_posts,
@@ -2483,6 +2513,7 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			last_refresh_failed_secs_ago: remembered_entry.and_then(|entry| entry.last_refresh_failed_at).map(|instant| instant.elapsed().as_secs()),
 			refresh_frequency_secs: remembered_entry.map(effective_freshness_target_secs),
 			schedule_state: schedule_state.to_string(),
+			queue_position,
 			predicted_next_fetch_in_secs,
 			blocked_until_secs,
 			consecutive_failures: remembered_entry.map(|entry| entry.consecutive_failures).unwrap_or_default(),

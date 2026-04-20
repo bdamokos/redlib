@@ -5,16 +5,41 @@
 {% block body %}
 <main class="cache_status_page">
 	<h1>Cache Status</h1>
-	<p>This page only shows cached and scheduled sources derived from your saved subscriptions and flair subscriptions.</p>
+	<p>This page shows the feeds Redlib can currently keep warm for this browser's saved subscriptions and flair subscriptions.</p>
 	<p>Generated at Unix time {{ generated_at_unix }}.</p>
 
 	<div class="panel">
-		<p>Visible sources: {{ summary.sources_total }}</p>
-		<p>Cached now: {{ summary.cached_sources }}</p>
-		<p>Daemon-managed: {{ summary.daemon_managed_sources }}</p>
-		<p>Scheduled: {{ summary.scheduled_sources }}</p>
-		<p>In flight: {{ summary.in_flight_sources }}</p>
-		<p>Blocked: {{ summary.blocked_sources }}</p>
+		<p><strong>Visible sources:</strong> {{ summary.sources_total }}</p>
+		<p><strong>Cached now:</strong> {{ summary.cached_sources }}</p>
+		<p><strong>Daemon-managed:</strong> {{ summary.daemon_managed_sources }}</p>
+		<p><strong>Scheduled:</strong> {{ summary.scheduled_sources }}</p>
+		<p><strong>In flight:</strong> {{ summary.in_flight_sources }}</p>
+		<p><strong>Blocked:</strong> {{ summary.blocked_sources }}</p>
+	</div>
+
+	<div class="panel">
+		<p><strong>How the next update time is calculated:</strong> the background daemon's next wake-up is in about {{ self.human_duration(seconds_until_daemon_tick) }}, and each wake-up refreshes one eligible remembered feed.</p>
+		<p>It does <em>not</em> simply walk uncached feeds in order. Feeds that have never refreshed successfully go first, then overdue feeds, then feeds with the highest age-vs-target freshness ratio, with recent user requests used as a tiebreaker.</p>
+		<p>So a feed's “Next Fetch” time is roughly: <em>time until the next daemon tick + (its queue position × one daemon interval)</em>.</p>
+		<p>The per-feed “Refresh frequency” is adaptive: it is estimated from how often that feed posts, clamped to a minimum and maximum, and stretched further after repeated failures.</p>
+	</div>
+
+	<div class="panel">
+		<p><strong>Next feeds likely to refresh:</strong></p>
+		{% if upcoming_sources.is_empty() %}
+		<p>No daemon-managed feeds are currently queued.</p>
+		{% else %}
+		<ol>
+			{% for source in upcoming_sources %}
+			<li>
+				<a href="{{ source.feed_url }}">{{ source.display_name }}</a>
+				— {% if source.schedule_state == "in_flight" %}refreshing now{% else %}
+				{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}about {{ self.human_duration(seconds) }} from now{% when None %}waiting for queue placement{% endmatch %}
+				{% endif %}
+			</li>
+			{% endfor %}
+		</ol>
+		{% endif %}
 	</div>
 
 	{% if sources.is_empty() %}
@@ -32,6 +57,7 @@
 				<th>Last Fetched</th>
 				<th>Refresh Frequency</th>
 				<th>Schedule State</th>
+				<th>Queue</th>
 				<th>Next Fetch</th>
 				<th>Failures</th>
 			</tr>
@@ -39,7 +65,7 @@
 		<tbody>
 			{% for source in sources %}
 			<tr>
-				<td>{{ source.display_name }}</td>
+				<td><a href="{{ source.feed_url }}">{{ source.display_name }}</a></td>
 				<td>{{ source.source_type }}</td>
 				<td>{% if source.cached %}yes{% else %}no{% endif %}</td>
 				<td>{{ source.cached_posts }}</td>
@@ -47,7 +73,8 @@
 				<td>{% match source.cache_expires_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
 				<td>{% match source.cached_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
 				<td>{% match source.refresh_frequency_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
-				<td>{{ source.schedule_state }}</td>
+				<td>{{ self.schedule_state_label(source.schedule_state.as_str()) }}</td>
+				<td>{% match source.queue_position %}{% when Some with (position) %}#{{ position + 1 }}{% when None %}-{% endmatch %}</td>
 				<td>{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
 				<td>{{ source.consecutive_failures }}</td>
 			</tr>
