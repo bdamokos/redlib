@@ -391,6 +391,10 @@ main {
     padding-bottom: 4em;
 }
 
+main:has(#column_one.post_page) {
+    max-width: calc(100% - 40px);
+}
+
 .wide main {
     max-width: calc(100% - 40px);
 }
