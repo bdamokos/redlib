@@ -214,6 +214,56 @@ async fn fetch_parent_comment_lookup(parent_ids: &[String]) -> HashMap<String, P
 	parents
 }
 
+async fn fetch_following_link_post_lookup(post_ids: &[String]) -> HashMap<String, Post> {
+	let mut linked_posts = HashMap::new();
+
+	for chunk in post_ids.chunks(FOLLOWING_PARENT_COMMENT_BATCH_SIZE) {
+		let ids = chunk.iter().map(|id| format!("t3_{id}")).collect::<Vec<_>>().join(",");
+		let path = format!("/api/info.json?raw_json=1&id={ids}");
+		let Ok(response) = json(path, false).await else {
+			continue;
+		};
+		let Some(children) = response["data"]["children"].as_array() else {
+			continue;
+		};
+		for child in children {
+			if child["kind"].as_str().unwrap_or_default() != "t3" {
+				continue;
+			}
+			let post = crate::utils::parse_post(child).await;
+			linked_posts.insert(post.id.clone(), post);
+		}
+	}
+
+	linked_posts
+}
+
+fn append_missing_following_link_posts(mut posts: Vec<Post>, mut linked_posts: HashMap<String, Post>) -> Vec<Post> {
+	let mut existing_post_ids = posts
+		.iter()
+		.filter(|post| post.kind == "t3")
+		.map(|post| post.id.clone())
+		.collect::<HashSet<_>>();
+	let linked_post_ids = posts
+		.iter()
+		.filter(|post| post.kind == "t1" && post.post_type == "comment")
+		.filter_map(link_post_id_from_listing)
+		.collect::<Vec<_>>();
+
+	for post_id in linked_post_ids {
+		if existing_post_ids.contains(&post_id) {
+			continue;
+		}
+		let Some(post) = linked_posts.remove(&post_id) else {
+			continue;
+		};
+		existing_post_ids.insert(post_id);
+		posts.push(post);
+	}
+
+	posts
+}
+
 pub(crate) async fn hydrate_following_comment_context(mut posts: Vec<Post>) -> Vec<Post> {
 	let parent_ids = posts
 		.iter()
@@ -242,7 +292,23 @@ pub(crate) async fn hydrate_following_comment_context(mut posts: Vec<Post>) -> V
 		post.parent_comment = parent.clone();
 	}
 
-	posts
+	let linked_post_ids = posts
+		.iter()
+		.filter(|post| post.kind == "t1" && post.post_type == "comment")
+		.filter_map(link_post_id_from_listing)
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.collect::<Vec<_>>();
+	if linked_post_ids.is_empty() {
+		return posts;
+	}
+
+	let linked_posts = fetch_following_link_post_lookup(&linked_post_ids).await;
+	if linked_posts.is_empty() {
+		return posts;
+	}
+
+	append_missing_following_link_posts(posts, linked_posts)
 }
 
 pub(crate) fn dedupe_and_sort_following_comments(comments: &mut Vec<FollowingComment>) {
@@ -979,7 +1045,7 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<Vec<Post>, St
 
 #[cfg(test)]
 mod tests {
-	use super::collapse_duplicate_submissions;
+	use super::{append_missing_following_link_posts, collapse_duplicate_submissions};
 	use askama::Template;
 	use url::form_urlencoded;
 
@@ -1109,6 +1175,21 @@ mod tests {
 		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
 		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "Second title");
 		assert_eq!(collapsed[0].collapsed_duplicates[0].display_community, "r/sub_two");
+	}
+
+	#[test]
+	fn append_missing_following_link_posts_adds_missing_original_threads() {
+		let mut comment = test_comment("c1", "demo_sub", "<div class=\"md\"><p>hi</p></div>", "t3", "Thread title");
+		comment.link_id = "t3_thread1".to_string();
+		let original = test_post("thread1", "Thread title", "demo_sub", "<div class=\"md\"><p>post body</p></div>", "self", "", &[]);
+
+		let hydrated = append_missing_following_link_posts(
+			vec![comment],
+			std::iter::once(("thread1".to_string(), original)).collect(),
+		);
+
+		assert_eq!(hydrated.len(), 2);
+		assert!(hydrated.iter().any(|post| post.kind == "t3" && post.id == "thread1"));
 	}
 
 	#[test]
