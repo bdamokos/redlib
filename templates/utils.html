@@ -662,12 +662,14 @@
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
 			data-preview-render-mode="animation"
 			data-post-id="{{ post.id }}"
-			data-media-url="{{ post.media.video_preview_job_hint }}"
 			data-poster-url="{{ post.media.poster }}"
 			data-duration-seconds="{{ post.media.duration_seconds }}"
 			data-width="{{ post.media.width }}"
 			data-height="{{ post.media.height }}"
 			data-page-path="{{ post.permalink }}"
+			{% if !post.media.video_preview_job_hint.is_empty() %}
+			data-media-url="{{ post.media.video_preview_job_hint }}"
+			{% endif %}
 			{% if !post.media.video_preview_fallback_url.is_empty() %}
 			data-preview-fallback-video-url="{{ post.media.video_preview_fallback_url }}"
 			{% endif %}

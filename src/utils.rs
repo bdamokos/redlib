@@ -364,10 +364,6 @@ impl Media {
 		let redgifs_poster = redgifs_bundle.as_ref().map(|paths| paths.poster_path().to_string()).unwrap_or_default();
 		let redgifs_duration_seconds = redgifs_bundle.as_ref().map(|paths| paths.duration_seconds()).unwrap_or_default();
 		let redgifs_username = redgifs_bundle.as_ref().map(|paths| paths.username().to_string()).unwrap_or_default();
-		let redgifs_preview_media_url = redgifs_bundle
-			.as_ref()
-			.and_then(|paths| redgifs::direct_media_url_from_path(paths.video_path()))
-			.unwrap_or_default();
 		let redgifs_preview_fallback_url = redgifs_bundle.as_ref().map(|paths| paths.mobile_video_path().to_string()).unwrap_or_default();
 		let redgifs_url = redgifs_id.as_ref().map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
 
@@ -470,7 +466,9 @@ impl Media {
 		let video_preview_enabled =
 			crate::video_preview::feature_enabled() && (post_type == "video" || post_type == "gif") && embed_code.is_empty() && !url_val.as_str().unwrap_or_default().is_empty();
 		let video_preview_job_hint = if redgifs_url.is_some() {
-			redgifs_preview_media_url
+			// RedGifs posts should use their small mobile MP4 directly as the
+			// preview layer instead of generating server-side animated previews.
+			String::new()
 		} else if post_type == "video" || post_type == "gif" {
 			url_val.as_str().unwrap_or_default().to_string()
 		} else {

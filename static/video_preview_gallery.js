@@ -577,6 +577,14 @@
             return;
         }
 
+        if (host.dataset.previewFallbackVideoUrl && !host.dataset.mediaUrl) {
+            state.suppressPreviewLease = true;
+            state.ready = true;
+            setLoadingState(host, "ready");
+            activatePreviewFallback(host, state);
+            return;
+        }
+
         state.leasing = true;
         state.previewGenerationStartedAt = performance.now();
         setLoadingState(host, "queued");
@@ -685,7 +693,7 @@
     }
 
     function observeHosts(root) {
-        (root || document).querySelectorAll(".video_preview_host[data-media-url]").forEach(function (host) {
+        (root || document).querySelectorAll(".video_preview_host[data-media-url], .video_preview_host[data-preview-fallback-video-url]").forEach(function (host) {
             bindPreviewLifecycle(host);
 
             if (!activeHosts.has(host)) {
