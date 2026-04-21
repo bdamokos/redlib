@@ -2929,8 +2929,21 @@ th {
     overflow-x: auto;
 }
 
-.cache_status_page .sortable_table {
+.cache_status_page {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
     width: 100%;
+    min-width: 0;
+}
+
+.cache_status_page > * + * {
+    margin-top: 12px;
+}
+
+.cache_status_page .sortable_table {
+    min-width: 100%;
+    width: max-content;
 }
 
 .cache_status_page .sortable_table th,
