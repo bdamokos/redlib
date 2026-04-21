@@ -115,7 +115,7 @@
 			<small class="author_flair">{% call render_flair(post.author.flair.flair_parts) %}</small>
 		{% endif %}
 		<span class="dot">&bull;</span>
-		<span class="created" title="{{ post.created }}">{{ post.rel_time }}</span>
+		<span class="created" title="{{ post.created }}" data-created-ts="{{ post.created_ts }}">{{ post.rel_time }}</span>
 		{% if !post.awards.is_empty() && prefs.hide_awards != "on" %}
 		<span class="dot">&bull;</span>
 		<span class="awards">
@@ -336,7 +336,7 @@
 		<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
 		{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
 		<span class="dot">&bull;</span>
-		<span class="created" title="{{ post.created }}">{{ post.rel_time }}</span>
+		<span class="created" title="{{ post.created }}" data-created-ts="{{ post.created_ts }}">{{ post.rel_time }}</span>
 		{% if !post.awards.is_empty() && prefs.hide_awards != "on" %}
 			{% for award in post.awards.clone() %}
 			<span class="award" title="{{ award.name }}">

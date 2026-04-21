@@ -5,7 +5,6 @@
     }
 
     var PAGE_SETTLED_DELAY_MS = 1200;
-    var PREVIEW_FALLBACK_DELAY_MS = 4000;
     var PREVIEW_FALLBACK_POLL_MS = 500;
     var DESKTOP_PREVIEW_FALLBACK_QUERY = "(min-width: 1000px) and (hover: hover) and (pointer: fine)";
 
@@ -398,7 +397,6 @@
     }
 
     function eligiblePreviewFallbackHosts() {
-        var now = performance.now();
         var candidates = [];
 
         activeHosts.forEach(function (state, host) {
@@ -406,9 +404,6 @@
                 return;
             }
             if (!shouldRenderHost(host)) {
-                return;
-            }
-            if (!state.previewGenerationStartedAt || now - state.previewGenerationStartedAt < PREVIEW_FALLBACK_DELAY_MS) {
                 return;
             }
 

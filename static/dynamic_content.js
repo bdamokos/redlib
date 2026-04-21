@@ -4,6 +4,7 @@
         window.initializeSubscriptionForms?.(root);
         window.loadAuthorLinks?.(root);
         window.markTruncatedPreviews?.();
+        window.refreshPostTimes?.(root);
         window.initializeHlsVideos?.(root);
         window.initializeDashVideos?.(root);
         window.observeVideoPreviewHosts?.(root);
