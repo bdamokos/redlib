@@ -1870,6 +1870,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 
 			let no_posts = page_posts.is_empty();
 			let all_posts_hidden_nsfw = !no_posts && (page_posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			if is_following_route(&url) {
+				page_posts = crate::user::hydrate_following_submission_posts(page_posts).await;
+			}
 			utils::hydrate_post_author_links_from_cache(&mut page_posts);
 			info!(
 				"post_cache: community-full-page url={} cache_page={} session={} rendered_posts={} no_posts={} has_next={} ua={}",
@@ -2369,6 +2372,9 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 
 			let no_posts = page_ready && page_posts.is_empty();
 			let all_posts_hidden_nsfw = !no_posts && (page_posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			if is_following_route(&url) {
+				page_posts = crate::user::hydrate_following_submission_posts(page_posts).await;
+			}
 			utils::hydrate_post_author_links_from_cache(&mut page_posts);
 			let user_agent = req.headers().get("user-agent").and_then(|value| value.to_str().ok()).unwrap_or_default();
 			info!(
@@ -2890,6 +2896,8 @@ mod tests {
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			poll: None,
 			score: ("1".to_string(), "1".to_string()),
 			upvote_ratio: 100,
@@ -4316,6 +4324,9 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		None
 	};
 	let (mut posts, has_next_unseen) = contextual_listing_posts_from_feed_page(feed_seen_for_posts.as_ref(), page, &mut feed_page, &merged_posts);
+	if is_following_route(&current_url) {
+		posts = crate::user::hydrate_following_submission_posts(posts).await;
+	}
 	utils::hydrate_post_author_links_from_cache(&mut posts);
 
 	let prev_page_url = if page > 0 {

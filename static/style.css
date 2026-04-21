@@ -1540,6 +1540,51 @@ body.following_feed .post_author {
     font-weight: bold;
 }
 
+.post_header_following_thread {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.post_following_thread_top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    width: 100%;
+}
+
+.post_following_thread_meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 6px;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.post_following_meta_label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.55;
+}
+
+.post_following_posted .post_following_meta_label {
+    margin-right: 0.2em;
+}
+
+a.post_following_post_date {
+    text-decoration: none;
+    font-weight: 500;
+}
+
+a.post_following_post_date:hover {
+    text-decoration: underline;
+}
+
 .inline_subscription_form {
     display: inline;
     margin-left: 4px;
@@ -1615,9 +1660,15 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 }
 
 .post_following_comments_label {
-    margin: 0 0 6px;
+    margin: 12px 0 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--highlighted);
     font-weight: 600;
-    color: var(--accent);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--foreground);
+    opacity: 0.72;
 }
 
 .post_following_comments_list {
@@ -2603,6 +2654,11 @@ summary.comment_data {
 
 .compact .post_preview {
     display: none;
+}
+
+/* Following bundles need the parent submission visible even in compact layout */
+body.following_feed.compact .post_following_bundle .post_preview {
+    display: block;
 }
 
 .compact .post_media {

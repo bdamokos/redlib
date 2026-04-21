@@ -681,6 +681,10 @@ pub struct FollowingComment {
 	pub parent_comment: ParentComment,
 	pub link_title: String,
 	pub link_permalink: String,
+	/// Original poster of the submission (from `link_author` on comment listings).
+	pub link_author: String,
+	/// Submission creation time when Reddit includes `link_created_utc` on the comment.
+	pub link_created_ts: u64,
 	pub thread_comments: (String, String),
 	pub thread_nsfw: bool,
 }
@@ -701,6 +705,10 @@ pub struct Post {
 	pub link_id: String,
 	pub link_title: String,
 	pub link_permalink: String,
+	/// Submission OP (user-comment listings only); empty for ordinary submissions.
+	pub link_author: String,
+	/// Submission `created_utc` when provided on comment listings (`link_created_utc`).
+	pub link_created_ts: u64,
 	pub poll: Option<Poll>,
 	pub score: (String, String),
 	pub upvote_ratio: i64,
@@ -755,6 +763,8 @@ impl Clone for Post {
 			link_id: self.link_id.clone(),
 			link_title: self.link_title.clone(),
 			link_permalink: self.link_permalink.clone(),
+			link_author: self.link_author.clone(),
+			link_created_ts: self.link_created_ts,
 			poll: self.poll.clone(),
 			score: self.score.clone(),
 			upvote_ratio: self.upvote_ratio,
@@ -810,6 +820,8 @@ impl Default for Post {
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			poll: None,
 			score: ("0".to_string(), "0".to_string()),
 			upvote_ratio: 0,
@@ -876,6 +888,12 @@ impl Post {
 				}
 			}
 			let link_permalink = listing_link_permalink(data["link_permalink"].as_str().unwrap_or_default(), &permalink);
+			let link_author = if kind == "t1" { val(post, "link_author") } else { String::new() };
+			let link_created_ts = if kind == "t1" {
+				data["link_created_utc"].as_f64().unwrap_or_default().round() as u64
+			} else {
+				0
+			};
 
 			let (rel_time, created) = time(data["created_utc"].as_f64().unwrap_or_default());
 			let created_ts = data["created_utc"].as_f64().unwrap_or_default().round() as u64;
@@ -926,6 +944,8 @@ impl Post {
 				link_id,
 				link_title: val(post, "link_title"),
 				link_permalink,
+				link_author,
+				link_created_ts,
 				poll: Poll::parse(&data["poll_data"]),
 				score: if data["hide_score"].as_bool().unwrap_or_default() {
 					("\u{2022}".to_string(), "Hidden".to_string())
@@ -1010,6 +1030,22 @@ impl Post {
 		} else {
 			"redgifs_uploader redgifs_uploader_mismatch"
 		}
+	}
+
+	/// Relative post age (recomputes from `created_ts` when `rel_time` was not filled in).
+	pub fn display_rel_time(&self) -> String {
+		if !self.rel_time.is_empty() {
+			return self.rel_time.clone();
+		}
+		rel_time_from_unix(self.created_ts)
+	}
+
+	/// Absolute timestamp for tooltips (recomputes from `created_ts` when `created` was not filled in).
+	pub fn display_created_tooltip(&self) -> String {
+		if !self.created.is_empty() {
+			return self.created.clone();
+		}
+		abs_time_title_from_unix(self.created_ts)
 	}
 }
 
@@ -2295,6 +2331,8 @@ pub async fn parse_post(post: &Value) -> Post {
 		link_id: val(post, "link_id"),
 		link_title: val(post, "link_title"),
 		link_permalink: listing_link_permalink(post["data"]["link_permalink"].as_str().unwrap_or_default(), &val(post, "permalink")),
+		link_author: String::new(),
+		link_created_ts: 0,
 		poll,
 		score: format_num(score),
 		upvote_ratio: ratio as i64,
@@ -3577,6 +3615,22 @@ pub fn time(created: f64) -> (String, String) {
 	)
 }
 
+/// Relative label for a Unix timestamp (empty when `ts == 0`).
+pub fn rel_time_from_unix(ts: u64) -> String {
+	if ts == 0 {
+		return String::new();
+	}
+	time(ts as f64).0
+}
+
+/// Absolute UTC tooltip string for a Unix timestamp (empty when `ts == 0`).
+pub fn abs_time_title_from_unix(ts: u64) -> String {
+	if ts == 0 {
+		return String::new();
+	}
+	time(ts as f64).1
+}
+
 /// val() function used to parse JSON from Reddit APIs
 pub fn val(j: &Value, k: &str) -> String {
 	j["data"][k].as_str().unwrap_or_default().to_string()
@@ -3846,6 +3900,8 @@ mod tests {
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			poll: None,
 			score: ("1".to_string(), "1".to_string()),
 			upvote_ratio: 100,
@@ -3928,6 +3984,8 @@ mod tests {
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			poll: None,
 			score: ("1".to_string(), "1".to_string()),
 			upvote_ratio: 100,

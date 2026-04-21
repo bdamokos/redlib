@@ -158,6 +158,8 @@ pub(crate) fn following_comment_from_listing_post(post: Post) -> FollowingCommen
 		parent_comment: post.parent_comment,
 		link_title: post.link_title,
 		link_permalink: post.link_permalink,
+		link_author: post.link_author,
+		link_created_ts: post.link_created_ts,
 		thread_comments: post.comments,
 		thread_nsfw: post.flags.nsfw,
 	}
@@ -264,6 +266,55 @@ fn append_missing_following_link_posts(mut posts: Vec<Post>, mut linked_posts: H
 	posts
 }
 
+/// Bundled `/following` row with only comment metadata (no submission body/media loaded yet).
+pub(crate) fn following_submission_needs_content_fetch(post: &Post) -> bool {
+	post.kind == "t3"
+		&& !post.following_comments.is_empty()
+		&& post.preview_body.is_empty()
+		&& post.body.is_empty()
+		&& post.media.url.is_empty()
+		&& post.gallery.is_empty()
+		&& post.thumbnail.url.is_empty()
+}
+
+fn merge_full_submission_into_following_bundle(shell: &mut Post, full: Post) {
+	let following_comments = std::mem::take(&mut shell.following_comments);
+	let bookmarked = shell.bookmarked;
+	let bookmark_new_comments = shell.bookmark_new_comments;
+	*shell = full;
+	shell.following_comments = following_comments;
+	shell.bookmarked = bookmarked;
+	shell.bookmark_new_comments = bookmark_new_comments;
+}
+
+/// Loads full thread submissions for synthetic bundled posts (and any shell missing media/body).
+pub(crate) async fn hydrate_following_submission_posts(mut posts: Vec<Post>) -> Vec<Post> {
+	let ids: Vec<String> = posts
+		.iter()
+		.filter(|p| following_submission_needs_content_fetch(p))
+		.map(|p| p.id.clone())
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.collect();
+	if ids.is_empty() {
+		return posts;
+	}
+	let lookup = fetch_following_link_post_lookup(&ids).await;
+	if lookup.is_empty() {
+		return posts;
+	}
+	for post in &mut posts {
+		if !following_submission_needs_content_fetch(post) {
+			continue;
+		}
+		let Some(full) = lookup.get(&post.id).cloned() else {
+			continue;
+		};
+		merge_full_submission_into_following_bundle(post, full);
+	}
+	posts
+}
+
 pub(crate) async fn hydrate_following_comment_context(mut posts: Vec<Post>) -> Vec<Post> {
 	let parent_ids = posts
 		.iter()
@@ -345,9 +396,8 @@ fn synthetic_post_from_orphan_bundle(post_id: String, mut comments: Vec<Followin
 	post.kind = "t3".into();
 	post.title = first.link_title.clone();
 	post.community = first.community.clone();
-	// Orphan bundles don't include the submission listing row, so use the followed comment author
-	// to keep `/following` consistent and avoid blank usernames in the UI.
-	post.author.name = first.author.clone();
+	post.author.name = first.link_author.clone();
+	post.link_author = first.link_author.clone();
 	post.permalink = crate::utils::listing_link_permalink(&first.link_permalink, &first.permalink);
 	post.link_permalink = first.link_permalink.clone();
 	post.link_title = first.link_title.clone();
@@ -356,6 +406,19 @@ fn synthetic_post_from_orphan_bundle(post_id: String, mut comments: Vec<Followin
 	post.flags.nsfw = nsfw;
 	post.flags.nsfw_str = if nsfw { "true" } else { "false" }.into();
 	post.following_comments = comments;
+	let link_ts = post
+		.following_comments
+		.iter()
+		.map(|c| c.link_created_ts)
+		.find(|&ts| ts > 0)
+		.unwrap_or(0);
+	if link_ts > 0 {
+		let (rel_time, created) = crate::utils::time(link_ts as f64);
+		post.rel_time = rel_time;
+		post.created = created;
+		post.created_ts = link_ts;
+		post.link_created_ts = link_ts;
+	}
 	Some(post)
 }
 
@@ -1077,6 +1140,8 @@ mod tests {
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			poll: None,
 			score: ("1".to_string(), "1".to_string()),
 			upvote_ratio: 100,
@@ -1193,6 +1258,39 @@ mod tests {
 	}
 
 	#[test]
+	fn merge_full_submission_keeps_following_comments_and_bookmark_state() {
+		let mut shell = Post::default();
+		shell.id = "abc".to_string();
+		shell.kind = "t3".into();
+		shell.following_comments.push(FollowingComment {
+			id: "c1".to_string(),
+			author: "u1".to_string(),
+			body: String::new(),
+			permalink: String::new(),
+			created_ts: 0,
+			rel_time: String::new(),
+			community: "s".to_string(),
+			score: ("0".to_string(), "0".to_string()),
+			parent_id: String::new(),
+			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
+			thread_comments: ("0".to_string(), "0".to_string()),
+			thread_nsfw: false,
+		});
+		shell.bookmarked = true;
+		let full = test_post("abc", "T", "s", "<div class=\"md\"><p>inside</p></div>", "self", "", &[]);
+		super::merge_full_submission_into_following_bundle(&mut shell, full);
+		assert_eq!(shell.following_comments.len(), 1);
+		assert_eq!(shell.following_comments[0].id, "c1");
+		assert!(shell.body.contains("inside"));
+		assert!(shell.bookmarked);
+	}
+
+	#[test]
 	fn collapse_merges_following_comments_for_duplicate_media() {
 		let mut a = test_post("one", "A", "s1", "", "image", "https://i.redd.it/x.jpg", &[]);
 		a.following_comments.push(FollowingComment {
@@ -1209,6 +1307,8 @@ mod tests {
 			parent_comment: ParentComment::default(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			thread_comments: ("0".to_string(), "0".to_string()),
 			thread_nsfw: false,
 		});
@@ -1227,6 +1327,8 @@ mod tests {
 			parent_comment: ParentComment::default(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			thread_comments: ("0".to_string(), "0".to_string()),
 			thread_nsfw: false,
 		});
@@ -1823,6 +1925,8 @@ mod tests {
 			},
 			link_title: "Thread title".to_string(),
 			link_permalink: "/r/demo_sub/comments/thread/".to_string(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			thread_comments: ("32".to_string(), "32".to_string()),
 			thread_nsfw: false,
 		});

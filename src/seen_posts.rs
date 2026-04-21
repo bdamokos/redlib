@@ -318,6 +318,8 @@ mod tests {
 			link_id: String::new(),
 			link_title: String::new(),
 			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
 			poll: None,
 			score: (String::new(), String::new()),
 			upvote_ratio: 0,

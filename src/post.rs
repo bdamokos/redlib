@@ -84,6 +84,8 @@ fn empty_post_for_shell(community: &str, permalink: &str) -> Post {
 		link_id: String::new(),
 		link_title: String::new(),
 		link_permalink: String::new(),
+		link_author: String::new(),
+		link_created_ts: 0,
 		poll: None,
 		score: ("0".to_string(), "0".to_string()),
 		upvote_ratio: 0,

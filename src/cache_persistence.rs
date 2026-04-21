@@ -160,6 +160,10 @@ pub(crate) struct PersistedFollowingComment {
 	pub parent_comment: PersistedParentComment,
 	pub link_title: String,
 	pub link_permalink: String,
+	#[serde(default)]
+	pub link_author: String,
+	#[serde(default)]
+	pub link_created_ts: u64,
 	pub thread_comments: (String, String),
 	pub thread_nsfw: bool,
 }
@@ -182,6 +186,10 @@ pub(crate) struct PersistedPost {
 	pub link_id: String,
 	pub link_title: String,
 	pub link_permalink: String,
+	#[serde(default)]
+	pub link_author: String,
+	#[serde(default)]
+	pub link_created_ts: u64,
 	pub poll: Option<PersistedPoll>,
 	pub score: (String, String),
 	pub upvote_ratio: i64,
@@ -813,6 +821,8 @@ impl PersistedFollowingComment {
 			parent_comment: PersistedParentComment::from_runtime(&value.parent_comment),
 			link_title: value.link_title.clone(),
 			link_permalink: value.link_permalink.clone(),
+			link_author: value.link_author.clone(),
+			link_created_ts: value.link_created_ts,
 			thread_comments: value.thread_comments.clone(),
 			thread_nsfw: value.thread_nsfw,
 		}
@@ -833,6 +843,8 @@ impl PersistedFollowingComment {
 			parent_comment: self.parent_comment.into_runtime(),
 			link_title: self.link_title,
 			link_permalink: self.link_permalink,
+			link_author: self.link_author,
+			link_created_ts: self.link_created_ts,
 			thread_comments: self.thread_comments,
 			thread_nsfw: self.thread_nsfw,
 		}
@@ -883,6 +895,8 @@ impl PersistedPost {
 			link_id: value.link_id.clone(),
 			link_title: value.link_title.clone(),
 			link_permalink: value.link_permalink.clone(),
+			link_author: value.link_author.clone(),
+			link_created_ts: value.link_created_ts,
 			poll: value.poll.as_ref().map(PersistedPoll::from_runtime),
 			score: value.score.clone(),
 			upvote_ratio: value.upvote_ratio,
@@ -923,6 +937,8 @@ impl PersistedPost {
 			link_id: self.link_id,
 			link_title: self.link_title,
 			link_permalink: self.link_permalink,
+			link_author: self.link_author,
+			link_created_ts: self.link_created_ts,
 			poll: self.poll.map(PersistedPoll::into_runtime),
 			score: self.score,
 			upvote_ratio: self.upvote_ratio,
