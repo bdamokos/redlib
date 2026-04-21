@@ -1032,20 +1032,20 @@ impl Post {
 		}
 	}
 
-	/// Relative post age (recomputes from `created_ts` when `rel_time` was not filled in).
+	/// Relative post age (prefers `created_ts` so cached labels don't go stale).
 	pub fn display_rel_time(&self) -> String {
-		if !self.rel_time.is_empty() {
-			return self.rel_time.clone();
+		if self.created_ts > 0 {
+			return rel_time_from_unix(self.created_ts);
 		}
-		rel_time_from_unix(self.created_ts)
+		self.rel_time.clone()
 	}
 
-	/// Absolute timestamp for tooltips (recomputes from `created_ts` when `created` was not filled in).
+	/// Absolute timestamp for tooltips (prefers `created_ts` so cached labels don't go stale).
 	pub fn display_created_tooltip(&self) -> String {
-		if !self.created.is_empty() {
-			return self.created.clone();
+		if self.created_ts > 0 {
+			return abs_time_title_from_unix(self.created_ts);
 		}
-		abs_time_title_from_unix(self.created_ts)
+		self.created.clone()
 	}
 }
 
@@ -3937,6 +3937,71 @@ mod tests {
 
 		assert_eq!(posts[0].rel_time, time(created_ts as f64).0);
 		assert_eq!(posts[0].created, time(created_ts as f64).1);
+	}
+
+	#[test]
+	fn post_display_time_prefers_created_timestamp_over_cached_label() {
+		let created_ts = (OffsetDateTime::now_utc().unix_timestamp() - 2 * 60 * 60) as u64;
+		let post = Post {
+			id: "demo".to_string(),
+			kind: "t3".to_string(),
+			title: "Demo".to_string(),
+			community: "demo_sub".to_string(),
+			body: String::new(),
+			author: Author {
+				name: "demo_user".to_string(),
+				flair: Flair {
+					flair_parts: Vec::new(),
+					text: String::new(),
+					background_color: String::new(),
+					foreground_color: String::new(),
+				},
+				distinguished: String::new(),
+				external_links: Vec::new(),
+				avg_video_length: None,
+			},
+			permalink: "/r/demo_sub/comments/demo/".to_string(),
+			parent_id: String::new(),
+			parent_kind: String::new(),
+			parent_comment: ParentComment::default(),
+			link_id: String::new(),
+			link_title: String::new(),
+			link_permalink: String::new(),
+			link_author: String::new(),
+			link_created_ts: 0,
+			poll: None,
+			score: ("1".to_string(), "1".to_string()),
+			upvote_ratio: 100,
+			post_type: "self".to_string(),
+			flair: Flair {
+				flair_parts: Vec::new(),
+				text: String::new(),
+				background_color: String::new(),
+				foreground_color: String::new(),
+			},
+			flags: Flags::new(false, false, false),
+			thumbnail: Media::empty(),
+			media: Media::empty(),
+			domain: String::new(),
+			rel_time: "1m ago".to_string(),
+			created: "stale".to_string(),
+			created_ts,
+			num_duplicates: 0,
+			comments: ("0".to_string(), "0".to_string()),
+			gallery: Vec::new(),
+			awards: Awards(Vec::new()),
+			nsfw: false,
+			out_url: None,
+			ws_url: String::new(),
+			preview_body: String::new(),
+			collapsed_duplicates: Vec::new(),
+			following_comments: Vec::new(),
+			bookmarked: false,
+			bookmark_new_comments: None,
+		};
+
+		assert_eq!(post.display_rel_time(), time(created_ts as f64).0);
+		assert_eq!(post.display_created_tooltip(), time(created_ts as f64).1);
 	}
 
 	#[test]
