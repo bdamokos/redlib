@@ -2667,8 +2667,14 @@ pub fn canonical_reddit_path(path: &str) -> String {
 
 	if let Some(rest) = raw_path.strip_prefix("/user/") {
 		let mut parts = rest.split('/');
-		if let (Some(username), Some("videos"), None) = (parts.next(), parts.next(), parts.next()) {
-			return format!("/user/{username}/submitted?sort=new");
+		if let (Some(username), Some(listing), None) = (parts.next(), parts.next(), parts.next()) {
+			if listing == "videos" {
+				return format!("/user/{username}/submitted?sort=new");
+			}
+
+			if ["hot", "new", "top", "controversial"].contains(&listing) {
+				return format!("/user/{username}/?sort={listing}");
+			}
 		}
 	}
 
@@ -4488,6 +4494,8 @@ mod tests {
 			super::canonical_reddit_path("/user/spez/videos?video_user=spez&video_age_max_hours=24"),
 			"/user/spez/submitted?sort=new"
 		);
+		assert_eq!(super::canonical_reddit_path("/user/spez/new"), "/user/spez/?sort=new");
+		assert_eq!(super::canonical_reddit_path("/user/spez/top"), "/user/spez/?sort=top");
 		assert_eq!(super::canonical_reddit_path("/r/rust/new"), "/r/rust/new");
 	}
 
