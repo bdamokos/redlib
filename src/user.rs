@@ -241,11 +241,7 @@ async fn fetch_following_link_post_lookup(post_ids: &[String]) -> HashMap<String
 }
 
 fn append_missing_following_link_posts(mut posts: Vec<Post>, mut linked_posts: HashMap<String, Post>) -> Vec<Post> {
-	let mut existing_post_ids = posts
-		.iter()
-		.filter(|post| post.kind == "t3")
-		.map(|post| post.id.clone())
-		.collect::<HashSet<_>>();
+	let mut existing_post_ids = posts.iter().filter(|post| post.kind == "t3").map(|post| post.id.clone()).collect::<HashSet<_>>();
 	let linked_post_ids = posts
 		.iter()
 		.filter(|post| post.kind == "t1" && post.post_type == "comment")
@@ -406,12 +402,7 @@ fn synthetic_post_from_orphan_bundle(post_id: String, mut comments: Vec<Followin
 	post.flags.nsfw = nsfw;
 	post.flags.nsfw_str = if nsfw { "true" } else { "false" }.into();
 	post.following_comments = comments;
-	let link_ts = post
-		.following_comments
-		.iter()
-		.map(|c| c.link_created_ts)
-		.find(|&ts| ts > 0)
-		.unwrap_or(0);
+	let link_ts = post.following_comments.iter().map(|c| c.link_created_ts).find(|&ts| ts > 0).unwrap_or(0);
 	if link_ts > 0 {
 		let (rel_time, created) = crate::utils::time(link_ts as f64);
 		post.rel_time = rel_time;
@@ -1248,10 +1239,7 @@ mod tests {
 		comment.link_id = "t3_thread1".to_string();
 		let original = test_post("thread1", "Thread title", "demo_sub", "<div class=\"md\"><p>post body</p></div>", "self", "", &[]);
 
-		let hydrated = append_missing_following_link_posts(
-			vec![comment],
-			std::iter::once(("thread1".to_string(), original)).collect(),
-		);
+		let hydrated = append_missing_following_link_posts(vec![comment], std::iter::once(("thread1".to_string(), original)).collect());
 
 		assert_eq!(hydrated.len(), 2);
 		assert!(hydrated.iter().any(|post| post.kind == "t3" && post.id == "thread1"));
@@ -2433,6 +2421,175 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	// Retrieve other variables from Redlib request
 	let sort = param(&path, "sort").unwrap_or_default();
+	let prefs = Preferences::new(&req);
+	let filters = get_filters(&req);
+	let user_filter = ["u_", &username].concat();
+	let is_filtered = filters.contains(&user_filter);
+	let user_subreddits = user_sidebar_subreddits(&username);
+	let avg_video_length = cached_avg_video_length(&username);
+
+	if !is_filtered {
+		if video_listing {
+			let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
+			if let Some(cached_posts) = crate::post_cache::servable_cached_source_posts(&source) {
+				let shell_user = cached_user_metadata(&username).unwrap_or_else(|| User {
+					name: username.clone(),
+					..Default::default()
+				});
+				let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
+				let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
+				let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
+				let listing_data = video_mode::build_listing(&cached_posts, &filters, &parsed_query, now_unix());
+				let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
+				let request_has_video_params = video_mode::query_has_video_params(query);
+				let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+				let start = cache_page.saturating_mul(crate::post_cache::POSTS_PER_PAGE);
+				let end = (start + crate::post_cache::POSTS_PER_PAGE).min(listing_data.posts.len());
+				let mut posts = if start < listing_data.posts.len() {
+					listing_data.posts[start..end].to_vec()
+				} else {
+					Vec::new()
+				};
+				utils::hydrate_post_author_links_from_cache(&mut posts);
+				let no_posts = listing_data.posts.is_empty();
+				let all_posts_hidden_nsfw = !posts.is_empty() && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+				let eligible_video_posts = cached_posts
+					.iter()
+					.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+					.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
+					.filter(|post| video_mode::is_video_post(post))
+					.count();
+				let video_mode_sidebar = build_video_mode_sidebar(&url, &listing_data, &posts, &normalized_query);
+
+				return Ok(template(&UserTemplate {
+					user: shell_user,
+					username: username.clone(),
+					posts,
+					user_subreddits,
+					coomer_recent_posts,
+					fallback_notice: String::new(),
+					sort: (String::new(), String::new()),
+					ends: (String::new(), String::new()),
+					listing: listing.clone(),
+					prefs,
+					url: url.clone(),
+					redirect_url,
+					is_filtered: false,
+					all_posts_filtered: eligible_video_posts > 0 && listing_data.posts.is_empty(),
+					all_posts_hidden_nsfw,
+					avg_video_length,
+					no_posts,
+					shell_mode: false,
+					fragment_url: String::new(),
+					replace_selector: "main".to_string(),
+					prev_page_url: if cache_page > 0 {
+						video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query, request_has_video_params)
+					} else {
+						String::new()
+					},
+					next_page_url: if end < listing_data.posts.len() {
+						video_mode_page_url(&url, cache_page + 1, &normalized_query, request_has_video_params)
+					} else {
+						String::new()
+					},
+					loading_message: String::new(),
+					video_mode_enabled: true,
+					video_mode_sidebar,
+				}));
+			}
+		} else if let Some((mut posts, after, has_prev, has_next)) = cached_user_listing_posts(&username, &listing, &sort, query) {
+			let shell_user = cached_user_metadata(&username).unwrap_or_else(|| User {
+				name: username.clone(),
+				..Default::default()
+			});
+			let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
+			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+			utils::hydrate_post_author_links_from_cache(&mut posts);
+			let no_posts = posts.is_empty();
+			let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+			let prev_page_url = if has_prev {
+				let prev_url = format!("/user/{username}/submitted");
+				let prev_query = form_urlencoded::Serializer::new(String::new())
+					.extend_pairs(
+						form_urlencoded::parse(query.as_bytes())
+							.into_owned()
+							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
+					)
+					.append_pair("cache_page", &cache_page.saturating_sub(1).to_string())
+					.finish();
+				if prev_query.is_empty() {
+					prev_url
+				} else {
+					format!("{prev_url}?{prev_query}")
+				}
+			} else {
+				String::new()
+			};
+			let next_page_url = if has_next && !after.is_empty() {
+				let next_url = format!("/user/{username}/submitted");
+				let next_query = form_urlencoded::Serializer::new(String::new())
+					.extend_pairs(
+						form_urlencoded::parse(query.as_bytes())
+							.into_owned()
+							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
+					)
+					.append_pair("after", &after)
+					.finish();
+				if next_query.is_empty() {
+					next_url
+				} else {
+					format!("{next_url}?{next_query}")
+				}
+			} else if has_next {
+				let next_url = format!("/user/{username}/submitted");
+				let next_query = form_urlencoded::Serializer::new(String::new())
+					.extend_pairs(
+						form_urlencoded::parse(query.as_bytes())
+							.into_owned()
+							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
+					)
+					.append_pair("cache_page", &(cache_page + 1).to_string())
+					.finish();
+				if next_query.is_empty() {
+					next_url
+				} else {
+					format!("{next_url}?{next_query}")
+				}
+			} else {
+				String::new()
+			};
+
+			return Ok(template(&UserTemplate {
+				user: shell_user,
+				username: username.clone(),
+				posts,
+				user_subreddits,
+				coomer_recent_posts,
+				fallback_notice: String::new(),
+				sort: (sort, param(&path, "t").unwrap_or_default()),
+				ends: (String::new(), String::new()),
+				listing: listing.clone(),
+				prefs,
+				url: url.clone(),
+				redirect_url,
+				is_filtered: false,
+				all_posts_filtered,
+				all_posts_hidden_nsfw,
+				avg_video_length,
+				no_posts,
+				shell_mode: false,
+				fragment_url: String::new(),
+				replace_selector: "#column_one".to_string(),
+				prev_page_url,
+				next_page_url,
+				loading_message: String::new(),
+				video_mode_enabled: false,
+				video_mode_sidebar: empty_video_mode_sidebar(),
+			}));
+		}
+	}
+
 	// Shell sidebar is not replaced when the listing fragment loads (only `#column_one`), so load
 	// full profile metadata here—including Coomer link expansion and recent-post panel data.
 	let shell_user = match user(&username).await {
@@ -2443,13 +2600,12 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		}),
 	};
 	let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
-	let user_subreddits = user_sidebar_subreddits(&username);
 	let video_mode_sidebar = if video_listing {
 		let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
 		let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
 		let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
 		let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
-		let listing_data = video_mode::build_listing(&cached_posts, &get_filters(&req), &parsed_query, now_unix());
+		let listing_data = video_mode::build_listing(&cached_posts, &filters, &parsed_query, now_unix());
 		let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
 		let preview_posts = listing_data.posts.iter().take(crate::post_cache::POSTS_PER_PAGE).cloned().collect::<Vec<_>>();
 		build_video_mode_sidebar(&url, &listing_data, &preview_posts, &normalized_query)
@@ -2457,7 +2613,6 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		empty_video_mode_sidebar()
 	};
 
-	let avg_video_length = cached_avg_video_length(&username);
 	Ok(template(&UserTemplate {
 		user: shell_user,
 		username: username.clone(),
@@ -2468,7 +2623,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		sort: (sort, param(&path, "t").unwrap_or_default()),
 		ends: (param(&path, "after").unwrap_or_default(), String::new()),
 		listing: listing.clone(),
-		prefs: Preferences::new(&req),
+		prefs,
 		url: url.clone(),
 		redirect_url,
 		is_filtered: false,
@@ -2653,7 +2808,9 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			}
 			fallback_notice = instance_scrape::scrape_notice().to_string();
 			(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
-		} else if let Some((posts, after, has_prev, has_next)) = cached_listing_page {
+		} else if let Some((mut posts, after, has_prev, has_next)) = cached_listing_page {
+			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+			utils::hydrate_post_author_links_from_cache(&mut posts);
 			let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
 			let prev = if has_prev {
 				let prev_page = cache_page.saturating_sub(1).to_string();
@@ -2708,7 +2865,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			} else {
 				String::new()
 			};
-			(user.clone(), posts, (String::new(), String::new()), prev, next, false)
+			(user.clone(), posts, (String::new(), String::new()), prev, next, all_posts_filtered)
 		} else {
 			match fetch_user_listing_posts(&username, &path, &listing, &filters).await {
 				Ok((posts, after, all_posts_filtered)) => (
