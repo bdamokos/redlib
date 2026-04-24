@@ -4283,6 +4283,28 @@ mod tests {
 	}
 
 	#[test]
+	fn cache_status_reports_only_sources_visible_to_preferences() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let visible_source = new_source("rust");
+		let hidden_source = new_source("private");
+		seed_source(&visible_source, vec![test_post("rust-1", "rust", now)]);
+		seed_source(&hidden_source, vec![test_post("private-1", "private", now)]);
+
+		let prefs = Preferences {
+			subscriptions: vec!["rust".to_string()],
+			..Preferences::default()
+		};
+
+		let status = cache_status_for_preferences(&prefs);
+		let names = status.sources.iter().map(|source| source.display_name.as_str()).collect::<Vec<_>>();
+
+		assert_eq!(names, vec!["rust"]);
+		assert!(status.sources[0].cached);
+	}
+
+	#[test]
 	fn cache_status_seeds_remembered_rows_without_prior_feed_hit() {
 		let _guard = test_lock();
 		reset_test_caches();

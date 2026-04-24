@@ -4268,15 +4268,7 @@ pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, Str
 			.then_with(|| left.display_name.to_lowercase().cmp(&right.display_name.to_lowercase()))
 	});
 	upcoming_sources.truncate(5);
-	let mut recent_sources = status.sources.iter().filter(|source| source.cached_age_secs.is_some()).cloned().collect::<Vec<_>>();
-	recent_sources.sort_by(|left, right| {
-		left
-			.cached_age_secs
-			.unwrap_or(u64::MAX)
-			.cmp(&right.cached_age_secs.unwrap_or(u64::MAX))
-			.then_with(|| left.display_name.to_lowercase().cmp(&right.display_name.to_lowercase()))
-	});
-	recent_sources.truncate(5);
+	let recent_sources = recent_cached_sources(&status.sources);
 	Ok(template(&CacheStatusTemplate {
 		prefs,
 		url: req.uri().path().to_string(),
@@ -4287,6 +4279,19 @@ pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, Str
 		upcoming_sources,
 		recent_sources,
 	}))
+}
+
+fn recent_cached_sources(sources: &[crate::post_cache::CacheStatusSource]) -> Vec<crate::post_cache::CacheStatusSource> {
+	let mut recent_sources = sources.iter().filter(|source| source.cached_age_secs.is_some()).cloned().collect::<Vec<_>>();
+	recent_sources.sort_by(|left, right| {
+		left
+			.cached_age_secs
+			.unwrap_or(u64::MAX)
+			.cmp(&right.cached_age_secs.unwrap_or(u64::MAX))
+			.then_with(|| left.display_name.to_lowercase().cmp(&right.display_name.to_lowercase()))
+	});
+	recent_sources.truncate(5);
+	recent_sources
 }
 
 pub async fn cache_status_api(req: Request<Body>) -> Result<Response<Body>, String> {
