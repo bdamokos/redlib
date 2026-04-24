@@ -1,6 +1,15 @@
 {% extends "base.html" %}
+{% import "utils.html" as utils %}
 
 {% block title %}Cache Status{% endblock %}
+
+{% block subscriptions %}
+{% call utils::sub_list("", "") %}
+{% endblock %}
+
+{% block search %}
+{% call utils::search("".to_owned(), "") %}
+{% endblock %}
 
 {% block head %}
 	{% call super() %}
@@ -41,6 +50,22 @@
 				— {% if source.schedule_state == "in_flight" %}refreshing now{% else %}
 				{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}about {{ self.human_duration(seconds) }} from now{% when None %}waiting for queue placement{% endmatch %}
 				{% endif %}
+			</li>
+			{% endfor %}
+		</ol>
+		{% endif %}
+	</div>
+
+	<div class="panel">
+		<p><strong>Most recently cached feeds:</strong></p>
+		{% if recent_sources.is_empty() %}
+		<p>No visible feeds are cached yet.</p>
+		{% else %}
+		<ol>
+			{% for source in recent_sources %}
+			<li>
+				<a href="{{ source.feed_url }}">{{ source.display_name }}</a>
+				— {% match source.cached_age_secs %}{% when Some with (seconds) %}cached about {{ self.human_duration(seconds) }} ago{% when None %}cached recently{% endmatch %}
 			</li>
 			{% endfor %}
 		</ol>
