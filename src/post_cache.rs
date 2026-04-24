@@ -926,6 +926,13 @@ pub(crate) fn store_source_posts_for_cache(source: &FeedSource, posts: Vec<Post>
 	store_source_posts_with_origin(source, posts, after, refresh_origin);
 }
 
+#[cfg(test)]
+pub(crate) fn age_source_cache_for_test(source: &FeedSource, age: Duration) {
+	let mut cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+	let entry = cache.get_mut(&source.cache_key()).expect("source cache entry must exist");
+	entry.fetched_at = Instant::now() - age;
+}
+
 pub(crate) fn snapshot_persisted_source_entries(now_unix: u64) -> Vec<PersistedSourceCacheEntry> {
 	let Ok(cache) = SOURCE_CACHE.lock() else {
 		return Vec::new();

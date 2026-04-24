@@ -1687,6 +1687,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 	let aggregate_front_page = req.param("sub").is_none() && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
 	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
+	if aggregate_front_page {
+		crate::post_cache::remember_frontpage_subreddits(&prefs);
+	}
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
 		String::new()
@@ -2853,7 +2856,7 @@ mod tests {
 	use askama::Template;
 	use hyper::{Body, Request};
 	use std::collections::{HashSet, VecDeque};
-	use std::time::Instant;
+	use std::time::{Duration, Instant};
 
 	use crate::post_cache::{self, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
@@ -3212,6 +3215,31 @@ mod tests {
 		assert!(html.contains("<center>Loading posts...</center>"));
 		assert!(!html.contains("<center>Loading followed feeds in the background."));
 		assert!(html.contains("feed_status_banner"));
+	}
+
+	#[tokio::test]
+	async fn following_full_page_uses_existing_daemon_cache() {
+		let username = "u_following_daemon_cache";
+		let submitted_source = FeedSource::subreddit(username, FeedSort::New);
+		let comments_source = FeedSource::user_comments(username, FeedSort::New);
+		let cached_post = metric_post("following-daemon-cache-submission", username, 1_000, 42, false);
+
+		post_cache::store_source_posts_for_cache(&submitted_source, vec![cached_post], String::new(), Some(RefreshOrigin::Daemon));
+		post_cache::store_source_posts_for_cache(&comments_source, Vec::new(), String::new(), Some(RefreshOrigin::Daemon));
+		post_cache::age_source_cache_for_test(&submitted_source, Duration::from_secs(post_cache::CACHE_TTL_SECS + 60));
+		post_cache::age_source_cache_for_test(&comments_source, Duration::from_secs(post_cache::CACHE_TTL_SECS + 60));
+
+		let req = Request::builder()
+			.uri("/following/new")
+			.header("cookie", format!("subscriptions={username}; show_nsfw=on; post_sort=new"))
+			.body(Body::empty())
+			.unwrap();
+		let response = super::community(req).await.expect("following response");
+		let body = hyper::body::to_bytes(response.into_body()).await.expect("following body");
+		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
+
+		assert!(html.contains("Post following-daemon-cache-submission"), "{html}");
+		assert!(html.contains("from daemon cache"), "{html}");
 	}
 
 	#[test]
