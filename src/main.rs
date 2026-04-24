@@ -192,6 +192,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"space_scroll.js" => resource(include_str!("../static/space_scroll.js"), "text/javascript", false).await,
 		"network_image.js" => resource(include_str!("../static/network_image.js"), "text/javascript", false).await,
 		"post_preview.js" => resource(include_str!("../static/post_preview.js"), "text/javascript", false).await,
+		"relative_time.js" => resource(include_str!("../static/relative_time.js"), "text/javascript", false).await,
 		"browser_session.js" => resource(include_str!("../static/browser_session.js"), "text/javascript", false).await,
 		"author_links.js" => resource(include_str!("../static/author_links.js"), "text/javascript", false).await,
 		"subscription.js" => resource(include_str!("../static/subscription.js"), "text/javascript", false).await,
