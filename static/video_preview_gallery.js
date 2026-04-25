@@ -67,6 +67,7 @@
         }
 
         layer.classList.remove("is-visible");
+        layer.hidden = true;
     }
 
     function syncAnimatedPreviewVisibility(host) {
@@ -77,6 +78,7 @@
         }
 
         var shouldShow = layerHasPreviewContent(layer) && video.paused && video.currentTime <= 0.05;
+        layer.hidden = !shouldShow;
         layer.classList.toggle("is-visible", shouldShow);
     }
 
