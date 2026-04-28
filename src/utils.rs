@@ -2566,7 +2566,7 @@ fn largest_preview_url(resolutions: &Value) -> String {
 	resolutions
 		.as_array()
 		.and_then(|items| items.last())
-		.and_then(|item| item["url"].as_str())
+		.and_then(preview_item_url)
 		.map(format_url)
 		.unwrap_or_default()
 }
@@ -2578,8 +2578,8 @@ fn preview_srcset(resolutions: &Value) -> String {
 			items
 				.iter()
 				.filter_map(|item| {
-					let url = item["url"].as_str()?;
-					let width = item["width"].as_i64()?;
+					let url = preview_item_url(item)?;
+					let width = item["width"].as_i64().or_else(|| item["x"].as_i64())?;
 					Some(format!("{} {}w", format_url(url), width))
 				})
 				.collect::<Vec<_>>()
@@ -2588,12 +2588,28 @@ fn preview_srcset(resolutions: &Value) -> String {
 		.unwrap_or_default()
 }
 
+fn preview_item_url(item: &Value) -> Option<&str> {
+	item["url"].as_str().or_else(|| item["u"].as_str())
+}
+
 /// Direct urls to proxy if proxy is enabled
 pub fn format_url(url: &str) -> String {
 	if url.is_empty() || url == "self" || url == "default" || url == "nsfw" || url == "spoiler" {
 		String::new()
 	} else {
-		Url::parse(url).map_or(url.to_string(), |parsed| {
+		let normalized = if url.contains('"') || url.contains('<') || url.contains('>') {
+			url.to_string()
+		} else {
+			decode_html(url).unwrap_or_else(|_| url.to_string())
+		};
+		let url = normalized.as_str();
+
+		let parsed = match Url::parse(url) {
+			Ok(parsed) => parsed,
+			Err(_) => return normalized,
+		};
+
+		{
 			let domain = parsed.domain().unwrap_or_default();
 
 			let capture = |regex: &Regex, format: &str, segments: i16| {
@@ -2647,7 +2663,7 @@ pub fn format_url(url: &str) -> String {
 				d if d.starts_with("v") && d.ends_with(".redgifs.com") => redgifs::watch_path_from_url(url).map_or_else(|| url.to_string(), |path| format!("/redgifs/{path}")),
 				_ => url.to_string(),
 			}
-		})
+		}
 	}
 }
 
@@ -3824,7 +3840,7 @@ mod tests {
 		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
 		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
 		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, rewrite_urls, time, user_profile_details,
-		write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, Media, Post, Preferences,
+		write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media, Post, Preferences,
 	};
 	use crate::utils::ParentComment;
 	use futures_lite::future::block_on;
@@ -4462,6 +4478,10 @@ mod tests {
 			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
 			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
 		);
+		assert_eq!(
+			format_url("https://preview.redd.it/8gmvr73q9mxg1.jpg?width=616&amp;format=pjpg&amp;auto=webp&amp;s=b95df138adbea90b0e1424ac3993aeec16172361"),
+			"/preview/pre/8gmvr73q9mxg1.jpg?width=616&format=pjpg&auto=webp&s=b95df138adbea90b0e1424ac3993aeec16172361"
+		);
 		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/360.mp4");
 		assert_eq!(
 			format_url("https://v.redd.it/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"),
@@ -4481,6 +4501,49 @@ mod tests {
 		assert_eq!(format_url("default"), "");
 		assert_eq!(format_url("nsfw"), "");
 		assert_eq!(format_url("spoiler"), "");
+	}
+
+	#[test]
+	fn gallery_media_decodes_html_escaped_preview_urls() {
+		let items = json!([
+			{
+				"media_id": "8gmvr73q9mxg1",
+				"caption": "",
+				"outbound_url": ""
+			}
+		]);
+		let metadata = json!({
+			"8gmvr73q9mxg1": {
+				"m": "image/jpg",
+				"s": {
+					"u": "https://preview.redd.it/8gmvr73q9mxg1.jpg?width=1080&amp;format=pjpg&amp;auto=webp&amp;s=fullhash",
+					"x": 1080,
+					"y": 2560
+				},
+				"p": [
+					{
+						"u": "https://preview.redd.it/8gmvr73q9mxg1.jpg?width=320&amp;format=pjpg&amp;auto=webp&amp;s=smallhash",
+						"x": 320,
+						"y": 758
+					},
+					{
+						"u": "https://preview.redd.it/8gmvr73q9mxg1.jpg?width=616&amp;format=pjpg&amp;auto=webp&amp;s=b95df138adbea90b0e1424ac3993aeec16172361",
+						"x": 616,
+						"y": 1460
+					}
+				]
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery[0].url, "/preview/pre/8gmvr73q9mxg1.jpg?width=1080&format=pjpg&auto=webp&s=fullhash");
+		assert_eq!(
+			gallery[0].preview_url,
+			"/preview/pre/8gmvr73q9mxg1.jpg?width=616&format=pjpg&auto=webp&s=b95df138adbea90b0e1424ac3993aeec16172361"
+		);
+		assert!(gallery[0].preview_srcset.contains("&format=pjpg&auto=webp&s=smallhash 320w"));
+		assert!(!gallery[0].preview_srcset.contains("&amp;"));
 	}
 
 	#[test]
