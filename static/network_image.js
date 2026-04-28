@@ -1,12 +1,17 @@
 const AUTO_MODE = "auto";
 const FAST_BYTES_PER_MS = 250;
+const EAGER_IMAGE_COUNT = 2;
+const LAZY_PRELOAD_MARGIN = "3000px 0px";
+
+let lazyImageObserver = null;
+let autoUpgradeDecided = false;
 
 function getImageMode() {
   return document.body?.dataset.imageQuality || AUTO_MODE;
 }
 
-function contentImages() {
-  return Array.from(document.querySelectorAll("img[data-full-src], .post_media_image img, .gallery img"));
+function contentImages(root = document) {
+  return Array.from(root.querySelectorAll("img[data-full-src], .post_media_image img, .gallery img"));
 }
 
 function qualityBadge() {
@@ -64,9 +69,63 @@ function upgradeDeferredImages(images) {
   });
 }
 
-function wireAutoImageUpgrade() {
+function setEager(img, highPriority = false) {
+  if (img.loading === "lazy" || img.getAttribute("loading") === "lazy") {
+    img.loading = "eager";
+    img.setAttribute("loading", "eager");
+  }
+
+  if (highPriority && "fetchPriority" in img) {
+    img.fetchPriority = "high";
+  }
+}
+
+function lazyPreloadObserver() {
+  if (lazyImageObserver || !("IntersectionObserver" in window)) {
+    return lazyImageObserver;
+  }
+
+  lazyImageObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) {
+        return;
+      }
+
+      const img = entry.target;
+      setEager(img);
+      lazyImageObserver.unobserve(img);
+    });
+  }, {
+    rootMargin: LAZY_PRELOAD_MARGIN,
+    threshold: 0,
+  });
+
+  return lazyImageObserver;
+}
+
+function primeLazyImages(root = document) {
+  const images = contentImages(root);
+  const observer = lazyPreloadObserver();
+
+  images.forEach((img, index) => {
+    if (img.dataset.networkImagePrimed === "true") {
+      return;
+    }
+
+    img.dataset.networkImagePrimed = "true";
+
+    if (index < EAGER_IMAGE_COUNT || !observer) {
+      setEager(img, index === 0);
+      return;
+    }
+
+    observer.observe(img);
+  });
+}
+
+function wireAutoImageUpgrade(root = document) {
   const mode = getImageMode();
-  const allImages = contentImages();
+  const allImages = contentImages(root);
 
   if (mode === "best") {
     showQuality("Images: downloading full resolution");
@@ -83,6 +142,10 @@ function wireAutoImageUpgrade() {
     return;
   }
 
+  if (autoUpgradeDecided) {
+    return;
+  }
+
   showQuality("Images: downloading resized previews");
 
   const images = Array.from(document.querySelectorAll("img[data-full-src]"));
@@ -93,6 +156,7 @@ function wireAutoImageUpgrade() {
 
   const [firstImage, ...remainingImages] = images;
   const decide = () => {
+    autoUpgradeDecided = true;
     if (shouldUpgradeAfterPreview(firstImage)) {
       upgradeDeferredImages(remainingImages);
       showQuality("Images: downloading full resolution");
@@ -109,4 +173,10 @@ function wireAutoImageUpgrade() {
   firstImage.addEventListener("load", decide, { once: true });
 }
 
-document.addEventListener("DOMContentLoaded", wireAutoImageUpgrade);
+function initializeNetworkImages(root = document) {
+  primeLazyImages(root);
+  wireAutoImageUpgrade(root);
+}
+
+window.initializeNetworkImages = initializeNetworkImages;
+document.addEventListener("DOMContentLoaded", () => initializeNetworkImages(document));

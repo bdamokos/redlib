@@ -7,6 +7,7 @@
         window.refreshPostTimes?.(root);
         window.initializeHlsVideos?.(root);
         window.initializeDashVideos?.(root);
+        window.initializeNetworkImages?.(root);
         window.observeVideoPreviewHosts?.(root);
         window.observeVideoVisibility?.(root);
     };
