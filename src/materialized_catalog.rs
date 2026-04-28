@@ -148,12 +148,7 @@ fn allowed_source_keys_for_session(session: &FeedSession) -> HashSet<CatalogSour
 		.collect()
 }
 
-fn query_posts_for_keys_limited(
-	catalog: &MaterializedCatalog,
-	allowed_keys: &HashSet<CatalogSourceKey>,
-	filters: &HashSet<String>,
-	limit: usize,
-) -> Vec<Post> {
+fn query_posts_for_keys_limited(catalog: &MaterializedCatalog, allowed_keys: &HashSet<CatalogSourceKey>, filters: &HashSet<String>, limit: usize) -> Vec<Post> {
 	if allowed_keys.is_empty() {
 		return Vec::new();
 	}
