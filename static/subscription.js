@@ -17,18 +17,38 @@
         return decodeURIComponent(escape(atob(padded)));
     };
 
-    const readCookie = (name) => {
-        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const match = document.cookie.match(new RegExp(`(?:^|; )${escaped}=([^;]*)`));
-        return match ? decodeURIComponent(match[1]) : "";
+    /** One parse of `document.cookie` so shard reads cannot mix revisions from concurrent writers. */
+    const parseCookieSnapshot = (header) => {
+        const jar = new Map();
+        if (!header) {
+            return jar;
+        }
+        for (const part of header.split(/;\s*/)) {
+            if (!part) {
+                continue;
+            }
+            const eq = part.indexOf("=");
+            if (eq < 1) {
+                continue;
+            }
+            const name = part.slice(0, eq);
+            const raw = part.slice(eq + 1);
+            try {
+                jar.set(name, decodeURIComponent(raw));
+            } catch (_error) {
+                jar.set(name, raw);
+            }
+        }
+        return jar;
     };
 
     const readShardedCookie = (baseName) => {
+        const jar = parseCookieSnapshot(document.cookie);
         let index = 0;
         let value = "";
         while (true) {
             const cookieName = index === 0 ? baseName : `${baseName}${index}`;
-            const chunk = readCookie(cookieName);
+            const chunk = jar.get(cookieName) ?? "";
             if (!chunk) {
                 break;
             }
@@ -36,6 +56,93 @@
             index += 1;
         }
         return value;
+    };
+
+    const listTokensFromRaw = (raw) =>
+        raw
+            .split("+")
+            .map((item) => item.trim())
+            .filter(Boolean);
+
+    const normalizeListCookieString = (raw) => {
+        const tokens = listTokensFromRaw(raw);
+        const map = new Map(tokens.map((t) => [t.toLowerCase(), t]));
+        return Array.from(map.values())
+            .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }))
+            .join("+");
+    };
+
+    const listCookieStringsEqual = (a, b) => normalizeListCookieString(a) === normalizeListCookieString(b);
+
+    const sortFlairEntries = (entries) =>
+        entries
+            .map((entry) => ({ subreddit: entry.subreddit, flair: entry.flair }))
+            .sort((left, right) => {
+                const subredditOrder = left.subreddit.localeCompare(right.subreddit, undefined, { sensitivity: "base" });
+                if (subredditOrder !== 0) {
+                    return subredditOrder;
+                }
+                return left.flair.localeCompare(right.flair, undefined, { sensitivity: "base" });
+            });
+
+    const canonicalFlairCookieString = (raw) => {
+        if (!raw) {
+            return "";
+        }
+        try {
+            const entries = JSON.parse(base64UrlDecode(raw));
+            if (!Array.isArray(entries)) {
+                return raw;
+            }
+            return base64UrlEncode(JSON.stringify(sortFlairEntries(entries)));
+        } catch (_error) {
+            return raw;
+        }
+    };
+
+    const flairCookieStringsEqual = (a, b) => canonicalFlairCookieString(a) === canonicalFlairCookieString(b);
+
+    const normalizeBookmarkEntries = (entries) =>
+        entries
+            .filter((entry) => entry && entry.i && entry.p)
+            .sort((left, right) => (right.b || 0) - (left.b || 0) || right.i.localeCompare(left.i))
+            .slice(0, maxBookmarks);
+
+    const canonicalBookmarkCookieString = (raw) => {
+        if (!raw) {
+            return "";
+        }
+        try {
+            const arr = JSON.parse(base64UrlDecode(raw));
+            if (!Array.isArray(arr)) {
+                return raw;
+            }
+            return JSON.stringify(normalizeBookmarkEntries(arr));
+        } catch (_error) {
+            return raw;
+        }
+    };
+
+    const bookmarkCookieStringsEqual = (a, b) => canonicalBookmarkCookieString(a) === canonicalBookmarkCookieString(b);
+
+    /** Optimistic compare-and-retry so concurrent tabs are less likely to drop writes. */
+    const readModifyWriteSharded = (baseName, applyIntent, areEquivalent, maxRetries = 8) => {
+        for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+            const before = readShardedCookie(baseName);
+            const next = applyIntent(before);
+            const mid = readShardedCookie(baseName);
+            if (mid !== before) {
+                continue;
+            }
+            writeShardedCookie(baseName, next);
+            const after = readShardedCookie(baseName);
+            if (areEquivalent(after, next)) {
+                return;
+            }
+        }
+        const before = readShardedCookie(baseName);
+        const next = applyIntent(before);
+        writeShardedCookie(baseName, next);
     };
 
     const removeCookie = (name) => {
@@ -64,16 +171,7 @@
         }
     };
 
-    const readListCookie = (baseName) =>
-        readShardedCookie(baseName)
-            .split("+")
-            .map((item) => item.trim())
-            .filter(Boolean);
-
-    const writeListCookie = (baseName, values) => {
-        const sorted = Array.from(new Set(values)).sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }));
-        writeShardedCookie(baseName, sorted.join("+"));
-    };
+    const readListCookie = (baseName) => listTokensFromRaw(readShardedCookie(baseName));
 
     const readFlairCookie = () => {
         const encoded = readShardedCookie("flair_subscriptions");
@@ -85,23 +183,6 @@
         } catch (_error) {
             return [];
         }
-    };
-
-    const writeFlairCookie = (subscriptions) => {
-        if (!subscriptions.length) {
-            writeShardedCookie("flair_subscriptions", "");
-            return;
-        }
-        const normalized = subscriptions
-            .map((entry) => ({ subreddit: entry.subreddit, flair: entry.flair }))
-            .sort((left, right) => {
-                const subredditOrder = left.subreddit.localeCompare(right.subreddit, undefined, { sensitivity: "base" });
-                if (subredditOrder !== 0) {
-                    return subredditOrder;
-                }
-                return left.flair.localeCompare(right.flair, undefined, { sensitivity: "base" });
-            });
-        writeShardedCookie("flair_subscriptions", base64UrlEncode(JSON.stringify(normalized)));
     };
 
     const readBookmarksCookie = () => {
@@ -117,17 +198,14 @@
     };
 
     const writeBookmarksCookie = (entries) => {
-        if (!entries.length) {
-            writeShardedCookie("bookmarks", "");
-            return;
-        }
-
-        const normalized = entries
-            .filter((entry) => entry && entry.i && entry.p)
-            .sort((left, right) => (right.b || 0) - (left.b || 0) || right.i.localeCompare(left.i))
-            .slice(0, maxBookmarks);
-
-        writeShardedCookie("bookmarks", base64UrlEncode(JSON.stringify(normalized)));
+        readModifyWriteSharded(
+            "bookmarks",
+            () => {
+                const normalized = normalizeBookmarkEntries(entries);
+                return normalized.length === 0 ? "" : base64UrlEncode(JSON.stringify(normalized));
+            },
+            bookmarkCookieStringsEqual,
+        );
     };
 
     const updateFormState = (form, nextState) => {
@@ -255,12 +333,31 @@
                 throw new Error("Missing flair subscription metadata");
             }
 
-            let entries = readFlairCookie();
-            entries = entries.filter((entry) => !(entry.subreddit === subreddit && entry.flair === flair));
-            if (isEnabling) {
-                entries.push({ subreddit, flair });
-            }
-            writeFlairCookie(entries);
+            readModifyWriteSharded(
+                "flair_subscriptions",
+                (beforeRaw) => {
+                    let entries = [];
+                    if (beforeRaw) {
+                        try {
+                            entries = JSON.parse(base64UrlDecode(beforeRaw));
+                        } catch (_error) {
+                            entries = [];
+                        }
+                    }
+                    if (!Array.isArray(entries)) {
+                        entries = [];
+                    }
+                    entries = entries.filter((entry) => !(entry.subreddit === subreddit && entry.flair === flair));
+                    if (isEnabling) {
+                        entries.push({ subreddit, flair });
+                    }
+                    if (entries.length === 0) {
+                        return "";
+                    }
+                    return base64UrlEncode(JSON.stringify(sortFlairEntries(entries)));
+                },
+                flairCookieStringsEqual,
+            );
             return;
         }
 
@@ -279,20 +376,28 @@
             throw new Error("Missing cookie values");
         }
 
-        let values = readListCookie(cookieName);
-        const normalized = new Map(values.map((value) => [value.toLowerCase(), value]));
+        readModifyWriteSharded(
+            cookieName,
+            (beforeRaw) => {
+                const values = listTokensFromRaw(beforeRaw);
+                const normalized = new Map(values.map((value) => [value.toLowerCase(), value]));
 
-        for (const value of cookieValues) {
-            const key = value.toLowerCase();
-            if (isEnabling) {
-                normalized.set(key, value);
-            } else {
-                normalized.delete(key);
-            }
-        }
+                for (const value of cookieValues) {
+                    const key = value.toLowerCase();
+                    if (isEnabling) {
+                        normalized.set(key, value);
+                    } else {
+                        normalized.delete(key);
+                    }
+                }
 
-        values = Array.from(normalized.values());
-        writeListCookie(cookieName, values);
+                const sorted = Array.from(normalized.values()).sort((left, right) =>
+                    left.localeCompare(right, undefined, { sensitivity: "base" }),
+                );
+                return sorted.join("+");
+            },
+            listCookieStringsEqual,
+        );
     };
 
     const bindForm = (form) => {
