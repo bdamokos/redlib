@@ -13,9 +13,10 @@ use wreq::redirect::Policy;
 use wreq::{Client as WreqClient, EmulationFactory, Method as WreqMethod, Response as WreqResponse};
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{io, result::Result};
 
@@ -33,6 +34,12 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
+
+const IMAGE_PRELOAD_TTL: Duration = Duration::from_secs(15 * 60);
+const IMAGE_PRELOAD_MAX_ENTRY_BYTES: usize = 12 * 1024 * 1024;
+const IMAGE_PRELOAD_MAX_TOTAL_BYTES: usize = 384 * 1024 * 1024;
+const IMAGE_PRELOAD_MAX_POSTS: usize = 16;
+const IMAGE_PRELOAD_MAX_URLS: usize = 40;
 
 pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::new(|| {
 	hyper_rustls::HttpsConnectorBuilder::new()
@@ -86,6 +93,92 @@ pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 pub static LAST_REDDIT_RATELIMIT: LazyLock<std::sync::Mutex<Option<RedditRateLimitSnapshot>>> = LazyLock::new(|| std::sync::Mutex::new(None));
+static IMAGE_PRELOAD_CACHE: LazyLock<Mutex<ImagePreloadCache>> = LazyLock::new(|| Mutex::new(ImagePreloadCache::default()));
+
+#[derive(Clone)]
+struct CachedImageResponse {
+	status: hyper::StatusCode,
+	content_type: Option<HeaderValue>,
+	cache_control: Option<HeaderValue>,
+	body: body::Bytes,
+	inserted_at: Instant,
+}
+
+#[derive(Default)]
+struct ImagePreloadCache {
+	entries: HashMap<String, CachedImageResponse>,
+	order: VecDeque<String>,
+	inflight: HashSet<String>,
+	total_bytes: usize,
+}
+
+impl ImagePreloadCache {
+	fn prune_expired(&mut self) {
+		let now = Instant::now();
+		let expired = self
+			.entries
+			.iter()
+			.filter_map(|(url, entry)| (now.duration_since(entry.inserted_at) > IMAGE_PRELOAD_TTL).then(|| url.clone()))
+			.collect::<Vec<_>>();
+
+		for url in expired {
+			self.remove(&url);
+		}
+	}
+
+	fn remove(&mut self, url: &str) {
+		if let Some(entry) = self.entries.remove(url) {
+			self.total_bytes = self.total_bytes.saturating_sub(entry.body.len());
+		}
+		self.order.retain(|key| key != url);
+		self.inflight.remove(url);
+	}
+
+	fn get(&mut self, url: &str) -> Option<CachedImageResponse> {
+		self.prune_expired();
+		self.entries.get(url).cloned()
+	}
+
+	fn is_inflight(&mut self, url: &str) -> bool {
+		self.prune_expired();
+		self.inflight.contains(url)
+	}
+
+	fn mark_inflight(&mut self, url: &str) -> bool {
+		self.prune_expired();
+		if self.entries.contains_key(url) || self.inflight.contains(url) {
+			return false;
+		}
+		self.inflight.insert(url.to_string());
+		true
+	}
+
+	fn insert(&mut self, url: String, entry: CachedImageResponse) {
+		self.inflight.remove(&url);
+		if entry.body.len() > IMAGE_PRELOAD_MAX_ENTRY_BYTES {
+			return;
+		}
+		if let Some(old) = self.entries.remove(&url) {
+			self.total_bytes = self.total_bytes.saturating_sub(old.body.len());
+			self.order.retain(|key| key != &url);
+		}
+		self.total_bytes += entry.body.len();
+		self.order.push_back(url.clone());
+		self.entries.insert(url, entry);
+		while self.total_bytes > IMAGE_PRELOAD_MAX_TOTAL_BYTES {
+			let Some(oldest) = self.order.pop_front() else {
+				break;
+			};
+			if let Some(old) = self.entries.remove(&oldest) {
+				self.total_bytes = self.total_bytes.saturating_sub(old.body.len());
+			}
+		}
+	}
+
+	fn clear_inflight(&mut self, url: &str) {
+		self.inflight.remove(url);
+	}
+}
 
 const URL_PAIRS: [(&str, &str); 2] = [
 	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
@@ -441,13 +534,216 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 	}
 }
 
+fn cacheable_image_url(url: &str) -> bool {
+	url.starts_with("https://i.redd.it/")
+		|| url.starts_with("https://preview.redd.it/")
+		|| url.starts_with("https://external-preview.redd.it/")
+		|| url.starts_with("https://a.thumbs.redditmedia.com/")
+		|| url.starts_with("https://b.thumbs.redditmedia.com/")
+}
+
+fn local_proxy_image_to_upstream(local_url: &str) -> Option<String> {
+	let (path, query) = local_url.split_once('?').unwrap_or((local_url, ""));
+	let suffix = if query.is_empty() { String::new() } else { format!("?{query}") };
+
+	if let Some(path) = path.strip_prefix("/img/") {
+		return Some(format!("https://i.redd.it/{path}{suffix}"));
+	}
+	if let Some(path) = path.strip_prefix("/preview/pre/") {
+		return Some(format!("https://preview.redd.it/{path}{suffix}"));
+	}
+	if let Some(path) = path.strip_prefix("/preview/external-pre/") {
+		return Some(format!("https://external-preview.redd.it/{path}{suffix}"));
+	}
+	if let Some(id) = path.strip_prefix("/thumb/a/") {
+		return Some(format!("https://a.thumbs.redditmedia.com/{id}{suffix}"));
+	}
+	if let Some(id) = path.strip_prefix("/thumb/b/") {
+		return Some(format!("https://b.thumbs.redditmedia.com/{id}{suffix}"));
+	}
+
+	None
+}
+
+fn collect_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) -> Vec<String> {
+	let mut urls = Vec::new();
+	let mut seen = HashSet::new();
+	let prefer_full = prefs.image_quality == "best";
+
+	fn push_image_url(urls: &mut Vec<String>, seen: &mut HashSet<String>, url: &str) {
+		if url.is_empty() {
+			return;
+		}
+		let upstream = local_proxy_image_to_upstream(url).unwrap_or_else(|| url.to_string());
+		if !cacheable_image_url(&upstream) || !seen.insert(upstream.clone()) {
+			return;
+		}
+		urls.push(upstream);
+	}
+
+	for post in posts.iter().take(IMAGE_PRELOAD_MAX_POSTS) {
+		if post.flags.nsfw && prefs.show_nsfw != "on" {
+			continue;
+		}
+		if post.post_type == "image" {
+			if prefer_full {
+				push_image_url(&mut urls, &mut seen, &post.media.url);
+			} else {
+				push_image_url(
+					&mut urls,
+					&mut seen,
+					if post.media.preview_url.is_empty() { &post.media.url } else { &post.media.preview_url },
+				);
+			}
+		} else if post.post_type == "gallery" {
+			for image in &post.gallery {
+				if prefer_full {
+					push_image_url(&mut urls, &mut seen, &image.url);
+				} else {
+					push_image_url(&mut urls, &mut seen, if image.preview_url.is_empty() { &image.url } else { &image.preview_url });
+				}
+				if urls.len() >= IMAGE_PRELOAD_MAX_URLS {
+					return urls;
+				}
+			}
+		} else if !post.thumbnail.url.is_empty() {
+			push_image_url(&mut urls, &mut seen, &post.thumbnail.url);
+		}
+
+		if urls.len() >= IMAGE_PRELOAD_MAX_URLS {
+			return urls;
+		}
+	}
+
+	urls
+}
+
+pub fn preload_post_images(posts: &[Post], prefs: &crate::utils::Preferences) {
+	if cfg!(test) {
+		return;
+	}
+
+	let Ok(handle) = tokio::runtime::Handle::try_current() else {
+		return;
+	};
+
+	for url in collect_post_image_urls(posts, prefs) {
+		let should_spawn = IMAGE_PRELOAD_CACHE.lock().map(|mut cache| cache.mark_inflight(&url)).unwrap_or(false);
+		if !should_spawn {
+			continue;
+		}
+
+		handle.spawn(async move {
+			if let Err(err) = preload_image_url(url.clone()).await {
+				trace!("image preload skipped for {url}: {err}");
+				if let Ok(mut cache) = IMAGE_PRELOAD_CACHE.lock() {
+					cache.clear_inflight(&url);
+				}
+			}
+		});
+	}
+}
+
+async fn preload_image_url(url: String) -> Result<(), String> {
+	let parsed_uri = url.parse::<Uri>().map_err(|_| "Couldn't parse preload URL".to_string())?;
+	let mut builder = Request::get(parsed_uri);
+	{
+		let client = OAUTH_CLIENT.load_full();
+		builder = builder.header("User-Agent", client.user_agent());
+	}
+	let request = builder.body(Body::empty()).map_err(|_| "Couldn't build preload request".to_string())?;
+	let response = CLIENT.request(request).await.map_err(|e| e.to_string())?;
+	let status = response.status();
+	if !status.is_success() {
+		return Err(format!("upstream returned {status}"));
+	}
+
+	let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+	if !content_type.as_ref().and_then(|value| value.to_str().ok()).is_some_and(|value| value.starts_with("image/")) {
+		return Err("upstream response was not an image".to_string());
+	}
+	if response
+		.headers()
+		.get(header::CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<usize>().ok())
+		.is_some_and(|length| length > IMAGE_PRELOAD_MAX_ENTRY_BYTES)
+	{
+		return Err("upstream image is too large to preload".to_string());
+	}
+	let cache_control = response.headers().get(header::CACHE_CONTROL).cloned();
+	let body = body::to_bytes(response.into_body()).await.map_err(|e| e.to_string())?;
+	let entry = CachedImageResponse {
+		status,
+		content_type,
+		cache_control,
+		body,
+		inserted_at: Instant::now(),
+	};
+
+	if let Ok(mut cache) = IMAGE_PRELOAD_CACHE.lock() {
+		cache.insert(url, entry);
+	}
+	Ok(())
+}
+
+fn image_cache_get(url: &str) -> Option<CachedImageResponse> {
+	IMAGE_PRELOAD_CACHE.lock().ok().and_then(|mut cache| cache.get(url))
+}
+
+fn image_cache_inflight(url: &str) -> bool {
+	IMAGE_PRELOAD_CACHE.lock().map(|mut cache| cache.is_inflight(url)).unwrap_or(false)
+}
+
+async fn image_cache_get_or_wait(url: &str) -> Option<CachedImageResponse> {
+	if let Some(entry) = image_cache_get(url) {
+		return Some(entry);
+	}
+
+	if !image_cache_inflight(url) {
+		return None;
+	}
+
+	for _ in 0..30 {
+		tokio::time::sleep(Duration::from_millis(25)).await;
+		if let Some(entry) = image_cache_get(url) {
+			return Some(entry);
+		}
+		if !image_cache_inflight(url) {
+			return None;
+		}
+	}
+
+	None
+}
+
+fn cached_image_response(entry: CachedImageResponse) -> Result<Response<Body>, String> {
+	let mut builder = Response::builder().status(entry.status).header("x-redlib-image-preload-cache", "hit");
+	if let Some(content_type) = entry.content_type {
+		builder = builder.header(header::CONTENT_TYPE, content_type);
+	}
+	if let Some(cache_control) = entry.cache_control {
+		builder = builder.header(header::CACHE_CONTROL, cache_control);
+	}
+	builder.body(Body::from(entry.body)).map_err(|error| error.to_string())
+}
+
 pub async fn proxy(req: Request<Body>, format: &str) -> Result<Response<Body>, String> {
-	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
+	let mut url = match req.uri().query() {
+		Some(query) => format!("{format}?{query}"),
+		None => format.to_string(),
+	};
 
 	// For each parameter in request
 	for (name, value) in &req.params() {
 		// Fill the parameter value in the url
 		url = url.replace(&format!("{{{name}}}"), value);
+	}
+
+	if cacheable_image_url(&url) && req.headers().get("Range").is_none() {
+		if let Some(entry) = image_cache_get_or_wait(&url).await {
+			return cached_image_response(entry);
+		}
 	}
 
 	stream(&url, &req).await
@@ -950,6 +1246,23 @@ fn test_detects_network_security_block_page() {
 #[test]
 fn test_response_preview_truncates_and_escapes_newlines() {
 	assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
+}
+
+#[test]
+fn test_local_proxy_image_to_upstream_preserves_query() {
+	assert_eq!(
+		local_proxy_image_to_upstream("/img/example.jpg?width=640&format=pjpg"),
+		Some("https://i.redd.it/example.jpg?width=640&format=pjpg".to_string())
+	);
+	assert_eq!(
+		local_proxy_image_to_upstream("/preview/pre/example.png?width=1080"),
+		Some("https://preview.redd.it/example.png?width=1080".to_string())
+	);
+	assert_eq!(
+		local_proxy_image_to_upstream("/preview/external-pre/example.jpg"),
+		Some("https://external-preview.redd.it/example.jpg".to_string())
+	);
+	assert_eq!(local_proxy_image_to_upstream("/vid/demo/DASH_720.mp4"), None);
 }
 
 #[test]

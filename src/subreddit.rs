@@ -711,6 +711,7 @@ fn subreddit_fragment_path(req: &Request<Body>) -> String {
 
 fn render_feed_fragment(mut template_data: FeedFragmentTemplate) -> Result<Response<Body>, String> {
 	utils::refresh_post_times(&mut template_data.posts);
+	crate::client::preload_post_images(&template_data.posts, &template_data.prefs);
 	let body = template_data.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)
@@ -737,6 +738,7 @@ fn render_subreddit_fragment(
 	}
 
 	utils::refresh_post_times(&mut template_data.posts);
+	crate::client::preload_post_images(&template_data.posts, &template_data.prefs);
 	let body = template_data.render().map_err(|error| error.to_string())?;
 	let mut response = Response::builder()
 		.status(200)
@@ -1947,6 +1949,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				}
 			}
 
+			crate::client::preload_post_images(&page_template.posts, &page_template.prefs);
 			let mut response = template(&page_template);
 			if let Some(ref ctx) = feed_seen_shell {
 				if ctx.applies {
