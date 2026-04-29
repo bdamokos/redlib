@@ -2859,7 +2859,7 @@ mod tests {
 	use std::time::{Duration, Instant};
 
 	use crate::post_cache::{self, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin};
-	use crate::utils::{Author, Awards, Flags, Flair, Media, Post, Preferences, Subreddit};
+	use crate::utils::{Author, Awards, Flags, Flair, FollowingComment, Media, ParentComment, Post, Preferences, Subreddit};
 
 	fn empty_flair() -> Flair {
 		Flair {
@@ -2943,6 +2943,28 @@ mod tests {
 		post.media.url = format!("https://i.redd.it/{id}.jpg");
 		post.permalink = format!("/r/{community}/comments/{id}/");
 		post
+	}
+
+	fn test_following_comment() -> FollowingComment {
+		FollowingComment {
+			id: "comment_demo".to_string(),
+			author: "followed_user".to_string(),
+			body: "Followed user comment".to_string(),
+			permalink: "/r/demo_sub/comments/demo/comment_demo/".to_string(),
+			created_ts: 1,
+			rel_time: "30m ago".to_string(),
+			community: "demo_sub".to_string(),
+			score: ("1".to_string(), "1".to_string()),
+			parent_id: String::new(),
+			parent_kind: "t3".to_string(),
+			parent_comment: ParentComment::default(),
+			link_title: "Primary post title".to_string(),
+			link_permalink: "/r/demo_sub/comments/demo/".to_string(),
+			link_author: "demo_user".to_string(),
+			link_created_ts: 1,
+			thread_comments: ("0".to_string(), "0".to_string()),
+			thread_nsfw: false,
+		}
 	}
 
 	async fn seed_contextual_session(source: FeedSource, posts: Vec<Post>, fingerprint: &str) -> String {
@@ -3370,6 +3392,34 @@ mod tests {
 
 		assert!(!html.contains("feed_status_banner"));
 		assert!(html.contains("id=\"feed_content\""));
+	}
+
+	#[test]
+	fn following_feed_posts_use_standard_listing_header() {
+		let mut post = test_post();
+		post.following_comments.push(test_following_comment());
+
+		let html = super::FeedFragmentTemplate {
+			posts: vec![post],
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/following/new".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("class=\"post_header\""));
+		assert!(html.contains("<a class=\"post_subreddit\" href=\"/r/demo_sub\">r/demo_sub</a>"));
+		assert!(html.contains("<a class=\"post_author \" href=\"/u/demo_user\">u/demo_user</a>"));
+		assert!(html.contains("post_following_comments"));
+		assert!(!html.contains("post_header_following_thread"));
+		assert!(!html.contains("post_following_thread_meta"));
 	}
 
 	#[test]

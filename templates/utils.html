@@ -302,57 +302,13 @@
 	class="post{% if post.flags.stickied %} stickied{% endif %}{% if post.following_comments.len() > 0 %} post_following_bundle{% endif %}"
 	data-post-type="{{ post.post_type }}"
 	data-created-ts="{{ post.created_ts }}">
-	<div class="post_header{% if post.following_comments.len() > 0 %} post_header_following_thread{% endif %}">
+	<div class="post_header">
 		{% let community -%}
 		{% if post.community.starts_with("u_") -%}
 			{% let community = format!("u/{}", &post.community[2..]) -%}
 		{% else -%}
 			{% let community = format!("r/{}", post.community) -%}
 		{% endif -%}
-		{% if post.following_comments.len() > 0 %}
-		<div class="post_following_thread_top">
-			<a class="post_subreddit" href="/{{ community }}">{{ community }}</a>
-			{% if show_subscription_button && !post.community.starts_with("u_") && !prefs.has_subscription(post.community) %}
-			<form
-				class="inline_subscription_form"
-				action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}&canonical={{ post.community }}"
-				method="POST"
-				data-subscription-form
-					data-subscription-target="subreddit:{{ post.community }}"
-					data-subscription-state="unsubscribed"
-					data-state-on="subscribed"
-					data-state-off="unsubscribed"
-					data-subscribe-action="/r/{{ post.community }}/subscribe?redirect={{ redirect_url }}&canonical={{ post.community }}"
-					data-unsubscribe-action="/r/{{ post.community }}/unsubscribe?redirect={{ redirect_url }}&canonical={{ post.community }}"
-					data-subscribe-label="Follow"
-					data-unsubscribe-label="Unfollow"
-					data-subscribe-class="subscribe"
-					data-unsubscribe-class="unsubscribe"
-					data-cookie-mode="list"
-					data-cookie-name="subscriptions"
-					data-cookie-values="{{ post.community }}">
-				<button class="subscribe" type="submit">Follow</button>
-			</form>
-			{% endif %}
-		</div>
-		<div class="post_following_thread_meta">
-			{% if !post.author.name.is_empty() %}
-			<span class="post_following_meta_label">Posted by</span>
-			<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
-			{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
-			<span class="dot">&bull;</span>
-			{% endif %}
-			<span class="post_following_posted"><span class="post_following_meta_label">Posted</span> <a class="created post_following_post_date" href="{{ post.permalink }}" title="{{ post.display_created_tooltip() }}" data-created-ts="{{ post.created_ts }}">{% let prt = post.display_rel_time() %}{% if !prt.is_empty() %}{{ prt }}{% else %}—{% endif %}</a></span>
-			{% if !post.awards.is_empty() && prefs.hide_awards != "on" %}
-				{% for award in post.awards.clone() %}
-				<span class="dot">&bull;</span>
-				<span class="award" title="{{ award.name }}">
-					<img alt="{{ award.name }}" src="{{ award.icon_url }}" width="16" height="16"/>
-				</span>
-				{% endfor %}
-			{% endif %}
-		</div>
-		{% else %}
 		<a class="post_subreddit" href="/{{ community }}">{{ community }}</a>
 		{% if show_subscription_button && !post.community.starts_with("u_") && !prefs.has_subscription(post.community) %}
 		<form
@@ -388,7 +344,6 @@
 			</span>
 			{% endfor %}
 		{% endif %}
-		{% endif %}
 	</div>
 	<h2 class="post_title">
 		{% if post.kind == "t1" %}
@@ -407,7 +362,7 @@
 		{% endif %}
 	</h2>
 	<!-- POST MEDIA/THUMBNAIL -->
-	{% if post.kind != "t1" && (prefs.layout.is_empty() || str_eq(prefs.layout, "card") || post.following_comments.len() > 0) %}
+	{% if post.kind != "t1" && (prefs.layout.is_empty() || str_eq(prefs.layout, "card")) %}
 		{% if post.post_type == "image" %}
 		<div class="post_media_content">
 			<a href="{{ post.media.url }}" class="post_media_image {% if post.media.height < post.media.width*2 %}short{% endif %}" >
