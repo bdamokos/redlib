@@ -16,7 +16,7 @@ use wreq_util::{Emulation, EmulationOS, EmulationOption};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{io, result::Result};
 
@@ -36,10 +36,12 @@ const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
 const IMAGE_PRELOAD_TTL: Duration = Duration::from_secs(15 * 60);
-const IMAGE_PRELOAD_MAX_ENTRY_BYTES: usize = 12 * 1024 * 1024;
-const IMAGE_PRELOAD_MAX_TOTAL_BYTES: usize = 384 * 1024 * 1024;
-const IMAGE_PRELOAD_MAX_POSTS: usize = 16;
-const IMAGE_PRELOAD_MAX_URLS: usize = 40;
+const IMAGE_PRELOAD_MAX_ENTRY_BYTES: usize = 6 * 1024 * 1024;
+const IMAGE_PRELOAD_MAX_TOTAL_BYTES: usize = 96 * 1024 * 1024;
+const IMAGE_PRELOAD_MAX_POSTS: usize = 8;
+const IMAGE_PRELOAD_MAX_URLS: usize = 12;
+const IMAGE_PRELOAD_CONCURRENCY: usize = 3;
+const IMAGE_PRELOAD_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::new(|| {
 	hyper_rustls::HttpsConnectorBuilder::new()
@@ -94,6 +96,7 @@ pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 pub static LAST_REDDIT_RATELIMIT: LazyLock<std::sync::Mutex<Option<RedditRateLimitSnapshot>>> = LazyLock::new(|| std::sync::Mutex::new(None));
 static IMAGE_PRELOAD_CACHE: LazyLock<Mutex<ImagePreloadCache>> = LazyLock::new(|| Mutex::new(ImagePreloadCache::default()));
+static IMAGE_PRELOAD_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(IMAGE_PRELOAD_CONCURRENCY)));
 
 #[derive(Clone)]
 struct CachedImageResponse {
@@ -634,6 +637,13 @@ pub fn preload_post_images(posts: &[Post], prefs: &crate::utils::Preferences) {
 		}
 
 		handle.spawn(async move {
+			let Ok(_permit) = IMAGE_PRELOAD_SEMAPHORE.clone().acquire_owned().await else {
+				if let Ok(mut cache) = IMAGE_PRELOAD_CACHE.lock() {
+					cache.clear_inflight(&url);
+				}
+				return;
+			};
+
 			if let Err(err) = preload_image_url(url.clone()).await {
 				trace!("image preload skipped for {url}: {err}");
 				if let Ok(mut cache) = IMAGE_PRELOAD_CACHE.lock() {
@@ -652,7 +662,10 @@ async fn preload_image_url(url: String) -> Result<(), String> {
 		builder = builder.header("User-Agent", client.user_agent());
 	}
 	let request = builder.body(Body::empty()).map_err(|_| "Couldn't build preload request".to_string())?;
-	let response = CLIENT.request(request).await.map_err(|e| e.to_string())?;
+	let response = tokio::time::timeout(IMAGE_PRELOAD_UPSTREAM_TIMEOUT, CLIENT.request(request))
+		.await
+		.map_err(|_| "preload request timed out".to_string())?
+		.map_err(|e| e.to_string())?;
 	let status = response.status();
 	if !status.is_success() {
 		return Err(format!("upstream returned {status}"));
@@ -672,7 +685,10 @@ async fn preload_image_url(url: String) -> Result<(), String> {
 		return Err("upstream image is too large to preload".to_string());
 	}
 	let cache_control = response.headers().get(header::CACHE_CONTROL).cloned();
-	let body = body::to_bytes(response.into_body()).await.map_err(|e| e.to_string())?;
+	let body = tokio::time::timeout(IMAGE_PRELOAD_UPSTREAM_TIMEOUT, body::to_bytes(response.into_body()))
+		.await
+		.map_err(|_| "preload body timed out".to_string())?
+		.map_err(|e| e.to_string())?;
 	let entry = CachedImageResponse {
 		status,
 		content_type,
