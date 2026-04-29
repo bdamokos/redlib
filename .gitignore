@@ -14,3 +14,6 @@ logs/reddit_api/
 target-docker/*
 nginx/
 .playwright-cli/
+.playwright-mcp/
+output/playwright/
+tmp/
