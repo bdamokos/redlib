@@ -249,6 +249,12 @@ pub(crate) struct PersistedRememberedSubredditEntry {
 	pub consecutive_failures: u32,
 	pub estimated_post_interval_secs: u64,
 	pub refresh_in_flight: bool,
+	#[serde(default)]
+	pub visit_priority_score: f64,
+	#[serde(default)]
+	pub visit_priority_last_update_unix: Option<u64>,
+	#[serde(default)]
+	pub visit_signal_last_applied_unix: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

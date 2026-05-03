@@ -2688,6 +2688,16 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		crate::post_cache::remember_subreddit_request(&format!("u_{username}"));
 	}
 
+	let user_visit_signal_page = param(&format!("?{query}"), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
+	if (video_listing || (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty()))
+		&& user_visit_signal_page == 0
+	{
+		crate::post_cache::record_remembered_feed_visit_signal(&crate::post_cache::FeedSource::subreddit(
+			format!("u_{username}"),
+			crate::post_cache::FeedSort::New,
+		));
+	}
+
 	let filters = get_filters(&req);
 	let fragment = if filters.contains(&["u_", &username].concat()) {
 		UserFragmentTemplate {

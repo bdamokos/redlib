@@ -11,6 +11,7 @@ use hyper::{Body, Request, Response, StatusCode};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
@@ -20,6 +21,14 @@ use tokio::time::{Duration, MissedTickBehavior};
 pub(crate) const CACHE_TTL_SECS: u64 = 10_800;
 pub(crate) const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 pub(crate) const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
+/// Visit-interest boost decays with this half-life so manual browsing lifts refresh priority temporarily.
+const VISIT_PRIORITY_HALFLIFE_SECS: u64 = 72 * 60 * 60;
+/// Minimum time between visit signals for the same feed (pagination / rapid reload spam guard).
+const VISIT_SIGNAL_COOLDOWN_SECS: u64 = 45 * 60;
+const VISIT_PRIORITY_BUMP: f64 = 1.0;
+const VISIT_PRIORITY_MAX_SCORE: f64 = 16.0;
+/// Maps decaying visit score into `effective_freshness_target` reduction: target *= 1/(1 + k*score).
+const VISIT_PRIORITY_SENSITIVITY: f64 = 0.35;
 const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
 const PERMANENT_FAILURE_BACKOFF_SECS: u64 = 14 * 24 * 60 * 60;
 const ACTIVE_BROWSER_SESSION_TTL_SECS: u64 = 20;
@@ -221,6 +230,10 @@ pub struct RememberedSubredditEntry {
 	pub consecutive_failures: u32,
 	pub estimated_post_interval_secs: u64,
 	pub refresh_in_flight: bool,
+	/// Accumulated visit-interest score (decays with [`VISIT_PRIORITY_HALFLIFE_SECS`] wall-clock).
+	pub visit_priority_score: f64,
+	pub visit_priority_last_update_at: Option<Instant>,
+	pub visit_signal_last_applied_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -498,7 +511,54 @@ fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 		consecutive_failures: 0,
 		estimated_post_interval_secs: DEFAULT_ESTIMATED_POST_INTERVAL_SECS,
 		refresh_in_flight: false,
+		visit_priority_score: 0.0,
+		visit_priority_last_update_at: None,
+		visit_signal_last_applied_at: None,
 	}
+}
+
+fn visit_priority_score_now(entry: &RememberedSubredditEntry) -> f64 {
+	let Some(anchor) = entry.visit_priority_last_update_at else {
+		return 0.0;
+	};
+	let dt = anchor.elapsed().as_secs_f64();
+	let lambda = std::f64::consts::LN_2 / VISIT_PRIORITY_HALFLIFE_SECS as f64;
+	entry.visit_priority_score * (-lambda * dt).exp()
+}
+
+/// Browsing the canonical first page of a remembered `new` feed (subreddit, flair, or `u_` listing)
+/// temporarily increases daemon refresh priority. Throttled by [`VISIT_SIGNAL_COOLDOWN_SECS`]; score
+/// decays with a 72h half-life so repeat visits stack while interest is sustained.
+pub fn record_remembered_feed_visit_signal(source: &FeedSource) {
+	let Some(normalized) = normalize_remembered_source(source) else {
+		return;
+	};
+	let Some(key) = remembered_feed_key_for_source(&normalized) else {
+		return;
+	};
+
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let entry = match remembered.entry(key) {
+		Entry::Occupied(slot) => slot.into_mut(),
+		Entry::Vacant(slot) => {
+			let name = slot.key().clone();
+			slot.insert(new_remembered_subreddit_entry(name))
+		}
+	};
+
+	if entry
+		.visit_signal_last_applied_at
+		.is_some_and(|t| t.elapsed().as_secs() < VISIT_SIGNAL_COOLDOWN_SECS)
+	{
+		return;
+	}
+
+	let mut score = visit_priority_score_now(entry);
+	score = (score + VISIT_PRIORITY_BUMP).min(VISIT_PRIORITY_MAX_SCORE);
+	entry.visit_priority_score = score;
+	entry.visit_priority_last_update_at = Some(Instant::now());
+	entry.visit_signal_last_applied_at = Some(Instant::now());
+	crate::cache_persistence::mark_dirty();
 }
 
 fn prune_active_browser_sessions_locked(sessions: &mut HashMap<String, ActiveBrowserSession>) {
@@ -676,12 +736,13 @@ fn freshness_target_secs(estimated_post_interval_secs: u64) -> u64 {
 }
 
 fn effective_freshness_target_secs(entry: &RememberedSubredditEntry) -> u64 {
-	let base = freshness_target_secs(entry.estimated_post_interval_secs);
+	let mut base = freshness_target_secs(entry.estimated_post_interval_secs);
 	if entry.consecutive_failures >= 2 {
-		base.saturating_mul(entry.consecutive_failures.max(1).min(8) as u64)
-	} else {
-		base
+		base = base.saturating_mul(entry.consecutive_failures.max(1).min(8) as u64);
 	}
+	let score = visit_priority_score_now(entry);
+	let boosted = (base as f64 / (1.0 + VISIT_PRIORITY_SENSITIVITY * score)).max(MIN_FRESHNESS_TARGET_SECS as f64);
+	boosted as u64
 }
 
 fn remembered_entry_refresh_blocked(entry: &RememberedSubredditEntry) -> bool {
@@ -971,6 +1032,9 @@ pub(crate) fn snapshot_persisted_remembered_subreddits(now_unix: u64) -> Vec<Per
 			consecutive_failures: entry.consecutive_failures,
 			estimated_post_interval_secs: entry.estimated_post_interval_secs,
 			refresh_in_flight: entry.refresh_in_flight,
+			visit_priority_score: entry.visit_priority_score,
+			visit_priority_last_update_unix: option_instant_to_unix(entry.visit_priority_last_update_at, now_unix),
+			visit_signal_last_applied_unix: option_instant_to_unix(entry.visit_signal_last_applied_at, now_unix),
 		})
 		.collect()
 }
@@ -999,6 +1063,9 @@ pub(crate) fn restore_persisted_state(
 					consecutive_failures: entry.consecutive_failures,
 					estimated_post_interval_secs: entry.estimated_post_interval_secs,
 					refresh_in_flight: false,
+					visit_priority_score: entry.visit_priority_score,
+					visit_priority_last_update_at: option_unix_to_instant(entry.visit_priority_last_update_unix, now_unix),
+					visit_signal_last_applied_at: option_unix_to_instant(entry.visit_signal_last_applied_unix, now_unix),
 				},
 			))
 		})
@@ -2550,8 +2617,9 @@ mod tests {
 		catalog_source_candidates, count_sources_in_state, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions,
 		initial_source_budget_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
 		pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh,
-		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request,
-		remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
+		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, effective_freshness_target_secs,
+		remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state,
+		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
 		snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, store_source_posts, store_source_posts_with_origin,
 		sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedSubredditEntry,
 		SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS,
@@ -2611,6 +2679,9 @@ mod tests {
 			consecutive_failures: 0,
 			estimated_post_interval_secs: 21_600,
 			refresh_in_flight: false,
+			visit_priority_score: 0.0,
+			visit_priority_last_update_at: None,
+			visit_signal_last_applied_at: None,
 		}
 	}
 
@@ -3102,6 +3173,36 @@ mod tests {
 		assert_eq!(remembered.len(), 2);
 		assert!(remembered.contains_key("rust"));
 		assert!(remembered.contains_key("u_demo"));
+	}
+
+	#[test]
+	fn visit_signal_shortens_effective_freshness_target() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		let before = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].clone();
+		let target_before = effective_freshness_target_secs(&before);
+		record_remembered_feed_visit_signal(&new_source("rust"));
+		let after = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].clone();
+		let target_after = effective_freshness_target_secs(&after);
+		assert!(
+			target_after < target_before,
+			"visit signal should increase refresh priority (lower freshness target secs)"
+		);
+	}
+
+	#[test]
+	fn visit_signal_cooldown_prevents_immediate_second_bump() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		record_remembered_feed_visit_signal(&new_source("rust"));
+		let once = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].visit_priority_score;
+		record_remembered_feed_visit_signal(&new_source("rust"));
+		let twice = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].visit_priority_score;
+		assert_eq!(once, twice);
 	}
 
 	#[test]
