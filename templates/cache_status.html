@@ -36,6 +36,7 @@
 		<p>It does <em>not</em> simply walk uncached feeds in order. Feeds that have never refreshed successfully go first, then overdue feeds, then feeds with the highest age-vs-target freshness ratio, with recent user requests used as a tiebreaker.</p>
 		<p>So a feed's “Next Fetch” time is roughly: <em>time until the next daemon tick + (its queue position × one daemon interval)</em>.</p>
 		<p>The per-feed “Refresh frequency” is adaptive: it is estimated from how often that feed posts, clamped to a minimum and maximum, and stretched further after repeated failures.</p>
+		<p><strong>Freshest cached post</strong> is how long ago the <em>newest</em> timestamp among all posts in that cache snapshot was (including bundled comment activity and collapsed duplicates), not necessarily the first row you see on a re-sorted view such as video mode.</p>
 	</div>
 
 	<div class="panel">
@@ -83,7 +84,7 @@
 					<th data-sort-type="text"><button type="button" class="sort_button">Type</button></th>
 					<th data-sort-type="text"><button type="button" class="sort_button">Cached</button></th>
 					<th data-sort-type="number"><button type="button" class="sort_button">Posts</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Head Post Age</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Freshest cached post</button></th>
 					<th data-sort-type="number"><button type="button" class="sort_button">Cache Expires In</button></th>
 					<th data-sort-type="number"><button type="button" class="sort_button">Last Fetched</button></th>
 					<th data-sort-type="number"><button type="button" class="sort_button">Refresh Frequency</button></th>

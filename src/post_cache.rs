@@ -3,7 +3,7 @@ use crate::cache_persistence::{
 };
 use crate::materialized_catalog;
 use crate::oauth::oauth_is_available;
-use crate::user::{collapse_duplicate_submissions, update_user_video_stats_from_posts};
+use crate::user::{collapse_duplicate_submissions, post_feed_activity_ts, update_user_video_stats_from_posts};
 use crate::utils::{Post, Preferences};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyper::body::to_bytes;
@@ -284,6 +284,7 @@ pub struct CacheStatusSource {
 	pub cached: bool,
 	pub cached_posts: usize,
 	pub cached_age_secs: Option<u64>,
+	/// Unix time of the most recent cached post activity (`post_feed_activity_ts`), not the first row.
 	pub head_post_created_ts: Option<u64>,
 	pub head_post_age_secs: Option<u64>,
 	pub cache_expires_in_secs: Option<u64>,
@@ -2487,6 +2488,22 @@ pub fn cache_status_seconds_until_daemon_tick() -> u64 {
 		.unwrap_or(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS)
 }
 
+fn freshest_cached_post_activity_ts(entry: &CachedSourcePosts) -> Option<u64> {
+	let mut best: Option<u64> = None;
+	for post in &entry.posts {
+		let ts = post_feed_activity_ts(post);
+		if ts > 0 {
+			best = Some(best.map_or(ts, |b| b.max(ts)));
+		}
+		for duplicate in &post.collapsed_duplicates {
+			if duplicate.created_ts > 0 {
+				best = Some(best.map_or(duplicate.created_ts, |b| b.max(duplicate.created_ts)));
+			}
+		}
+	}
+	best
+}
+
 fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let mut entries = remembered
@@ -2524,7 +2541,7 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 		let cached = cache_entry.is_some();
 		let cached_posts = cache_entry.map(|entry| entry.posts.len()).unwrap_or_default();
 		let cached_age_secs = cache_entry.map(|entry| entry.fetched_at.elapsed().as_secs());
-		let head_post_created_ts = cache_entry.and_then(|entry| entry.posts.first().map(|post| post.created_ts));
+		let head_post_created_ts = cache_entry.and_then(freshest_cached_post_activity_ts);
 		let head_post_age_secs = head_post_created_ts.map(|created_ts| generated_at_unix.saturating_sub(created_ts));
 		let cache_expires_in_secs = if let Some(entry) = remembered_entry.filter(|entry| remembered_entry_is_active(entry)) {
 			Some(REMEMBERED_SUBREDDIT_TTL_SECS.saturating_sub(entry.last_requested_at.elapsed().as_secs()))
@@ -4388,6 +4405,29 @@ mod tests {
 
 		assert_eq!(source.head_post_created_ts, Some(now - 90));
 		assert!(source.head_post_age_secs.is_some_and(|age| age >= 90));
+	}
+
+	#[test]
+	fn cache_status_head_post_age_uses_freshest_cached_post_not_first_row() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let rust_source = new_source("rust");
+		seed_source(
+			&rust_source,
+			vec![test_post("rust-old", "rust", now - 120), test_post("rust-new", "rust", now - 90)],
+		);
+
+		let prefs = Preferences {
+			subscriptions: vec!["rust".to_string()],
+			..Preferences::default()
+		};
+
+		let status = cache_status_for_preferences(&prefs);
+		let source = status.sources.iter().find(|source| source.display_name == "rust").expect("rust cache status");
+
+		assert_eq!(source.head_post_created_ts, Some(now - 90));
+		assert!(source.head_post_age_secs.is_some_and(|age| age >= 90 && age < 95));
 	}
 
 	#[test]
