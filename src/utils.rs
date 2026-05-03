@@ -1948,6 +1948,20 @@ fn decode_cookie_chunk(value: &str) -> String {
 
 const MAX_COOKIE_SHARDS: usize = 16;
 
+/// Highest shard index present on the request (`subscriptions` → 0, `subscriptions1` → 1, …).
+/// Used to avoid emitting dozens of `Set-Cookie` removals (which proxies/browsers may truncate),
+/// while still clearing every shard the client actually sent.
+fn highest_present_shard_index(req: &Request<Body>, base_name: &str) -> Option<usize> {
+	let mut highest: Option<usize> = None;
+	for index in 0..MAX_COOKIE_SHARDS {
+		let cookie_name = if index == 0 { base_name.to_string() } else { format!("{base_name}{index}") };
+		if req.cookie(&cookie_name).is_some() {
+			highest = Some(highest.map_or(index, |h| h.max(index)));
+		}
+	}
+	highest
+}
+
 pub fn read_sharded_cookie(req: &Request<Body>, base_name: &str) -> String {
 	let mut value = String::new();
 	let mut index = 0usize;
@@ -1985,14 +1999,19 @@ pub fn write_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, 
 		);
 	}
 
-	for stale_index in chunks.len()..MAX_COOKIE_SHARDS {
-		let cookie_name = if stale_index == 0 { base_name.to_string() } else { format!("{base_name}{stale_index}") };
-		response.remove_cookie(cookie_name);
+	let last_new_index = chunks.len().saturating_sub(1);
+	let old_upper = highest_present_shard_index(req, base_name).unwrap_or(MAX_COOKIE_SHARDS - 1);
+	if last_new_index < old_upper {
+		for stale_index in (last_new_index + 1)..=old_upper {
+			let cookie_name = if stale_index == 0 { base_name.to_string() } else { format!("{base_name}{stale_index}") };
+			response.remove_cookie(cookie_name);
+		}
 	}
 }
 
-pub fn clear_sharded_cookie(response: &mut Response<Body>, _req: &Request<Body>, base_name: &str) {
-	for index in 0..MAX_COOKIE_SHARDS {
+pub fn clear_sharded_cookie(response: &mut Response<Body>, req: &Request<Body>, base_name: &str) {
+	let end = highest_present_shard_index(req, base_name).unwrap_or(MAX_COOKIE_SHARDS - 1);
+	for index in 0..=end {
 		let cookie_name = if index == 0 { base_name.to_string() } else { format!("{base_name}{index}") };
 		response.remove_cookie(cookie_name);
 	}
@@ -4676,6 +4695,29 @@ mod tests {
 		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions=rust")));
 		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions1=")));
 		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions15=")));
+	}
+
+	#[test]
+	fn write_sharded_cookie_only_removes_stale_shards_seen_on_request() {
+		let req = Request::builder()
+			.header("Cookie", "subscriptions=x; subscriptions1=y; subscriptions2=z")
+			.body(Body::empty())
+			.unwrap();
+		let mut response = Response::builder().body(Body::empty()).unwrap();
+
+		write_sharded_cookie(&mut response, &req, "subscriptions", "only");
+
+		let set_cookie_headers = response
+			.headers()
+			.get_all("Set-Cookie")
+			.iter()
+			.map(|value| value.to_str().unwrap_or_default().to_string())
+			.collect::<Vec<_>>();
+
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions=only")));
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions1=")));
+		assert!(set_cookie_headers.iter().any(|value| value.starts_with("subscriptions2=")));
+		assert!(!set_cookie_headers.iter().any(|value| value.starts_with("subscriptions15=")));
 	}
 
 	#[test]

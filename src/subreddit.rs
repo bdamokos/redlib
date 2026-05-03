@@ -13,6 +13,7 @@ use askama::Template;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cookie::Cookie;
 use htmlescape::decode_html;
+use hyper::header::CONTENT_TYPE;
 use hyper::{Body, Request, Response};
 use log::{info, warn};
 
@@ -529,6 +530,16 @@ fn wiki_source_path(req: &Request<Body>) -> String {
 
 fn is_async_subscription_request(req: &Request<Body>) -> bool {
 	req.headers().get("X-Redlib-Ajax").and_then(|value| value.to_str().ok()).is_some_and(|value| value == "1")
+}
+
+/// 200 + body so intermediaries reliably forward `Set-Cookie` (some strip or mishandle 204).
+fn async_subscription_ok_response() -> Response<Body> {
+	Response::builder()
+		.status(200)
+		.header("Cache-Control", "no-store")
+		.header(CONTENT_TYPE, "text/plain; charset=utf-8")
+		.body(Body::from("OK"))
+		.unwrap_or_default()
 }
 
 fn update_url_query(url: &str, updates: &[(&str, Option<&str>)]) -> String {
@@ -4587,7 +4598,7 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	};
 
 	let mut response = if is_async_subscription_request(&req) {
-		Response::builder().status(204).header("Cache-Control", "no-store").body(Body::empty()).unwrap_or_default()
+		async_subscription_ok_response()
 	} else {
 		redirect(&path)
 	};
@@ -4654,7 +4665,7 @@ pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, S
 	};
 
 	let mut response = if is_async_subscription_request(&req) {
-		Response::builder().status(204).header("Cache-Control", "no-store").body(Body::empty()).unwrap_or_default()
+		async_subscription_ok_response()
 	} else {
 		redirect(&path)
 	};

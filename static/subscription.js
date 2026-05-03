@@ -58,6 +58,18 @@
         return value;
     };
 
+    /** Max shard index present in `jar` (0 for `name`, 1 for `name1`, …). */
+    const highestPresentShardIndex = (jar, baseName) => {
+        let highest = -1;
+        for (let i = 0; i < maxCookieShards; i += 1) {
+            const cookieName = i === 0 ? baseName : `${baseName}${i}`;
+            if (jar.has(cookieName) && (jar.get(cookieName) ?? "") !== "") {
+                highest = i;
+            }
+        }
+        return highest;
+    };
+
     const listTokensFromRaw = (raw) =>
         raw
             .split("+")
@@ -152,8 +164,12 @@
     const writeShardedCookie = (baseName, value) => {
         const chunkSize = 3800;
         const chunks = value ? value.match(new RegExp(`.{1,${chunkSize}}`, "g")) || [] : [];
+        const jar = parseCookieSnapshot(document.cookie);
+        const oldUpper = highestPresentShardIndex(jar, baseName);
+
         if (chunks.length === 0) {
-            for (let staleIndex = 0; staleIndex < maxCookieShards; staleIndex += 1) {
+            const end = oldUpper >= 0 ? oldUpper : maxCookieShards - 1;
+            for (let staleIndex = 0; staleIndex <= end; staleIndex += 1) {
                 const staleName = staleIndex === 0 ? baseName : `${baseName}${staleIndex}`;
                 removeCookie(staleName);
             }
@@ -165,9 +181,13 @@
             document.cookie = `${cookieName}=${encodeURIComponent(chunk)}; expires=${oneYearFromNow()}; path=/; SameSite=Lax`;
         });
 
-        for (let staleIndex = chunks.length; staleIndex < maxCookieShards; staleIndex += 1) {
-            const staleName = staleIndex === 0 ? baseName : `${baseName}${staleIndex}`;
-            removeCookie(staleName);
+        const lastNew = chunks.length - 1;
+        const capStale = oldUpper >= 0 ? oldUpper : lastNew;
+        if (lastNew < capStale) {
+            for (let staleIndex = lastNew + 1; staleIndex <= capStale; staleIndex += 1) {
+                const staleName = staleIndex === 0 ? baseName : `${baseName}${staleIndex}`;
+                removeCookie(staleName);
+            }
         }
     };
 

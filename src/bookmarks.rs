@@ -3,6 +3,7 @@ use crate::utils::{clear_sharded_cookie, format_num, parse_post, read_sharded_co
 use askama::Template;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyper::body::to_bytes;
+use hyper::header::CONTENT_TYPE;
 use hyper::StatusCode;
 use hyper::{Body, Request, Response};
 use serde::{Deserialize, Serialize};
@@ -176,6 +177,15 @@ fn request_is_ajax(parts: &hyper::http::request::Parts) -> bool {
 	parts.headers.get("X-Redlib-Ajax").and_then(|value| value.to_str().ok()).is_some_and(|value| value == "1")
 }
 
+fn ajax_bookmark_ok_response() -> Response<Body> {
+	Response::builder()
+		.status(200)
+		.header("Cache-Control", "no-store")
+		.header(CONTENT_TYPE, "text/plain; charset=utf-8")
+		.body(Body::from("OK"))
+		.unwrap_or_default()
+}
+
 fn redirect_target(_parts: &hyper::http::request::Parts, form: &HashMap<String, String>) -> String {
 	form
 		.get("redirect")
@@ -272,7 +282,7 @@ pub async fn add(req: Request<Body>) -> Result<Response<Body>, String> {
 	add_entry(&mut entries, new_entry);
 
 	let mut response = if is_ajax {
-		Response::builder().status(204).header("Cache-Control", "no-store").body(Body::empty()).unwrap_or_default()
+		ajax_bookmark_ok_response()
 	} else {
 		redirect(&redirect_to)
 	};
@@ -293,7 +303,7 @@ pub async fn remove(req: Request<Body>) -> Result<Response<Body>, String> {
 	entries.retain(|entry| entry.id != id);
 
 	let mut response = if is_ajax {
-		Response::builder().status(204).header("Cache-Control", "no-store").body(Body::empty()).unwrap_or_default()
+		ajax_bookmark_ok_response()
 	} else {
 		redirect(&redirect_to)
 	};
