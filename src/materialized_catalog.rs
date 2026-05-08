@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::cache_persistence::PersistedPost;
 use crate::post_cache::{FeedSession, FeedSort, FeedSource, SessionSourceState};
 use crate::utils::Post;
@@ -33,17 +34,20 @@ pub struct CatalogUserSidebarStats {
 	pub subreddit_counts: Vec<(String, u32)>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedCatalogSnapshot {
 	pub records: Vec<PersistedCatalogRecord>,
 }
 
+#[cfg(test)]
 impl Default for PersistedCatalogSnapshot {
 	fn default() -> Self {
 		Self { records: Vec::new() }
 	}
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedCatalogRecord {
 	pub post: PersistedPost,
@@ -54,6 +58,7 @@ pub(crate) struct PersistedCatalogRecord {
 	pub source_keys: Vec<PersistedCatalogSourceKey>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum PersistedCatalogSourceKey {
 	Subreddit(String),
@@ -218,6 +223,7 @@ pub(crate) fn apply_source_refresh(source: &FeedSource, posts: &[Post]) {
 	rebuild_indexes(&mut catalog);
 }
 
+#[cfg(test)]
 pub(crate) fn restore_catalog(snapshot: PersistedCatalogSnapshot) {
 	let mut catalog = MaterializedCatalog::default();
 	for record in snapshot.records {
@@ -245,6 +251,7 @@ pub(crate) fn restore_catalog(snapshot: PersistedCatalogSnapshot) {
 	*state = catalog;
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_catalog() -> PersistedCatalogSnapshot {
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	let mut records = catalog
@@ -263,12 +270,14 @@ pub(crate) fn snapshot_catalog() -> PersistedCatalogSnapshot {
 	PersistedCatalogSnapshot { records }
 }
 
+#[cfg(test)]
 pub(crate) fn query_session_stream(session: &FeedSession) -> Vec<Post> {
 	let allowed_keys = allowed_source_keys_for_session(session);
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	query_posts_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, usize::MAX)
 }
 
+#[cfg(test)]
 pub(crate) fn query_source_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
 	let allowed_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
@@ -369,6 +378,7 @@ pub(crate) fn reset_catalog() {
 #[cfg(test)]
 pub(crate) static MATERIALIZED_CATALOG_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(test)]
 impl PersistedCatalogSourceKey {
 	fn from_runtime(value: CatalogSourceKey) -> Self {
 		match value {

@@ -1,5 +1,5 @@
 use crate::config::get_setting;
-use crate::{materialized_catalog, post_cache, subreddit, utils};
+use crate::{post_cache, subreddit, utils};
 use log::warn;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -11,13 +11,11 @@ use tokio::sync::mpsc;
 
 const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v1.bin";
-const MATERIALIZED_CATALOG_FILE_NAME: &str = "materialized-catalog.v1.bin";
 const DEFAULT_CACHE_DIR: &str = "/var/lib/redlib/cache";
 const WRITE_DEBOUNCE_SECS: u64 = 1;
 
 static PERSISTENCE_EVENTS: OnceLock<mpsc::UnboundedSender<()>> = OnceLock::new();
 static PERSISTENCE_PATH: LazyLock<PathBuf> = LazyLock::new(snapshot_path);
-static MATERIALIZED_CATALOG_PATH: LazyLock<PathBuf> = LazyLock::new(materialized_catalog_path);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) enum PersistedRefreshOrigin {
@@ -296,11 +294,12 @@ struct PersistedCacheSnapshot {
 	subreddit_users: Vec<PersistedSubredditUsersEntry>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCatalogSnapshotFile {
 	version: u8,
 	saved_at_unix: u64,
-	snapshot: materialized_catalog::PersistedCatalogSnapshot,
+	snapshot: crate::materialized_catalog::PersistedCatalogSnapshot,
 }
 
 pub fn cache_dir() -> String {
@@ -309,10 +308,6 @@ pub fn cache_dir() -> String {
 
 pub(crate) fn snapshot_path() -> PathBuf {
 	Path::new(&cache_dir()).join(SNAPSHOT_FILE_NAME)
-}
-
-pub(crate) fn materialized_catalog_path() -> PathBuf {
-	Path::new(&cache_dir()).join(MATERIALIZED_CATALOG_FILE_NAME)
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -354,9 +349,6 @@ pub fn init() {
 					while rx.try_recv().is_ok() {}
 					if let Err(error) = write_snapshot() {
 						warn!("cache_persistence: failed to persist subreddit cache snapshot: {error}");
-					}
-					if let Err(error) = write_catalog_snapshot() {
-						warn!("cache_persistence: failed to persist materialized catalog snapshot: {error}");
 					}
 				}
 			});
@@ -415,50 +407,7 @@ fn write_snapshot() -> Result<(), String> {
 }
 
 fn load_catalog_snapshot_or_rebuild() {
-	let path = &*MATERIALIZED_CATALOG_PATH;
-	let bytes = match fs::read(path) {
-		Ok(bytes) => bytes,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-			post_cache::rebuild_materialized_catalog_from_source_cache();
-			return;
-		}
-		Err(error) => {
-			warn!("cache_persistence: failed to read materialized catalog snapshot: {error}");
-			post_cache::rebuild_materialized_catalog_from_source_cache();
-			return;
-		}
-	};
-
-	match deserialize_catalog_snapshot(&bytes) {
-		Ok(snapshot) => materialized_catalog::restore_catalog(snapshot.snapshot),
-		Err(error) => {
-			warn!("cache_persistence: failed to load materialized catalog snapshot: {error}");
-			post_cache::rebuild_materialized_catalog_from_source_cache();
-		}
-	}
-}
-
-fn write_catalog_snapshot() -> Result<(), String> {
-	let now_unix = unix_now();
-	let snapshot = PersistedCatalogSnapshotFile {
-		version: SNAPSHOT_VERSION,
-		saved_at_unix: now_unix,
-		snapshot: materialized_catalog::snapshot_catalog(),
-	};
-
-	let bytes = serialize_catalog_snapshot(&snapshot)?;
-	let final_path = &*MATERIALIZED_CATALOG_PATH;
-	let temp_path = final_path.with_extension("tmp");
-
-	if let Some(parent) = final_path.parent() {
-		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-	}
-
-	let mut file = File::create(&temp_path).map_err(|error| error.to_string())?;
-	file.write_all(&bytes).map_err(|error| error.to_string())?;
-	file.sync_all().map_err(|error| error.to_string())?;
-	drop(file);
-	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())
+	post_cache::rebuild_materialized_catalog_from_source_cache();
 }
 
 fn serialize_snapshot(snapshot: &PersistedCacheSnapshot) -> Result<Vec<u8>, String> {
@@ -473,10 +422,12 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 	Ok(snapshot)
 }
 
+#[cfg(test)]
 fn serialize_catalog_snapshot(snapshot: &PersistedCatalogSnapshotFile) -> Result<Vec<u8>, String> {
 	bincode::serialize(snapshot).map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn deserialize_catalog_snapshot(bytes: &[u8]) -> Result<PersistedCatalogSnapshotFile, String> {
 	let snapshot: PersistedCatalogSnapshotFile = bincode::deserialize(bytes).map_err(|error| error.to_string())?;
 	if snapshot.version != SNAPSHOT_VERSION {

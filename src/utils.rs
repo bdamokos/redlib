@@ -1324,9 +1324,16 @@ pub async fn prefetch_post_author_links(posts: &[Post]) {
 		.into_iter()
 		.collect::<Vec<_>>();
 	authors.sort_unstable();
+	prefetch_author_links(authors).await;
+}
 
+pub async fn prefetch_author_links(authors: Vec<String>) {
 	let mut pending = JoinSet::new();
 	for author in authors {
+		if cached_author_links(&author).is_some() {
+			continue;
+		}
+
 		pending.spawn(async move {
 			let _ = author_external_links(&author).await;
 		});

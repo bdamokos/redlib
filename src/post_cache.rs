@@ -547,10 +547,7 @@ pub fn record_remembered_feed_visit_signal(source: &FeedSource) {
 		}
 	};
 
-	if entry
-		.visit_signal_last_applied_at
-		.is_some_and(|t| t.elapsed().as_secs() < VISIT_SIGNAL_COOLDOWN_SECS)
-	{
+	if entry.visit_signal_last_applied_at.is_some_and(|t| t.elapsed().as_secs() < VISIT_SIGNAL_COOLDOWN_SECS) {
 		return;
 	}
 
@@ -823,8 +820,50 @@ fn mark_remembered_source_refresh_started(source: &FeedSource) {
 	crate::cache_persistence::mark_dirty();
 }
 
+fn prune_source_cache_locked(cache: &mut HashMap<String, CachedSourcePosts>) -> Vec<FeedSource> {
+	let mut pruned_sources = Vec::new();
+	cache.retain(|_, entry| {
+		let keep = source_cache_is_servable(&entry.source, entry);
+		if !keep {
+			pruned_sources.push(entry.source.clone());
+		}
+		keep
+	});
+	pruned_sources
+}
+
+pub(crate) fn prune_source_cache() {
+	let pruned_sources = {
+		let Ok(mut cache) = SOURCE_CACHE.lock() else {
+			return;
+		};
+		prune_source_cache_locked(&mut cache)
+	};
+
+	if pruned_sources.is_empty() {
+		return;
+	}
+
+	for source in &pruned_sources {
+		if materialized_catalog::source_is_supported(source) {
+			materialized_catalog::apply_source_refresh(source, &[]);
+		}
+	}
+	crate::cache_persistence::mark_dirty();
+}
+
 fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) {
 	update_user_video_stats_from_posts(&posts);
+	let pruned_sources = if let Ok(mut cache) = SOURCE_CACHE.lock() {
+		prune_source_cache_locked(&mut cache)
+	} else {
+		Vec::new()
+	};
+	for pruned_source in &pruned_sources {
+		if materialized_catalog::source_is_supported(pruned_source) {
+			materialized_catalog::apply_source_refresh(pruned_source, &[]);
+		}
+	}
 	if materialized_catalog::source_is_supported(source) {
 		materialized_catalog::apply_source_refresh(source, &posts);
 	}
@@ -862,7 +901,7 @@ fn publish_remembered_source_refresh(source: &FeedSource, posts: Vec<Post>, afte
 	// Even when the listing itself came from a scrape/backup instance (DirectLiveFetch),
 	// we still want to populate cached author profile links so `hydrate_post_author_links_from_cache`
 	// has something to attach for the page render.
-	spawn_author_link_prefetch(posts.clone());
+	spawn_author_link_prefetch(&posts);
 
 	let Some(key) = remembered_feed_key_for_source(&source) else {
 		return;
@@ -996,6 +1035,7 @@ pub(crate) fn age_source_cache_for_test(source: &FeedSource, age: Duration) {
 }
 
 pub(crate) fn snapshot_persisted_source_entries(now_unix: u64) -> Vec<PersistedSourceCacheEntry> {
+	prune_source_cache();
 	let Ok(cache) = SOURCE_CACHE.lock() else {
 		return Vec::new();
 	};
@@ -1110,6 +1150,7 @@ pub(crate) fn restore_persisted_state(
 }
 
 pub(crate) fn rebuild_materialized_catalog_from_source_cache() {
+	prune_source_cache();
 	let sources = SOURCE_CACHE
 		.lock()
 		.unwrap_or_else(|err| err.into_inner())
@@ -1195,13 +1236,31 @@ pub async fn browser_session_release(req: Request<Body>) -> Result<Response<Body
 	json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
 }
 
-fn spawn_author_link_prefetch(posts: Vec<Post>) {
+fn post_author_names_for_prefetch(posts: &[Post]) -> Vec<String> {
+	let mut authors = posts
+		.iter()
+		.map(|post| post.author.name.trim())
+		.filter(|name| !name.is_empty() && *name != "[deleted]")
+		.map(ToString::to_string)
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.collect::<Vec<_>>();
+	authors.sort_unstable();
+	authors
+}
+
+fn spawn_author_link_prefetch(posts: &[Post]) {
 	if tokio::runtime::Handle::try_current().is_err() {
 		return;
 	}
 
+	let authors = post_author_names_for_prefetch(posts);
+	if authors.is_empty() {
+		return;
+	}
+
 	tokio::spawn(async move {
-		crate::utils::prefetch_post_author_links(&posts).await;
+		crate::utils::prefetch_author_links(authors).await;
 	});
 }
 
@@ -1273,6 +1332,7 @@ pub fn spawn_remembered_feed_daemon() {
 			if let Ok(mut next_tick) = REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT.lock() {
 				*next_tick = Some(Instant::now() + Duration::from_secs(REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS));
 			}
+			prune_source_cache();
 			cleanup_decayed_remembered_subreddits();
 			let (total, active, eligible, blocked_or_in_flight) = remembered_subreddit_daemon_counts();
 			info!(
@@ -1437,7 +1497,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		crate::utils::store_post_flairs(&posts);
 		store_source_posts(&source, posts.clone(), after.clone());
 		if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
-			spawn_author_link_prefetch(posts.clone());
+			spawn_author_link_prefetch(&posts);
 		}
 	}
 
@@ -2630,17 +2690,16 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_browser_session_paths, attempted_source_count, background_target_reached, background_target_sources, build_session_id, cache_status_for_preferences,
-		catalog_source_candidates, count_sources_in_state, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions,
-		initial_source_budget_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
-		pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, publish_plain_subreddit_refresh,
-		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, effective_freshness_target_secs,
-		remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state,
-		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
-		snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, store_source_posts, store_source_posts_with_origin,
-		sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedSubredditEntry,
-		SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS,
-		FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, build_session_id,
+		cache_status_for_preferences, catalog_source_candidates, count_sources_in_state, effective_freshness_target_secs, feed_page, feed_status, followup_source_budget,
+		get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
+		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache,
+		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, remember_flair_request,
+		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts,
+		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, store_source_posts,
+		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
+		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
+		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -3203,10 +3262,7 @@ mod tests {
 		record_remembered_feed_visit_signal(&new_source("rust"));
 		let after = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].clone();
 		let target_after = effective_freshness_target_secs(&after);
-		assert!(
-			target_after < target_before,
-			"visit signal should increase refresh priority (lower freshness target secs)"
-		);
+		assert!(target_after < target_before, "visit signal should increase refresh priority (lower freshness target secs)");
 	}
 
 	#[test]
@@ -3286,6 +3342,37 @@ mod tests {
 		assert!(!source_cache_is_servable(&source, entry));
 		drop(cache);
 		assert!(get_cached_source_page(&source, 0, 25).is_none());
+	}
+
+	#[test]
+	fn pruning_expired_source_cache_removes_catalog_membership() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		seed_source(&source, vec![test_post("one", "rust", 100)]);
+		assert_eq!(catalog_source_candidates(std::slice::from_ref(&source), &HashSet::new()).unwrap().len(), 1);
+
+		age_source_cache_for_test(&source, Duration::from_secs(CACHE_TTL_SECS + 60));
+		prune_source_cache();
+
+		assert!(SOURCE_CACHE.lock().unwrap().get(&source.cache_key()).is_none());
+		assert!(catalog_source_candidates(&[source], &HashSet::new()).unwrap().is_empty());
+	}
+
+	#[test]
+	fn pruning_keeps_remembered_source_catalog_membership() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		seed_source(&source, vec![test_post("one", "rust", 100)]);
+		age_source_cache_for_test(&source, Duration::from_secs(CACHE_TTL_SECS + 60));
+		prune_source_cache();
+
+		assert!(SOURCE_CACHE.lock().unwrap().get(&source.cache_key()).is_some());
+		assert_eq!(catalog_source_candidates(&[source], &HashSet::new()).unwrap().len(), 1);
 	}
 
 	#[test]
@@ -4413,10 +4500,7 @@ mod tests {
 		reset_test_caches();
 		let now = chrono::Utc::now().timestamp() as u64;
 		let rust_source = new_source("rust");
-		seed_source(
-			&rust_source,
-			vec![test_post("rust-old", "rust", now - 120), test_post("rust-new", "rust", now - 90)],
-		);
+		seed_source(&rust_source, vec![test_post("rust-old", "rust", now - 120), test_post("rust-new", "rust", now - 90)]);
 
 		let prefs = Preferences {
 			subscriptions: vec!["rust".to_string()],
