@@ -2594,10 +2594,14 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	// full profile metadata here—including Coomer link expansion and recent-post panel data.
 	let shell_user = match user(&username).await {
 		Ok(user) => user,
-		Err(_) => cached_user_metadata(&username).unwrap_or_else(|| User {
-			name: username.clone(),
-			..Default::default()
-		}),
+		Err(msg) => match msg.as_str() {
+			"banned" => return Ok(error(req, &format!("u/{username} has been banned from Reddit")).await.unwrap_or_default()),
+			"suspended" => return Ok(error(req, &format!("u/{username} has been suspended on Reddit")).await.unwrap_or_default()),
+			_ => cached_user_metadata(&username).unwrap_or_else(|| User {
+				name: username.clone(),
+				..Default::default()
+			}),
+		},
 	};
 	let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
 	let video_mode_sidebar = if video_listing {
@@ -2678,6 +2682,13 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	} else {
 		user(&username).await
 	};
+	if let Err(msg) = &user_result {
+		match msg.as_str() {
+			"banned" => return Ok(error(req, &format!("u/{username} has been banned from Reddit")).await.unwrap_or_default()),
+			"suspended" => return Ok(error(req, &format!("u/{username} has been suspended on Reddit")).await.unwrap_or_default()),
+			_ => {}
+		}
+	}
 	let metadata_error = user_result.as_ref().err().cloned();
 	let metadata_rate_limited = metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback);
 	let user = user_result.unwrap_or_default();
@@ -2905,7 +2916,15 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				}
 				Err(msg) => {
 					warn!("user: direct listing request failed for {} without usable scrape fallback: {}", current_url, msg);
-					return Err(msg);
+					match msg.as_str() {
+						"banned" => {
+							return Ok(error(req, &format!("u/{username} has been banned from Reddit")).await.unwrap_or_default());
+						}
+						"suspended" => {
+							return Ok(error(req, &format!("u/{username} has been suspended on Reddit")).await.unwrap_or_default());
+						}
+						_ => return Err(msg),
+					}
 				}
 			}
 		};

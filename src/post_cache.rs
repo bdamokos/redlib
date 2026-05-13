@@ -1616,7 +1616,9 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 }
 
 fn session_uses_materialized_catalog(session: &FeedSession) -> bool {
-	session_merge_sort(session) == FeedSort::New && session.sources.iter().all(|entry| materialized_catalog::source_is_supported(&entry.source))
+	session_merge_sort(session) == FeedSort::New
+		&& !session.request.bundle_followed_user_comments
+		&& session.sources.iter().all(|entry| materialized_catalog::source_is_supported(&entry.source))
 }
 
 fn parse_numeric_score(post: &Post) -> Option<i64> {
@@ -1698,7 +1700,7 @@ fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Po
 	};
 	merged = collapse_duplicate_submissions(merged);
 	if session.request.bundle_followed_user_comments && merge_sort == FeedSort::New {
-		merged.sort_by(|a, b| crate::user::post_feed_activity_ts(b).cmp(&crate::user::post_feed_activity_ts(a)));
+		return interleave_followed_posts_by_actor(merged);
 	}
 	merged
 }
@@ -1755,6 +1757,56 @@ fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, mut posts: Ve
 		}
 		FeedSort::Hot => posts,
 	}
+}
+
+fn followed_post_actor_key(post: &Post) -> String {
+	post
+		.following_comments
+		.first()
+		.map(|comment| comment.author.trim())
+		.filter(|author| !author.is_empty())
+		.unwrap_or_else(|| post.author.name.trim())
+		.to_lowercase()
+}
+
+fn interleave_followed_posts_by_actor(mut posts: Vec<Post>) -> Vec<Post> {
+	if posts.len() < 2 {
+		return posts;
+	}
+
+	posts.sort_by(|a, b| {
+		crate::user::post_feed_activity_ts(b)
+			.cmp(&crate::user::post_feed_activity_ts(a))
+			.then_with(|| followed_post_actor_key(a).cmp(&followed_post_actor_key(b)))
+			.then_with(|| a.id.cmp(&b.id))
+	});
+
+	let mut groups: Vec<(String, VecDeque<Post>)> = Vec::new();
+	let mut group_indexes = HashMap::new();
+	for post in posts {
+		let actor = followed_post_actor_key(&post);
+		let actor = if actor.is_empty() { post.id.clone() } else { actor };
+		let index = *group_indexes.entry(actor.clone()).or_insert_with(|| {
+			groups.push((actor, VecDeque::new()));
+			groups.len() - 1
+		});
+		groups[index].1.push_back(post);
+	}
+
+	let mut interleaved = Vec::new();
+	loop {
+		let mut emitted = false;
+		for (_, queue) in &mut groups {
+			if let Some(post) = queue.pop_front() {
+				interleaved.push(post);
+				emitted = true;
+			}
+		}
+		if !emitted {
+			break;
+		}
+	}
+	interleaved
 }
 
 /// `/following` uses two session sources per person (submitted + comments). For status text and
@@ -2949,6 +3001,52 @@ mod tests {
 			live.iter().map(|post| post.id.as_str()).collect::<Vec<_>>()
 		);
 		assert_eq!(catalog.first().map(|post| post.following_comments.len()), Some(1));
+	}
+
+	#[test]
+	fn following_new_interleaves_cached_followed_accounts() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let mut sources = Vec::new();
+		let now = 10_000;
+		for user_index in 0..10 {
+			let username = format!("followed_{user_index}");
+			let source = FeedSource::subreddit(format!("u_{username}"), FeedSort::New);
+			let post_count = if user_index < 2 { 30 } else { 1 };
+			let mut posts = Vec::new();
+			for post_index in 0..post_count {
+				let mut post = test_post(
+					&format!("{username}-{post_index}"),
+					&format!("community_{user_index}"),
+					now - ((user_index as u64) * 10) - post_index as u64,
+				);
+				post.author.name = username.clone();
+				posts.push(post);
+			}
+			seed_source(&source, posts);
+			sources.push(source);
+		}
+
+		let session = FeedSession {
+			id: "following-interleave".to_string(),
+			request: FeedSessionRequest {
+				sources: sources.clone(),
+				bundle_followed_user_comments: true,
+				..Default::default()
+			},
+			sources: sources.into_iter().map(|source| session_entry(source, SessionSourceState::Ready)).collect(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let first_ten_authors = merged_posts_for_session(&session).into_iter().take(10).map(|post| post.author.name).collect::<HashSet<_>>();
+
+		assert_eq!(first_ten_authors.len(), 10);
 	}
 
 	#[test]
