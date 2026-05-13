@@ -2427,15 +2427,27 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let is_filtered = filters.contains(&user_filter);
 	let user_subreddits = user_sidebar_subreddits(&username);
 	let avg_video_length = cached_avg_video_length(&username);
+	let (resolved_user, status_notice) = match user(&username).await {
+		Ok(user) => (user, String::new()),
+		Err(msg) => {
+			let notice = match msg.as_str() {
+				"banned" => format!("u/{username} has been banned from Reddit"),
+				"suspended" => format!("u/{username} has been suspended on Reddit"),
+				_ => String::new(),
+			};
+			let user = cached_user_metadata(&username).unwrap_or_else(|| User {
+				name: username.clone(),
+				..Default::default()
+			});
+			(user, notice)
+		}
+	};
 
 	if !is_filtered {
 		if video_listing {
 			let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
 			if let Some(cached_posts) = crate::post_cache::servable_cached_source_posts(&source) {
-				let shell_user = cached_user_metadata(&username).unwrap_or_else(|| User {
-					name: username.clone(),
-					..Default::default()
-				});
+				let shell_user = resolved_user.clone();
 				let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
 				let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
 				let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
@@ -2467,7 +2479,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 					posts,
 					user_subreddits,
 					coomer_recent_posts,
-					fallback_notice: String::new(),
+					fallback_notice: status_notice.clone(),
 					sort: (String::new(), String::new()),
 					ends: (String::new(), String::new()),
 					listing: listing.clone(),
@@ -2498,10 +2510,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 				}));
 			}
 		} else if let Some((mut posts, after, has_prev, has_next)) = cached_user_listing_posts(&username, &listing, &sort, query) {
-			let shell_user = cached_user_metadata(&username).unwrap_or_else(|| User {
-				name: username.clone(),
-				..Default::default()
-			});
+			let shell_user = resolved_user.clone();
 			let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
 			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 			utils::hydrate_post_author_links_from_cache(&mut posts);
@@ -2566,7 +2575,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 				posts,
 				user_subreddits,
 				coomer_recent_posts,
-				fallback_notice: String::new(),
+				fallback_notice: status_notice.clone(),
 				sort: (sort, param(&path, "t").unwrap_or_default()),
 				ends: (String::new(), String::new()),
 				listing: listing.clone(),
@@ -2592,17 +2601,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	// Shell sidebar is not replaced when the listing fragment loads (only `#column_one`), so load
 	// full profile metadata here—including Coomer link expansion and recent-post panel data.
-	let shell_user = match user(&username).await {
-		Ok(user) => user,
-		Err(msg) => match msg.as_str() {
-			"banned" => return Ok(error(req, &format!("u/{username} has been banned from Reddit")).await.unwrap_or_default()),
-			"suspended" => return Ok(error(req, &format!("u/{username} has been suspended on Reddit")).await.unwrap_or_default()),
-			_ => cached_user_metadata(&username).unwrap_or_else(|| User {
-				name: username.clone(),
-				..Default::default()
-			}),
-		},
-	};
+	let shell_user = resolved_user;
 	let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
 	let video_mode_sidebar = if video_listing {
 		let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
@@ -2623,7 +2622,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		posts: Vec::new(),
 		user_subreddits,
 		coomer_recent_posts,
-		fallback_notice: String::new(),
+		fallback_notice: status_notice,
 		sort: (sort, param(&path, "t").unwrap_or_default()),
 		ends: (param(&path, "after").unwrap_or_default(), String::new()),
 		listing: listing.clone(),
@@ -2657,6 +2656,15 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let query = req.uri().query().unwrap_or_default();
 	let video_listing = is_video_listing(&listing);
 
+	fn join_notices(primary: &str, secondary: &str) -> String {
+		match (primary.trim().is_empty(), secondary.trim().is_empty()) {
+			(true, true) => String::new(),
+			(false, true) => primary.to_string(),
+			(true, false) => secondary.to_string(),
+			(false, false) => format!("{primary} {secondary}"),
+		}
+	}
+
 	let path = user_listing_path(&username, &listing, query, &default_sort);
 	let url = user_reddit_path(&username, &listing, query);
 	let current_url = if query.is_empty() { url.clone() } else { format!("{url}") };
@@ -2682,13 +2690,15 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	} else {
 		user(&username).await
 	};
-	if let Err(msg) = &user_result {
-		match msg.as_str() {
-			"banned" => return Ok(error(req, &format!("u/{username} has been banned from Reddit")).await.unwrap_or_default()),
-			"suspended" => return Ok(error(req, &format!("u/{username} has been suspended on Reddit")).await.unwrap_or_default()),
-			_ => {}
-		}
-	}
+	let status_notice = user_result
+		.as_ref()
+		.err()
+		.and_then(|msg| match msg.as_str() {
+			"banned" => Some(format!("u/{username} has been banned from Reddit")),
+			"suspended" => Some(format!("u/{username} has been suspended on Reddit")),
+			_ => None,
+		})
+		.unwrap_or_default();
 	let metadata_error = user_result.as_ref().err().cloned();
 	let metadata_rate_limited = metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback);
 	let user = user_result.unwrap_or_default();
@@ -2716,7 +2726,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			posts: Vec::new(),
 			user_subreddits: user_sidebar_subreddits(&username),
 			coomer_recent_posts,
-			fallback_notice: String::new(),
+			fallback_notice: status_notice.clone(),
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			ends: (param(&path, "after").unwrap_or_default(), String::new()),
 			listing,
@@ -2827,7 +2837,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
 				);
 			}
-			fallback_notice = instance_scrape::scrape_notice().to_string();
+			fallback_notice = join_notices(&status_notice, instance_scrape::scrape_notice());
 			(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
 		} else if let Some((mut posts, after, has_prev, has_next)) = cached_listing_page {
 			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
@@ -2911,23 +2921,16 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 							Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
 						);
 					}
-					fallback_notice = instance_scrape::scrape_notice().to_string();
+					fallback_notice = join_notices(&status_notice, instance_scrape::scrape_notice());
 					(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
 				}
 				Err(msg) => {
 					warn!("user: direct listing request failed for {} without usable scrape fallback: {}", current_url, msg);
-					match msg.as_str() {
-						"banned" => {
-							return Ok(error(req, &format!("u/{username} has been banned from Reddit")).await.unwrap_or_default());
-						}
-						"suspended" => {
-							return Ok(error(req, &format!("u/{username} has been suspended on Reddit")).await.unwrap_or_default());
-						}
-						_ => return Err(msg),
-					}
+					return Err(msg);
 				}
 			}
 		};
+		fallback_notice = join_notices(&status_notice, &fallback_notice);
 		let no_posts = posts.is_empty();
 		let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 		let avg_video_length = cached_avg_video_length(&username);
