@@ -2447,8 +2447,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		if video_listing {
 			let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
 			if let Some(cached_posts) = crate::post_cache::servable_cached_source_posts(&source) {
-				let shell_user = resolved_user.clone();
-				let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
+				let mut shell_user = resolved_user.clone();
 				let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
 				let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
 				let listing_data = video_mode::build_listing(&cached_posts, &filters, &parsed_query, now_unix());
@@ -2463,6 +2462,8 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 					Vec::new()
 				};
 				utils::hydrate_post_author_links_from_cache(&mut posts);
+				utils::hydrate_user_external_links_from_author_cache(&mut shell_user).await;
+				let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
 				let no_posts = listing_data.posts.is_empty();
 				let all_posts_hidden_nsfw = !posts.is_empty() && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				let eligible_video_posts = cached_posts
@@ -2510,10 +2511,11 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 				}));
 			}
 		} else if let Some((mut posts, after, has_prev, has_next)) = cached_user_listing_posts(&username, &listing, &sort, query) {
-			let shell_user = resolved_user.clone();
-			let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
+			let mut shell_user = resolved_user.clone();
 			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 			utils::hydrate_post_author_links_from_cache(&mut posts);
+			utils::hydrate_user_external_links_from_author_cache(&mut shell_user).await;
+			let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
 			let no_posts = posts.is_empty();
 			let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 			let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
@@ -2959,6 +2961,9 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	};
 
 	let mut fragment = fragment;
+	utils::hydrate_post_author_links_from_cache(&mut fragment.posts);
+	utils::hydrate_user_external_links_from_author_cache(&mut fragment.user).await;
+	fragment.coomer_recent_posts = utils::coomer_recent_posts_panel(&fragment.user.external_links).await;
 	utils::refresh_post_times(&mut fragment.posts);
 	let body = fragment.render().map_err(|error| error.to_string())?;
 	Response::builder()

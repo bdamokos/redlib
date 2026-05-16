@@ -1017,6 +1017,7 @@ impl Post {
 				bookmark_new_comments: None,
 			});
 		}
+		hydrate_post_author_links_from_cache(&mut posts);
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
 	}
 
@@ -1301,6 +1302,8 @@ pub fn cached_author_external_links(name: &str) -> Vec<ExternalLink> {
 }
 
 pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
+	cache_author_watched_links_from_posts(posts);
+
 	let Ok(mut links_cache) = AUTHOR_LINKS_CACHE.lock() else {
 		return;
 	};
@@ -1312,6 +1315,19 @@ pub fn hydrate_post_author_links_from_cache(posts: &mut [Post]) {
 		let author = post.author.name.trim();
 		post.author.external_links = links_cache.get(author).map(|entry| entry.links.clone()).unwrap_or_default();
 	}
+}
+
+pub async fn hydrate_user_external_links_from_author_cache(user: &mut User) {
+	if !user.external_links.is_empty() {
+		return;
+	}
+
+	let links = cached_author_external_links(&user.name);
+	if links.is_empty() {
+		return;
+	}
+
+	user.external_links = external_links_with_coomer_lookups(links).await;
 }
 
 pub async fn prefetch_post_author_links(posts: &[Post]) {
@@ -2848,6 +2864,34 @@ fn extract_external_links(sources: &[&str]) -> Vec<ExternalLink> {
 	links
 }
 
+fn extract_watched_creator_links(sources: &[&str]) -> Vec<ExternalLink> {
+	extract_external_links(sources).into_iter().filter(is_watched_creator_profile_link).collect()
+}
+
+fn is_watched_creator_profile_link(link: &ExternalLink) -> bool {
+	if !is_creator_link_host(&link.host) {
+		return false;
+	}
+
+	let Ok(parsed) = Url::parse(&link.url) else {
+		return false;
+	};
+	let segments = parsed
+		.path_segments()
+		.map(|segments| segments.filter(|segment| !segment.is_empty()).collect::<Vec<_>>())
+		.unwrap_or_default();
+	let Some(first) = segments.first().map(|segment| segment.trim()) else {
+		return false;
+	};
+	let profile = match first.to_ascii_lowercase().as_str() {
+		"u" | "user" | "users" | "profile" => segments.get(1).map(|segment| segment.trim()),
+		"posts" | "media" | "about" | "terms" | "privacy" | "login" | "signup" => None,
+		_ => Some(first),
+	};
+
+	profile.is_some_and(|profile| !profile.is_empty())
+}
+
 fn build_external_link(raw: &str) -> Option<ExternalLink> {
 	build_external_link_with_label(raw, None)
 }
@@ -3462,6 +3506,33 @@ fn cached_author_links(name: &str) -> Option<Vec<ExternalLink>> {
 	cache.get(author).map(|entry| entry.links.clone())
 }
 
+fn cache_author_watched_links_from_posts(posts: &mut [Post]) {
+	let mut discovered: HashMap<String, Vec<ExternalLink>> = HashMap::new();
+
+	for post in posts.iter() {
+		let author = post.author.name.trim();
+		if author.is_empty() || author == "[deleted]" || cached_author_links(author).is_some_and(|links| !links.is_empty()) {
+			continue;
+		}
+
+		let outbound_url = post.out_url.as_deref().unwrap_or_default();
+		let links = extract_watched_creator_links(&[post.title.as_str(), post.body.as_str(), outbound_url]);
+		if links.is_empty() {
+			continue;
+		}
+
+		let entry = discovered.entry(author.to_string()).or_default();
+		append_external_links(entry, links);
+	}
+
+	for (author, links) in discovered {
+		if links.is_empty() || cached_author_links(&author).is_some_and(|cached| !cached.is_empty()) {
+			continue;
+		}
+		store_author_links(&author, dedupe_external_links_by_host(links));
+	}
+}
+
 fn store_author_links(name: &str, links: Vec<ExternalLink>) {
 	let author = name.trim();
 	if author.is_empty() || author == "[deleted]" {
@@ -3863,10 +3934,11 @@ impl_template_str_eq!(User);
 #[cfg(test)]
 mod tests {
 	use super::{
-		clear_sharded_cookie, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host,
-		encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links, extract_profile_social_links, format_num, format_url, format_video_duration,
-		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, rewrite_urls, time, user_profile_details,
-		write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media, Post, Preferences,
+		cache_author_watched_links_from_posts, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker,
+		decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links,
+		extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration, hydrate_post_author_links_from_cache, read_sharded_cookie,
+		redgifs_uploader_matches_author, refresh_post_times, rewrite_urls, store_author_links, time, user_profile_details, write_sharded_cookie, Author, Awards,
+		CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media, Post, Preferences,
 	};
 	use crate::utils::ParentComment;
 	use futures_lite::future::block_on;
@@ -4216,6 +4288,61 @@ mod tests {
 		assert_eq!(profile.external_links.len(), 1);
 		assert_eq!(profile.external_links[0].host, "realankri.com");
 		assert_eq!(profile.external_links[0].url, "https://realankri.com/");
+	}
+
+	#[test]
+	fn extracts_watched_creator_links_from_posts_and_comments_only() {
+		let links = extract_watched_creator_links(&[
+			r#"<div class="md"><p>Find me at <a href="https://onlyfans.com/alice">OF</a> and https://fansly.com/user/640681284019953664.</p></div>"#,
+			"https://onlyfans.com/privacy https://twitter.com/alice",
+		]);
+
+		assert_eq!(links.len(), 2);
+		assert_eq!(links[0].host, "fansly.com");
+		assert_eq!(links[1].host, "onlyfans.com");
+		assert!(links.iter().all(|link| !link.url.contains("privacy")));
+	}
+
+	#[test]
+	fn opportunistic_author_link_cache_uses_seen_post_content() {
+		clear_test_caches();
+
+		let mut post = Post::default();
+		post.body = r#"<div class="md"><p>Sub here <a href="https://onlyfans.com/demo_creator">OnlyFans</a></p></div>"#.to_string();
+		post.author.name = "demo_user_seen".to_string();
+		let mut posts = vec![post];
+
+		cache_author_watched_links_from_posts(&mut posts);
+		hydrate_post_author_links_from_cache(&mut posts);
+
+		assert_eq!(posts[0].author.external_links.len(), 1);
+		assert_eq!(posts[0].author.external_links[0].url, "https://onlyfans.com/demo_creator");
+	}
+
+	#[test]
+	fn opportunistic_author_link_cache_does_not_replace_existing_profile_links() {
+		clear_test_caches();
+		store_author_links(
+			"demo_user",
+			vec![ExternalLink {
+				label: "fansly.com".to_string(),
+				url: "https://fansly.com/existing".to_string(),
+				host: "fansly.com".to_string(),
+				icon_path: "/site_icon/fansly.com".to_string(),
+				has_coomer: false,
+			}],
+		);
+
+		let mut post = Post::default();
+		post.body = r#"<a href="https://onlyfans.com/new">OnlyFans</a>"#.to_string();
+		post.author.name = "demo_user".to_string();
+		let mut posts = vec![post];
+
+		cache_author_watched_links_from_posts(&mut posts);
+		hydrate_post_author_links_from_cache(&mut posts);
+
+		assert_eq!(posts[0].author.external_links.len(), 1);
+		assert_eq!(posts[0].author.external_links[0].url, "https://fansly.com/existing");
 	}
 
 	#[test]
