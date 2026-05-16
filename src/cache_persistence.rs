@@ -398,6 +398,10 @@ pub(crate) fn read_source_cache_entry(source_cache_key: &str) -> Result<Option<P
 	bincode::deserialize(&bytes).map(Some).map_err(|error| error.to_string())
 }
 
+pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
+	source_cache_path(source_cache_key).is_file()
+}
+
 pub(crate) fn remove_source_cache_entry(source_cache_key: &str) {
 	if let Err(error) = fs::remove_file(source_cache_path(source_cache_key)) {
 		if error.kind() != std::io::ErrorKind::NotFound {

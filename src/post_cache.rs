@@ -1555,6 +1555,18 @@ fn source_has_resident_servable_cache(source: &FeedSource) -> bool {
 	cache.get(&source.cache_key()).is_some_and(|entry| source_cache_is_servable(source, entry))
 }
 
+fn source_has_persisted_cache_entry(source: &FeedSource) -> bool {
+	#[cfg(test)]
+	{
+		let _ = source;
+		return false;
+	}
+	#[cfg(not(test))]
+	{
+		crate::cache_persistence::source_cache_entry_exists(&source.cache_key())
+	}
+}
+
 async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin: RefreshOrigin) -> Result<CachedSourcePosts, String> {
 	if let Some(entry) = cached_source_posts(&source) {
 		return Ok(entry);
@@ -2081,6 +2093,13 @@ fn session_has_remaining_sources(session: &FeedSession) -> bool {
 	session.sources.iter().any(|entry| entry.state == SessionSourceState::Unstarted)
 }
 
+fn session_has_remaining_persisted_cache_sources(session: &FeedSession) -> bool {
+	session
+		.sources
+		.iter()
+		.any(|entry| entry.state == SessionSourceState::Unstarted && source_has_persisted_cache_entry(&entry.source))
+}
+
 fn remembered_entry_for_source<'a>(remembered: &'a HashMap<String, RememberedSubredditEntry>, source: &FeedSource) -> Option<&'a RememberedSubredditEntry> {
 	remembered_feed_key_for_source(source).and_then(|key| remembered.get(&key))
 }
@@ -2146,6 +2165,10 @@ fn warm_targets(session: &FeedSession, target_count: usize) -> Vec<usize> {
 	targets.sort_by(|left_index, right_index| {
 		let left_source = &session.sources[*left_index].source;
 		let right_source = &session.sources[*right_index].source;
+		match source_has_persisted_cache_entry(right_source).cmp(&source_has_persisted_cache_entry(left_source)) {
+			Ordering::Equal => {}
+			ordering => return ordering,
+		}
 		let left_entry = remembered_entry_for_source(&remembered, left_source);
 		let right_entry = remembered_entry_for_source(&remembered, right_source);
 		compare_warm_target_priority(*left_index, left_source, left_entry, *right_index, right_source, right_entry)
@@ -2277,13 +2300,17 @@ async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, ma
 async fn warm_session_background(session_id: String) {
 	loop {
 		reconcile_stuck_fetching_sources(&session_id).await;
-		let (remaining, target_reached) = {
+		let (remaining, target_reached, remaining_persisted_cache_sources) = {
 			let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(session) = sessions.get(&session_id) else {
 				return;
 			};
 			let target_reached = background_target_reached(session);
-			(warm_targets(session, PAGE_FILL_BATCH), target_reached)
+			(
+				warm_targets(session, PAGE_FILL_BATCH),
+				target_reached,
+				session_has_remaining_persisted_cache_sources(session),
+			)
 		};
 
 		if remaining.is_empty() {
@@ -2297,7 +2324,7 @@ async fn warm_session_background(session_id: String) {
 			return;
 		}
 
-		if target_reached {
+		if target_reached && !remaining_persisted_cache_sources {
 			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			if let Some(session) = sessions.get_mut(&session_id) {
 				session.background_active = false;
@@ -2715,6 +2742,47 @@ fn freshest_cached_post_activity_ts(entry: &CachedSourcePosts) -> Option<u64> {
 	best
 }
 
+fn freshest_persisted_cached_post_activity_ts(entry: &PersistedSourceCacheEntry) -> Option<u64> {
+	let mut best: Option<u64> = None;
+	for post in &entry.posts {
+		if post.created_ts > 0 {
+			best = Some(best.map_or(post.created_ts, |b| b.max(post.created_ts)));
+		}
+		for duplicate in &post.collapsed_duplicates {
+			if duplicate.created_ts > 0 {
+				best = Some(best.map_or(duplicate.created_ts, |b| b.max(duplicate.created_ts)));
+			}
+		}
+	}
+	best
+}
+
+fn read_persisted_source_entry_for_status(source: &FeedSource) -> Option<PersistedSourceCacheEntry> {
+	#[cfg(test)]
+	{
+		let _ = source;
+		return None;
+	}
+	#[cfg(not(test))]
+	{
+		let cache_key = source.cache_key();
+		let entry = match crate::cache_persistence::read_source_cache_entry(&cache_key) {
+			Ok(Some(entry)) => entry,
+			Ok(None) => return None,
+			Err(error) => {
+				warn!("post_cache: failed to read source cache status for {}: {}", source.display_name(), error);
+				return None;
+			}
+		};
+		let expected_key = remembered_feed_key_for_source(source)?;
+		(entry.subreddit == expected_key).then_some(entry)
+	}
+}
+
+fn persisted_source_entry_is_servable(entry: &PersistedSourceCacheEntry, remembered_entry: Option<&RememberedSubredditEntry>, now_unix: u64) -> bool {
+	remembered_entry.is_some_and(remembered_entry_is_active) || now_unix.saturating_sub(entry.fetched_at_unix) <= CACHE_TTL_SECS
+}
+
 fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let mut entries = remembered
@@ -2749,15 +2817,27 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 		let cache_entry = cache.get(&cache_key);
 		let remembered_entry = remembered_feed_key_for_source(&source).and_then(|key| remembered.get(&key));
 		let daemon_managed = remembered_feed_key_for_source(&source).is_some();
-		let cached = cache_entry.is_some();
-		let cached_posts = cache_entry.map(|entry| entry.posts.len()).unwrap_or_default();
-		let cached_age_secs = cache_entry.map(|entry| entry.fetched_at.elapsed().as_secs());
-		let head_post_created_ts = cache_entry.and_then(freshest_cached_post_activity_ts);
+		let disk_entry = cache_entry
+			.is_none()
+			.then(|| read_persisted_source_entry_for_status(&source))
+			.flatten()
+			.filter(|entry| persisted_source_entry_is_servable(entry, remembered_entry, generated_at_unix));
+		let cached = cache_entry.is_some() || disk_entry.is_some();
+		let cached_posts = cache_entry
+			.map(|entry| entry.posts.len())
+			.or_else(|| disk_entry.as_ref().map(|entry| entry.posts.len()))
+			.unwrap_or_default();
+		let cached_age_secs = cache_entry
+			.map(|entry| entry.fetched_at.elapsed().as_secs())
+			.or_else(|| disk_entry.as_ref().map(|entry| generated_at_unix.saturating_sub(entry.fetched_at_unix)));
+		let head_post_created_ts = cache_entry
+			.and_then(freshest_cached_post_activity_ts)
+			.or_else(|| disk_entry.as_ref().and_then(freshest_persisted_cached_post_activity_ts));
 		let head_post_age_secs = head_post_created_ts.map(|created_ts| generated_at_unix.saturating_sub(created_ts));
 		let cache_expires_in_secs = if let Some(entry) = remembered_entry.filter(|entry| remembered_entry_is_active(entry)) {
 			Some(REMEMBERED_SUBREDDIT_TTL_SECS.saturating_sub(entry.last_requested_at.elapsed().as_secs()))
 		} else {
-			cache_entry.map(|entry| CACHE_TTL_SECS.saturating_sub(entry.fetched_at.elapsed().as_secs()))
+			cached_age_secs.map(|age_secs| CACHE_TTL_SECS.saturating_sub(age_secs))
 		};
 		let blocked_until_secs = remembered_entry
 			.and_then(|entry| entry.banned_until)
@@ -2808,7 +2888,15 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			head_post_created_ts,
 			head_post_age_secs,
 			cache_expires_in_secs,
-			last_refresh_origin: cache_entry.and_then(|entry| entry.refresh_origin).map(|origin| format!("{origin:?}").to_lowercase()),
+			last_refresh_origin: cache_entry
+				.and_then(|entry| entry.refresh_origin)
+				.map(|origin| format!("{origin:?}").to_lowercase())
+				.or_else(|| {
+					disk_entry
+						.as_ref()
+						.and_then(|entry| entry.refresh_origin)
+						.map(|origin| format!("{origin:?}").to_lowercase())
+				}),
 			last_refresh_succeeded_secs_ago: remembered_entry
 				.and_then(|entry| entry.last_refresh_succeeded_at)
 				.map(|instant| instant.elapsed().as_secs()),
