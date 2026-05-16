@@ -636,39 +636,73 @@ async fn main() {
 }
 
 pub async fn proxy_commit_info() -> Result<Response<Body>, String> {
+	let body = match fetch_commit_info().await {
+		Ok(body) => body,
+		Err(e) => {
+			warn!("Failed to fetch commit info: {e}");
+			return Ok(
+				Response::builder()
+					.status(502)
+					.header("content-type", "text/plain; charset=utf-8")
+					.body(Body::from("Failed to fetch commit info"))
+					.unwrap_or_default(),
+			);
+		}
+	};
+
 	Ok(
 		Response::builder()
 			.status(200)
 			.header("content-type", "application/atom+xml")
-			.body(Body::from(fetch_commit_info().await))
+			.body(Body::from(body))
 			.unwrap_or_default(),
 	)
 }
 
-#[cached(time = 600)]
-async fn fetch_commit_info() -> String {
+#[cached(time = 600, result = true)]
+async fn fetch_commit_info() -> Result<String, String> {
 	let uri = Uri::from_str("https://github.com/redlib-org/redlib/commits/main.atom").expect("Invalid URI");
 
-	let resp: Body = CLIENT.get(uri).await.expect("Failed to request GitHub").into_body();
+	let resp: Body = CLIENT.get(uri).await.map_err(|e| format!("Failed to request GitHub: {e}"))?.into_body();
 
-	hyper::body::to_bytes(resp).await.expect("Failed to read body").iter().copied().map(|x| x as char).collect()
+	hyper::body::to_bytes(resp)
+		.await
+		.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+		.map_err(|e| format!("Failed to read body: {e}"))
 }
 
 pub async fn proxy_instances() -> Result<Response<Body>, String> {
+	let body = match fetch_instances().await {
+		Ok(body) => body,
+		Err(e) => {
+			warn!("Failed to fetch instances: {e}");
+			return Ok(
+				Response::builder()
+					.status(502)
+					.header("content-type", "text/plain; charset=utf-8")
+					.body(Body::from("Failed to fetch instances"))
+					.unwrap_or_default(),
+			);
+		}
+	};
+
 	Ok(
 		Response::builder()
 			.status(200)
 			.header("content-type", "application/json")
-			.body(Body::from(fetch_instances().await))
+			.body(Body::from(body))
 			.unwrap_or_default(),
 	)
 }
 
-#[cached(time = 600)]
-async fn fetch_instances() -> String {
+#[cached(time = 600, result = true)]
+async fn fetch_instances() -> Result<String, String> {
 	let uri = Uri::from_str("https://raw.githubusercontent.com/redlib-org/redlib-instances/refs/heads/main/instances.json").expect("Invalid URI");
 
-	let resp: Body = CLIENT.get(uri).await.expect("Failed to request GitHub").into_body();
+	let resp: Body = CLIENT.get(uri).await.map_err(|e| format!("Failed to request GitHub: {e}"))?.into_body();
 
-	hyper::body::to_bytes(resp).await.expect("Failed to read body").iter().copied().map(|x| x as char).collect()
+	hyper::body::to_bytes(resp)
+		.await
+		.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+		.map_err(|e| format!("Failed to read body: {e}"))
 }
