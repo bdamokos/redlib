@@ -17,3 +17,5 @@ nginx/
 .playwright-mcp/
 output/playwright/
 tmp/
+.clawpatch/
+cookies.txt
