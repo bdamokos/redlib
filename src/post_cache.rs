@@ -44,6 +44,7 @@ const PAGE_FILL_BATCH: usize = 4;
 const MAX_SYNC_FILL_BATCHES: usize = 2;
 const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
 pub const POSTS_PER_PAGE: usize = 25;
+const DEFAULT_SOURCE_RESIDENT_TTL_SECS: u64 = 15 * 60;
 
 /// Max time the server waits for a full first contextual page (or background complete) before
 /// sealing whatever merged posts exist so the HTML/fragment response does not keep changing.
@@ -216,6 +217,7 @@ struct CachedSourcePosts {
 	posts: Vec<Post>,
 	after: String,
 	fetched_at: Instant,
+	last_accessed: Instant,
 	refresh_origin: Option<RefreshOrigin>,
 }
 
@@ -431,6 +433,13 @@ static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>
 
 fn source_cache_is_expired(entry: &CachedSourcePosts) -> bool {
 	entry.fetched_at.elapsed().as_secs() > CACHE_TTL_SECS
+}
+
+fn source_resident_ttl_secs() -> u64 {
+	std::env::var("REDLIB_SOURCE_CACHE_RESIDENT_TTL_SECS")
+		.ok()
+		.and_then(|value| value.parse::<u64>().ok())
+		.unwrap_or(DEFAULT_SOURCE_RESIDENT_TTL_SECS)
 }
 
 fn remembered_entry_is_active(entry: &RememberedSubredditEntry) -> bool {
@@ -700,6 +709,100 @@ fn source_cache_is_servable(source: &FeedSource, entry: &CachedSourcePosts) -> b
 	source_cache_is_servable_with_mode(source, entry, CacheServeMode::Normal)
 }
 
+fn persisted_source_entry_from_cache(entry: &CachedSourcePosts, now_unix: u64) -> Option<PersistedSourceCacheEntry> {
+	let source_key = remembered_feed_key_for_source(&entry.source)?;
+	Some(PersistedSourceCacheEntry {
+		subreddit: source_key,
+		posts: entry.posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
+		after: entry.after.clone(),
+		fetched_at_unix: instant_to_unix(entry.fetched_at, now_unix),
+		refresh_origin: entry.refresh_origin.map(PersistedRefreshOrigin::from_runtime),
+	})
+}
+
+fn write_source_entry_to_disk(source_cache_key: &str, entry: &CachedSourcePosts) {
+	#[cfg(test)]
+	{
+		let _ = (source_cache_key, entry);
+		return;
+	}
+	#[cfg(not(test))]
+	{
+		let Some(persisted) = persisted_source_entry_from_cache(entry, crate::cache_persistence::unix_now()) else {
+			return;
+		};
+		if let Err(error) = crate::cache_persistence::write_source_cache_entry(source_cache_key, &persisted) {
+			warn!("post_cache: failed to persist source cache entry {}: {}", entry.source.display_name(), error);
+		}
+	}
+}
+
+fn write_persisted_source_entry_to_disk(source: &FeedSource, entry: &PersistedSourceCacheEntry) {
+	#[cfg(test)]
+	{
+		let _ = (source, entry);
+		return;
+	}
+	#[cfg(not(test))]
+	{
+		if let Err(error) = crate::cache_persistence::write_source_cache_entry(&source.cache_key(), entry) {
+			warn!("post_cache: failed to persist source cache entry {}: {}", source.display_name(), error);
+		}
+	}
+}
+
+fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Option<CachedSourcePosts> {
+	#[cfg(test)]
+	{
+		let _ = (source, mode);
+		return None;
+	}
+	#[cfg(not(test))]
+	{
+		let cache_key = source.cache_key();
+		let persisted = match crate::cache_persistence::read_source_cache_entry(&cache_key) {
+			Ok(Some(entry)) => entry,
+			Ok(None) => return None,
+			Err(error) => {
+				warn!("post_cache: failed to read source cache entry {}: {}", source.display_name(), error);
+				return None;
+			}
+		};
+		let expected_key = remembered_feed_key_for_source(source)?;
+		if persisted.subreddit != expected_key {
+			warn!(
+				"post_cache: ignoring source cache entry {} with mismatched key {}",
+				source.display_name(),
+				persisted.subreddit
+			);
+			return None;
+		}
+
+		let now_unix = crate::cache_persistence::unix_now();
+		let posts = persisted.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
+		let entry = CachedSourcePosts {
+			source: source.clone(),
+			posts,
+			after: persisted.after,
+			fetched_at: unix_to_instant(persisted.fetched_at_unix, now_unix),
+			last_accessed: Instant::now(),
+			refresh_origin: persisted.refresh_origin.map(PersistedRefreshOrigin::into_runtime),
+		};
+		if !source_cache_is_servable_with_mode(source, &entry, mode) {
+			return None;
+		}
+
+		update_user_video_stats_from_posts(&entry.posts);
+		if materialized_catalog::source_is_supported(source) {
+			materialized_catalog::apply_source_refresh(source, &entry.posts);
+		}
+		if let Ok(mut cache) = SOURCE_CACHE.lock() {
+			cache.insert(cache_key, entry.clone());
+		}
+		Some(entry)
+	}
+}
+
 fn median_u64(values: &mut [u64]) -> u64 {
 	values.sort_unstable();
 	let mid = values.len() / 2;
@@ -820,12 +923,21 @@ fn mark_remembered_source_refresh_started(source: &FeedSource) {
 	crate::cache_persistence::mark_dirty();
 }
 
-fn prune_source_cache_locked(cache: &mut HashMap<String, CachedSourcePosts>) -> Vec<FeedSource> {
+fn should_evict_resident_source_entry(entry: &CachedSourcePosts) -> bool {
+	is_persisted_subreddit_feed_source(&entry.source) && !has_active_browser_sessions() && entry.last_accessed.elapsed().as_secs() > source_resident_ttl_secs()
+}
+
+fn prune_source_cache_locked(cache: &mut HashMap<String, CachedSourcePosts>) -> Vec<(FeedSource, bool)> {
 	let mut pruned_sources = Vec::new();
-	cache.retain(|_, entry| {
-		let keep = source_cache_is_servable(&entry.source, entry);
+	cache.retain(|key, entry| {
+		let servable = source_cache_is_servable(&entry.source, entry);
+		let evict_resident = servable && should_evict_resident_source_entry(entry);
+		let keep = servable && !evict_resident;
 		if !keep {
-			pruned_sources.push(entry.source.clone());
+			if is_persisted_subreddit_feed_source(&entry.source) {
+				write_source_entry_to_disk(key, entry);
+			}
+			pruned_sources.push((entry.source.clone(), !evict_resident));
 		}
 		keep
 	});
@@ -844,9 +956,12 @@ pub(crate) fn prune_source_cache() {
 		return;
 	}
 
-	for source in &pruned_sources {
+	for (source, remove_disk_entry) in &pruned_sources {
 		if materialized_catalog::source_is_supported(source) {
 			materialized_catalog::apply_source_refresh(source, &[]);
+		}
+		if *remove_disk_entry {
+			crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
 		}
 	}
 	crate::cache_persistence::mark_dirty();
@@ -859,9 +974,12 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	} else {
 		Vec::new()
 	};
-	for pruned_source in &pruned_sources {
+	for (pruned_source, remove_disk_entry) in &pruned_sources {
 		if materialized_catalog::source_is_supported(pruned_source) {
 			materialized_catalog::apply_source_refresh(pruned_source, &[]);
+		}
+		if *remove_disk_entry {
+			crate::cache_persistence::remove_source_cache_entry(&pruned_source.cache_key());
 		}
 	}
 	if materialized_catalog::source_is_supported(source) {
@@ -875,9 +993,13 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 				posts,
 				after,
 				fetched_at: Instant::now(),
+				last_accessed: Instant::now(),
 				refresh_origin,
 			},
 		);
+		if let Some(entry) = cache.get(&source.cache_key()) {
+			write_source_entry_to_disk(&source.cache_key(), entry);
+		}
 	}
 	if is_persisted_subreddit_feed_source(source) || materialized_catalog::source_is_supported(source) {
 		crate::cache_persistence::mark_dirty();
@@ -1015,6 +1137,7 @@ pub fn cleanup_decayed_remembered_subreddits() {
 			continue;
 		};
 		cache.remove(&source.cache_key());
+		crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
 		materialized_catalog::apply_source_refresh(&source, &[]);
 		if let FeedSource::Subreddit { name, .. } = &source {
 			crate::subreddit::remove_subreddit_metadata_cache(name);
@@ -1040,19 +1163,7 @@ pub(crate) fn snapshot_persisted_source_entries(now_unix: u64) -> Vec<PersistedS
 		return Vec::new();
 	};
 
-	cache
-		.values()
-		.filter_map(|entry| {
-			let source_key = remembered_feed_key_for_source(&entry.source)?;
-			Some(PersistedSourceCacheEntry {
-				subreddit: source_key,
-				posts: entry.posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
-				after: entry.after.clone(),
-				fetched_at_unix: instant_to_unix(entry.fetched_at, now_unix),
-				refresh_origin: entry.refresh_origin.map(PersistedRefreshOrigin::from_runtime),
-			})
-		})
-		.collect()
+	cache.values().filter_map(|entry| persisted_source_entry_from_cache(entry, now_unix)).collect()
 }
 
 pub(crate) fn snapshot_persisted_remembered_subreddits(now_unix: u64) -> Vec<PersistedRememberedSubredditEntry> {
@@ -1116,35 +1227,21 @@ pub(crate) fn restore_persisted_state(
 		remembered.extend(restored_remembered.clone());
 	}
 
-	let restored_sources = source_entries
-		.into_iter()
-		.filter_map(|entry| {
-			let source = remembered_feed_source_from_key(&entry.subreddit)?;
-			let remembered_key = remembered_feed_key_for_source(&source)?;
-			let age_secs = now_unix.saturating_sub(entry.fetched_at_unix);
-			let remember_kept = restored_remembered.get(&remembered_key).is_some();
-			if age_secs > CACHE_TTL_SECS && !remember_kept {
-				return None;
-			}
+	for entry in source_entries {
+		let Some(source) = remembered_feed_source_from_key(&entry.subreddit) else {
+			continue;
+		};
+		let Some(remembered_key) = remembered_feed_key_for_source(&source) else {
+			continue;
+		};
+		let age_secs = now_unix.saturating_sub(entry.fetched_at_unix);
+		let remember_kept = restored_remembered.get(&remembered_key).is_some();
+		if age_secs > CACHE_TTL_SECS && !remember_kept {
+			crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
+			continue;
+		}
 
-			let posts = entry.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
-			update_user_video_stats_from_posts(&posts);
-
-			Some((
-				source.cache_key(),
-				CachedSourcePosts {
-					source,
-					posts,
-					after: entry.after,
-					fetched_at: unix_to_instant(entry.fetched_at_unix, now_unix),
-					refresh_origin: entry.refresh_origin.map(PersistedRefreshOrigin::into_runtime),
-				},
-			))
-		})
-		.collect::<HashMap<_, _>>();
-
-	if let Ok(mut cache) = SOURCE_CACHE.lock() {
-		cache.extend(restored_sources);
+		write_persisted_source_entry_to_disk(&source, &entry);
 	}
 	rebuild_materialized_catalog_from_source_cache();
 }
@@ -1392,11 +1489,7 @@ pub const fn initial_source_window() -> usize {
 }
 
 pub fn get_cached_source_page_with_mode(source: &FeedSource, page: usize, per_page: usize, mode: CacheServeMode) -> Option<(Vec<Post>, String, bool, bool)> {
-	let cache = SOURCE_CACHE.lock().ok()?;
-	let entry = cache.get(&source.cache_key())?;
-	if !source_cache_is_servable_with_mode(source, entry, mode) {
-		return None;
-	}
+	let entry = cached_source_posts_with_mode(source, mode)?;
 
 	let start = page * per_page;
 	if start >= entry.posts.len() {
@@ -1430,13 +1523,7 @@ fn store_source_posts(source: &FeedSource, posts: Vec<Post>, after: String) {
 }
 
 fn cached_source_origin_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<RefreshOrigin> {
-	let cache = SOURCE_CACHE.lock().ok()?;
-	let entry = cache.get(&source.cache_key())?;
-	if !source_cache_is_servable_with_mode(source, entry, mode) {
-		return None;
-	}
-
-	entry.refresh_origin
+	cached_source_posts_with_mode(source, mode).and_then(|entry| entry.refresh_origin)
 }
 
 fn cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
@@ -1444,17 +1531,28 @@ fn cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
 }
 
 fn cached_source_posts_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<CachedSourcePosts> {
-	let cache = SOURCE_CACHE.lock().ok()?;
-	let entry = cache.get(&source.cache_key())?;
-	if !source_cache_is_servable_with_mode(source, entry, mode) {
-		return None;
+	let cache_key = source.cache_key();
+	if let Ok(mut cache) = SOURCE_CACHE.lock() {
+		if let Some(entry) = cache.get_mut(&cache_key) {
+			if source_cache_is_servable_with_mode(source, entry, mode) {
+				entry.last_accessed = Instant::now();
+				return Some(entry.clone());
+			}
+		}
 	}
 
-	Some(entry.clone())
+	load_source_entry_from_disk(source, mode)
 }
 
 fn cached_source_posts(source: &FeedSource) -> Option<CachedSourcePosts> {
 	cached_source_posts_with_mode(source, CacheServeMode::Normal)
+}
+
+fn source_has_resident_servable_cache(source: &FeedSource) -> bool {
+	let Ok(cache) = SOURCE_CACHE.lock() else {
+		return false;
+	};
+	cache.get(&source.cache_key()).is_some_and(|entry| source_cache_is_servable(source, entry))
 }
 
 async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin: RefreshOrigin) -> Result<CachedSourcePosts, String> {
@@ -1506,6 +1604,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		posts,
 		after,
 		fetched_at: Instant::now(),
+		last_accessed: Instant::now(),
 		refresh_origin: remembered_feed_key_for_source(&source).map(|_| refresh_origin),
 	})
 }
@@ -1565,7 +1664,7 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 fn reconcile_session_with_source_cache(session: &mut FeedSession) {
 	let mut changed = false;
 	for entry in &mut session.sources {
-		if cached_source_posts(&entry.source).is_some() && entry.state != SessionSourceState::Ready {
+		if source_has_resident_servable_cache(&entry.source) && entry.state != SessionSourceState::Ready {
 			entry.state = SessionSourceState::Ready;
 			entry.last_error = None;
 			changed = true;
@@ -1848,7 +1947,7 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 	let daemon_cached_sources = session
 		.sources
 		.iter()
-		.filter(|entry| cached_source_origin(&entry.source) == Some(RefreshOrigin::Daemon))
+		.filter(|entry| entry.state == SessionSourceState::Ready && cached_source_origin(&entry.source) == Some(RefreshOrigin::Daemon))
 		.count();
 	let failed_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Failed).count();
 	let total_user_sources = session
@@ -3093,7 +3192,7 @@ mod tests {
 	}
 
 	#[test]
-	fn restore_persisted_state_rebuilds_catalog_query_results() {
+	fn restore_persisted_state_keeps_source_payloads_out_of_resident_cache() {
 		let _guard = test_lock();
 		reset_test_caches();
 
@@ -3106,25 +3205,9 @@ mod tests {
 		reset_test_caches();
 		restore_persisted_state(source_entries, remembered_entries, 1_000_100, 1_000_100);
 
-		let session = FeedSession {
-			id: "catalog-restore".to_string(),
-			request: FeedSessionRequest {
-				sources: vec![new_source("rust")],
-				..Default::default()
-			},
-			sources: vec![session_entry(new_source("rust"), SessionSourceState::Ready)],
-			frozen_pages: HashMap::new(),
-			background_active: false,
-			background_complete: true,
-			requested_page: 0,
-			last_updated: Instant::now(),
-			revision: 0,
-		};
-
-		assert_eq!(
-			merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>(),
-			vec!["persisted".to_string()]
-		);
+		assert!(SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+		assert!(catalog_source_candidates(&[source], &HashSet::new()).unwrap().is_empty());
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).contains_key("rust"));
 	}
 
 	#[test]
@@ -3307,7 +3390,7 @@ mod tests {
 	}
 
 	#[test]
-	fn restored_source_cache_rehydrates_author_video_stats() {
+	fn restored_source_cache_defers_author_video_stats_until_source_load() {
 		let _guard = test_lock();
 		reset_test_caches();
 
@@ -3326,10 +3409,7 @@ mod tests {
 		reset_test_caches();
 		restore_persisted_state(source_entries, remembered_entries, now_unix, now_unix);
 
-		assert_eq!(
-			crate::user::cached_avg_video_length("author_restore"),
-			Some(("1:15".to_string(), "from 1 seen video".to_string()))
-		);
+		assert_eq!(crate::user::cached_avg_video_length("author_restore"), None);
 	}
 
 	#[test]
@@ -3471,6 +3551,23 @@ mod tests {
 
 		assert!(SOURCE_CACHE.lock().unwrap().get(&source.cache_key()).is_some());
 		assert_eq!(catalog_source_candidates(&[source], &HashSet::new()).unwrap().len(), 1);
+	}
+
+	#[test]
+	fn pruning_evicts_idle_remembered_source_from_resident_memory() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		store_source_posts_with_origin(&source, vec![test_post("one", "rust", 100)], String::new(), Some(RefreshOrigin::Daemon));
+		SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&source.cache_key()).unwrap().last_accessed =
+			Instant::now() - Duration::from_secs(super::source_resident_ttl_secs() + 60);
+		prune_source_cache();
+
+		assert!(SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&source.cache_key()).is_none());
+		assert!(catalog_source_candidates(&[source], &HashSet::new()).unwrap().is_empty());
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).contains_key("rust"));
 	}
 
 	#[test]
@@ -4725,7 +4822,7 @@ mod tests {
 		SOURCE_CACHE.lock().unwrap().clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
 		restore_persisted_state(remembered_snapshot, remembered_state, 1_000_100, 1_000_100);
-		assert!(SOURCE_CACHE.lock().unwrap().contains_key(&remembered_source.cache_key()));
+		assert!(SOURCE_CACHE.lock().unwrap().get(&remembered_source.cache_key()).is_none());
 		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().contains_key("remembered"));
 	}
 
@@ -4745,7 +4842,7 @@ mod tests {
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
 		restore_persisted_state(posts_snapshot, remembered_snapshot, 3_000_000, 3_000_000);
 
-		assert!(SOURCE_CACHE.lock().unwrap().contains_key(&user_source.cache_key()));
+		assert!(SOURCE_CACHE.lock().unwrap().get(&user_source.cache_key()).is_none());
 		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().contains_key("u_followeduser"));
 	}
 }

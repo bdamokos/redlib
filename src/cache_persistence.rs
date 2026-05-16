@@ -1,5 +1,6 @@
 use crate::config::get_setting;
 use crate::{post_cache, subreddit, utils};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use log::warn;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -11,6 +12,7 @@ use tokio::sync::mpsc;
 
 const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v1.bin";
+const SOURCE_CACHE_DIR_NAME: &str = "sources.v1";
 const DEFAULT_CACHE_DIR: &str = "/var/lib/redlib/cache";
 const WRITE_DEBOUNCE_SECS: u64 = 1;
 
@@ -310,6 +312,14 @@ pub(crate) fn snapshot_path() -> PathBuf {
 	Path::new(&cache_dir()).join(SNAPSHOT_FILE_NAME)
 }
 
+fn source_cache_dir() -> PathBuf {
+	Path::new(&cache_dir()).join(SOURCE_CACHE_DIR_NAME)
+}
+
+fn source_cache_path(source_cache_key: &str) -> PathBuf {
+	source_cache_dir().join(format!("{}.bin", URL_SAFE_NO_PAD.encode(source_cache_key.as_bytes())))
+}
+
 pub(crate) fn unix_now() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0)).as_secs()
 }
@@ -359,6 +369,40 @@ pub fn init() {
 pub fn mark_dirty() {
 	if let Some(sender) = PERSISTENCE_EVENTS.get() {
 		let _ = sender.send(());
+	}
+}
+
+pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &PersistedSourceCacheEntry) -> Result<(), String> {
+	let final_path = source_cache_path(source_cache_key);
+	let temp_path = final_path.with_extension("tmp");
+
+	if let Some(parent) = final_path.parent() {
+		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+	}
+
+	let bytes = bincode::serialize(entry).map_err(|error| error.to_string())?;
+	let mut file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	file.write_all(&bytes).map_err(|error| error.to_string())?;
+	file.sync_all().map_err(|error| error.to_string())?;
+	drop(file);
+	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())
+}
+
+pub(crate) fn read_source_cache_entry(source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, String> {
+	let path = source_cache_path(source_cache_key);
+	let bytes = match fs::read(path) {
+		Ok(bytes) => bytes,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.to_string()),
+	};
+	bincode::deserialize(&bytes).map(Some).map_err(|error| error.to_string())
+}
+
+pub(crate) fn remove_source_cache_entry(source_cache_key: &str) {
+	if let Err(error) = fs::remove_file(source_cache_path(source_cache_key)) {
+		if error.kind() != std::io::ErrorKind::NotFound {
+			warn!("cache_persistence: failed to remove source cache entry {source_cache_key}: {error}");
+		}
 	}
 }
 

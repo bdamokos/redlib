@@ -441,7 +441,7 @@ async fn new_boilerplate(
 /// Accept-Encoding: gzip, compress, br
 /// Accept-Encoding: br;q=1.0, gzip;q=0.8, *;q=0.1
 /// ```
-#[cached]
+#[cached(size = 32, time = 3600)]
 fn determine_compressor(accept_encoding: String) -> Option<CompressionType> {
 	if accept_encoding.is_empty() {
 		return None;
@@ -688,12 +688,6 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 /// This is a helper function for [`compress_response`] and should not be
 /// called directly.
 
-// I've chosen a TTL of 600 (== 10 minutes) since compression is
-// computationally expensive and we don't want to be doing it often. This is
-// larger than client::json's TTL, but that's okay, because if client::json
-// returns a new serde_json::Value, body_bytes changes, so this function will
-// execute again.
-#[cached(size = 100, time = 600, result = true)]
 fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
 	// io::Cursor implements io::Read, required for our encoders.
 	let mut reader = io::Cursor::new(body_bytes);
