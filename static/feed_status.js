@@ -119,7 +119,8 @@
                     banner.classList.toggle("warming", !!status.warming);
                 }
 
-                const shouldRefreshFragment = lastRefreshToken === null || lastRefreshToken !== status.refresh_token;
+                const shouldRefreshFragment =
+                    !hasVisiblePosts() && (lastRefreshToken === null || lastRefreshToken !== status.refresh_token);
 
                 if (shouldRefreshFragment) {
                     const fragmentResponse = await fetchWithTimeout(fragmentUrl, {

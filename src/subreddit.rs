@@ -1829,21 +1829,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		None
 	};
 	let user_agent = req.headers().get("user-agent").and_then(|value| value.to_str().ok()).unwrap_or_default();
-	let safari_contextual_front_page = contextual_front_page
-		&& user_agent.contains("Safari/")
-		&& !user_agent.contains("Chrome/")
-		&& !user_agent.contains("Chromium/")
-		&& !user_agent.contains("CriOS/")
-		&& !user_agent.contains("Edg/")
-		&& !user_agent.contains("OPR/");
-
-	// Avoid post-load DOM fragment replacement on /following by rendering the full page server-side.
-	// The shell->fragment swap causes large CLS when the fragment arrives seconds after first paint,
-	// and Safari has been observed receiving rendered fragment HTML without painting the swapped posts.
-	if (is_following_route(&url) || safari_contextual_front_page) && contextual_front_page {
-		if safari_contextual_front_page && !is_following_route(&url) {
-			info!("post_cache: using server-side contextual front page render for Safari ua={}", user_agent);
-		}
+	// Avoid post-load DOM fragment replacement for contextual front pages by rendering the
+	// first visible listing server-side. The shell->fragment swap causes visible content
+	// changes after first paint, and the feed is intentionally sealed before paint so later
+	// background warmups do not reshuffle the displayed posts.
+	if contextual_front_page {
 		let query = req.uri().query().unwrap_or_default().to_string();
 		let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
 		let timeframe = param(&format!("?{}", query), "t").unwrap_or_default();
@@ -1866,16 +1856,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		)
 		.await;
 
-		if cache_page == 0 && !safari_contextual_front_page {
+		if cache_page == 0 {
 			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
 		}
 
-		let mut page = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
-		if page.is_none() && cache_page == 0 && safari_contextual_front_page {
-			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
-			page = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
-		}
-
+		let page = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
 		if let Some(mut page) = page {
 			let feed_status = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
 			let feed_status_message = feed_status.as_ref().map(|status| status.status_message.clone()).unwrap_or_default();
