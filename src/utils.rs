@@ -3913,14 +3913,6 @@ macro_rules! impl_template_str_eq {
 			pub fn str_eq(&self, a: &str, b: &str) -> bool {
 				a == b
 			}
-
-			pub fn bool_to_str(&self, val: bool) -> &'static str {
-				if val {
-					"true"
-				} else {
-					"false"
-				}
-			}
 		}
 	};
 }

@@ -45,6 +45,7 @@ struct CachedUserVideoStats {
 	cached_at: Instant,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct UserVideoStats {
 	average_duration_seconds: i64,
@@ -746,6 +747,7 @@ pub(crate) fn update_user_video_stats_from_posts(posts: &[Post]) {
 	}
 }
 
+#[cfg(test)]
 fn cached_user_video_stats(username: &str) -> Option<UserVideoStats> {
 	let cache_key = normalize_user_video_stats_cache_key(username);
 	if cache_key.is_empty() {

@@ -24,10 +24,6 @@ pub struct RedgifsMediaPaths {
 }
 
 impl RedgifsMediaPaths {
-	pub(crate) fn video_path(&self) -> &str {
-		&self.video_path
-	}
-
 	pub(crate) fn poster_path(&self) -> &str {
 		&self.poster_path
 	}

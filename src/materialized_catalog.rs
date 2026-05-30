@@ -271,13 +271,6 @@ pub(crate) fn snapshot_catalog() -> PersistedCatalogSnapshot {
 }
 
 #[cfg(test)]
-pub(crate) fn query_session_stream(session: &FeedSession) -> Vec<Post> {
-	let allowed_keys = allowed_source_keys_for_session(session);
-	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	query_posts_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, usize::MAX)
-}
-
-#[cfg(test)]
 pub(crate) fn query_source_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
 	let allowed_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());

@@ -372,6 +372,7 @@ pub fn mark_dirty() {
 	}
 }
 
+#[cfg(not(test))]
 pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &PersistedSourceCacheEntry) -> Result<(), String> {
 	let final_path = source_cache_path(source_cache_key);
 	let temp_path = final_path.with_extension("tmp");
@@ -388,6 +389,7 @@ pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &Persisted
 	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())
 }
 
+#[cfg(not(test))]
 pub(crate) fn read_source_cache_entry(source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, String> {
 	let path = source_cache_path(source_cache_key);
 	let bytes = match fs::read(path) {
@@ -398,6 +400,7 @@ pub(crate) fn read_source_cache_entry(source_cache_key: &str) -> Result<Option<P
 	bincode::deserialize(&bytes).map(Some).map_err(|error| error.to_string())
 }
 
+#[cfg(not(test))]
 pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 	source_cache_path(source_cache_key).is_file()
 }
@@ -493,6 +496,7 @@ impl PersistedRefreshOrigin {
 		}
 	}
 
+	#[cfg(not(test))]
 	pub(crate) fn into_runtime(self) -> post_cache::RefreshOrigin {
 		match self {
 			Self::Daemon => post_cache::RefreshOrigin::Daemon,
