@@ -130,12 +130,41 @@ struct UserSubredditEntry {
 }
 
 fn user_sidebar_subreddits(username: &str) -> Vec<UserSubredditEntry> {
-	crate::materialized_catalog::catalog_user_sidebar_stats(username)
-		.map(|stats| stats.subreddit_counts)
-		.unwrap_or_else(|| utils::cached_user_subreddits(username))
-		.into_iter()
-		.map(|(name, count)| UserSubredditEntry { name, count })
-		.collect()
+	let mut counts: HashMap<String, (String, u32)> = HashMap::new();
+
+	let mut merge_count = |name: String, count: u32| {
+		let trimmed = name.trim();
+		if trimmed.is_empty() || trimmed.starts_with("u_") || count == 0 {
+			return;
+		}
+
+		let normalized = trimmed.to_lowercase();
+		let entry = counts.entry(normalized).or_insert_with(|| (trimmed.to_string(), 0));
+		if entry.0 == entry.0.to_lowercase() && trimmed != trimmed.to_lowercase() {
+			entry.0 = trimmed.to_string();
+		}
+		entry.1 = entry.1.max(count);
+	};
+
+	if let Some(stats) = crate::materialized_catalog::catalog_user_sidebar_stats(username) {
+		for (name, count) in stats.subreddit_counts {
+			merge_count(name, count);
+		}
+	}
+
+	for (name, count) in utils::cached_user_subreddits(username) {
+		merge_count(name, count);
+	}
+
+	let mut subreddits = counts.into_values().map(|(name, count)| UserSubredditEntry { name, count }).collect::<Vec<_>>();
+	subreddits.sort_by(|left, right| {
+		right
+			.count
+			.cmp(&left.count)
+			.then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+			.then_with(|| left.name.cmp(&right.name))
+	});
+	subreddits
 }
 
 fn link_post_id_from_listing(post: &Post) -> Option<String> {
@@ -2009,6 +2038,34 @@ mod tests {
 		assert_eq!(
 			subreddits.into_iter().map(|entry| (entry.name, entry.count)).collect::<Vec<_>>(),
 			vec![("rust".to_string(), 2), ("programming".to_string(), 1)]
+		);
+	}
+
+	#[test]
+	fn user_sidebar_subreddits_merge_page_tallies_with_partial_catalog_stats() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		super::clear_test_caches();
+		crate::utils::clear_test_caches();
+		crate::materialized_catalog::reset_catalog();
+
+		let username = "partial_catalog_sidebar_user";
+		let mut first = test_post("catalog-one", "Catalog one", "kissing_porn", "", "self", "", &[]);
+		first.author.name = username.to_string();
+		let mut second = test_post("catalog-two", "Catalog two", "kissing_porn", "", "self", "", &[]);
+		second.author.name = username.to_string();
+		crate::materialized_catalog::apply_source_refresh(
+			&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
+			&[first, second],
+		);
+
+		let visible = test_post("visible-one", "Visible one", "NSFWverifiedamateurs", "", "self", "", &[]);
+		let overlapping = test_post("visible-two", "Visible two", "kissing_porn", "", "self", "", &[]);
+		crate::utils::store_user_subreddits(username, &[visible, overlapping]);
+
+		let subreddits = super::user_sidebar_subreddits(username);
+		assert_eq!(
+			subreddits.into_iter().map(|entry| (entry.name, entry.count)).collect::<Vec<_>>(),
+			vec![("kissing_porn".to_string(), 2), ("NSFWverifiedamateurs".to_string(), 1)]
 		);
 	}
 
