@@ -18,7 +18,7 @@ use cached::proc_macro::cached;
 use cookie::Cookie;
 use htmlescape::decode_html;
 use hyper::body::to_bytes;
-use hyper::header::{CONTENT_ENCODING, LOCATION};
+use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use hyper::{Body, Request, Response, Uri};
 use libflate::deflate::{Decoder, Encoder};
 use libflate::gzip::Decoder as GzipDecoder;
@@ -30,6 +30,7 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use serde_json_path::{JsonPath, JsonPathExt};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
@@ -41,6 +42,13 @@ use std::time::{Duration as StdDuration, Instant};
 use time::{macros::format_description, Duration, OffsetDateTime};
 use tokio::task::JoinSet;
 use url::Url;
+
+const COOMERFANS_HOST: &str = "coomerfans.com";
+const COOMERFANS_ORIGIN: &str = "https://coomerfans.com";
+const COOMERFANS_VIDEO_PROBE_LIMIT: usize = 12;
+const KEMONO_HOST: &str = "kemono.cr";
+const KEMONO_ORIGIN: &str = "https://kemono.cr";
+const KEMONO_API_ORIGIN: &str = "https://kemono.cr/api";
 
 /// Write a message to stderr on debug mode. This function is a no-op on
 /// release code.
@@ -915,7 +923,7 @@ impl Post {
 				body = rewrite_urls(&val(post, "body_html"));
 			}
 
-			posts.push(Self {
+			let parsed_post = Self {
 				id: val(post, "id"),
 				kind,
 				title,
@@ -1015,7 +1023,13 @@ impl Post {
 				following_comments: Vec::new(),
 				bookmarked: false,
 				bookmark_new_comments: None,
-			});
+			};
+
+			if is_deleted_reddit_placeholder_post(&parsed_post) || is_deleted_reddit_placeholder_post_by_content(&parsed_post).await {
+				continue;
+			}
+
+			posts.push(parsed_post);
 		}
 		hydrate_post_author_links_from_cache(&mut posts);
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
@@ -2568,6 +2582,15 @@ static REGEX_URL_EXTERNAL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new
 static REGEX_URL_STYLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://styles\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_STATIC_MEDIA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://www\.redditstatic\.com/(.*)").unwrap());
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_BASENAME: &str = "p1povyvu85vg1.jpg";
+const REDDIT_DELETED_IMAGE_PLACEHOLDER_WIDTH: i64 = 130;
+const REDDIT_DELETED_IMAGE_PLACEHOLDER_HEIGHT: i64 = 60;
+const REDDIT_DELETED_IMAGE_PLACEHOLDER_BODY_LEN: usize = 1048;
+const REDDIT_DELETED_IMAGE_PLACEHOLDER_MAX_PROBE_BYTES: usize = 4096;
+const REDDIT_DELETED_IMAGE_PLACEHOLDER_PROBE_TIMEOUT_SECS: u64 = 4;
+const REDDIT_DELETED_IMAGE_PLACEHOLDER_SHA256: [u8; 32] = [
+	0x35, 0xa0, 0x93, 0x2c, 0x61, 0xe0, 0x9a, 0x8c, 0x1c, 0xad, 0x9e, 0xec, 0x75, 0xb6, 0x7a, 0x03, 0x60, 0x20, 0x56, 0x46, 0x3e, 0xd2, 0x10, 0x31, 0x0d, 0x2a, 0x09, 0xcf,
+	0x0b, 0x00, 0x2e, 0xd5,
+];
 
 fn is_deleted_reddit_placeholder_url(url: &str) -> bool {
 	let normalized = format_url(url);
@@ -2576,6 +2599,164 @@ fn is_deleted_reddit_placeholder_url(url: &str) -> bool {
 	}
 
 	url_path_basename(&normalized).eq_ignore_ascii_case(REDDIT_DELETED_IMAGE_PLACEHOLDER_BASENAME) && normalized.contains("/preview/pre/")
+}
+
+fn deleted_placeholder_probe_timeout() -> StdDuration {
+	StdDuration::from_secs(REDDIT_DELETED_IMAGE_PLACEHOLDER_PROBE_TIMEOUT_SECS)
+}
+
+fn deleted_placeholder_dimensions(width: i64, height: i64) -> bool {
+	width == REDDIT_DELETED_IMAGE_PLACEHOLDER_WIDTH && height == REDDIT_DELETED_IMAGE_PLACEHOLDER_HEIGHT
+}
+
+fn image_body_matches_deleted_reddit_placeholder(body: &[u8]) -> bool {
+	if body.len() != REDDIT_DELETED_IMAGE_PLACEHOLDER_BODY_LEN {
+		return false;
+	}
+
+	let digest = Sha256::digest(body);
+	digest[..] == REDDIT_DELETED_IMAGE_PLACEHOLDER_SHA256
+}
+
+fn local_proxy_path_to_reddit_image_upstream(path: &str, query: Option<&str>) -> Option<String> {
+	let suffix = query.filter(|value| !value.is_empty()).map(|value| format!("?{value}")).unwrap_or_default();
+
+	if let Some(path) = path.strip_prefix("/img/") {
+		return Some(format!("https://i.redd.it/{path}{suffix}"));
+	}
+	if let Some(path) = path.strip_prefix("/preview/pre/") {
+		return Some(format!("https://preview.redd.it/{path}{suffix}"));
+	}
+	if let Some(path) = path.strip_prefix("/preview/external-pre/") {
+		return Some(format!("https://external-preview.redd.it/{path}{suffix}"));
+	}
+
+	None
+}
+
+fn reddit_image_url_to_upstream(url: &str) -> Option<String> {
+	let normalized = if url.contains('"') || url.contains('<') || url.contains('>') {
+		url.to_string()
+	} else {
+		decode_html(url).unwrap_or_else(|_| url.to_string())
+	};
+
+	if let Ok(parsed) = Url::parse(&normalized) {
+		if matches!(parsed.domain(), Some("i.redd.it" | "preview.redd.it" | "external-preview.redd.it")) {
+			return Some(normalized);
+		}
+		return local_proxy_path_to_reddit_image_upstream(parsed.path(), parsed.query());
+	}
+
+	let (path, query) = normalized.split_once('?').map_or((normalized.as_str(), None), |(path, query)| (path, Some(query)));
+	local_proxy_path_to_reddit_image_upstream(path, query)
+}
+
+fn media_deleted_placeholder_probe_urls(url: &str, preview_url: &str) -> Vec<String> {
+	let mut urls = Vec::new();
+	let mut seen = HashSet::new();
+
+	for url in [url, preview_url] {
+		let Some(upstream) = reddit_image_url_to_upstream(url) else {
+			continue;
+		};
+		if seen.insert(upstream.clone()) {
+			urls.push(upstream);
+		}
+	}
+
+	urls
+}
+
+fn media_may_be_deleted_placeholder(media: &Media) -> bool {
+	(!media.url.is_empty() || !media.preview_url.is_empty())
+		&& (deleted_placeholder_dimensions(media.width, media.height) || (media.width <= 0 && media.height <= 0))
+		&& !media_deleted_placeholder_probe_urls(&media.url, &media.preview_url).is_empty()
+}
+
+fn gallery_media_may_be_deleted_placeholder(media: &GalleryMedia) -> bool {
+	(!media.url.is_empty() || !media.preview_url.is_empty())
+		&& (deleted_placeholder_dimensions(media.width, media.height) || (media.width <= 0 && media.height <= 0))
+		&& !media_deleted_placeholder_probe_urls(&media.url, &media.preview_url).is_empty()
+}
+
+async fn reddit_image_url_matches_deleted_placeholder_content(url: &str) -> bool {
+	let Ok(parsed_uri) = url.parse::<Uri>() else {
+		return false;
+	};
+
+	let mut builder = Request::get(parsed_uri);
+	{
+		let client = OAUTH_CLIENT.load_full();
+		builder = builder.header("User-Agent", client.user_agent());
+	}
+	let Ok(request) = builder.body(Body::empty()) else {
+		return false;
+	};
+
+	let response = match tokio::time::timeout(deleted_placeholder_probe_timeout(), CLIENT.request(request)).await {
+		Ok(Ok(response)) => response,
+		_ => return false,
+	};
+
+	if !response
+		.headers()
+		.get(CONTENT_TYPE)
+		.and_then(|value| value.to_str().ok())
+		.is_some_and(|value| value.starts_with("image/"))
+	{
+		return false;
+	}
+
+	if response
+		.headers()
+		.get(CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<usize>().ok())
+		.is_some_and(|length| length > REDDIT_DELETED_IMAGE_PLACEHOLDER_MAX_PROBE_BYTES)
+	{
+		return false;
+	}
+
+	let body = match tokio::time::timeout(deleted_placeholder_probe_timeout(), read_response_bytes(response)).await {
+		Ok(Ok(body)) => body,
+		_ => return false,
+	};
+
+	image_body_matches_deleted_reddit_placeholder(&body)
+}
+
+async fn media_matches_deleted_placeholder_content(url: &str, preview_url: &str) -> bool {
+	for url in media_deleted_placeholder_probe_urls(url, preview_url) {
+		if reddit_image_url_matches_deleted_placeholder_content(&url).await {
+			return true;
+		}
+	}
+
+	false
+}
+
+async fn is_deleted_reddit_placeholder_post_by_content(post: &Post) -> bool {
+	match post.post_type.as_str() {
+		"image" => media_may_be_deleted_placeholder(&post.media) && media_matches_deleted_placeholder_content(&post.media.url, &post.media.preview_url).await,
+		"gallery" => {
+			if post.gallery.is_empty() {
+				return false;
+			}
+
+			for image in &post.gallery {
+				if is_deleted_reddit_placeholder_url(&image.url) || is_deleted_reddit_placeholder_url(&image.preview_url) {
+					continue;
+				}
+				if !gallery_media_may_be_deleted_placeholder(image) || !media_matches_deleted_placeholder_content(&image.url, &image.preview_url).await {
+					return false;
+				}
+			}
+
+			true
+		}
+		_ => false,
+	}
 }
 
 pub fn is_deleted_reddit_placeholder_post(post: &Post) -> bool {
@@ -2953,6 +3134,8 @@ pub async fn external_links_with_coomer_lookups(links: Vec<ExternalLink>) -> Vec
 
 	for link in links {
 		append_external_links(&mut coomer_links, coomer_lookup_links(&link).await);
+		append_external_links(&mut coomer_links, coomerfans_lookup_links(&link).await);
+		append_external_links(&mut coomer_links, kemono_lookup_links(&link).await);
 	}
 
 	append_external_links(&mut expanded_links, coomer_links);
@@ -2965,7 +3148,7 @@ pub async fn external_links_with_coomer_flags(links: Vec<ExternalLink>) -> Vec<E
 	for (index, link) in links.iter().enumerate() {
 		let link = link.clone();
 		pending.spawn(async move {
-			let has_coomer = !coomer_lookup_links(&link).await.is_empty();
+			let has_coomer = !coomer_lookup_links(&link).await.is_empty() || !coomerfans_lookup_links(&link).await.is_empty() || !kemono_lookup_links(&link).await.is_empty();
 			(index, has_coomer)
 		});
 	}
@@ -3026,6 +3209,30 @@ async fn coomer_lookup_links(link: &ExternalLink) -> Vec<ExternalLink> {
 	coomer_lookup_links_with_checker(link, coomer_lookup_exists).await
 }
 
+async fn coomerfans_lookup_links(link: &ExternalLink) -> Vec<ExternalLink> {
+	let mut matches = Vec::new();
+
+	for candidate in coomerfans_lookup_candidates(link).await {
+		if coomerfans_lookup_exists(candidate.url.clone()).await {
+			matches.push(candidate);
+		}
+	}
+
+	matches
+}
+
+async fn kemono_lookup_links(link: &ExternalLink) -> Vec<ExternalLink> {
+	let mut matches = Vec::new();
+
+	for candidate in kemono_lookup_candidates(link).await {
+		if kemono_lookup_exists(candidate.url.clone()).await {
+			matches.push(candidate);
+		}
+	}
+
+	matches
+}
+
 #[derive(Default, Clone, Deserialize)]
 struct CoomerListingFile {
 	#[serde(default)]
@@ -3063,6 +3270,16 @@ struct CoomerMergedPost {
 	has_video: bool,
 }
 
+#[derive(Clone, Default, Deserialize)]
+struct KemonoCreatorProfile {
+	#[serde(default)]
+	id: String,
+	#[serde(default)]
+	name: String,
+	#[serde(default)]
+	service: String,
+}
+
 async fn coomer_lookup_links_with_checker<F, Fut>(link: &ExternalLink, exists: F) -> Vec<ExternalLink>
 where
 	F: Fn(String) -> Fut + Copy,
@@ -3095,6 +3312,48 @@ async fn coomer_lookup_candidates_from_links(links: Vec<ExternalLink>) -> Vec<Ex
 			continue;
 		};
 		append_external_links(&mut candidates, vec![coomer_link]);
+	}
+
+	candidates
+}
+
+async fn coomerfans_lookup_candidates(link: &ExternalLink) -> Vec<ExternalLink> {
+	if let Some(direct_link) = direct_coomerfans_lookup_link(link).await {
+		return vec![direct_link];
+	}
+
+	coomerfans_lookup_candidates_from_links(nested_creator_links(link).await).await
+}
+
+async fn coomerfans_lookup_candidates_from_links(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
+	let mut candidates = Vec::new();
+
+	for link in links {
+		let Some(coomerfans_link) = direct_coomerfans_lookup_link(&link).await else {
+			continue;
+		};
+		append_external_links(&mut candidates, vec![coomerfans_link]);
+	}
+
+	candidates
+}
+
+async fn kemono_lookup_candidates(link: &ExternalLink) -> Vec<ExternalLink> {
+	if let Some(direct_link) = direct_kemono_lookup_link(link).await {
+		return vec![direct_link];
+	}
+
+	kemono_lookup_candidates_from_links(nested_creator_links(link).await).await
+}
+
+async fn kemono_lookup_candidates_from_links(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
+	let mut candidates = Vec::new();
+
+	for link in links {
+		let Some(kemono_link) = direct_kemono_lookup_link(&link).await else {
+			continue;
+		};
+		append_external_links(&mut candidates, vec![kemono_link]);
 	}
 
 	candidates
@@ -3214,7 +3473,32 @@ fn extract_allmylinks_creator_links(html: &str) -> Vec<ExternalLink> {
 }
 
 fn is_creator_link_host(host: &str) -> bool {
-	matches!(host, "onlyfans.com" | "www.onlyfans.com" | "fansly.com" | "www.fansly.com")
+	matches!(
+		host,
+		"onlyfans.com"
+			| "www.onlyfans.com"
+			| "fansly.com"
+			| "www.fansly.com"
+			| "patreon.com"
+			| "www.patreon.com"
+			| "fantia.jp"
+			| "www.fantia.jp"
+			| "boosty.to"
+			| "www.boosty.to"
+			| "subscribestar.com"
+			| "www.subscribestar.com"
+			| "subscribestar.adult"
+			| "www.subscribestar.adult"
+			| "gumroad.com"
+			| "www.gumroad.com"
+			| "afdian.com"
+			| "www.afdian.com"
+			| "fanbox.cc"
+			| "www.fanbox.cc"
+			| "ci-en.dlsite.com"
+	) || host.ends_with(".fanbox.cc")
+		|| host.ends_with(".gumroad.com")
+		|| host.ends_with("dlsite.com")
 }
 
 fn coomer_profile_urls_from_links(links: &[ExternalLink]) -> Vec<String> {
@@ -3222,7 +3506,10 @@ fn coomer_profile_urls_from_links(links: &[ExternalLink]) -> Vec<String> {
 	let mut urls = Vec::new();
 
 	for link in links {
-		let Some(profile_url) = canonical_coomer_profile_url(&link.url) else {
+		let Some(profile_url) = canonical_coomer_profile_url(&link.url)
+			.or_else(|| canonical_coomerfans_profile_url(&link.url))
+			.or_else(|| canonical_kemono_profile_url(&link.url))
+		else {
 			continue;
 		};
 		if seen.insert(profile_url.clone()) {
@@ -3254,6 +3541,140 @@ async fn direct_coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> 
 		icon_path: "/site_icon/coomer.st".to_string(),
 		has_coomer: false,
 	})
+}
+
+async fn direct_coomerfans_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
+	let parsed = Url::parse(&link.url).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	let (service, profile_name) = match host.as_str() {
+		"onlyfans.com" | "www.onlyfans.com" => ("onlyfans", creator_profile_name_for_search(&parsed)?),
+		"fansly.com" | "www.fansly.com" => ("fansly", creator_profile_name_for_search(&parsed)?),
+		_ => return None,
+	};
+	let profile_url = resolve_coomerfans_profile_url(service.to_string(), profile_name).await?;
+	let label = match service {
+		"onlyfans" => "CoomerFans (OnlyFans)",
+		"fansly" => "CoomerFans (Fansly)",
+		_ => return None,
+	};
+
+	Some(ExternalLink {
+		label: label.to_string(),
+		url: profile_url,
+		host: COOMERFANS_HOST.to_string(),
+		icon_path: format!("/site_icon/{COOMERFANS_HOST}"),
+		has_coomer: false,
+	})
+}
+
+fn creator_profile_name_for_search(parsed: &Url) -> Option<String> {
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+	let profile_segment = match segments.as_slice() {
+		["u" | "user" | "users" | "profile", profile, ..] => *profile,
+		[profile, ..] => *profile,
+		[] => return None,
+	};
+	let profile_name = percent_decode_str(profile_segment).decode_utf8_lossy().trim().to_string();
+	if profile_name.is_empty()
+		|| is_numeric_identifier(&profile_name)
+		|| matches!(
+			profile_name.to_ascii_lowercase().as_str(),
+			"posts" | "media" | "about" | "terms" | "privacy" | "login" | "signup"
+		) {
+		return None;
+	}
+
+	Some(profile_name)
+}
+
+async fn direct_kemono_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
+	let (service, profile_id) = kemono_profile_candidate_from_external_url(&link.url)?;
+	let profile = resolve_kemono_profile(service, profile_id).await?;
+	let service_label = kemono_service_label(&profile.service)?;
+
+	Some(ExternalLink {
+		label: format!("Kemono ({service_label})"),
+		url: format!("{KEMONO_ORIGIN}/{}/user/{}", profile.service, profile.id),
+		host: KEMONO_HOST.to_string(),
+		icon_path: format!("/site_icon/{KEMONO_HOST}"),
+		has_coomer: false,
+	})
+}
+
+fn kemono_service_label(service: &str) -> Option<&'static str> {
+	match service {
+		"afdian" => Some("Afdian"),
+		"boosty" => Some("Boosty"),
+		"dlsite" => Some("DLsite"),
+		"fanbox" => Some("Fanbox"),
+		"fantia" => Some("Fantia"),
+		"gumroad" => Some("Gumroad"),
+		"patreon" => Some("Patreon"),
+		"subscribestar" => Some("SubscribeStar"),
+		_ => None,
+	}
+}
+
+fn kemono_profile_candidate_from_external_url(raw_url: &str) -> Option<(String, String)> {
+	let parsed = Url::parse(raw_url).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+
+	let candidate = match host.as_str() {
+		"patreon.com" | "www.patreon.com" => {
+			let query_id = parsed.query_pairs().find(|(key, _)| key == "u").map(|(_, value)| value.to_string());
+			let id = query_id.or_else(|| first_profile_segment(&segments).map(ToString::to_string))?;
+			("patreon", id)
+		}
+		"fantia.jp" | "www.fantia.jp" => {
+			let fanclub_index = segments.iter().position(|segment| segment.eq_ignore_ascii_case("fanclubs"))?;
+			("fantia", (*segments.get(fanclub_index + 1)?).to_string())
+		}
+		"boosty.to" | "www.boosty.to" => ("boosty", first_profile_segment(&segments)?.to_string()),
+		"subscribestar.com" | "www.subscribestar.com" | "subscribestar.adult" | "www.subscribestar.adult" => ("subscribestar", first_profile_segment(&segments)?.to_string()),
+		"gumroad.com" | "www.gumroad.com" => ("gumroad", first_profile_segment(&segments)?.to_string()),
+		host if host.ends_with(".gumroad.com") && !matches!(host, "app.gumroad.com" | "api.gumroad.com") => ("gumroad", host.trim_end_matches(".gumroad.com").to_string()),
+		"afdian.com" | "www.afdian.com" => {
+			let id = match segments.as_slice() {
+				["a", profile, ..] => *profile,
+				[profile, ..] => *profile,
+				[] => return None,
+			};
+			("afdian", id.to_string())
+		}
+		"fanbox.cc" | "www.fanbox.cc" => {
+			let id = first_profile_segment(&segments)?.trim_start_matches('@').to_string();
+			("fanbox", id)
+		}
+		host if host.ends_with(".fanbox.cc") && !matches!(host, "www.fanbox.cc" | "api.fanbox.cc") => ("fanbox", host.trim_end_matches(".fanbox.cc").to_string()),
+		"ci-en.dlsite.com" => {
+			let creator_index = segments.iter().position(|segment| segment.eq_ignore_ascii_case("creator"))?;
+			("dlsite", (*segments.get(creator_index + 1)?).to_string())
+		}
+		host if host.ends_with("dlsite.com") => {
+			let maker_index = segments.iter().position(|segment| segment.eq_ignore_ascii_case("maker_id"))?;
+			("dlsite", (*segments.get(maker_index + 1)?).to_string())
+		}
+		_ => return None,
+	};
+
+	let profile_id = percent_decode_str(&candidate.1).decode_utf8_lossy().trim().to_string();
+	if profile_id.is_empty() {
+		return None;
+	}
+	Some((candidate.0.to_string(), profile_id))
+}
+
+fn first_profile_segment<'a>(segments: &'a [&str]) -> Option<&'a str> {
+	let first = segments.first()?.trim();
+	if first.is_empty()
+		|| matches!(
+			first.to_ascii_lowercase().as_str(),
+			"about" | "api" | "checkout" | "collections" | "explore" | "home" | "login" | "notifications" | "posts" | "privacy" | "settings" | "signup" | "terms"
+		) {
+		return None;
+	}
+	Some(first)
 }
 
 async fn coomer_profile_id(parsed: &Url, is_fansly: bool) -> Option<String> {
@@ -3296,6 +3717,62 @@ fn canonical_coomer_profile_url(url: &str) -> Option<String> {
 	Some(format!("https://coomer.st/{service}/user/{profile_id}"))
 }
 
+fn canonical_coomerfans_profile_url(url: &str) -> Option<String> {
+	let parts = coomerfans_profile_parts(url)?;
+	Some(format!("{COOMERFANS_ORIGIN}/u/{}/{}/{}", parts.service, parts.model_id, parts.profile_name))
+}
+
+struct CoomerFansProfileParts {
+	service: String,
+	model_id: String,
+	profile_name: String,
+}
+
+fn coomerfans_profile_parts(url: &str) -> Option<CoomerFansProfileParts> {
+	let parsed = Url::parse(url).or_else(|_| Url::parse(COOMERFANS_ORIGIN).and_then(|base| base.join(url))).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host != COOMERFANS_HOST && host != format!("www.{COOMERFANS_HOST}") {
+		return None;
+	}
+
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+	let ["u", service, model_id, profile_name, ..] = segments.as_slice() else {
+		return None;
+	};
+	if !matches!(*service, "onlyfans" | "fansly" | "candfans") || !is_numeric_identifier(model_id) || profile_name.trim().is_empty() {
+		return None;
+	}
+
+	Some(CoomerFansProfileParts {
+		service: (*service).to_string(),
+		model_id: (*model_id).to_string(),
+		profile_name: (*profile_name).to_string(),
+	})
+}
+
+fn canonical_kemono_profile_url(url: &str) -> Option<String> {
+	let (service, profile_id) = kemono_profile_parts(url)?;
+	Some(format!("{KEMONO_ORIGIN}/{service}/user/{profile_id}"))
+}
+
+fn kemono_profile_parts(url: &str) -> Option<(String, String)> {
+	let parsed = Url::parse(url).or_else(|_| Url::parse(KEMONO_ORIGIN).and_then(|base| base.join(url))).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host != KEMONO_HOST && host != format!("www.{KEMONO_HOST}") {
+		return None;
+	}
+
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+	let [service, "user", profile_id, ..] = segments.as_slice() else {
+		return None;
+	};
+	if kemono_service_label(service).is_none() || profile_id.trim().is_empty() {
+		return None;
+	}
+
+	Some(((*service).to_string(), (*profile_id).to_string()))
+}
+
 fn coomer_posts_api_url(url: &str) -> Option<String> {
 	let parsed = Url::parse(url).ok()?;
 	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
@@ -3309,6 +3786,11 @@ fn coomer_posts_api_url(url: &str) -> Option<String> {
 	};
 
 	Some(format!("https://coomer.st/api/v1/{service}/user/{profile_id}/posts"))
+}
+
+fn kemono_posts_api_url(url: &str) -> Option<String> {
+	let (service, profile_id) = kemono_profile_parts(url)?;
+	Some(format!("{KEMONO_API_ORIGIN}/v1/{service}/user/{profile_id}/posts"))
 }
 
 fn is_numeric_identifier(value: &str) -> bool {
@@ -3347,6 +3829,82 @@ async fn resolve_fansly_account_id(username: String) -> Option<String> {
 }
 
 #[cached(size = 2048, time = 10800)]
+async fn resolve_coomerfans_profile_url(service: String, profile_name: String) -> Option<String> {
+	let service = service.trim().to_ascii_lowercase();
+	let profile_name = profile_name.trim();
+	if !matches!(service.as_str(), "onlyfans" | "fansly") || profile_name.is_empty() {
+		return None;
+	}
+
+	let mut url = Url::parse(COOMERFANS_ORIGIN).ok()?;
+	url.query_pairs_mut().append_pair("q", profile_name);
+	let html = fetch_external_page_html(url.to_string(), 2).await.ok()?;
+	coomerfans_profile_link_from_search_html(&html, &service, profile_name)
+}
+
+fn coomerfans_profile_link_from_search_html(html: &str, service: &str, profile_name: &str) -> Option<String> {
+	let Ok(anchor_selector) = scraper::Selector::parse("a[href]") else {
+		return None;
+	};
+	let document = scraper::Html::parse_document(html);
+	let target_fingerprint = creator_identity_fingerprint(profile_name);
+	let mut service_matches = Vec::new();
+
+	for anchor in document.select(&anchor_selector) {
+		let Some(href) = anchor.value().attr("href") else {
+			continue;
+		};
+		let Some(parts) = coomerfans_profile_parts(href) else {
+			continue;
+		};
+		if parts.service != service {
+			continue;
+		}
+		let canonical = format!("{COOMERFANS_ORIGIN}/u/{}/{}/{}", parts.service, parts.model_id, parts.profile_name);
+		if !target_fingerprint.is_empty() && target_fingerprint == creator_identity_fingerprint(&parts.profile_name) {
+			return Some(canonical);
+		}
+		service_matches.push(canonical);
+	}
+
+	if service_matches.len() == 1 {
+		service_matches.pop()
+	} else {
+		None
+	}
+}
+
+#[cached(size = 4096, time = 10800)]
+async fn resolve_kemono_profile(service: String, profile_id: String) -> Option<KemonoCreatorProfile> {
+	let service = service.trim().to_ascii_lowercase();
+	let profile_id = profile_id.trim();
+	if kemono_service_label(&service).is_none() || profile_id.is_empty() {
+		return None;
+	}
+
+	let api_url = format!("{KEMONO_API_ORIGIN}/v1/{service}/user/{profile_id}/profile");
+	let request = Request::builder()
+		.method("GET")
+		.uri(&api_url)
+		.header("Accept", "text/css")
+		.header("Accept-Encoding", "identity")
+		.header("User-Agent", OAUTH_CLIENT.load_full().user_agent())
+		.body(Body::empty())
+		.ok()?;
+	let response = CLIENT.request(request).await.ok()?;
+	if !response.status().is_success() {
+		return None;
+	}
+
+	let body = read_response_bytes(response).await.ok()?;
+	let profile: KemonoCreatorProfile = serde_json::from_slice(&body).ok()?;
+	if profile.id.is_empty() || kemono_service_label(&profile.service).is_none() {
+		return None;
+	}
+	Some(profile)
+}
+
+#[cached(size = 2048, time = 10800)]
 async fn coomer_lookup_exists(url: String) -> bool {
 	let Some(api_url) = coomer_profile_api_url(&url) else {
 		return false;
@@ -3358,6 +3916,37 @@ async fn coomer_lookup_exists(url: String) -> bool {
 		.header("Accept", "text/css")
 		.header("Accept-Encoding", "identity")
 		.header("User-Agent", &user_agent)
+		.body(Body::empty())
+	{
+		Ok(request) => request,
+		Err(_) => return false,
+	};
+
+	let Ok(response) = CLIENT.request(request).await else {
+		return false;
+	};
+	response.status().is_success()
+}
+
+#[cached(size = 2048, time = 10800)]
+async fn kemono_lookup_exists(url: String) -> bool {
+	let Some((service, profile_id)) = kemono_profile_parts(&url) else {
+		return false;
+	};
+	resolve_kemono_profile(service, profile_id).await.is_some()
+}
+
+#[cached(size = 2048, time = 10800)]
+async fn coomerfans_lookup_exists(url: String) -> bool {
+	let Some(profile_url) = canonical_coomerfans_profile_url(&url) else {
+		return false;
+	};
+	let request = match Request::builder()
+		.method("GET")
+		.uri(&profile_url)
+		.header("Accept", "text/html,*/*;q=0.8")
+		.header("Accept-Encoding", "identity")
+		.header("User-Agent", OAUTH_CLIENT.load_full().user_agent())
 		.body(Body::empty())
 	{
 		Ok(request) => request,
@@ -3387,10 +3976,20 @@ fn coomer_profile_api_url(url: &str) -> Option<String> {
 
 #[cached(size = 2048, time = 86400, result = true)]
 async fn fetch_coomer_profile_recent_posts(profile_url: String) -> Result<Vec<CoomerMergedPost>, String> {
+	if canonical_coomerfans_profile_url(&profile_url).is_some() {
+		return fetch_coomerfans_profile_recent_posts(profile_url).await;
+	}
+	if canonical_kemono_profile_url(&profile_url).is_some() {
+		return fetch_kemono_profile_recent_posts(profile_url).await;
+	}
+
+	fetch_coomer_api_profile_recent_posts(profile_url).await
+}
+
+async fn fetch_coomer_api_profile_recent_posts(profile_url: String) -> Result<Vec<CoomerMergedPost>, String> {
 	let Some(api_url) = coomer_posts_api_url(&profile_url) else {
 		return Ok(Vec::new());
 	};
-
 	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
 	let request = Request::builder()
 		.method("GET")
@@ -3411,7 +4010,69 @@ async fn fetch_coomer_profile_recent_posts(profile_url: String) -> Result<Vec<Co
 	Ok(posts.into_iter().map(coomer_listing_post_to_recent_post).collect())
 }
 
+async fn fetch_kemono_profile_recent_posts(profile_url: String) -> Result<Vec<CoomerMergedPost>, String> {
+	let Some((service, profile_id)) = kemono_profile_parts(&profile_url) else {
+		return Ok(Vec::new());
+	};
+	let profile_id = resolve_kemono_profile(service.clone(), profile_id.clone())
+		.await
+		.map(|profile| profile.id)
+		.unwrap_or(profile_id);
+	let api_url = format!("{KEMONO_API_ORIGIN}/v1/{service}/user/{profile_id}/posts");
+	let user_agent = OAUTH_CLIENT.load_full().user_agent().to_string();
+	let request = Request::builder()
+		.method("GET")
+		.uri(&api_url)
+		.header("Accept", "text/css")
+		.header("Accept-Encoding", "identity")
+		.header("User-Agent", user_agent)
+		.body(Body::empty())
+		.map_err(|err| err.to_string())?;
+
+	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+	if !response.status().is_success() {
+		return Err(format!("kemono posts request failed with status {}", response.status()));
+	}
+
+	let body = read_response_bytes(response).await?;
+	let posts: Vec<CoomerListingPost> = serde_json::from_slice(&body).map_err(|err| err.to_string())?;
+	Ok(posts.into_iter().map(kemono_listing_post_to_recent_post).collect())
+}
+
+async fn fetch_coomerfans_profile_recent_posts(profile_url: String) -> Result<Vec<CoomerMergedPost>, String> {
+	let profile_url = canonical_coomerfans_profile_url(&profile_url).ok_or_else(|| "invalid CoomerFans profile URL".to_string())?;
+	let html = fetch_external_page_html(profile_url, 2).await?;
+	let mut posts = coomerfans_profile_listing_posts(&html);
+
+	let mut pending = JoinSet::new();
+	for (index, post) in posts.iter().take(COOMERFANS_VIDEO_PROBE_LIMIT).enumerate() {
+		let post_url = post.url.clone();
+		pending.spawn(async move { (index, fetch_coomerfans_post_has_video(post_url).await.unwrap_or(false)) });
+	}
+
+	while let Some(result) = pending.join_next().await {
+		let Ok((index, has_video)) = result else {
+			continue;
+		};
+		if has_video {
+			if let Some(post) = posts.get_mut(index) {
+				post.has_video = true;
+			}
+		}
+	}
+
+	Ok(posts)
+}
+
 fn coomer_listing_post_to_recent_post(post: CoomerListingPost) -> CoomerMergedPost {
+	listing_post_to_recent_post(post, "https://coomer.st")
+}
+
+fn kemono_listing_post_to_recent_post(post: CoomerListingPost) -> CoomerMergedPost {
+	listing_post_to_recent_post(post, KEMONO_ORIGIN)
+}
+
+fn listing_post_to_recent_post(post: CoomerListingPost, origin: &str) -> CoomerMergedPost {
 	let mut title = coomer_clean_text(&post.title);
 	if title.is_empty() {
 		title = coomer_clean_text(&post.substring);
@@ -3423,7 +4084,7 @@ fn coomer_listing_post_to_recent_post(post: CoomerListingPost) -> CoomerMergedPo
 	let published = coomer_date_label(&post.published);
 	let sort_key = coomer_sort_key(&post.published);
 	let has_video = coomer_listing_file_is_video(&post.file) || post.attachments.iter().any(coomer_listing_file_is_video);
-	let url = format!("https://coomer.st/{}/user/{}/post/{}", post.service, post.user, post.id);
+	let url = format!("{origin}/{}/user/{}/post/{}", post.service, post.user, post.id);
 
 	CoomerMergedPost {
 		title,
@@ -3432,6 +4093,101 @@ fn coomer_listing_post_to_recent_post(post: CoomerListingPost) -> CoomerMergedPo
 		sort_key,
 		has_video,
 	}
+}
+
+fn coomerfans_profile_listing_posts(html: &str) -> Vec<CoomerMergedPost> {
+	let Ok(post_selector) = scraper::Selector::parse(".posts-list .post") else {
+		return Vec::new();
+	};
+	let Ok(primary_link_selector) = scraper::Selector::parse("h3 a[href^='/p/'], h3 a[href^=\"/p/\"]") else {
+		return Vec::new();
+	};
+	let Ok(fallback_link_selector) = scraper::Selector::parse("a.view-post[href^='/p/'], a.view-post[href^=\"/p/\"]") else {
+		return Vec::new();
+	};
+	let Ok(date_selector) = scraper::Selector::parse(".post-date") else {
+		return Vec::new();
+	};
+
+	let document = scraper::Html::parse_document(html);
+	let mut posts = Vec::new();
+	for post in document.select(&post_selector) {
+		let link = post.select(&primary_link_selector).next().or_else(|| post.select(&fallback_link_selector).next());
+		let Some(link) = link else {
+			continue;
+		};
+		let Some(href) = link.value().attr("href") else {
+			continue;
+		};
+		let Some(url) = coomerfans_absolute_url(href) else {
+			continue;
+		};
+
+		let title_attr = link.value().attr("title").unwrap_or_default();
+		let title_text = link.text().collect::<Vec<_>>().join(" ");
+		let mut title = coomer_clean_text(if title_attr.trim().is_empty() { &title_text } else { title_attr });
+		if title.is_empty() {
+			title = "Untitled post".to_string();
+		}
+
+		let date_text = post.select(&date_selector).next().map(|date| date.text().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+		let body_text = post.text().collect::<Vec<_>>().join(" ");
+		let published = coomerfans_date_label(&date_text);
+		let sort_key = coomerfans_sort_key(&date_text);
+		let has_video = coomerfans_text_suggests_video(&title) || coomerfans_text_suggests_video(&body_text);
+
+		posts.push(CoomerMergedPost {
+			title,
+			url,
+			published,
+			sort_key,
+			has_video,
+		});
+	}
+
+	posts
+}
+
+fn coomerfans_absolute_url(path_or_url: &str) -> Option<String> {
+	Url::parse(COOMERFANS_ORIGIN).ok()?.join(path_or_url).ok().map(|url| url.to_string())
+}
+
+#[cached(size = 8192, time = 86400, result = true)]
+async fn fetch_coomerfans_post_has_video(post_url: String) -> Result<bool, String> {
+	let url = coomerfans_absolute_url(&post_url).ok_or_else(|| "invalid CoomerFans post URL".to_string())?;
+	let html = fetch_external_page_html(url, 2).await?;
+	Ok(coomerfans_post_html_has_video(&html))
+}
+
+fn coomerfans_post_html_has_video(html: &str) -> bool {
+	let lower = html.to_ascii_lowercase();
+	lower.contains("<video") || lower.contains("<source") && [".mp4", ".webm", ".mov", ".m4v"].iter().any(|ext| lower.contains(ext))
+}
+
+fn coomerfans_text_suggests_video(value: &str) -> bool {
+	let lower = value.to_ascii_lowercase();
+	[".mp4", ".webm", ".mov", ".m4v"].iter().any(|ext| lower.contains(ext))
+}
+
+fn coomerfans_date_label(published: &str) -> String {
+	let cleaned = coomerfans_clean_date_text(published);
+	cleaned.get(..10).filter(|value| value.chars().nth(4) == Some('-')).unwrap_or_default().to_string()
+}
+
+fn coomerfans_sort_key(published: &str) -> String {
+	let cleaned = coomerfans_clean_date_text(published);
+	cleaned.get(..19).unwrap_or(&cleaned).to_string()
+}
+
+fn coomerfans_clean_date_text(value: &str) -> String {
+	let decoded = decode_html(value).unwrap_or_else(|_| value.to_string());
+	decoded
+		.trim()
+		.strip_prefix("Added")
+		.unwrap_or(decoded.trim())
+		.split_whitespace()
+		.collect::<Vec<_>>()
+		.join(" ")
 }
 
 fn select_coomer_recent_posts(mut merged: Vec<CoomerMergedPost>) -> Option<CoomerRecentPostsPanel> {
@@ -4442,6 +5198,7 @@ mod tests {
 				{"props":{"pageProps":{"contentWarning":"generic","activeGates":["age"],"links":[
 					{"url":"https://onlyfans.com/example"},
 					{"url":"https://fansly.com/user/640681284019953664"},
+					{"url":"https://www.patreon.com/virgilknightley"},
 					{"url":"https://twitter.com/example"},
 					{"url":"https://onlyfans.com/example"}
 				]}}}
@@ -4450,9 +5207,10 @@ mod tests {
 
 		let links = extract_linktree_creator_links(html);
 
-		assert_eq!(links.len(), 2);
+		assert_eq!(links.len(), 3);
 		assert_eq!(links[0].host, "onlyfans.com");
 		assert_eq!(links[1].host, "fansly.com");
+		assert_eq!(links[2].host, "www.patreon.com");
 	}
 
 	#[test]
@@ -4508,6 +5266,139 @@ mod tests {
 			super::coomer_posts_api_url("https://coomer.st/fansly/user/12345"),
 			Some("https://coomer.st/api/v1/fansly/user/12345/posts".to_string())
 		);
+		assert_eq!(
+			super::canonical_coomerfans_profile_url("https://coomerfans.com/u/onlyfans/282403/notashyboifree?page=2"),
+			Some("https://coomerfans.com/u/onlyfans/282403/notashyboifree".to_string())
+		);
+		assert_eq!(
+			super::canonical_coomerfans_profile_url("https://coomerfans.com/u/onlyfans/notashyboifree/notashyboifree"),
+			None
+		);
+		assert_eq!(
+			super::canonical_kemono_profile_url("https://kemono.cr/patreon/user/63147906?foo=bar"),
+			Some("https://kemono.cr/patreon/user/63147906".to_string())
+		);
+		assert_eq!(
+			super::kemono_posts_api_url("https://kemono.cr/fanbox/user/276779"),
+			Some("https://kemono.cr/api/v1/fanbox/user/276779/posts".to_string())
+		);
+	}
+
+	#[test]
+	fn resolves_coomerfans_profile_from_model_search_html() {
+		let html = r#"
+			<div class="thumbs-list">
+				<div class="thumb">
+					<a href="/u/onlyfans/282403/notashyboifree" title="notashyboifree">
+						<p>notashyboifree</p>
+					</a>
+					<a class="th-tag">onlyfans</a>
+				</div>
+				<div class="thumb">
+					<a href="/u/fansly/349131/notashyboifree" title="notashyboifree">
+						<p>notashyboifree</p>
+					</a>
+					<a class="th-tag">fansly</a>
+				</div>
+			</div>
+		"#;
+
+		assert_eq!(
+			super::coomerfans_profile_link_from_search_html(html, "onlyfans", "notashyboifree"),
+			Some("https://coomerfans.com/u/onlyfans/282403/notashyboifree".to_string())
+		);
+	}
+
+	#[test]
+	fn parses_coomerfans_profile_posts_and_detects_video_html() {
+		let html = r#"
+			<section class="model-posts">
+				<div class="posts-list">
+					<div class="post">
+						<h3><a href="/p/413886/179815/fansly" title="Hotel_Sex.mp4"></a></h3>
+						<p>Hotel_Sex.mp4</p>
+						<span class="post-date">2024-06-13 09:17:15 &#43;0000 UTC</span>
+					</div>
+					<div class="post">
+						<h3><a href="/p/43933832/282403/onlyfans">Image post</a></h3>
+						<span class="post-date">2024-11-06 11:49:06 &#43;0000 UTC</span>
+					</div>
+				</div>
+			</section>
+		"#;
+
+		let posts = super::coomerfans_profile_listing_posts(html);
+
+		assert_eq!(posts.len(), 2);
+		assert_eq!(posts[0].url, "https://coomerfans.com/p/413886/179815/fansly");
+		assert_eq!(posts[0].published, "2024-06-13");
+		assert_eq!(posts[0].sort_key, "2024-06-13 09:17:15");
+		assert!(posts[0].has_video);
+		assert!(!posts[1].has_video);
+		assert!(super::coomerfans_post_html_has_video(
+			r#"<video class="video-js"><source src="https://img1.coomerfans.com/storage/demo.mp4?e=1&amp;hash=2"></video>"#
+		));
+		assert!(!super::coomerfans_post_html_has_video(
+			r#"<link href="https://cdn.jsdelivr.net/npm/video.js@8/dist/video-js.css">"#
+		));
+	}
+
+	#[test]
+	fn extracts_kemono_supported_profile_candidates() {
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://www.patreon.com/virgilknightley"),
+			Some(("patreon".to_string(), "virgilknightley".to_string()))
+		);
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://www.patreon.com/posts/demo?u=63147906"),
+			Some(("patreon".to_string(), "63147906".to_string()))
+		);
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://kisa.fanbox.cc/posts/123"),
+			Some(("fanbox".to_string(), "kisa".to_string()))
+		);
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://fantia.jp/fanclubs/12345"),
+			Some(("fantia".to_string(), "12345".to_string()))
+		);
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://boosty.to/example/posts/abc"),
+			Some(("boosty".to_string(), "example".to_string()))
+		);
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://example.gumroad.com/l/demo"),
+			Some(("gumroad".to_string(), "example".to_string()))
+		);
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://afdian.com/a/demo_creator"),
+			Some(("afdian".to_string(), "demo_creator".to_string()))
+		);
+		assert_eq!(
+			super::kemono_profile_candidate_from_external_url("https://ci-en.dlsite.com/creator/1234/article/1"),
+			Some(("dlsite".to_string(), "1234".to_string()))
+		);
+	}
+
+	#[test]
+	fn kemono_listing_post_normalization_uses_api_shape_and_video_detection() {
+		let normalized = super::kemono_listing_post_to_recent_post(CoomerListingPost {
+			id: "153516192".to_string(),
+			user: "63147906".to_string(),
+			service: "patreon".to_string(),
+			title: String::new(),
+			substring: "<p>Preview <em>text</em></p>".to_string(),
+			published: "2026-03-20T14:51:16".to_string(),
+			file: CoomerListingFile {
+				name: "trailer.webm".to_string(),
+				path: "/aa/bb/trailer.webm".to_string(),
+			},
+			attachments: Vec::new(),
+		});
+
+		assert_eq!(normalized.title, "Preview text");
+		assert_eq!(normalized.published, "2026-03-20");
+		assert!(normalized.has_video);
+		assert_eq!(normalized.url, "https://kemono.cr/patreon/user/63147906/post/153516192");
 	}
 
 	#[test]
@@ -4921,6 +5812,62 @@ fn test_url_path_basename() {
 	assert_eq!(url_path_basename("https://doma.in/first/last"), "last");
 	// empty path
 	assert_eq!(url_path_basename("/"), "");
+}
+
+#[test]
+fn test_matches_deleted_reddit_placeholder_image_body() {
+	let body = base64::engine::general_purpose::STANDARD
+		.decode(concat!(
+			"iVBORw0KGgoAAAANSUhEUgAAAIIAAAA8CAAAAACPqD0kAAAD30lEQVRYw+1YW0hUQRieU+vmqmtltl6im0QRZVAvvfRQgVSWQkGUkBiGLwVlYT4I3TSWrYeg",
+			"C4ZtlrppgUEXM4IkokiIoDSLKCrMoL2dLa3o8jTNOfPPzNk46TnLgTU4/8v+M/P9//n2MDP/d36EbLPNNttsG/eGEWoIJRCkN4F1oAaSkzA52yIKPh2ogeRY",
+			"n3xCFAxB9SDXcR/59e9FqHlfVlvwU2sWDaTBpX3DwRoyKA/ldkbet+VBEAAF3vNsu/p3tvbHqlFmc+h1hRpPknNMeWj0t7D2AZok57edd7n8F7UU+msmLv1N",
+			"BmcWdW1xTTl0C4IAyPF5z8torlpp9Q/U1JyW2oTjoUqK0Sk45ZySu0j2IJQT1lKYsLyyVcFMR98xsQgEAZDjn0an01xu5SesTON4qJJijL3QWtVegWQC88jq",
+			"lJtOX+0oyaeYjwUIpc9ieSmQ41ecaue56Go2jof+e1dwCiX3I5kocC7V5W9D6NcqqZZOjyySKrFDwZz0p3l6zkIQABkeI/fQOkGhxe9KbcTxUAMUUr9dQWha",
+			"IBRUtk7N5wG6ndCu6Iv9d1rV13IhHD2fDkEAZHiyvP6Dm1OYGpBfbhuOhxo5G483WHbflc5GaMEbs1Epyz45LaNwvMsz47rXbNSm8Ebrbv2MwHCwKcOufrZZ",
+			"ISAsxSVgPuO4nv/nhY11kYEeUOs8u7G9wYOH34zUsVUo/xrBoBEavcXoWFiSwoUsVWVQ3m2KAtMDap1nFMoKcbWz6CdbhfKvEQya4lJ3Aj0ZXFw4KLFUXwrn",
+			"3zVFgekBt0aDYqdEiqOE2SqUf41g0FBYMjD5lW9P9Wme6kbXZocpCkIPaCjwMV2F8q8RDBoK0oeqpqKbXUU8lbTmsrm3IPSAHgW6CuWfCYaVHJeiOI1DZWmR",
+			"j06eanD+ws+mKAg9oEeBrkL5Z4KB47qHFKcY56F7nSLVzlh4h+WH76/y/zUJ5/+v8t+ZBAp2+bdtnNQ/rF8U8ZjlEieDQk/yKeAEKeDayMM56sc/7wMcifbO",
+			"E0KCjjA0IEhEVnvs7W6hHrhH5AN4gDBMod7hvaZ+/PM+QIPDe1sICTrC0IAgEYH2zPQWoR50PEAYplCAsmPqxz/vA5CZESEk6AhDA4JYLBehXKEedDxAmKCQ",
+			"NUy7XqwPQGZkISToCEMDglg0VxUwTD3oeIAwTKHB0XBTfQTvA9Q7jnYKIUFHGBoQSi/kkjv9glAPGi8FPECAsBibgk9+NFd9BO8DHIjenymEBB1haEAo27Ej",
+			"9o6IWaEemNc9BB4gjB4KE8fXwgZEYhQsbUDE2dakNCBss2082R8Yuqirf+6nOAAAAABJRU5ErkJggg=="
+		))
+		.expect("fixture should decode");
+	let mut modified = body.clone();
+	let last_byte = modified.len() - 1;
+	modified[last_byte] ^= 0x01;
+
+	assert!(image_body_matches_deleted_reddit_placeholder(&body));
+	assert!(!image_body_matches_deleted_reddit_placeholder(&modified));
+}
+
+#[test]
+fn test_deleted_reddit_placeholder_probe_candidates() {
+	assert_eq!(
+		reddit_image_url_to_upstream("/img/1jgvmac4sg4h1.jpg"),
+		Some("https://i.redd.it/1jgvmac4sg4h1.jpg".to_string())
+	);
+	assert_eq!(
+		reddit_image_url_to_upstream("https://redlib.example/preview/pre/1jgvmac4sg4h1.jpg?width=640"),
+		Some("https://preview.redd.it/1jgvmac4sg4h1.jpg?width=640".to_string())
+	);
+	assert!(media_may_be_deleted_placeholder(&Media {
+		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
+		preview_url: String::new(),
+		preview_srcset: String::new(),
+		hls_url: String::new(),
+		dash_url: String::new(),
+		width: 130,
+		height: 60,
+		poster: String::new(),
+		duration_seconds: 0,
+		duration: String::new(),
+		download_name: String::new(),
+		embed_code: String::new(),
+		video_preview_enabled: false,
+		video_preview_job_hint: String::new(),
+		video_preview_fallback_url: String::new(),
+		redgifs_username: String::new(),
+	}));
 }
 
 #[test]

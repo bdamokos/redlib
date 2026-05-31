@@ -2298,7 +2298,7 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(html.contains("Recent Coomer videos"));
+		assert!(html.contains("Recent archive videos"));
 		assert!(html.contains("A much longer Coomer title"));
 		assert!(html.contains("2025-09-10"));
 		assert!(html.contains("user_coomer_post_badge"));
@@ -2352,7 +2352,7 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("All posts are hidden because they are NSFW"));
-		assert!(html.contains("Recent Coomer videos"));
+		assert!(html.contains("Recent archive videos"));
 		assert!(html.contains("Visible from coomer"));
 	}
 
@@ -2771,13 +2771,8 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	}
 
 	let user_visit_signal_page = param(&format!("?{query}"), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
-	if (video_listing || (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty()))
-		&& user_visit_signal_page == 0
-	{
-		crate::post_cache::record_remembered_feed_visit_signal(&crate::post_cache::FeedSource::subreddit(
-			format!("u_{username}"),
-			crate::post_cache::FeedSort::New,
-		));
+	if (video_listing || (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty())) && user_visit_signal_page == 0 {
+		crate::post_cache::record_remembered_feed_visit_signal(&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New));
 	}
 
 	let filters = get_filters(&req);

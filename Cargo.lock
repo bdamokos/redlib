@@ -1998,6 +1998,7 @@ dependencies = [
  "serde_json_path",
  "serde_urlencoded",
  "serde_yaml",
+ "sha2",
  "tegen",
  "time",
  "tokio",

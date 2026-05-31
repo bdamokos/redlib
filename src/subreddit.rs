@@ -2094,11 +2094,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		crate::post_cache::remember_subreddit_request(&sub_name);
 		if request_after.is_empty() && request_before.is_empty() && cache_page == 0 {
 			if !active_flair_filter.is_empty() {
-				crate::post_cache::record_remembered_feed_visit_signal(&FeedSource::flair(
-					sub_name.clone(),
-					active_flair_filter.clone(),
-					FeedSort::New,
-				));
+				crate::post_cache::record_remembered_feed_visit_signal(&FeedSource::flair(sub_name.clone(), active_flair_filter.clone(), FeedSort::New));
 			} else {
 				crate::post_cache::record_remembered_feed_visit_signal(&FeedSource::subreddit(sub_name.clone(), FeedSort::New));
 			}

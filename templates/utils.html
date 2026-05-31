@@ -648,7 +648,12 @@
 	{% if post.post_type == "video" || post.post_type == "gif" %}
 	{% if !post.media.embed_code.is_empty() %}
 	<div class="post_media_content">
-		<div class="post_media_embed" {% if post.media.width > 0 && post.media.height > 0 -%}style="width: {{ post.media.width }}px; height: {{ post.media.height }}px;"{% endif -%}>
+		<div
+			class="post_media_embed{% if post.media.width > 0 && post.media.height > 0 %} post_media_embed_sized{% endif %}"
+			{% if post.media.width > 0 && post.media.height > 0 -%}
+			style="--post-media-width: {{ post.media.width }}; --post-media-height: {{ post.media.height }};"
+			{% endif -%}
+		>
 			{{ post.media.embed_code|safe }}
 		</div>
 	</div>

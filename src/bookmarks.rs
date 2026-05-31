@@ -281,11 +281,7 @@ pub async fn add(req: Request<Body>) -> Result<Response<Body>, String> {
 	let mut entries = read_bookmarks(&req);
 	add_entry(&mut entries, new_entry);
 
-	let mut response = if is_ajax {
-		ajax_bookmark_ok_response()
-	} else {
-		redirect(&redirect_to)
-	};
+	let mut response = if is_ajax { ajax_bookmark_ok_response() } else { redirect(&redirect_to) };
 	write_bookmarks(&mut response, &req, &entries)?;
 	Ok(response)
 }
@@ -302,11 +298,7 @@ pub async fn remove(req: Request<Body>) -> Result<Response<Body>, String> {
 	let mut entries = read_bookmarks(&req);
 	entries.retain(|entry| entry.id != id);
 
-	let mut response = if is_ajax {
-		ajax_bookmark_ok_response()
-	} else {
-		redirect(&redirect_to)
-	};
+	let mut response = if is_ajax { ajax_bookmark_ok_response() } else { redirect(&redirect_to) };
 	write_bookmarks(&mut response, &req, &entries)?;
 	Ok(response)
 }

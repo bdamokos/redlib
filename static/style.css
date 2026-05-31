@@ -1479,6 +1479,7 @@ a.search_subreddit_link:hover {
 }
 
 .post {
+    --post-media-max-height: 85vh;
     border-radius: 5px;
     background: var(--post);
     box-shadow: var(--shadow);
@@ -1495,6 +1496,12 @@ a.search_subreddit_link:hover {
         "post_score post_following_comments post_thumbnail" auto
         "post_score post_duplicates post_thumbnail" auto
         / minmax(40px, auto) minmax(0, 1fr) fit-content(min(20%, 152px));
+}
+
+@supports (height: 100dvh) {
+    .post {
+        --post-media-max-height: 85dvh;
+    }
 }
 
 .post:not(:last-child) {
@@ -1827,9 +1834,10 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     height: auto;
     background-color: #000;
     max-width: 100%;
-    max-height: 512px;
+    max-height: var(--post-media-max-height);
     display: block;
     margin: auto;
+    object-fit: contain;
 }
 
 .post_media_meta {
@@ -1886,6 +1894,7 @@ a.redgifs_uploader_mismatch {
 .video_preview_stage {
     background-color: #000;
     margin: 0 auto;
+    max-height: var(--post-media-max-height);
     max-width: 100%;
     overflow: hidden;
     position: relative;
@@ -1895,6 +1904,7 @@ a.redgifs_uploader_mismatch {
 .video_preview_stage_sized {
     aspect-ratio: var(--video-preview-width) / var(--video-preview-height);
     width: min(100%, calc(var(--video-preview-width) * 1px));
+    width: min(100%, calc(var(--video-preview-width) * 1px), calc(var(--post-media-max-height) * var(--video-preview-width) / var(--video-preview-height)));
 }
 
 .video_preview_stage_sized > .post_media_video {
@@ -2004,7 +2014,7 @@ a.redgifs_uploader_mismatch {
     width: auto;
     height: auto;
     max-width: 100%;
-    max-height: 512px;
+    max-height: var(--post-media-max-height);
     display: block;
     margin: auto;
 }
@@ -2031,6 +2041,7 @@ a.redgifs_uploader_mismatch {
 
 .post_media_image svg {
     max-width: 100%;
+    max-height: var(--post-media-max-height);
     height: auto;
     align-self: center;
     background-color: var(--highlighted);
@@ -2042,6 +2053,8 @@ a.redgifs_uploader_mismatch {
 
 .post_media_image img {
     max-width: 100%;
+    max-height: var(--post-media-max-height);
+    object-fit: contain;
     vertical-align: bottom;
 }
 
@@ -2058,7 +2071,9 @@ a.redgifs_uploader_mismatch {
 }
 
 .gallery a {
-    display: block;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     overflow: hidden;
     border-radius: 12px;
     background: var(--highlighted);
@@ -2068,7 +2083,9 @@ a.redgifs_uploader_mismatch {
     display: block;
     width: 100%;
     max-width: 100%;
+    max-height: var(--post-media-max-height);
     height: auto;
+    object-fit: contain;
     vertical-align: bottom;
     background: var(--highlighted);
 }
@@ -2118,7 +2135,7 @@ a.redgifs_uploader_mismatch {
 }
 
 .post_page .post.highlighted .gallery img {
-    max-height: min(75vh, 900px);
+    max-height: var(--post-media-max-height);
     object-fit: contain;
 }
 
@@ -2147,6 +2164,8 @@ a.redgifs_uploader_mismatch {
 
 .post_body img {
     max-width: 100%;
+    max-height: var(--post-media-max-height);
+    object-fit: contain;
     display: block;
     margin-left: auto;
     margin-right: auto;
@@ -3244,10 +3263,19 @@ th {
 }
 
 .post_media_embed {
+    aspect-ratio: 16 / 9;
+    max-height: var(--post-media-max-height);
+    overflow: hidden;
     position: relative;
     width: 100%;
     max-width: 100%;
     margin: 0 auto;
+}
+
+.post_media_embed_sized {
+    aspect-ratio: var(--post-media-width) / var(--post-media-height);
+    width: min(100%, calc(var(--post-media-width) * 1px));
+    width: min(100%, calc(var(--post-media-width) * 1px), calc(var(--post-media-max-height) * var(--post-media-width) / var(--post-media-height)));
 }
 
 .post_media_embed iframe {

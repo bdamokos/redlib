@@ -25,6 +25,7 @@ clap = { version = "4.5.23", default-features = false, features = [
 ] }
 regex = "1.10.2"
 serde = { version = "1.0.193", features = ["derive"] }
+sha2 = "0.10.9"
 cookie = "0.18.0"
 futures-lite = "2.2.0"
 hyper = { version = "0.14.31", features = ["full"] }
