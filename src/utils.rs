@@ -17,7 +17,7 @@ use brotli::Decompressor as BrotliDecompressor;
 use cached::proc_macro::cached;
 use cookie::Cookie;
 use htmlescape::decode_html;
-use hyper::body::to_bytes;
+use hyper::body::{to_bytes, HttpBody as _};
 use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use hyper::{Body, Request, Response, Uri};
 use libflate::deflate::{Decoder, Encoder};
@@ -49,6 +49,15 @@ const COOMERFANS_VIDEO_PROBE_LIMIT: usize = 12;
 const KEMONO_HOST: &str = "kemono.cr";
 const KEMONO_ORIGIN: &str = "https://kemono.cr";
 const KEMONO_API_ORIGIN: &str = "https://kemono.cr/api";
+const OPTIONAL_EXTERNAL_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+fn optional_external_request_timeout() -> StdDuration {
+	StdDuration::from_secs(4)
+}
+
+fn optional_external_enrichment_timeout() -> StdDuration {
+	StdDuration::from_secs(5)
+}
 
 /// Write a message to stderr on debug mode. This function is a no-op on
 /// release code.
@@ -1025,7 +1034,7 @@ impl Post {
 				bookmark_new_comments: None,
 			};
 
-			if is_deleted_reddit_placeholder_post(&parsed_post) || is_deleted_reddit_placeholder_post_by_content(&parsed_post).await {
+			if is_deleted_reddit_placeholder_post(&parsed_post) {
 				continue;
 			}
 
@@ -2270,6 +2279,40 @@ async fn read_response_text(response: Response<Body>) -> Result<String, String> 
 	String::from_utf8(body).map_err(|error| error.to_string())
 }
 
+async fn read_response_bytes_limited(response: Response<Body>, max_bytes: usize) -> Result<Vec<u8>, String> {
+	let encoding = response_content_encoding(&response);
+	let mut body = response.into_body();
+	let mut bytes = Vec::new();
+
+	while let Some(chunk) = body.data().await {
+		let chunk = chunk.map_err(|error| error.to_string())?;
+		if bytes.len().saturating_add(chunk.len()) > max_bytes {
+			return Err("response body exceeded size limit".to_string());
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+
+	decode_response_body_bytes(bytes, encoding.as_deref())
+}
+
+async fn request_optional_external(request: Request<Body>) -> Result<Response<Body>, String> {
+	tokio::time::timeout(optional_external_request_timeout(), CLIENT.request(request))
+		.await
+		.map_err(|_| "external request timed out".to_string())?
+		.map_err(|error| error.to_string())
+}
+
+async fn read_optional_external_bytes(response: Response<Body>) -> Result<Vec<u8>, String> {
+	tokio::time::timeout(optional_external_request_timeout(), read_response_bytes_limited(response, OPTIONAL_EXTERNAL_MAX_BODY_BYTES))
+		.await
+		.map_err(|_| "external response body timed out".to_string())?
+}
+
+async fn read_optional_external_text(response: Response<Body>) -> Result<String, String> {
+	let body = read_optional_external_bytes(response).await?;
+	String::from_utf8(body).map_err(|error| error.to_string())
+}
+
 /// Gets a `HashSet` of filters from the cookie in the given `Request`.
 pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
 	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
@@ -2355,7 +2398,7 @@ pub async fn parse_post(post: &Value) -> Post {
 	};
 
 	// Build a post using data parsed from Reddit post API
-	Post {
+	let mut parsed_post = Post {
 		id: val(post, "id"),
 		kind: post["kind"].as_str().unwrap_or("t3").to_string(),
 		title: val(post, "title"),
@@ -2454,7 +2497,9 @@ pub async fn parse_post(post: &Value) -> Post {
 		following_comments: Vec::new(),
 		bookmarked: false,
 		bookmark_new_comments: None,
-	}
+	};
+	remove_deleted_reddit_placeholder_media(&mut parsed_post).await;
+	parsed_post
 }
 
 fn parent_kind(parent_id: &str) -> String {
@@ -2680,7 +2725,16 @@ fn gallery_media_may_be_deleted_placeholder(media: &GalleryMedia) -> bool {
 		&& !media_deleted_placeholder_probe_urls(&media.url, &media.preview_url).is_empty()
 }
 
-async fn reddit_image_url_matches_deleted_placeholder_content(url: &str) -> bool {
+fn media_has_deleted_placeholder_shape(media: &Media) -> bool {
+	deleted_placeholder_dimensions(media.width, media.height) && media_may_be_deleted_placeholder(media)
+}
+
+fn gallery_media_has_deleted_placeholder_shape(media: &GalleryMedia) -> bool {
+	deleted_placeholder_dimensions(media.width, media.height) && gallery_media_may_be_deleted_placeholder(media)
+}
+
+#[cached(size = 4096, time = 10800)]
+async fn reddit_image_url_matches_deleted_placeholder_content(url: String) -> bool {
 	let Ok(parsed_uri) = url.parse::<Uri>() else {
 		return false;
 	};
@@ -2718,7 +2772,12 @@ async fn reddit_image_url_matches_deleted_placeholder_content(url: &str) -> bool
 		return false;
 	}
 
-	let body = match tokio::time::timeout(deleted_placeholder_probe_timeout(), read_response_bytes(response)).await {
+	let body = match tokio::time::timeout(
+		deleted_placeholder_probe_timeout(),
+		read_response_bytes_limited(response, REDDIT_DELETED_IMAGE_PLACEHOLDER_MAX_PROBE_BYTES),
+	)
+	.await
+	{
 		Ok(Ok(body)) => body,
 		_ => return false,
 	};
@@ -2728,7 +2787,7 @@ async fn reddit_image_url_matches_deleted_placeholder_content(url: &str) -> bool
 
 async fn media_matches_deleted_placeholder_content(url: &str, preview_url: &str) -> bool {
 	for url in media_deleted_placeholder_probe_urls(url, preview_url) {
-		if reddit_image_url_matches_deleted_placeholder_content(&url).await {
+		if reddit_image_url_matches_deleted_placeholder_content(url).await {
 			return true;
 		}
 	}
@@ -2736,24 +2795,58 @@ async fn media_matches_deleted_placeholder_content(url: &str, preview_url: &str)
 	false
 }
 
-async fn is_deleted_reddit_placeholder_post_by_content(post: &Post) -> bool {
+async fn gallery_media_matches_deleted_placeholder(image: &GalleryMedia) -> bool {
+	is_deleted_reddit_placeholder_url(&image.url)
+		|| is_deleted_reddit_placeholder_url(&image.preview_url)
+		|| (gallery_media_may_be_deleted_placeholder(image) && media_matches_deleted_placeholder_content(&image.url, &image.preview_url).await)
+}
+
+pub async fn post_has_deleted_reddit_placeholder_media(post: &Post) -> bool {
 	match post.post_type.as_str() {
-		"image" => media_may_be_deleted_placeholder(&post.media) && media_matches_deleted_placeholder_content(&post.media.url, &post.media.preview_url).await,
+		"image" => {
+			is_deleted_reddit_placeholder_url(&post.media.url)
+				|| is_deleted_reddit_placeholder_url(&post.media.preview_url)
+				|| (media_may_be_deleted_placeholder(&post.media) && media_matches_deleted_placeholder_content(&post.media.url, &post.media.preview_url).await)
+		}
 		"gallery" => {
-			if post.gallery.is_empty() {
-				return false;
-			}
-
 			for image in &post.gallery {
-				if is_deleted_reddit_placeholder_url(&image.url) || is_deleted_reddit_placeholder_url(&image.preview_url) {
-					continue;
+				if gallery_media_matches_deleted_placeholder(image).await {
+					return true;
 				}
-				if !gallery_media_may_be_deleted_placeholder(image) || !media_matches_deleted_placeholder_content(&image.url, &image.preview_url).await {
-					return false;
+			}
+			false
+		}
+		_ => false,
+	}
+}
+
+async fn remove_deleted_reddit_placeholder_media(post: &mut Post) -> bool {
+	match post.post_type.as_str() {
+		"image" => {
+			if post_has_deleted_reddit_placeholder_media(post).await {
+				post.post_type = "self".to_string();
+				post.media = Media::empty();
+				true
+			} else {
+				false
+			}
+		}
+		"gallery" => {
+			let mut retained = Vec::with_capacity(post.gallery.len());
+			let mut removed = false;
+			for image in std::mem::take(&mut post.gallery) {
+				if gallery_media_matches_deleted_placeholder(&image).await {
+					removed = true;
+				} else {
+					retained.push(image);
 				}
 			}
 
-			true
+			post.gallery = retained;
+			if removed && post.gallery.is_empty() {
+				post.post_type = "self".to_string();
+			}
+			removed
 		}
 		_ => false,
 	}
@@ -2761,14 +2854,12 @@ async fn is_deleted_reddit_placeholder_post_by_content(post: &Post) -> bool {
 
 pub fn is_deleted_reddit_placeholder_post(post: &Post) -> bool {
 	match post.post_type.as_str() {
-		"image" => is_deleted_reddit_placeholder_url(&post.media.url) || is_deleted_reddit_placeholder_url(&post.media.preview_url),
-		"gallery" => {
-			!post.gallery.is_empty()
-				&& post
-					.gallery
-					.iter()
-					.all(|image| is_deleted_reddit_placeholder_url(&image.url) || is_deleted_reddit_placeholder_url(&image.preview_url))
+		"image" => {
+			is_deleted_reddit_placeholder_url(&post.media.url) || is_deleted_reddit_placeholder_url(&post.media.preview_url) || media_has_deleted_placeholder_shape(&post.media)
 		}
+		"gallery" => post.gallery.iter().any(|image| {
+			is_deleted_reddit_placeholder_url(&image.url) || is_deleted_reddit_placeholder_url(&image.preview_url) || gallery_media_has_deleted_placeholder_shape(image)
+		}),
 		_ => false,
 	}
 }
@@ -3129,15 +3220,33 @@ fn append_external_links(target: &mut Vec<ExternalLink>, links: Vec<ExternalLink
 }
 
 pub async fn external_links_with_coomer_lookups(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
-	let mut expanded_links = links.clone();
-	let mut coomer_links = Vec::new();
+	let base_links = links.clone();
+	let enrichment = async move {
+		let mut pending = JoinSet::new();
+		for link in links {
+			pending.spawn(async move {
+				let mut links = Vec::new();
+				append_external_links(&mut links, coomer_lookup_links(&link).await);
+				append_external_links(&mut links, coomerfans_lookup_links(&link).await);
+				append_external_links(&mut links, kemono_lookup_links(&link).await);
+				links
+			});
+		}
 
-	for link in links {
-		append_external_links(&mut coomer_links, coomer_lookup_links(&link).await);
-		append_external_links(&mut coomer_links, coomerfans_lookup_links(&link).await);
-		append_external_links(&mut coomer_links, kemono_lookup_links(&link).await);
-	}
+		let mut coomer_links = Vec::new();
+		while let Some(result) = pending.join_next().await {
+			let Ok(links) = result else {
+				continue;
+			};
+			append_external_links(&mut coomer_links, links);
+		}
+		coomer_links
+	};
 
+	let Ok(coomer_links) = tokio::time::timeout(optional_external_enrichment_timeout(), enrichment).await else {
+		return base_links;
+	};
+	let mut expanded_links = base_links;
 	append_external_links(&mut expanded_links, coomer_links);
 	expanded_links
 }
@@ -3172,19 +3281,25 @@ pub async fn coomer_recent_posts_panel(links: &[ExternalLink]) -> Option<CoomerR
 		return None;
 	}
 
-	let mut pending = JoinSet::new();
-	for profile_url in profile_urls {
-		pending.spawn(async move { fetch_coomer_profile_recent_posts(profile_url).await.unwrap_or_default() });
-	}
+	let fetch_posts = async move {
+		let mut pending = JoinSet::new();
+		for profile_url in profile_urls {
+			pending.spawn(async move { fetch_coomer_profile_recent_posts(profile_url).await.unwrap_or_default() });
+		}
 
-	let mut merged = Vec::new();
-	while let Some(result) = pending.join_next().await {
-		let Ok(posts) = result else {
-			continue;
-		};
-		merged.extend(posts);
-	}
+		let mut merged = Vec::new();
+		while let Some(result) = pending.join_next().await {
+			let Ok(posts) = result else {
+				continue;
+			};
+			merged.extend(posts);
+		}
+		merged
+	};
 
+	let Ok(merged) = tokio::time::timeout(optional_external_enrichment_timeout(), fetch_posts).await else {
+		return None;
+	};
 	select_coomer_recent_posts(merged)
 }
 
@@ -3401,7 +3516,7 @@ async fn fetch_external_page_html(url: String, redirects_left: usize) -> Result<
 			.header("User-Agent", OAUTH_CLIENT.load_full().user_agent())
 			.body(Body::empty())
 			.map_err(|err| err.to_string())?;
-		let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+		let response = request_optional_external(request).await?;
 
 		if response.status().is_redirection() && redirects_remaining > 0 {
 			let Some(location) = response.headers().get(LOCATION).and_then(|value| value.to_str().ok()) else {
@@ -3421,7 +3536,7 @@ async fn fetch_external_page_html(url: String, redirects_left: usize) -> Result<
 			return Err(format!("external page request failed with status {}", response.status()));
 		}
 
-		return read_response_text(response).await;
+		return read_optional_external_text(response).await;
 	}
 }
 
@@ -3814,12 +3929,12 @@ async fn resolve_fansly_account_id(username: String) -> Option<String> {
 		.header("User-Agent", user_agent)
 		.body(Body::empty())
 		.ok()?;
-	let response = CLIENT.request(request).await.ok()?;
+	let response = request_optional_external(request).await.ok()?;
 	if !response.status().is_success() {
 		return None;
 	}
 
-	let body = read_response_bytes(response).await.ok()?;
+	let body = read_optional_external_bytes(response).await.ok()?;
 	let parsed: Value = serde_json::from_slice(&body).ok()?;
 	parsed["response"]
 		.as_array()
@@ -3891,12 +4006,12 @@ async fn resolve_kemono_profile(service: String, profile_id: String) -> Option<K
 		.header("User-Agent", OAUTH_CLIENT.load_full().user_agent())
 		.body(Body::empty())
 		.ok()?;
-	let response = CLIENT.request(request).await.ok()?;
+	let response = request_optional_external(request).await.ok()?;
 	if !response.status().is_success() {
 		return None;
 	}
 
-	let body = read_response_bytes(response).await.ok()?;
+	let body = read_optional_external_bytes(response).await.ok()?;
 	let profile: KemonoCreatorProfile = serde_json::from_slice(&body).ok()?;
 	if profile.id.is_empty() || kemono_service_label(&profile.service).is_none() {
 		return None;
@@ -3922,7 +4037,7 @@ async fn coomer_lookup_exists(url: String) -> bool {
 		Err(_) => return false,
 	};
 
-	let Ok(response) = CLIENT.request(request).await else {
+	let Ok(response) = request_optional_external(request).await else {
 		return false;
 	};
 	response.status().is_success()
@@ -3953,7 +4068,7 @@ async fn coomerfans_lookup_exists(url: String) -> bool {
 		Err(_) => return false,
 	};
 
-	let Ok(response) = CLIENT.request(request).await else {
+	let Ok(response) = request_optional_external(request).await else {
 		return false;
 	};
 	response.status().is_success()
@@ -4000,12 +4115,12 @@ async fn fetch_coomer_api_profile_recent_posts(profile_url: String) -> Result<Ve
 		.body(Body::empty())
 		.map_err(|err| err.to_string())?;
 
-	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+	let response = request_optional_external(request).await?;
 	if !response.status().is_success() {
 		return Err(format!("coomer posts request failed with status {}", response.status()));
 	}
 
-	let body = read_response_bytes(response).await?;
+	let body = read_optional_external_bytes(response).await?;
 	let posts: Vec<CoomerListingPost> = serde_json::from_slice(&body).map_err(|err| err.to_string())?;
 	Ok(posts.into_iter().map(coomer_listing_post_to_recent_post).collect())
 }
@@ -4029,12 +4144,12 @@ async fn fetch_kemono_profile_recent_posts(profile_url: String) -> Result<Vec<Co
 		.body(Body::empty())
 		.map_err(|err| err.to_string())?;
 
-	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+	let response = request_optional_external(request).await?;
 	if !response.status().is_success() {
 		return Err(format!("kemono posts request failed with status {}", response.status()));
 	}
 
-	let body = read_response_bytes(response).await?;
+	let body = read_optional_external_bytes(response).await?;
 	let posts: Vec<CoomerListingPost> = serde_json::from_slice(&body).map_err(|err| err.to_string())?;
 	Ok(posts.into_iter().map(kemono_listing_post_to_recent_post).collect())
 }
@@ -4325,13 +4440,13 @@ async fn fetch_user_profile_page_html(name: &str) -> Result<String, String> {
 		.header("User-Agent", user_agent)
 		.body(Body::empty())
 		.map_err(|err| err.to_string())?;
-	let response = CLIENT.request(request).await.map_err(|err| err.to_string())?;
+	let response = request_optional_external(request).await?;
 
 	if !response.status().is_success() {
 		return Err(format!("profile html request failed with status {}", response.status()));
 	}
 
-	read_response_text(response).await
+	read_optional_external_text(response).await
 }
 
 fn extract_profile_social_links(source: &str) -> Vec<ExternalLink> {
@@ -4631,6 +4746,11 @@ pub async fn nsfw_landing(req: Request<Body>, req_url: String) -> Result<Respons
 	.unwrap_or_default();
 
 	Ok(Response::builder().status(403).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+}
+
+/// Converts a user feed fragment URL into the matching sidebar fragment URL.
+pub fn user_sidebar_fragment_href(fragment_url: &str) -> String {
+	fragment_url.strip_prefix("/user-fragment/").map(|rest| format!("/user-sidebar/{rest}")).unwrap_or_default()
 }
 
 /// Returns the last (non-empty) segment of a path string
@@ -5868,6 +5988,42 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		video_preview_fallback_url: String::new(),
 		redgifs_username: String::new(),
 	}));
+	assert!(media_may_be_deleted_placeholder(&Media {
+		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
+		preview_url: String::new(),
+		preview_srcset: String::new(),
+		hls_url: String::new(),
+		dash_url: String::new(),
+		width: 0,
+		height: 0,
+		poster: String::new(),
+		duration_seconds: 0,
+		duration: String::new(),
+		download_name: String::new(),
+		embed_code: String::new(),
+		video_preview_enabled: false,
+		video_preview_job_hint: String::new(),
+		video_preview_fallback_url: String::new(),
+		redgifs_username: String::new(),
+	}));
+	assert!(!media_may_be_deleted_placeholder(&Media {
+		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
+		preview_url: String::new(),
+		preview_srcset: String::new(),
+		hls_url: String::new(),
+		dash_url: String::new(),
+		width: 1080,
+		height: 1920,
+		poster: String::new(),
+		duration_seconds: 0,
+		duration: String::new(),
+		download_name: String::new(),
+		embed_code: String::new(),
+		video_preview_enabled: false,
+		video_preview_job_hint: String::new(),
+		video_preview_fallback_url: String::new(),
+		redgifs_username: String::new(),
+	}));
 }
 
 #[test]
@@ -5934,7 +6090,43 @@ fn test_detects_deleted_reddit_placeholder_galleries() {
 	];
 
 	assert!(is_deleted_reddit_placeholder_post(&deleted_gallery));
-	assert!(!is_deleted_reddit_placeholder_post(&mixed_gallery));
+	assert!(is_deleted_reddit_placeholder_post(&mixed_gallery));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_removes_deleted_reddit_placeholder_gallery_media() {
+	let mut post = Post::default();
+	post.post_type = "gallery".to_string();
+	post.gallery = vec![
+		GalleryMedia {
+			url: "/preview/pre/p1povyvu85vg1.jpg?width=640&format=pjpg&auto=webp&s=deadbeef".to_string(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
+			width: 130,
+			height: 60,
+			caption: String::new(),
+			outbound_url: String::new(),
+		},
+		GalleryMedia {
+			url: "https://example.com/real-image.jpg".to_string(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
+			width: 1080,
+			height: 1920,
+			caption: "kept".to_string(),
+			outbound_url: String::new(),
+		},
+	];
+
+	assert!(remove_deleted_reddit_placeholder_media(&mut post).await);
+	assert_eq!(post.post_type, "gallery");
+	assert_eq!(post.gallery.len(), 1);
+	assert_eq!(post.gallery[0].caption, "kept");
+
+	post.gallery[0].url = "/preview/pre/p1povyvu85vg1.jpg?width=640&format=pjpg&auto=webp&s=deadbeef".to_string();
+	assert!(remove_deleted_reddit_placeholder_media(&mut post).await);
+	assert_eq!(post.post_type, "self");
+	assert!(post.gallery.is_empty());
 }
 
 #[test]

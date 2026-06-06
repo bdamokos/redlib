@@ -19,6 +19,7 @@
     <div
         id="page_fragment"
         data-fragment-url="{{ fragment_url }}"
+        data-sidebar-fragment-url="{{ crate::utils::user_sidebar_fragment_href(fragment_url.as_str()) }}"
         data-replace-selector="{{ replace_selector }}"
         data-loading-message="{{ loading_message }}"
         data-error-message="Loading the user page is taking longer than expected."

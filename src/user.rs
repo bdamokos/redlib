@@ -118,6 +118,20 @@ struct UserFragmentTemplate {
 	video_mode_sidebar: video_mode::VideoModeSidebarData,
 }
 
+#[derive(Template)]
+#[template(path = "user_sidebar_fragment.html")]
+struct UserSidebarTemplate {
+	user: User,
+	user_subreddits: Vec<UserSubredditEntry>,
+	coomer_recent_posts: Option<utils::CoomerRecentPostsPanel>,
+	prefs: Preferences,
+	redirect_url: String,
+	is_filtered: bool,
+	avg_video_length: Option<(String, String)>,
+	video_mode_enabled: bool,
+	video_mode_sidebar: video_mode::VideoModeSidebarData,
+}
+
 impl UserFragmentTemplate {
 	pub fn str_eq(&self, x: &str, y: &str) -> bool {
 		x == y
@@ -1053,6 +1067,35 @@ fn user_fragment_path(username: &str, listing: &str, query: &str) -> String {
 	} else {
 		format!("{base}?{query}")
 	}
+}
+
+fn placeholder_user(username: &str) -> User {
+	User {
+		name: username.to_string(),
+		..Default::default()
+	}
+}
+
+fn cached_or_placeholder_user(username: &str) -> User {
+	cached_user_metadata(username).unwrap_or_else(|| placeholder_user(username))
+}
+
+fn cached_video_mode_sidebar(req: &Request<Body>, username: &str, url: &str, query: &str, filters: &HashSet<String>) -> video_mode::VideoModeSidebarData {
+	let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
+	let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
+	let cookie_value = crate::utils::read_sharded_cookie(req, video_mode::VIDEO_MODE_QUERY_COOKIE);
+	let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
+	let listing_data = video_mode::build_listing(&cached_posts, filters, &parsed_query, now_unix());
+	let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
+	let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+	let start = cache_page.saturating_mul(crate::post_cache::POSTS_PER_PAGE);
+	let end = (start + crate::post_cache::POSTS_PER_PAGE).min(listing_data.posts.len());
+	let preview_posts = if start < listing_data.posts.len() {
+		listing_data.posts[start..end].to_vec()
+	} else {
+		Vec::new()
+	};
+	build_video_mode_sidebar(url, &listing_data, &preview_posts, &normalized_query)
 }
 
 async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
@@ -2486,193 +2529,9 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let is_filtered = filters.contains(&user_filter);
 	let user_subreddits = user_sidebar_subreddits(&username);
 	let avg_video_length = cached_avg_video_length(&username);
-	let (resolved_user, status_notice) = match user(&username).await {
-		Ok(user) => (user, String::new()),
-		Err(msg) => {
-			let notice = match msg.as_str() {
-				"banned" => format!("u/{username} has been banned from Reddit"),
-				"suspended" => format!("u/{username} has been suspended on Reddit"),
-				_ => String::new(),
-			};
-			let user = cached_user_metadata(&username).unwrap_or_else(|| User {
-				name: username.clone(),
-				..Default::default()
-			});
-			(user, notice)
-		}
-	};
-
-	if !is_filtered {
-		if video_listing {
-			let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
-			if let Some(cached_posts) = crate::post_cache::servable_cached_source_posts(&source) {
-				let mut shell_user = resolved_user.clone();
-				let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
-				let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
-				let listing_data = video_mode::build_listing(&cached_posts, &filters, &parsed_query, now_unix());
-				let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
-				let request_has_video_params = video_mode::query_has_video_params(query);
-				let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
-				let start = cache_page.saturating_mul(crate::post_cache::POSTS_PER_PAGE);
-				let end = (start + crate::post_cache::POSTS_PER_PAGE).min(listing_data.posts.len());
-				let mut posts = if start < listing_data.posts.len() {
-					listing_data.posts[start..end].to_vec()
-				} else {
-					Vec::new()
-				};
-				utils::hydrate_post_author_links_from_cache(&mut posts);
-				utils::hydrate_user_external_links_from_author_cache(&mut shell_user).await;
-				let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
-				let no_posts = listing_data.posts.is_empty();
-				let all_posts_hidden_nsfw = !posts.is_empty() && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-				let eligible_video_posts = cached_posts
-					.iter()
-					.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
-					.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
-					.filter(|post| video_mode::is_video_post(post))
-					.count();
-				let video_mode_sidebar = build_video_mode_sidebar(&url, &listing_data, &posts, &normalized_query);
-
-				return Ok(template(&UserTemplate {
-					user: shell_user,
-					username: username.clone(),
-					posts,
-					user_subreddits,
-					coomer_recent_posts,
-					fallback_notice: status_notice.clone(),
-					sort: (String::new(), String::new()),
-					ends: (String::new(), String::new()),
-					listing: listing.clone(),
-					prefs,
-					url: url.clone(),
-					redirect_url,
-					is_filtered: false,
-					all_posts_filtered: eligible_video_posts > 0 && listing_data.posts.is_empty(),
-					all_posts_hidden_nsfw,
-					avg_video_length,
-					no_posts,
-					shell_mode: false,
-					fragment_url: String::new(),
-					replace_selector: "main".to_string(),
-					prev_page_url: if cache_page > 0 {
-						video_mode_page_url(&url, cache_page.saturating_sub(1), &normalized_query, request_has_video_params)
-					} else {
-						String::new()
-					},
-					next_page_url: if end < listing_data.posts.len() {
-						video_mode_page_url(&url, cache_page + 1, &normalized_query, request_has_video_params)
-					} else {
-						String::new()
-					},
-					loading_message: String::new(),
-					video_mode_enabled: true,
-					video_mode_sidebar,
-				}));
-			}
-		} else if let Some((mut posts, after, has_prev, has_next)) = cached_user_listing_posts(&username, &listing, &sort, query) {
-			let mut shell_user = resolved_user.clone();
-			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
-			utils::hydrate_post_author_links_from_cache(&mut posts);
-			utils::hydrate_user_external_links_from_author_cache(&mut shell_user).await;
-			let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
-			let no_posts = posts.is_empty();
-			let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-			let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
-			let prev_page_url = if has_prev {
-				let prev_url = format!("/user/{username}/submitted");
-				let prev_query = form_urlencoded::Serializer::new(String::new())
-					.extend_pairs(
-						form_urlencoded::parse(query.as_bytes())
-							.into_owned()
-							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
-					)
-					.append_pair("cache_page", &cache_page.saturating_sub(1).to_string())
-					.finish();
-				if prev_query.is_empty() {
-					prev_url
-				} else {
-					format!("{prev_url}?{prev_query}")
-				}
-			} else {
-				String::new()
-			};
-			let next_page_url = if has_next && !after.is_empty() {
-				let next_url = format!("/user/{username}/submitted");
-				let next_query = form_urlencoded::Serializer::new(String::new())
-					.extend_pairs(
-						form_urlencoded::parse(query.as_bytes())
-							.into_owned()
-							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
-					)
-					.append_pair("after", &after)
-					.finish();
-				if next_query.is_empty() {
-					next_url
-				} else {
-					format!("{next_url}?{next_query}")
-				}
-			} else if has_next {
-				let next_url = format!("/user/{username}/submitted");
-				let next_query = form_urlencoded::Serializer::new(String::new())
-					.extend_pairs(
-						form_urlencoded::parse(query.as_bytes())
-							.into_owned()
-							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
-					)
-					.append_pair("cache_page", &(cache_page + 1).to_string())
-					.finish();
-				if next_query.is_empty() {
-					next_url
-				} else {
-					format!("{next_url}?{next_query}")
-				}
-			} else {
-				String::new()
-			};
-
-			return Ok(template(&UserTemplate {
-				user: shell_user,
-				username: username.clone(),
-				posts,
-				user_subreddits,
-				coomer_recent_posts,
-				fallback_notice: status_notice.clone(),
-				sort: (sort, param(&path, "t").unwrap_or_default()),
-				ends: (String::new(), String::new()),
-				listing: listing.clone(),
-				prefs,
-				url: url.clone(),
-				redirect_url,
-				is_filtered: false,
-				all_posts_filtered,
-				all_posts_hidden_nsfw,
-				avg_video_length,
-				no_posts,
-				shell_mode: false,
-				fragment_url: String::new(),
-				replace_selector: "#column_one".to_string(),
-				prev_page_url,
-				next_page_url,
-				loading_message: String::new(),
-				video_mode_enabled: false,
-				video_mode_sidebar: empty_video_mode_sidebar(),
-			}));
-		}
-	}
-
-	// Shell sidebar is not replaced when the listing fragment loads (only `#column_one`), so load
-	// full profile metadata here—including Coomer link expansion and recent-post panel data.
-	let shell_user = resolved_user;
-	let coomer_recent_posts = utils::coomer_recent_posts_panel(&shell_user.external_links).await;
+	let shell_user = cached_or_placeholder_user(&username);
 	let video_mode_sidebar = if video_listing {
-		let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
-		let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
-		let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
-		let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
-		let listing_data = video_mode::build_listing(&cached_posts, &filters, &parsed_query, now_unix());
-		let normalized_query = normalized_video_mode_query(&parsed_query, &listing_data);
-		let preview_posts = listing_data.posts.iter().take(crate::post_cache::POSTS_PER_PAGE).cloned().collect::<Vec<_>>();
-		build_video_mode_sidebar(&url, &listing_data, &preview_posts, &normalized_query)
+		cached_video_mode_sidebar(&req, &username, &url, query, &filters)
 	} else {
 		empty_video_mode_sidebar()
 	};
@@ -2682,22 +2541,22 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		username: username.clone(),
 		posts: Vec::new(),
 		user_subreddits,
-		coomer_recent_posts,
-		fallback_notice: status_notice,
+		coomer_recent_posts: None,
+		fallback_notice: String::new(),
 		sort: (sort, param(&path, "t").unwrap_or_default()),
 		ends: (param(&path, "after").unwrap_or_default(), String::new()),
 		listing: listing.clone(),
 		prefs,
 		url: url.clone(),
 		redirect_url,
-		is_filtered: false,
+		is_filtered,
 		all_posts_filtered: false,
 		all_posts_hidden_nsfw: false,
 		avg_video_length,
 		no_posts: false,
 		shell_mode: true,
 		fragment_url: user_fragment_path(&username, &listing, query),
-		replace_selector: if video_listing { "main".to_string() } else { "#column_one".to_string() },
+		replace_selector: "#column_one".to_string(),
 		prev_page_url: String::new(),
 		next_page_url: String::new(),
 		loading_message: if video_listing {
@@ -2746,25 +2605,12 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	} else {
 		None
 	};
-	let user_result = if let Some(scraped) = &pre_scraped {
-		Ok(scraped.user.clone())
-	} else {
-		user(&username).await
-	};
-	let status_notice = user_result
+	let user = pre_scraped
 		.as_ref()
-		.err()
-		.and_then(|msg| match msg.as_str() {
-			"banned" => Some(format!("u/{username} has been banned from Reddit")),
-			"suspended" => Some(format!("u/{username} has been suspended on Reddit")),
-			_ => None,
-		})
-		.unwrap_or_default();
-	let metadata_error = user_result.as_ref().err().cloned();
-	let metadata_rate_limited = metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback);
-	let user = user_result.unwrap_or_default();
-
-	let coomer_recent_posts = utils::coomer_recent_posts_panel(&user.external_links).await;
+		.map(|scraped| scraped.user.clone())
+		.unwrap_or_else(|| cached_or_placeholder_user(&username));
+	let status_notice = String::new();
+	let coomer_recent_posts: Option<utils::CoomerRecentPostsPanel> = None;
 
 	if video_listing || (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty()) {
 		crate::post_cache::remember_subreddit_request(&format!("u_{username}"));
@@ -2863,24 +2709,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			&& param(&format!("?{query}"), "after").unwrap_or_default().is_empty()
 			&& param(&format!("?{query}"), "before").unwrap_or_default().is_empty();
 		let mut fallback_notice = String::new();
-		let maybe_scraped = if let Some(scraped) = pre_scraped {
-			Some(scraped)
-		} else if instance_scrape::instance_scrape_enabled() && metadata_rate_limited {
-			info!(
-				"user: retrying {} via scrape fallback after metadata error: {}",
-				current_url,
-				metadata_error.as_deref().unwrap_or_default()
-			);
-			match instance_scrape::scrape_user_page(&current_url).await {
-				Ok(scraped) => Some(scraped),
-				Err(scrape_error) => {
-					warn!("user: metadata scrape fallback failed for {}: {}", current_url, scrape_error);
-					None
-				}
-			}
-		} else {
-			None
-		};
+		let maybe_scraped = pre_scraped;
 		let (fragment_user, posts, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some(scraped) = maybe_scraped {
 			store_user_metadata(&username, &scraped.user);
 			utils::store_post_flairs(&scraped.posts);
@@ -3016,10 +2845,62 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 
 	let mut fragment = fragment;
 	utils::hydrate_post_author_links_from_cache(&mut fragment.posts);
-	utils::hydrate_user_external_links_from_author_cache(&mut fragment.user).await;
-	fragment.coomer_recent_posts = utils::coomer_recent_posts_panel(&fragment.user.external_links).await;
 	utils::refresh_post_times(&mut fragment.posts);
 	let body = fragment.render().map_err(|error| error.to_string())?;
+	Response::builder()
+		.status(200)
+		.header("content-type", "text/html; charset=utf-8")
+		.header("cache-control", "no-store")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())
+}
+
+pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
+	let listing = req.param("listing").unwrap_or_else(|| "overview".to_string());
+	let username = req.param("name").unwrap_or_else(|| "reddit".to_string());
+	let query = req.uri().query().unwrap_or_default();
+	let url = user_reddit_path(&username, &listing, query);
+	let redirect_url = url.trim_start_matches('/').replace('?', "%3F").replace('&', "%26");
+	let prefs = Preferences::new(&req);
+	let filters = get_filters(&req);
+	let is_filtered = filters.contains(&["u_", &username].concat());
+	let video_listing = is_video_listing(&listing);
+
+	let mut sidebar_user = match tokio::time::timeout(StdDuration::from_secs(12), user(&username)).await {
+		Ok(Ok(user)) => user,
+		Ok(Err(msg)) => {
+			info!("user sidebar: profile metadata unavailable for u/{username}: {msg}");
+			cached_or_placeholder_user(&username)
+		}
+		Err(_) => {
+			warn!("user sidebar: profile metadata timed out for u/{username}");
+			cached_or_placeholder_user(&username)
+		}
+	};
+	let _ = tokio::time::timeout(StdDuration::from_secs(3), utils::hydrate_user_external_links_from_author_cache(&mut sidebar_user)).await;
+	let coomer_recent_posts = tokio::time::timeout(StdDuration::from_secs(6), utils::coomer_recent_posts_panel(&sidebar_user.external_links))
+		.await
+		.unwrap_or(None);
+	let video_mode_sidebar = if video_listing {
+		cached_video_mode_sidebar(&req, &username, &url, query, &filters)
+	} else {
+		empty_video_mode_sidebar()
+	};
+
+	let body = UserSidebarTemplate {
+		user: sidebar_user,
+		user_subreddits: user_sidebar_subreddits(&username),
+		coomer_recent_posts,
+		prefs,
+		redirect_url,
+		is_filtered,
+		avg_video_length: cached_avg_video_length(&username),
+		video_mode_enabled: video_listing,
+		video_mode_sidebar,
+	}
+	.render()
+	.map_err(|error| error.to_string())?;
+
 	Response::builder()
 		.status(200)
 		.header("content-type", "text/html; charset=utf-8")
@@ -3044,6 +2925,9 @@ async fn user(name: &str) -> Result<User, String> {
 	let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
 	let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
 	let profile = utils::user_profile_details_with_social_links(name, &res["data"]["subreddit"]).await;
+	let external_links = tokio::time::timeout(StdDuration::from_secs(6), utils::external_links_with_coomer_lookups(profile.external_links.clone()))
+		.await
+		.unwrap_or_else(|_| profile.external_links.clone());
 
 	// Closure used to parse JSON from Reddit APIs
 	let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
@@ -3059,7 +2943,7 @@ async fn user(name: &str) -> Result<User, String> {
 		banner: about("banner_img"),
 		description: profile.blurb,
 		bio_html: profile.bio_html,
-		external_links: utils::external_links_with_coomer_lookups(profile.external_links).await,
+		external_links,
 		nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
 	};
 	store_user_metadata(name, &user);

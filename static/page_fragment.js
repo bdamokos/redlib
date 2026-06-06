@@ -9,6 +9,7 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
     }
 
+    const sidebarFragmentUrl = container.dataset.sidebarFragmentUrl || "";
     const loadingMessage = container.dataset.loadingMessage || "Loading the page...";
     const errorMessage = container.dataset.errorMessage || "Loading the page is taking longer than expected.";
     const timeoutMs = Number.parseInt(container.dataset.timeoutMs || "15000", 10);
@@ -118,6 +119,44 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const shouldRetryResponse = (status) => status >= 500;
 
+    const loadSidebarFragment = async () => {
+        if (!sidebarFragmentUrl) {
+            return;
+        }
+
+        try {
+            const response = await fetch(sidebarFragmentUrl, {
+                credentials: "same-origin",
+                headers: {
+                    "Cache-Control": "no-store",
+                },
+            });
+            if (!response.ok) {
+                window.console?.warn?.("page_fragment: sidebar non-OK response", {
+                    sidebarFragmentUrl,
+                    status: response.status,
+                });
+                return;
+            }
+
+            const html = await response.text();
+            const template = document.createElement("template");
+            template.innerHTML = html.trim();
+            const nextSidebar = template.content.querySelector("aside");
+            const currentSidebar = document.querySelector("aside");
+            if (!nextSidebar || !currentSidebar) {
+                return;
+            }
+            currentSidebar.replaceWith(nextSidebar);
+            refreshDynamicContent(document);
+        } catch (error) {
+            window.console?.warn?.("page_fragment: sidebar fetch failed", {
+                sidebarFragmentUrl,
+                error: String(error),
+            });
+        }
+    };
+
     const loadFragment = async (attempt = 1) => {
         if (banner) {
             setBannerVisible(true);
@@ -151,6 +190,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const html = await response.text();
             replaceFragment(html);
+            void loadSidebarFragment();
         } catch (error) {
             window.console?.warn?.("page_fragment: fetch attempt failed", {
                 fragmentUrl,
