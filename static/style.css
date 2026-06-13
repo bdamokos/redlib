@@ -1481,6 +1481,7 @@ a.search_subreddit_link:hover {
 .post {
     --post-media-default-max-height: 85vh;
     --post-media-max-height: var(--post-media-fit-height, var(--post-media-default-max-height));
+    --post-title-row-height: 1fr;
     border-radius: 5px;
     background: var(--post);
     box-shadow: var(--shadow);
@@ -1488,7 +1489,7 @@ a.search_subreddit_link:hover {
     transition: 0.2s background;
     grid-template:
         "post_score post_header post_thumbnail" auto
-        "post_score post_title  post_thumbnail" 1fr
+        "post_score post_title  post_thumbnail" var(--post-title-row-height)
         "post_score post_media  post_thumbnail" auto
         "post_score post_body   post_thumbnail" auto
         "post_score post_poll   post_thumbnail" auto
@@ -1497,6 +1498,13 @@ a.search_subreddit_link:hover {
         "post_score post_following_comments post_thumbnail" auto
         "post_score post_duplicates post_thumbnail" auto
         / minmax(40px, auto) minmax(0, 1fr) fit-content(min(20%, 152px));
+}
+
+.post[data-post-type="image"],
+.post[data-post-type="video"],
+.post[data-post-type="gif"],
+.post[data-post-type="gallery"] {
+    --post-title-row-height: auto;
 }
 
 @supports (height: 100dvh) {

@@ -5,16 +5,23 @@ function getScrollPaddingTop() {
     return Number.isNaN(parsedValue) ? 0 : parsedValue;
 }
 
-// Single media posts should fit after the visible title, body, footer, and media metadata.
-const SINGLE_POST_MEDIA_SELECTOR = [
+// Media should fit after the visible title and source metadata while leaving a hint for overflow below.
+const POST_MEDIA_SELECTOR = [
     ".post_media_column .video_preview_stage",
     ".post_media_content > .post_media_embed",
     ".post_media_content > .post_media_image > img",
     ".post_media_content > .post_media_image > svg",
+    ".gallery figure img",
+    ".gallery figure svg",
 ].join(", ");
 
 const POST_MEDIA_FIT_BOTTOM_GAP = 8;
+const POST_MEDIA_CONTINUATION_PEEK_LINES = 1.5;
+const POST_MEDIA_CONTINUATION_PEEK_MIN_HEIGHT = 32;
 const POST_MEDIA_FIT_MIN_HEIGHT = 96;
+const POST_MEDIA_STRETCHED_HEADER_TOLERANCE = 160;
+const POST_CONTINUATION_SELECTOR = ".post_body, .post_poll, .post_following_comments, .post_duplicates";
+const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notification";
 let postMediaFitFrame = null;
 
 function parsePostMediaLength(value, fallback) {
@@ -62,42 +69,149 @@ function hasKnownMediaSize(element) {
     return width > 0 && height > 0;
 }
 
-function isSingleMediaPost(post) {
+function isMediaPost(post) {
     if (!(post instanceof Element) || !post.classList.contains("post")) {
-        return false;
-    }
-
-    if (post.querySelector(".gallery")) {
         return false;
     }
 
     const postType = post.dataset.postType;
     if (!postType) {
-        return true;
+        return post.querySelector(POST_MEDIA_SELECTOR) !== null;
     }
 
-    return postType === "image" || postType === "video" || postType === "gif";
+    return postType === "image" || postType === "video" || postType === "gif" || postType === "gallery";
 }
 
-function getSinglePostMediaElement(post) {
-    if (!isSingleMediaPost(post)) {
+function getPostMediaElements(post) {
+    if (!isMediaPost(post)) {
+        return [];
+    }
+
+    return Array.from(post.querySelectorAll(POST_MEDIA_SELECTOR))
+        .filter((element) => isMeasurableElement(element) || hasKnownMediaSize(element));
+}
+
+function getMediaFitGroup(mediaElement) {
+    return mediaElement.closest(".post_media_column, .post_media_content > .post_media_embed, .post_media_content, .gallery figure") || mediaElement;
+}
+
+function hasContinuationContent(element) {
+    return element.textContent.trim() !== "" || element.querySelector("img, video, iframe, svg, li, .poll_option") !== null;
+}
+
+function getContinuationElements(post) {
+    return Array.from(post.querySelectorAll(POST_CONTINUATION_SELECTOR))
+        .filter(hasContinuationContent);
+}
+
+function getContinuationPeekHeight(post, continuationElements) {
+    const sampleElement = continuationElements[0] || post;
+    const styles = window.getComputedStyle(sampleElement);
+    const fontSize = Number.parseFloat(styles.fontSize) || 15;
+    let lineHeight = Number.parseFloat(styles.lineHeight);
+
+    if (Number.isNaN(lineHeight)) {
+        lineHeight = fontSize * 1.45;
+    }
+
+    return Math.max(
+        POST_MEDIA_CONTINUATION_PEEK_MIN_HEIGHT,
+        Math.ceil(lineHeight * POST_MEDIA_CONTINUATION_PEEK_LINES),
+    );
+}
+
+function getContentBottom(element) {
+    const children = Array.from(element.children)
+        .map((child) => child.getBoundingClientRect())
+        .filter((rect) => rect.width > 0 && rect.height > 0);
+
+    if (children.length === 0) {
+        return element.getBoundingClientRect().bottom;
+    }
+
+    return Math.max(...children.map((rect) => rect.bottom));
+}
+
+function getStableTopOverheadHeight(post, mediaGroupElement, actualTopOverheadHeight) {
+    const postRect = post.getBoundingClientRect();
+    const mediaGroupRect = mediaGroupElement.getBoundingClientRect();
+    const mediaTop = mediaGroupRect.top;
+    const contentBottom = Array.from(post.querySelectorAll(POST_MEDIA_HEADER_SELECTOR))
+        .reduce((bottom, element) => {
+            const rect = element.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0 || rect.top >= mediaTop) {
+                return bottom;
+            }
+
+            return Math.max(bottom, getContentBottom(element) - postRect.top);
+        }, 0);
+
+    if (contentBottom <= 0) {
+        return actualTopOverheadHeight;
+    }
+
+    const topGap = Math.max(
+        0,
+        Number.parseFloat(window.getComputedStyle(mediaGroupElement).marginTop) || 0,
+    );
+
+    const stableTopOverheadHeight = contentBottom + topGap;
+    if (actualTopOverheadHeight <= stableTopOverheadHeight + POST_MEDIA_STRETCHED_HEADER_TOLERANCE) {
+        return actualTopOverheadHeight;
+    }
+
+    return stableTopOverheadHeight;
+}
+
+function getContinuationFitHeight(post, mediaElement, mediaElements, availablePostHeight, baseMaxHeight) {
+    const postRect = post.getBoundingClientRect();
+    const mediaRect = mediaElement.getBoundingClientRect();
+    const mediaHeight = Math.max(0, mediaRect.height);
+    const mediaGroupElement = getMediaFitGroup(mediaElement);
+    const mediaGroupRect = mediaGroupElement.getBoundingClientRect();
+    const continuationElements = getContinuationElements(post);
+    const hasContinuation = mediaElements.length > 1 || continuationElements.length > 0;
+
+    if (!hasContinuation) {
         return null;
     }
 
-    const mediaElements = Array.from(post.querySelectorAll(SINGLE_POST_MEDIA_SELECTOR))
-        .filter((element) => isMeasurableElement(element) || hasKnownMediaSize(element));
+    const actualTopOverheadHeight = Math.max(0, mediaGroupRect.top - postRect.top);
+    const topOverheadHeight = getStableTopOverheadHeight(post, mediaGroupElement, actualTopOverheadHeight);
+    const mediaChromeHeight = Math.max(0, mediaGroupRect.height - mediaHeight);
+    const continuationPeekHeight = getContinuationPeekHeight(post, continuationElements);
 
-    return mediaElements.length === 1 ? mediaElements[0] : null;
+    return Math.min(
+        baseMaxHeight,
+        Math.max(
+            POST_MEDIA_FIT_MIN_HEIGHT,
+            availablePostHeight - topOverheadHeight - mediaChromeHeight - continuationPeekHeight,
+        ),
+    );
 }
 
-function fitSinglePostMediaToViewport(post) {
+function getContinuationOverflow(post, mediaElement, availablePostHeight) {
+    const mediaGroupElement = getMediaFitGroup(mediaElement);
+    const postRect = post.getBoundingClientRect();
+    const mediaGroupRect = mediaGroupElement.getBoundingClientRect();
+    const actualTopOverheadHeight = Math.max(0, mediaGroupRect.top - postRect.top);
+    const topOverheadHeight = getStableTopOverheadHeight(post, mediaGroupElement, actualTopOverheadHeight);
+
+    return topOverheadHeight
+        + mediaGroupRect.height
+        + getContinuationPeekHeight(post, getContinuationElements(post))
+        - availablePostHeight;
+}
+
+function fitPostMediaToViewport(post) {
     if (!(post instanceof HTMLElement)) {
         return;
     }
 
     post.style.removeProperty("--post-media-fit-height");
 
-    const mediaElement = getSinglePostMediaElement(post);
+    const mediaElements = getPostMediaElements(post);
+    const mediaElement = mediaElements[0] || null;
     if (mediaElement === null) {
         return;
     }
@@ -115,20 +229,23 @@ function fitSinglePostMediaToViewport(post) {
     }
 
     const postRect = post.getBoundingClientRect();
-    if (mediaHeight > 0 && postRect.height <= availablePostHeight + 1) {
-        return;
-    }
-
+    const continuationFitHeight = getContinuationFitHeight(post, mediaElement, mediaElements, availablePostHeight, baseMaxHeight);
     const nonMediaHeight = Math.max(0, postRect.height - mediaHeight);
-    let fitHeight = Math.min(
+    let fitHeight = continuationFitHeight ?? Math.min(
         baseMaxHeight,
         Math.max(POST_MEDIA_FIT_MIN_HEIGHT, availablePostHeight - nonMediaHeight),
     );
 
+    if (continuationFitHeight === null && mediaHeight > 0 && postRect.height <= availablePostHeight + 1) {
+        return;
+    }
+
     post.style.setProperty("--post-media-fit-height", `${Math.floor(fitHeight)}px`);
 
     for (let pass = 0; pass < 2; pass += 1) {
-        const overflow = post.getBoundingClientRect().height - availablePostHeight;
+        const overflow = continuationFitHeight === null
+            ? post.getBoundingClientRect().height - availablePostHeight
+            : getContinuationOverflow(post, mediaElement, availablePostHeight);
         if (overflow <= 1) {
             break;
         }
@@ -157,7 +274,7 @@ function getPostsFromRoot(root) {
 }
 
 function resizeSinglePostMediaToViewport(root = document) {
-    getPostsFromRoot(root).forEach(fitSinglePostMediaToViewport);
+    getPostsFromRoot(root).forEach(fitPostMediaToViewport);
 }
 
 function scheduleSinglePostMediaResize(root = document) {
