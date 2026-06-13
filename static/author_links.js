@@ -1,25 +1,86 @@
 (() => {
-    const renderAverageVideoLength = (container, avgVideoLength, avgVideoLengthTitle) => {
+    const RG_PROFILE_CLASSES = ["post_rg_profiles_2", "post_rg_profiles_3plus"];
+    const AVG_RETRY_DELAYS_MS = [2000, 6000, 15000, 30000];
+    let avgRetryTimer = null;
+
+    const rgProfileCountFromTitle = (title) => {
+        const match = String(title || "").match(/(?:^|\s)(\d+)\s+rg profiles(?:\s|$)/);
+        return match ? Number.parseInt(match[1], 10) || 0 : 0;
+    };
+
+    const updatePostRgProfileClass = (container, rgProfileCount) => {
+        const post = container.closest(".post");
+        if (!post) {
+            return;
+        }
+
+        post.classList.remove(...RG_PROFILE_CLASSES);
+        delete post.dataset.rgProfileCount;
+
+        if (rgProfileCount === 2) {
+            post.classList.add("post_rg_profiles_2");
+            post.dataset.rgProfileCount = "2";
+        } else if (rgProfileCount >= 3) {
+            post.classList.add("post_rg_profiles_3plus");
+            post.dataset.rgProfileCount = String(rgProfileCount);
+        }
+    };
+
+    const renderAverageVideoLength = (container, avgVideoLength, avgVideoLengthTitle, avgVideoLengthLabel, avgVideoLengthRgProfiles) => {
         const existing = container.querySelector(".author_avg_video_length");
+        const rgProfileCount = Number.parseInt(avgVideoLengthRgProfiles, 10) || rgProfileCountFromTitle(avgVideoLengthTitle);
         if (!avgVideoLength) {
             if (existing) {
                 existing.remove();
             }
+            updatePostRgProfileClass(container, 0);
             return;
         }
 
         const label = existing || document.createElement("span");
         label.className = "author_avg_video_length";
-        label.textContent = `avg ${avgVideoLength}`;
+        label.textContent = avgVideoLengthLabel || `avg ${avgVideoLength}`;
         label.title = avgVideoLengthTitle || "";
+        label.dataset.rgProfileCount = rgProfileCount > 1 ? String(rgProfileCount) : "";
+        updatePostRgProfileClass(container, rgProfileCount);
         if (!existing) {
             container.appendChild(label);
         }
     };
 
+    const scheduleAverageRetry = (delayMs) => {
+        if (avgRetryTimer) {
+            return;
+        }
+
+        avgRetryTimer = window.setTimeout(() => {
+            avgRetryTimer = null;
+            loadAuthorLinks(document);
+        }, delayMs);
+    };
+
+    const updateAverageRetryState = (container, hasAverageVideoLength) => {
+        if (hasAverageVideoLength) {
+            delete container.dataset.avgRefresh;
+            delete container.dataset.avgRetryCount;
+            return;
+        }
+
+        const retryCount = Number.parseInt(container.dataset.avgRetryCount, 10) || 0;
+        if (retryCount >= AVG_RETRY_DELAYS_MS.length) {
+            delete container.dataset.avgRefresh;
+            delete container.dataset.avgRetryCount;
+            return;
+        }
+
+        container.dataset.avgRefresh = "pending";
+        container.dataset.avgRetryCount = String(retryCount + 1);
+        scheduleAverageRetry(AVG_RETRY_DELAYS_MS[retryCount]);
+    };
+
     const loadAuthorLinks = (root = document) => {
         const containers = Array.from(root.querySelectorAll?.(".external_site_icons[data-author-name]") || []).filter(
-            (container) => container.dataset.state !== "loaded" && container.dataset.state !== "loading"
+            (container) => container.dataset.state !== "loading" && (container.dataset.state !== "loaded" || container.dataset.avgRefresh === "pending")
         );
         if (containers.length === 0) {
             return;
@@ -77,7 +138,14 @@
                         container.appendChild(anchor);
                     }
 
-                    renderAverageVideoLength(container, authorData.avg_video_length, authorData.avg_video_length_title);
+                    renderAverageVideoLength(
+                        container,
+                        authorData.avg_video_length,
+                        authorData.avg_video_length_title,
+                        authorData.avg_video_length_label,
+                        authorData.avg_video_length_rg_profiles
+                    );
+                    updateAverageRetryState(container, Boolean(authorData.avg_video_length));
                     container.dataset.state = "loaded";
                 }
             })

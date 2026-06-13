@@ -33,7 +33,7 @@
 	<div id="posts">
 	{% for post in duplicates -%}
 		{% if !(post.flags.nsfw) || str_eq(prefs.show_nsfw, "on") %}
-		<div class="post {% if post.flags.stickied %}stickied{% endif %}" id="{{ post.id }}">
+		<div class="post{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}" id="{{ post.id }}">
 				<p class="post_header">
 					{% let community -%}
 					{% if post.community.starts_with("u_") -%}

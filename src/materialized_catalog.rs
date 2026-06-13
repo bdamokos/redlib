@@ -312,7 +312,7 @@ pub(crate) fn catalog_user_sidebar_stats(username: &str) -> Option<CatalogUserSi
 	(!subreddit_counts.is_empty()).then_some(CatalogUserSidebarStats { subreddit_counts })
 }
 
-pub(crate) fn catalog_avg_video_length(username: &str) -> Option<(String, String)> {
+pub(crate) fn catalog_video_stats(username: &str) -> Option<crate::user::UserVideoStatsAccumulator> {
 	let username = username.trim().to_lowercase();
 	if username.is_empty() {
 		return None;
@@ -321,46 +321,20 @@ pub(crate) fn catalog_avg_video_length(username: &str) -> Option<(String, String
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	let post_ids = catalog.author_to_post_ids.get(&username)?;
 
-	let mut seen_keys: HashSet<String> = HashSet::new();
-	let mut seen_redgifs_users: HashSet<String> = HashSet::new();
-	let mut total_duration_seconds: i64 = 0;
-	let mut video_count: usize = 0;
+	let mut stats = crate::user::UserVideoStatsAccumulator::default();
 
 	for post_id in post_ids {
 		let Some(record) = catalog.posts_by_id.get(post_id) else {
 			continue;
 		};
-		let post = &record.post;
-
-		if matches!(post.post_type.as_str(), "video" | "gif") && !post.media.redgifs_username.is_empty() {
-			let slug = crate::utils::normalize_creator_identity_slug(&post.media.redgifs_username);
-			if !slug.is_empty() {
-				seen_redgifs_users.insert(slug);
-			}
-		}
-
-		let Some(video_key) = crate::user::video_aggregate_key(post) else {
-			continue;
-		};
-		if seen_keys.insert(video_key) {
-			video_count += 1;
-			total_duration_seconds += post.media.duration_seconds;
-		}
+		stats.observe_post(&record.post);
 	}
 
-	if video_count == 0 {
-		return None;
+	if stats.avg_video_length().is_some() {
+		Some(stats)
+	} else {
+		None
 	}
-
-	let average = total_duration_seconds / video_count as i64;
-	let count_label = if video_count == 1 { "video" } else { "videos" };
-	let mut meta = format!("from {} seen {count_label}", video_count);
-	let rg_profiles = seen_redgifs_users.len();
-	if rg_profiles > 1 {
-		meta.push_str(&format!(" · {rg_profiles} rg profiles"));
-	}
-
-	Some((crate::utils::format_video_duration(average), meta))
 }
 
 pub(crate) fn reset_catalog() {

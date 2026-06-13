@@ -5122,6 +5122,7 @@ mod tests {
 
 	#[test]
 	fn hydrate_post_author_links_from_cache_refreshes_avg_video_length() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 		crate::user::clear_test_caches();
 
 		let mut posts = vec![Post {

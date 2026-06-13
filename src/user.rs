@@ -38,10 +38,7 @@ struct CachedUserMetadata {
 
 #[derive(Clone)]
 struct CachedUserVideoStats {
-	seen_keys: HashSet<String>,
-	seen_redgifs_users: HashSet<String>,
-	total_duration_seconds: i64,
-	video_count: usize,
+	stats: UserVideoStatsAccumulator,
 	cached_at: Instant,
 }
 
@@ -50,6 +47,64 @@ struct CachedUserVideoStats {
 struct UserVideoStats {
 	average_duration_seconds: i64,
 	video_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UserVideoStatsAccumulator {
+	video_durations: HashMap<String, i64>,
+	seen_redgifs_users: HashSet<String>,
+}
+
+impl UserVideoStatsAccumulator {
+	pub(crate) fn observe_post(&mut self, post: &Post) {
+		if matches!(post.post_type.as_str(), "video" | "gif") && !post.media.redgifs_username.is_empty() {
+			let slug = utils::normalize_creator_identity_slug(&post.media.redgifs_username);
+			if !slug.is_empty() {
+				self.seen_redgifs_users.insert(slug);
+			}
+		}
+
+		let Some(video_key) = video_aggregate_key(post) else {
+			return;
+		};
+
+		self.video_durations.entry(video_key).or_insert(post.media.duration_seconds);
+	}
+
+	pub(crate) fn merge(&mut self, other: Self) {
+		for (video_key, duration_seconds) in other.video_durations {
+			self.video_durations.entry(video_key).or_insert(duration_seconds);
+		}
+		self.seen_redgifs_users.extend(other.seen_redgifs_users);
+	}
+
+	fn video_count(&self) -> usize {
+		self.video_durations.len()
+	}
+
+	fn total_duration_seconds(&self) -> i64 {
+		self.video_durations.values().sum()
+	}
+
+	fn average_duration_seconds(&self) -> Option<i64> {
+		let video_count = self.video_count();
+		if video_count == 0 {
+			return None;
+		}
+		Some(self.total_duration_seconds() / video_count as i64)
+	}
+
+	pub(crate) fn avg_video_length(&self) -> Option<(String, String)> {
+		let average = self.average_duration_seconds()?;
+		let video_count = self.video_count();
+		let count_label = if video_count == 1 { "video" } else { "videos" };
+		let mut meta = format!("from {} seen {count_label}", video_count);
+		let rg_profiles = self.seen_redgifs_users.len();
+		if rg_profiles > 1 {
+			meta.push_str(&format!(" · {rg_profiles} rg profiles"));
+		}
+		Some((utils::format_video_duration(average), meta))
+	}
 }
 
 static USER_VIDEO_STATS_CACHE: LazyLock<Mutex<HashMap<String, CachedUserVideoStats>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -718,21 +773,7 @@ fn prune_user_video_stats_cache(cache: &mut HashMap<String, CachedUserVideoStats
 }
 
 fn observe_user_video_post(entry: &mut CachedUserVideoStats, post: &Post) {
-	if matches!(post.post_type.as_str(), "video" | "gif") && !post.media.redgifs_username.is_empty() {
-		let slug = utils::normalize_creator_identity_slug(&post.media.redgifs_username);
-		if !slug.is_empty() {
-			entry.seen_redgifs_users.insert(slug);
-		}
-	}
-
-	let Some(video_key) = video_aggregate_key(post) else {
-		return;
-	};
-
-	if entry.seen_keys.insert(video_key) {
-		entry.video_count += 1;
-		entry.total_duration_seconds += post.media.duration_seconds;
-	}
+	entry.stats.observe_post(post);
 }
 
 fn update_user_video_stats(username: &str, posts: &[Post]) {
@@ -748,10 +789,7 @@ fn update_user_video_stats(username: &str, posts: &[Post]) {
 
 	let now = Instant::now();
 	let entry = cache.entry(cache_key.clone()).or_insert_with(|| CachedUserVideoStats {
-		seen_keys: HashSet::new(),
-		seen_redgifs_users: HashSet::new(),
-		total_duration_seconds: 0,
-		video_count: 0,
+		stats: UserVideoStatsAccumulator::default(),
 		cached_at: now,
 	});
 	entry.cached_at = now;
@@ -782,10 +820,7 @@ pub(crate) fn update_user_video_stats_from_posts(posts: &[Post]) {
 		}
 
 		let entry = cache.entry(cache_key).or_insert_with(|| CachedUserVideoStats {
-			seen_keys: HashSet::new(),
-			seen_redgifs_users: HashSet::new(),
-			total_duration_seconds: 0,
-			video_count: 0,
+			stats: UserVideoStatsAccumulator::default(),
 			cached_at: now,
 		});
 		entry.cached_at = now;
@@ -815,13 +850,9 @@ fn cached_user_video_stats(username: &str) -> Option<UserVideoStats> {
 	let entry = cache.get_mut(&cache_key)?;
 	entry.cached_at = Instant::now();
 
-	if entry.video_count == 0 {
-		return None;
-	}
-
 	Some(UserVideoStats {
-		average_duration_seconds: (entry.total_duration_seconds / entry.video_count as i64),
-		video_count: entry.video_count,
+		average_duration_seconds: entry.stats.average_duration_seconds()?,
+		video_count: entry.stats.video_count(),
 	})
 }
 
@@ -831,68 +862,55 @@ pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
 		return None;
 	}
 
-	let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() else {
-		return None;
-	};
-	prune_user_video_stats_cache(&mut cache);
-
-	let entry = match cache.get_mut(&cache_key) {
-		Some(entry) => entry,
-		None => {
-			drop(cache);
-			return crate::materialized_catalog::catalog_avg_video_length(&cache_key);
+	let mut stats = if let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() {
+		prune_user_video_stats_cache(&mut cache);
+		if let Some(entry) = cache.get_mut(&cache_key) {
+			entry.cached_at = Instant::now();
+			entry.stats.clone()
+		} else {
+			UserVideoStatsAccumulator::default()
 		}
+	} else {
+		UserVideoStatsAccumulator::default()
 	};
-	entry.cached_at = Instant::now();
 
-	if entry.video_count == 0 {
-		return None;
+	if let Some(catalog_stats) = crate::materialized_catalog::catalog_video_stats(&cache_key) {
+		stats.merge(catalog_stats);
 	}
 
-	let average = entry.total_duration_seconds / entry.video_count as i64;
-	let count_label = if entry.video_count == 1 { "video" } else { "videos" };
-	let mut meta = format!("from {} seen {count_label}", entry.video_count);
-	let rg_profiles = entry.seen_redgifs_users.len();
-	if rg_profiles > 1 {
-		meta.push_str(&format!(" · {rg_profiles} rg profiles"));
-	}
-	Some((utils::format_video_duration(average), meta))
+	stats.avg_video_length()
 }
 
 pub fn hydrate_posts_avg_video_length_from_cache(posts: &mut [Post]) {
-	let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() else {
-		return;
-	};
-	prune_user_video_stats_cache(&mut cache);
-
-	let now = Instant::now();
 	for post in posts.iter_mut() {
-		let cache_key = normalize_user_video_stats_cache_key(&post.author.name);
-		if cache_key.is_empty() {
-			post.author.avg_video_length = None;
-			continue;
-		}
-
-		let Some(entry) = cache.get_mut(&cache_key) else {
-			post.author.avg_video_length = None;
-			continue;
-		};
-		entry.cached_at = now;
-
-		if entry.video_count == 0 {
-			post.author.avg_video_length = None;
-			continue;
-		}
-
-		let average = entry.total_duration_seconds / entry.video_count as i64;
-		let count_label = if entry.video_count == 1 { "video" } else { "videos" };
-		let mut meta = format!("from {} seen {count_label}", entry.video_count);
-		let rg_profiles = entry.seen_redgifs_users.len();
-		if rg_profiles > 1 {
-			meta.push_str(&format!(" · {rg_profiles} rg profiles"));
-		}
-		post.author.avg_video_length = Some((utils::format_video_duration(average), meta));
+		post.author.avg_video_length = cached_avg_video_length(&post.author.name);
 	}
+}
+
+fn avg_video_length_redgifs_profile_count(meta: &str) -> Option<usize> {
+	let profile_segment = meta.split('·').find(|segment| segment.trim().ends_with("rg profiles"))?;
+	profile_segment.trim().split_whitespace().next()?.parse().ok()
+}
+
+pub fn avg_video_length_rg_profile_count(value: &(String, String)) -> usize {
+	avg_video_length_redgifs_profile_count(&value.1).unwrap_or_default()
+}
+
+pub fn avg_video_length_rg_profile_class(value: &Option<(String, String)>) -> &'static str {
+	match value.as_ref().map(avg_video_length_rg_profile_count).unwrap_or_default() {
+		2 => " post_rg_profiles_2",
+		count if count >= 3 => " post_rg_profiles_3plus",
+		_ => "",
+	}
+}
+
+pub fn avg_video_length_author_label(value: &(String, String)) -> String {
+	let mut label = format!("avg {}", value.0);
+	let rg_profiles = avg_video_length_rg_profile_count(value);
+	if rg_profiles > 1 {
+		label.push_str(&format!(" · rg {rg_profiles}"));
+	}
+	label
 }
 
 #[cfg(test)]
@@ -2224,6 +2242,7 @@ mod tests {
 
 	#[test]
 	fn avg_video_length_flags_multiple_redgifs_uploaders() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 		super::clear_test_caches();
 		let username = "demo_user_multi_redgifs";
 		let mut first = test_video_post("one", "One", "/redgifs/oneclip", 60);
@@ -2238,7 +2257,35 @@ mod tests {
 	}
 
 	#[test]
+	fn avg_video_length_merges_materialized_catalog_redgifs_uploaders() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		super::clear_test_caches();
+		crate::materialized_catalog::reset_catalog();
+
+		let username = "demo_user_catalog_multi_redgifs";
+		let mut first = test_video_post("one", "One", "/redgifs/oneclip", 60);
+		first.author.name = username.to_string();
+		first.media.redgifs_username = "alice".to_string();
+		let mut second = test_video_post("two", "Two", "/redgifs/twoclip", 60);
+		second.author.name = username.to_string();
+		second.media.redgifs_username = "bob".to_string();
+
+		super::update_user_video_stats(username, std::slice::from_ref(&first));
+		crate::materialized_catalog::apply_source_refresh(
+			&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
+			&[first, second],
+		);
+
+		let stats = super::cached_avg_video_length(username).unwrap();
+		assert_eq!(stats.0, "1:00");
+		assert!(stats.1.contains("2 rg profiles"), "expected catalog rg hint in {:?}", stats.1);
+
+		crate::materialized_catalog::reset_catalog();
+	}
+
+	#[test]
 	fn avg_video_length_omits_rg_profiles_when_single_redgifs_uploader() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 		super::clear_test_caches();
 		let username = "demo_user_one_rg";
 		let mut post = test_video_post("one", "One", "/redgifs/oneclip", 60);
@@ -2248,6 +2295,19 @@ mod tests {
 
 		let meta = super::cached_avg_video_length(username).unwrap().1;
 		assert!(!meta.contains("rg profiles"), "unexpected rg suffix in {meta:?}");
+	}
+
+	#[test]
+	fn avg_video_length_rg_profile_classes_have_two_penalty_levels() {
+		assert_eq!(
+			super::avg_video_length_rg_profile_class(&Some(("1:00".to_string(), "from 2 seen videos · 2 rg profiles".to_string()))),
+			" post_rg_profiles_2"
+		);
+		assert_eq!(
+			super::avg_video_length_rg_profile_class(&Some(("1:00".to_string(), "from 3 seen videos · 3 rg profiles".to_string()))),
+			" post_rg_profiles_3plus"
+		);
+		assert_eq!(super::avg_video_length_rg_profile_class(&Some(("1:00".to_string(), "from 2 seen videos".to_string()))), "");
 	}
 
 	#[test]
@@ -2482,7 +2542,7 @@ mod tests {
 			icon_path: "/icon/example.com".to_string(),
 			has_coomer: false,
 		}];
-		post.author.avg_video_length = Some(("1:01".to_string(), "from 2 seen videos".to_string()));
+		post.author.avg_video_length = Some(("1:01".to_string(), "from 2 seen videos · 2 rg profiles".to_string()));
 
 		let html = super::UserTemplate {
 			user: crate::utils::User {
@@ -2518,8 +2578,60 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("class=\"author_avg_video_length\""));
-		assert!(html.contains("avg 1:01"));
-		assert!(html.contains("from 2 seen videos"));
+		assert!(html.contains("data-state=\"loaded\""));
+		assert!(html.contains("post_rg_profiles_2"));
+		assert!(html.contains("avg 1:01 · rg 2"));
+		assert!(html.contains("from 2 seen videos · 2 rg profiles"));
+	}
+
+	#[test]
+	fn cached_author_links_without_avg_video_length_remain_hydratable() {
+		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
+		post.author.external_links = vec![crate::utils::ExternalLink {
+			label: "Example".to_string(),
+			url: "https://example.com/demo".to_string(),
+			host: "example.com".to_string(),
+			icon_path: "/icon/example.com".to_string(),
+			has_coomer: false,
+		}];
+		post.author.avg_video_length = None;
+
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![post],
+			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("class=\"external_site_icons\""));
+		assert!(html.contains("data-state=\"pending\""));
+		assert!(!html.contains("class=\"author_avg_video_length\""));
 	}
 
 	#[test]
@@ -3102,11 +3214,14 @@ pub async fn author_links(req: Request<Body>) -> Result<Response<Body>, String> 
 	let mut links_by_author = HashMap::new();
 	while let Some(result) = pending.join_next().await {
 		if let Ok((author, links, avg_video_length)) = result {
+			let rg_profile_count = avg_video_length.as_ref().map(avg_video_length_rg_profile_count).unwrap_or_default();
 			links_by_author.insert(
 				author,
 				serde_json::json!({
 					"links": links,
 					"avg_video_length": avg_video_length.as_ref().map(|value| value.0.clone()),
+					"avg_video_length_label": avg_video_length.as_ref().map(avg_video_length_author_label),
+					"avg_video_length_rg_profiles": rg_profile_count,
 					"avg_video_length_title": avg_video_length.map(|value| value.1),
 				}),
 			);

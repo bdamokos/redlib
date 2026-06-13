@@ -39,14 +39,14 @@
 
 {% macro external_site_icons(links, author_name, avg_video_length) -%}
 	{% if author_name != "" && author_name != "[deleted]" %}
-	<span class="external_site_icons" data-author-name="{{ author_name }}" data-state="{% if links.len() > 0 %}loaded{% else %}pending{% endif %}">
+	<span class="external_site_icons" data-author-name="{{ author_name }}" data-state="{% if links.len() > 0 && avg_video_length.is_some() %}loaded{% else %}pending{% endif %}">
 		{% for link in links.clone() %}
 			<a class="external_site_link" href="{{ link.url }}" rel="nofollow noopener noreferrer" title="{{ link.label }}">
 				<img loading="lazy" src="{{ link.icon_path }}" alt="{{ link.label }}" width="16" height="16">
 			</a>
 		{% endfor %}
 		{% if let Some(avg_video_length) = avg_video_length %}
-			<span class="author_avg_video_length" title="{{ avg_video_length.1 }}">avg {{ avg_video_length.0 }}</span>
+			<span class="author_avg_video_length" title="{{ avg_video_length.1 }}">{{ crate::user::avg_video_length_author_label(avg_video_length) }}</span>
 		{% endif %}
 	</span>
 	{% endif %}
@@ -101,7 +101,7 @@
 {% macro post(post) -%}
 {% set post_should_be_blurred = post.flags.spoiler && prefs.blur_spoiler=="on" -%}
 <!-- POST CONTENT -->
-<div class="post highlighted{% if post_should_be_blurred %} post_blurred{% endif %}">
+<div class="post highlighted{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post_should_be_blurred %} post_blurred{% endif %}">
 	<p class="post_header">
 		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
 		<span class="dot">&bull;</span>
@@ -299,7 +299,7 @@
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
 <div
 	id="{{ post.id }}"
-	class="post{% if post.flags.stickied %} stickied{% endif %}{% if post.following_comments.len() > 0 %} post_following_bundle{% endif %}"
+	class="post{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post.following_comments.len() > 0 %} post_following_bundle{% endif %}"
 	data-post-type="{{ post.post_type }}"
 	data-created-ts="{{ post.created_ts }}">
 	<div class="post_header">
