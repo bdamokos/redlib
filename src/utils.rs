@@ -2676,7 +2676,11 @@ fn deleted_placeholder_dimensions(width: i64, height: i64) -> bool {
 	width == REDDIT_DELETED_IMAGE_PLACEHOLDER_WIDTH && height == REDDIT_DELETED_IMAGE_PLACEHOLDER_HEIGHT
 }
 
-fn image_body_matches_deleted_reddit_placeholder(body: &[u8]) -> bool {
+pub(crate) fn deleted_reddit_placeholder_max_probe_bytes() -> usize {
+	REDDIT_DELETED_IMAGE_PLACEHOLDER_MAX_PROBE_BYTES
+}
+
+pub(crate) fn image_body_matches_deleted_reddit_placeholder(body: &[u8]) -> bool {
 	if body.len() != REDDIT_DELETED_IMAGE_PLACEHOLDER_BODY_LEN {
 		return false;
 	}
@@ -2791,7 +2795,7 @@ pub async fn hydrate_image_content_fingerprints(posts: &mut [Post]) {
 	}
 }
 
-fn reddit_image_url_to_upstream(url: &str) -> Option<String> {
+pub(crate) fn reddit_image_url_to_upstream(url: &str) -> Option<String> {
 	let normalized = if url.contains('"') || url.contains('<') || url.contains('>') {
 		url.to_string()
 	} else {
@@ -2807,6 +2811,32 @@ fn reddit_image_url_to_upstream(url: &str) -> Option<String> {
 
 	let (path, query) = normalized.split_once('?').map_or((normalized.as_str(), None), |(path, query)| (path, Some(query)));
 	local_proxy_path_to_reddit_image_upstream(path, query)
+}
+
+pub(crate) fn reddit_image_asset_key(url: &str) -> Option<String> {
+	let upstream = reddit_image_url_to_upstream(url)?;
+	let parsed = Url::parse(&upstream).ok()?;
+	let domain = parsed.domain()?;
+	Some(format!("{}{}", domain.to_ascii_lowercase(), parsed.path().to_ascii_lowercase()))
+}
+
+fn srcset_references_reddit_image_asset(srcset: &str, asset_key: &str) -> bool {
+	srcset
+		.split(',')
+		.filter_map(|candidate| candidate.split_whitespace().next())
+		.any(|url| reddit_image_asset_key(url).is_some_and(|key| key == asset_key))
+}
+
+pub(crate) fn media_references_reddit_image_asset(media: &Media, asset_key: &str) -> bool {
+	reddit_image_asset_key(&media.url).is_some_and(|key| key == asset_key)
+		|| reddit_image_asset_key(&media.preview_url).is_some_and(|key| key == asset_key)
+		|| srcset_references_reddit_image_asset(&media.preview_srcset, asset_key)
+}
+
+pub(crate) fn gallery_media_references_reddit_image_asset(media: &GalleryMedia, asset_key: &str) -> bool {
+	reddit_image_asset_key(&media.url).is_some_and(|key| key == asset_key)
+		|| reddit_image_asset_key(&media.preview_url).is_some_and(|key| key == asset_key)
+		|| srcset_references_reddit_image_asset(&media.preview_srcset, asset_key)
 }
 
 fn media_deleted_placeholder_probe_urls(url: &str, preview_url: &str) -> Vec<String> {
@@ -6140,6 +6170,42 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		video_preview_fallback_url: String::new(),
 		redgifs_username: String::new(),
 	}));
+}
+
+#[test]
+fn test_reddit_image_asset_key_matches_local_preview_variants() {
+	assert_eq!(
+		reddit_image_asset_key("/preview/pre/example.jpg?width=320&format=pjpg"),
+		Some("preview.redd.it/example.jpg".to_string())
+	);
+	assert_eq!(
+		reddit_image_asset_key("https://preview.redd.it/example.jpg?width=1080&format=pjpg"),
+		Some("preview.redd.it/example.jpg".to_string())
+	);
+
+	let media = Media {
+		url: "/img/example.jpg".to_string(),
+		preview_url: "/preview/pre/example.jpg?width=640&format=pjpg".to_string(),
+		preview_srcset: "/preview/pre/example.jpg?width=320&format=pjpg 320w, /preview/pre/example.jpg?width=960&format=pjpg 960w".to_string(),
+		content_fingerprint: String::new(),
+		hls_url: String::new(),
+		dash_url: String::new(),
+		width: 0,
+		height: 0,
+		poster: String::new(),
+		duration_seconds: 0,
+		duration: String::new(),
+		download_name: String::new(),
+		embed_code: String::new(),
+		video_preview_enabled: false,
+		video_preview_job_hint: String::new(),
+		video_preview_fallback_url: String::new(),
+		redgifs_username: String::new(),
+	};
+
+	assert!(media_references_reddit_image_asset(&media, "preview.redd.it/example.jpg"));
+	assert!(media_references_reddit_image_asset(&media, "i.redd.it/example.jpg"));
+	assert!(!media_references_reddit_image_asset(&media, "preview.redd.it/other.jpg"));
 }
 
 #[test]

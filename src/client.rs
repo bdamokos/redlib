@@ -3,7 +3,7 @@ use cached::proc_macro::cached;
 use futures_lite::{future::Boxed, FutureExt};
 use hyper::client::HttpConnector;
 use hyper::header::HeaderValue;
-use hyper::{body, body::Buf, header, Body, Client, Method, Request, Response, Uri};
+use hyper::{body, body::Buf, header, Body, Client, Method, Request, Response, StatusCode, Uri};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use libflate::gzip;
 use log::{error, info, trace, warn};
@@ -689,6 +689,10 @@ async fn preload_image_url(url: String) -> Result<(), String> {
 		.await
 		.map_err(|_| "preload body timed out".to_string())?
 		.map_err(|e| e.to_string())?;
+	if crate::utils::image_body_matches_deleted_reddit_placeholder(&body) {
+		crate::post_cache::mark_deleted_reddit_media_url(&url);
+		return Err("upstream image was Reddit's deleted placeholder".to_string());
+	}
 	let entry = CachedImageResponse {
 		status,
 		content_type,
@@ -733,6 +737,40 @@ async fn image_cache_get_or_wait(url: &str) -> Option<CachedImageResponse> {
 	None
 }
 
+fn image_content_type_is_image(content_type: Option<&HeaderValue>) -> bool {
+	content_type.and_then(|value| value.to_str().ok()).is_some_and(|value| value.starts_with("image/"))
+}
+
+fn cached_image_is_deleted_placeholder(entry: &CachedImageResponse) -> bool {
+	image_content_type_is_image(entry.content_type.as_ref()) && crate::utils::image_body_matches_deleted_reddit_placeholder(&entry.body)
+}
+
+fn deleted_media_response() -> Result<Response<Body>, String> {
+	Response::builder()
+		.status(StatusCode::GONE)
+		.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+		.header(header::CACHE_CONTROL, "no-store")
+		.header("x-redlib-deleted-media", "1")
+		.body(Body::from("Deleted Reddit image"))
+		.map_err(|error| error.to_string())
+}
+
+fn response_should_probe_deleted_placeholder(url: &str, req: &Request<Body>, res: &Response<Body>) -> bool {
+	if !cacheable_image_url(url) || req.headers().get("Range").is_some() {
+		return false;
+	}
+	if !image_content_type_is_image(res.headers().get(header::CONTENT_TYPE)) {
+		return false;
+	}
+
+	res
+		.headers()
+		.get(header::CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<usize>().ok())
+		.is_some_and(|length| length <= crate::utils::deleted_reddit_placeholder_max_probe_bytes())
+}
+
 fn cached_image_response(entry: CachedImageResponse) -> Result<Response<Body>, String> {
 	let mut builder = Response::builder().status(entry.status).header("x-redlib-image-preload-cache", "hit");
 	if let Some(content_type) = entry.content_type {
@@ -758,6 +796,10 @@ pub async fn proxy(req: Request<Body>, format: &str) -> Result<Response<Body>, S
 
 	if cacheable_image_url(&url) && req.headers().get("Range").is_none() {
 		if let Some(entry) = image_cache_get_or_wait(&url).await {
+			if cached_image_is_deleted_placeholder(&entry) {
+				crate::post_cache::mark_deleted_reddit_media_url(&url);
+				return deleted_media_response();
+			}
 			return cached_image_response(entry);
 		}
 	}
@@ -789,37 +831,45 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 
 	let stream_request = builder.body(Body::empty()).map_err(|_| "Couldn't build empty body in stream".to_string())?;
 
-	client
-		.request(stream_request)
-		.await
-		.map(|mut res| {
-			let content_type = res.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
-			let content_length = res
-				.headers()
-				.get(header::CONTENT_LENGTH)
-				.and_then(|value| value.to_str().ok())
-				.and_then(|value| value.parse::<u64>().ok());
-			let range = req.headers().get("Range").and_then(|value| value.to_str().ok()).map(str::to_owned);
-			let mut rm = |key: &str| res.headers_mut().remove(key);
+	let mut res = client.request(stream_request).await.map_err(|e| e.to_string())?;
+	let content_type = res.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
+	let content_length = res
+		.headers()
+		.get(header::CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<u64>().ok());
+	let range = req.headers().get("Range").and_then(|value| value.to_str().ok()).map(str::to_owned);
+	let mut rm = |key: &str| res.headers_mut().remove(key);
 
-			rm("access-control-expose-headers");
-			rm("server");
-			rm("vary");
-			rm("etag");
-			rm("x-cdn");
-			rm("x-cdn-client-region");
-			rm("x-cdn-name");
-			rm("x-cdn-server-region");
-			rm("x-reddit-cdn");
-			rm("x-reddit-video-features");
-			rm("Nel");
-			rm("Report-To");
+	rm("access-control-expose-headers");
+	rm("server");
+	rm("vary");
+	rm("etag");
+	rm("x-cdn");
+	rm("x-cdn-client-region");
+	rm("x-cdn-name");
+	rm("x-cdn-server-region");
+	rm("x-reddit-cdn");
+	rm("x-reddit-video-features");
+	rm("Nel");
+	rm("Report-To");
 
-			log_download_diagnostics("proxy_stream", url, res.status(), content_type.as_deref(), content_length, None, range.as_deref());
+	log_download_diagnostics("proxy_stream", url, res.status(), content_type.as_deref(), content_length, None, range.as_deref());
 
-			res
-		})
-		.map_err(|e| e.to_string())
+	if response_should_probe_deleted_placeholder(url, req, &res) {
+		let (parts, body) = res.into_parts();
+		let body = tokio::time::timeout(IMAGE_PRELOAD_UPSTREAM_TIMEOUT, body::to_bytes(body))
+			.await
+			.map_err(|_| "proxy image probe timed out".to_string())?
+			.map_err(|e| e.to_string())?;
+		if crate::utils::image_body_matches_deleted_reddit_placeholder(&body) {
+			crate::post_cache::mark_deleted_reddit_media_url(url);
+			return deleted_media_response();
+		}
+		return Ok(Response::from_parts(parts, Body::from(body)));
+	}
+
+	Ok(res)
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP

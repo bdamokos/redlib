@@ -2069,6 +2069,152 @@ fn touch_session(session: &mut FeedSession) {
 	session.revision = session.revision.wrapping_add(1);
 }
 
+#[derive(Default)]
+struct DeletedMediaPruneResult {
+	primary_media_removed: usize,
+	posts_removed: usize,
+	changed: bool,
+}
+
+fn post_has_non_media_content(post: &Post) -> bool {
+	!post.body.trim().is_empty() || !post.preview_body.trim().is_empty() || post.poll.is_some() || post.kind == "t1"
+}
+
+fn post_has_primary_media(post: &Post) -> bool {
+	match post.post_type.as_str() {
+		"image" => !post.media.url.is_empty() || !post.media.preview_url.is_empty(),
+		"gallery" => !post.gallery.is_empty(),
+		"video" | "gif" => !post.media.url.is_empty() || !post.media.hls_url.is_empty() || !post.media.dash_url.is_empty() || !post.media.embed_code.is_empty(),
+		"link" => !post.media.url.is_empty(),
+		_ => false,
+	}
+}
+
+fn prune_deleted_media_from_post(post: &mut Post, deleted_asset_key: &str) -> (bool, bool) {
+	let mut changed = false;
+	let mut primary_media_removed = false;
+
+	if crate::utils::media_references_reddit_image_asset(&post.thumbnail, deleted_asset_key) {
+		post.thumbnail = crate::utils::Media::empty();
+		changed = true;
+	}
+
+	match post.post_type.as_str() {
+		"image" => {
+			if crate::utils::media_references_reddit_image_asset(&post.media, deleted_asset_key) {
+				post.media = crate::utils::Media::empty();
+				post.post_type = "self".to_string();
+				changed = true;
+				primary_media_removed = true;
+			}
+		}
+		"gallery" => {
+			let before = post.gallery.len();
+			post
+				.gallery
+				.retain(|image| !crate::utils::gallery_media_references_reddit_image_asset(image, deleted_asset_key));
+			if post.gallery.len() != before {
+				changed = true;
+				primary_media_removed = true;
+				if post.gallery.is_empty() {
+					post.post_type = "self".to_string();
+				}
+			}
+		}
+		_ => {}
+	}
+
+	(changed, primary_media_removed)
+}
+
+fn prune_deleted_media_from_posts(posts: &mut Vec<Post>, deleted_asset_key: &str) -> DeletedMediaPruneResult {
+	let mut result = DeletedMediaPruneResult::default();
+
+	posts.retain_mut(|post| {
+		let (changed, primary_media_removed) = prune_deleted_media_from_post(post, deleted_asset_key);
+		if !changed {
+			return true;
+		}
+
+		result.changed = true;
+		if primary_media_removed {
+			result.primary_media_removed += 1;
+			if !post_has_non_media_content(post) && !post_has_primary_media(post) {
+				result.posts_removed += 1;
+				return false;
+			}
+		}
+
+		true
+	});
+
+	result
+}
+
+pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
+	let Some(deleted_asset_key) = crate::utils::reddit_image_asset_key(media_url) else {
+		return 0;
+	};
+
+	let mut updated_sources = Vec::new();
+	let mut removed_primary_media = 0;
+	let mut removed_posts = 0;
+
+	if let Ok(mut cache) = SOURCE_CACHE.lock() {
+		for (cache_key, entry) in cache.iter_mut() {
+			let result = prune_deleted_media_from_posts(&mut entry.posts, &deleted_asset_key);
+			if result.changed {
+				removed_primary_media += result.primary_media_removed;
+				removed_posts += result.posts_removed;
+				updated_sources.push((cache_key.clone(), entry.clone()));
+			}
+		}
+	}
+
+	let mut updated_sessions = 0;
+	if let Ok(mut sessions) = FEED_SESSIONS.lock() {
+		for session in sessions.values_mut() {
+			let mut session_changed = false;
+			for posts in session.frozen_pages.values_mut() {
+				let result = prune_deleted_media_from_posts(posts, &deleted_asset_key);
+				if result.changed {
+					removed_primary_media += result.primary_media_removed;
+					removed_posts += result.posts_removed;
+					session_changed = true;
+				}
+			}
+			if session_changed {
+				updated_sessions += 1;
+				touch_session(session);
+			}
+		}
+	}
+
+	for (cache_key, entry) in &updated_sources {
+		if materialized_catalog::source_is_supported(&entry.source) {
+			materialized_catalog::apply_source_refresh(&entry.source, &entry.posts);
+		}
+		write_source_entry_to_disk(cache_key, entry);
+	}
+
+	if !updated_sources.is_empty() {
+		crate::cache_persistence::mark_dirty();
+	}
+
+	if !updated_sources.is_empty() || updated_sessions > 0 {
+		info!(
+			"post_cache: marked deleted Reddit media asset {} (sources={}, sessions={}, primary_media_removed={}, posts_removed={})",
+			deleted_asset_key,
+			updated_sources.len(),
+			updated_sessions,
+			removed_primary_media,
+			removed_posts
+		);
+	}
+
+	removed_primary_media
+}
+
 fn background_target_posts(session: &FeedSession) -> usize {
 	(session.requested_page + 1 + BACKGROUND_LOOKAHEAD_PAGES) * POSTS_PER_PAGE
 }
@@ -2947,14 +3093,14 @@ mod tests {
 	use super::{
 		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, build_session_id,
 		cache_status_for_preferences, catalog_source_candidates, count_sources_in_state, effective_freshness_target_secs, feed_page, feed_status, followup_source_budget,
-		get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
-		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache,
-		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, remember_flair_request,
-		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts,
-		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, store_source_posts,
-		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
-		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
-		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget,
+		merged_posts_for_session, merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
+		prune_source_cache, publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal,
+		remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts,
+		session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable,
+		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource,
+		RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
+		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -3118,6 +3264,92 @@ mod tests {
 
 	fn new_flair_source(subreddit: &str, flair: &str) -> FeedSource {
 		FeedSource::flair(subreddit.to_string(), flair.to_string(), FeedSort::New)
+	}
+
+	#[test]
+	fn deleted_media_invalidation_removes_stale_image_posts_from_cache_and_sessions() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		let mut deleted = test_post("deleted", "rust", 200);
+		deleted.post_type = "image".to_string();
+		deleted.media.url = "/img/deleted.jpg".to_string();
+		deleted.media.preview_url = "/preview/pre/deleted.jpg?width=640&format=pjpg".to_string();
+		deleted.media.preview_srcset = "/preview/pre/deleted.jpg?width=320&format=pjpg 320w, /preview/pre/deleted.jpg?width=960&format=pjpg 960w".to_string();
+		let mut kept = test_post("kept", "rust", 100);
+		kept.post_type = "image".to_string();
+		kept.media.url = "/img/kept.jpg".to_string();
+
+		seed_source(&source, vec![deleted.clone(), kept.clone()]);
+		FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(
+			"session".to_string(),
+			FeedSession {
+				id: "session".to_string(),
+				request: FeedSessionRequest {
+					sources: vec![source.clone()],
+					..FeedSessionRequest::default()
+				},
+				sources: vec![session_entry(source.clone(), SessionSourceState::Ready)],
+				frozen_pages: HashMap::from([(0, vec![deleted, kept])]),
+				background_active: false,
+				background_complete: true,
+				requested_page: 0,
+				last_updated: Instant::now(),
+				revision: 0,
+			},
+		);
+
+		assert!(mark_deleted_reddit_media_url("https://preview.redd.it/deleted.jpg?width=640&format=pjpg") > 0);
+
+		let cached = servable_cached_source_posts(&source).expect("source cache should remain servable");
+		assert_eq!(cached.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["kept"]);
+		let frozen = feed_page("session", 0, POSTS_PER_PAGE).expect("session page should remain servable");
+		assert_eq!(frozen.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["kept"]);
+		let catalog_posts = crate::materialized_catalog::query_source_candidates(&[source], &HashSet::new());
+		assert_eq!(catalog_posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["kept"]);
+	}
+
+	#[test]
+	fn deleted_media_invalidation_prunes_gallery_until_empty() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		let mut gallery = test_post("gallery", "rust", 200);
+		gallery.post_type = "gallery".to_string();
+		gallery.gallery = vec![
+			crate::utils::GalleryMedia {
+				url: "/preview/pre/deleted.jpg?width=640&format=pjpg".to_string(),
+				preview_url: String::new(),
+				preview_srcset: String::new(),
+				width: 640,
+				height: 800,
+				caption: String::new(),
+				outbound_url: String::new(),
+			},
+			crate::utils::GalleryMedia {
+				url: "/preview/pre/kept.jpg?width=640&format=pjpg".to_string(),
+				preview_url: String::new(),
+				preview_srcset: String::new(),
+				width: 640,
+				height: 800,
+				caption: "kept".to_string(),
+				outbound_url: String::new(),
+			},
+		];
+
+		seed_source(&source, vec![gallery]);
+		assert_eq!(mark_deleted_reddit_media_url("https://preview.redd.it/deleted.jpg?width=960&format=pjpg"), 1);
+		let cached = servable_cached_source_posts(&source).expect("source cache should remain servable");
+		assert_eq!(cached.len(), 1);
+		assert_eq!(cached[0].post_type, "gallery");
+		assert_eq!(cached[0].gallery.len(), 1);
+		assert_eq!(cached[0].gallery[0].caption, "kept");
+
+		assert_eq!(mark_deleted_reddit_media_url("https://preview.redd.it/kept.jpg?width=960&format=pjpg"), 1);
+		let cached = servable_cached_source_posts(&source).expect("source cache should remain servable");
+		assert!(cached.is_empty());
 	}
 
 	#[test]
