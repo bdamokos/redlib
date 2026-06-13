@@ -1479,7 +1479,8 @@ a.search_subreddit_link:hover {
 }
 
 .post {
-    --post-media-max-height: 85vh;
+    --post-media-default-max-height: 85vh;
+    --post-media-max-height: var(--post-media-fit-height, var(--post-media-default-max-height));
     border-radius: 5px;
     background: var(--post);
     box-shadow: var(--shadow);
@@ -1500,7 +1501,7 @@ a.search_subreddit_link:hover {
 
 @supports (height: 100dvh) {
     .post {
-        --post-media-max-height: 85dvh;
+        --post-media-default-max-height: 85dvh;
     }
 }
 

@@ -10,6 +10,7 @@
         window.initializeNetworkImages?.(root);
         window.observeVideoPreviewHosts?.(root);
         window.observeVideoVisibility?.(root);
+        window.resizeSinglePostMediaToViewport?.(root);
     };
 
     window.refreshDynamicContent = initialize;

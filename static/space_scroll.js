@@ -5,6 +5,179 @@ function getScrollPaddingTop() {
     return Number.isNaN(parsedValue) ? 0 : parsedValue;
 }
 
+// Single media posts should fit after the visible title, body, footer, and media metadata.
+const SINGLE_POST_MEDIA_SELECTOR = [
+    ".post_media_column .video_preview_stage",
+    ".post_media_content > .post_media_embed",
+    ".post_media_content > .post_media_image > img",
+    ".post_media_content > .post_media_image > svg",
+].join(", ");
+
+const POST_MEDIA_FIT_BOTTOM_GAP = 8;
+const POST_MEDIA_FIT_MIN_HEIGHT = 96;
+let postMediaFitFrame = null;
+
+function parsePostMediaLength(value, fallback) {
+    const trimmedValue = value.trim().toLowerCase();
+    const parsedValue = Number.parseFloat(trimmedValue);
+
+    if (Number.isNaN(parsedValue)) {
+        return fallback;
+    }
+
+    if (trimmedValue.endsWith("px")) {
+        return parsedValue;
+    }
+
+    if (trimmedValue.endsWith("vh") || trimmedValue.endsWith("dvh")) {
+        return (window.innerHeight * parsedValue) / 100;
+    }
+
+    return fallback;
+}
+
+function getPostMediaBaseMaxHeight(post) {
+    const fallback = window.innerHeight * 0.85;
+    const defaultMaxHeight = window
+        .getComputedStyle(post)
+        .getPropertyValue("--post-media-default-max-height");
+
+    return parsePostMediaLength(defaultMaxHeight, fallback);
+}
+
+function getAvailablePostHeight() {
+    return Math.max(0, window.innerHeight - getScrollPaddingTop() - POST_MEDIA_FIT_BOTTOM_GAP);
+}
+
+function isMeasurableElement(element) {
+    const rect = element.getBoundingClientRect();
+
+    return rect.width > 0 && rect.height > 0;
+}
+
+function hasKnownMediaSize(element) {
+    const width = Number.parseFloat(element.getAttribute("width") || "");
+    const height = Number.parseFloat(element.getAttribute("height") || "");
+
+    return width > 0 && height > 0;
+}
+
+function isSingleMediaPost(post) {
+    if (!(post instanceof Element) || !post.classList.contains("post")) {
+        return false;
+    }
+
+    if (post.querySelector(".gallery")) {
+        return false;
+    }
+
+    const postType = post.dataset.postType;
+    if (!postType) {
+        return true;
+    }
+
+    return postType === "image" || postType === "video" || postType === "gif";
+}
+
+function getSinglePostMediaElement(post) {
+    if (!isSingleMediaPost(post)) {
+        return null;
+    }
+
+    const mediaElements = Array.from(post.querySelectorAll(SINGLE_POST_MEDIA_SELECTOR))
+        .filter((element) => isMeasurableElement(element) || hasKnownMediaSize(element));
+
+    return mediaElements.length === 1 ? mediaElements[0] : null;
+}
+
+function fitSinglePostMediaToViewport(post) {
+    if (!(post instanceof HTMLElement)) {
+        return;
+    }
+
+    post.style.removeProperty("--post-media-fit-height");
+
+    const mediaElement = getSinglePostMediaElement(post);
+    if (mediaElement === null) {
+        return;
+    }
+
+    const availablePostHeight = getAvailablePostHeight();
+    const baseMaxHeight = getPostMediaBaseMaxHeight(post);
+    if (availablePostHeight <= 0 || baseMaxHeight <= 0) {
+        return;
+    }
+
+    const mediaRect = mediaElement.getBoundingClientRect();
+    const mediaHeight = Math.max(0, mediaRect.height);
+    if (mediaHeight <= 0 && !hasKnownMediaSize(mediaElement)) {
+        return;
+    }
+
+    const postRect = post.getBoundingClientRect();
+    if (mediaHeight > 0 && postRect.height <= availablePostHeight + 1) {
+        return;
+    }
+
+    const nonMediaHeight = Math.max(0, postRect.height - mediaHeight);
+    let fitHeight = Math.min(
+        baseMaxHeight,
+        Math.max(POST_MEDIA_FIT_MIN_HEIGHT, availablePostHeight - nonMediaHeight),
+    );
+
+    post.style.setProperty("--post-media-fit-height", `${Math.floor(fitHeight)}px`);
+
+    for (let pass = 0; pass < 2; pass += 1) {
+        const overflow = post.getBoundingClientRect().height - availablePostHeight;
+        if (overflow <= 1) {
+            break;
+        }
+
+        const currentMediaHeight = mediaElement.getBoundingClientRect().height;
+        if (currentMediaHeight <= POST_MEDIA_FIT_MIN_HEIGHT + 1) {
+            break;
+        }
+
+        fitHeight = Math.max(POST_MEDIA_FIT_MIN_HEIGHT, fitHeight - Math.ceil(overflow));
+        post.style.setProperty("--post-media-fit-height", `${Math.floor(fitHeight)}px`);
+    }
+}
+
+function getPostsFromRoot(root) {
+    const container = root || document;
+    if (container instanceof Element && container.classList.contains("post")) {
+        return [container];
+    }
+
+    if (typeof container.querySelectorAll !== "function") {
+        return [];
+    }
+
+    return Array.from(container.querySelectorAll(".post"));
+}
+
+function resizeSinglePostMediaToViewport(root = document) {
+    getPostsFromRoot(root).forEach(fitSinglePostMediaToViewport);
+}
+
+function scheduleSinglePostMediaResize(root = document) {
+    if (postMediaFitFrame !== null) {
+        window.cancelAnimationFrame(postMediaFitFrame);
+    }
+
+    postMediaFitFrame = window.requestAnimationFrame(() => {
+        postMediaFitFrame = null;
+        resizeSinglePostMediaToViewport(root);
+    });
+}
+
+function handlePostMediaLoaded(event) {
+    const post = event.target instanceof Element ? event.target.closest(".post") : null;
+    if (post !== null) {
+        scheduleSinglePostMediaResize(post);
+    }
+}
+
 function getPostTop(post) {
     return Math.round(window.scrollY + post.getBoundingClientRect().top);
 }
@@ -152,6 +325,8 @@ document.addEventListener("keydown", (event) => {
         return;
     }
 
+    resizeSinglePostMediaToViewport(document);
+
     const targets = getScrollTargets();
     if (targets.length === 0) {
         return;
@@ -180,3 +355,10 @@ document.addEventListener("keydown", (event) => {
         behavior: "auto",
     });
 });
+
+window.resizeSinglePostMediaToViewport = resizeSinglePostMediaToViewport;
+document.addEventListener("DOMContentLoaded", () => resizeSinglePostMediaToViewport(document));
+window.addEventListener("resize", () => scheduleSinglePostMediaResize(document));
+window.addEventListener("orientationchange", () => scheduleSinglePostMediaResize(document));
+document.addEventListener("load", handlePostMediaLoaded, true);
+document.addEventListener("loadedmetadata", handlePostMediaLoaded, true);
