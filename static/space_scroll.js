@@ -327,25 +327,24 @@ document.addEventListener("keydown", (event) => {
 
     resizeSinglePostMediaToViewport(document);
 
+    if (isSpaceKey) {
+        event.preventDefault();
+        window.scrollTo({
+            top: Math.max(0, window.scrollY + (getViewportAdvanceHeight() * scrollDirection)),
+            behavior: "auto",
+        });
+        return;
+    }
+
     const targets = getScrollTargets();
     if (targets.length === 0) {
         return;
     }
 
     const scrollPaddingTop = getScrollPaddingTop();
-    const targetPost = isSpaceKey && !event.shiftKey
-        ? findViewportSkipTarget(targets)
-        : findAdjacentScrollTarget(targets, window.scrollY + scrollPaddingTop, scrollDirection);
+    const targetPost = findAdjacentScrollTarget(targets, window.scrollY + scrollPaddingTop, scrollDirection);
 
     if (targetPost === null) {
-        if (isSpaceKey) {
-            event.preventDefault();
-            window.scrollTo({
-                top: Math.max(0, window.scrollY + (getViewportAdvanceHeight() * scrollDirection)),
-                behavior: "auto",
-            });
-        }
-
         return;
     }
 
