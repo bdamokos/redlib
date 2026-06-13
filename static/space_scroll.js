@@ -22,6 +22,7 @@ const POST_MEDIA_FIT_MIN_HEIGHT = 96;
 const POST_MEDIA_STRETCHED_HEADER_TOLERANCE = 64;
 const POST_CONTINUATION_SELECTOR = ".post_body, .post_poll, .post_following_comments, .post_duplicates";
 const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notification";
+const PAGE_EDGE_TOLERANCE = 1;
 let postMediaFitFrame = null;
 
 function parsePostMediaLength(value, fallback) {
@@ -362,6 +363,28 @@ function getViewportAdvanceHeight() {
     return Math.max(1, viewportHeight - paddingTop);
 }
 
+function getMaxScrollTop() {
+    return Math.max(
+        0,
+        Math.max(
+            document.documentElement.scrollHeight,
+            document.body?.scrollHeight || 0,
+        ) - window.innerHeight,
+    );
+}
+
+function isAtPageEdge(direction) {
+    if (direction > 0) {
+        return window.scrollY >= getMaxScrollTop() - PAGE_EDGE_TOLERANCE;
+    }
+
+    if (direction < 0) {
+        return window.scrollY <= PAGE_EDGE_TOLERANCE;
+    }
+
+    return false;
+}
+
 function isInteractiveElement(element) {
     if (!(element instanceof Element)) {
         return false;
@@ -443,12 +466,28 @@ function getPaginationAccessKey(event) {
     return null;
 }
 
+function getPaginationAccessKeyForDirection(direction) {
+    if (direction > 0) {
+        return "N";
+    }
+
+    if (direction < 0) {
+        return "P";
+    }
+
+    return null;
+}
+
 function getPaginationLink(accessKey) {
     if (accessKey === null) {
         return null;
     }
 
     return document.querySelector(`a[accesskey='${accessKey}']`);
+}
+
+function getPaginationLinkForDirection(direction) {
+    return getPaginationLink(getPaginationAccessKeyForDirection(direction));
 }
 
 document.addEventListener("keydown", (event) => {
@@ -481,6 +520,13 @@ document.addEventListener("keydown", (event) => {
         return;
     }
 
+    const paginationLinkForDirection = getPaginationLinkForDirection(scrollDirection);
+    if (paginationLinkForDirection !== null && isAtPageEdge(scrollDirection)) {
+        event.preventDefault();
+        paginationLinkForDirection.click();
+        return;
+    }
+
     const targets = getScrollTargets();
     if (targets.length === 0) {
         return;
@@ -490,6 +536,11 @@ document.addEventListener("keydown", (event) => {
     const targetPost = findAdjacentScrollTarget(targets, window.scrollY + scrollPaddingTop, scrollDirection);
 
     if (targetPost === null) {
+        if (paginationLinkForDirection !== null) {
+            event.preventDefault();
+            paginationLinkForDirection.click();
+        }
+
         return;
     }
 
