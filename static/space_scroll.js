@@ -325,8 +325,6 @@ document.addEventListener("keydown", (event) => {
         return;
     }
 
-    resizeSinglePostMediaToViewport(document);
-
     if (isSpaceKey) {
         event.preventDefault();
         window.scrollTo({
