@@ -10,9 +10,9 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-const SNAPSHOT_VERSION: u8 = 1;
-const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v1.bin";
-const SOURCE_CACHE_DIR_NAME: &str = "sources.v1";
+const SNAPSHOT_VERSION: u8 = 2;
+const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v2.bin";
+const SOURCE_CACHE_DIR_NAME: &str = "sources.v2";
 const DEFAULT_CACHE_DIR: &str = "/var/lib/redlib/cache";
 const WRITE_DEBOUNCE_SECS: u64 = 1;
 
@@ -84,6 +84,8 @@ pub(crate) struct PersistedMedia {
 	pub url: String,
 	pub preview_url: String,
 	pub preview_srcset: String,
+	#[serde(default)]
+	pub content_fingerprint: String,
 	pub hls_url: String,
 	pub dash_url: String,
 	pub width: i64,
@@ -706,6 +708,7 @@ impl PersistedMedia {
 			url: value.url.clone(),
 			preview_url: value.preview_url.clone(),
 			preview_srcset: value.preview_srcset.clone(),
+			content_fingerprint: value.content_fingerprint.clone(),
 			hls_url: value.hls_url.clone(),
 			dash_url: value.dash_url.clone(),
 			width: value.width,
@@ -727,6 +730,7 @@ impl PersistedMedia {
 			url: self.url,
 			preview_url: self.preview_url,
 			preview_srcset: self.preview_srcset,
+			content_fingerprint: self.content_fingerprint,
 			hls_url: self.hls_url,
 			dash_url: self.dash_url,
 			width: self.width,

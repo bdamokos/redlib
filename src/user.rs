@@ -496,12 +496,13 @@ pub(crate) fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
 	let mut seen = HashMap::new();
 
 	for post in posts {
-		let Some(key) = duplicate_submission_key(&post) else {
+		let keys = duplicate_submission_keys(&post);
+		if keys.is_empty() {
 			collapsed.push(post);
 			continue;
-		};
+		}
 
-		if let Some(index) = seen.get(&key).copied() {
+		if let Some(index) = keys.iter().find_map(|key| seen.get(key).copied()) {
 			let primary: &mut Post = &mut collapsed[index];
 			if primary.body.is_empty() && primary.preview_body.is_empty() && !post.body.is_empty() {
 				primary.preview_body = post.body.clone();
@@ -509,27 +510,65 @@ pub(crate) fn collapse_duplicate_submissions(posts: Vec<Post>) -> Vec<Post> {
 			let mut merged = post;
 			merge_following_comments_into(primary, std::mem::take(&mut merged.following_comments));
 			primary.collapsed_duplicates.push(collapsed_duplicate(merged));
+			for key in keys {
+				seen.entry(key).or_insert(index);
+			}
 			continue;
 		}
 
-		seen.insert(key, collapsed.len());
+		let index = collapsed.len();
+		for key in keys {
+			seen.insert(key, index);
+		}
 		collapsed.push(post);
 	}
 
 	collapsed
 }
 
-pub(crate) fn duplicate_submission_key(post: &Post) -> Option<String> {
-	match post.post_type.as_str() {
-		"gallery" if !post.gallery.is_empty() => Some(format!(
-			"gallery:{}",
-			post.gallery.iter().map(|image| normalize_duplicate_url(&image.url)).collect::<Vec<_>>().join("|")
-		)),
-		"image" if !post.media.url.is_empty() => Some(format!("image:{}", normalize_duplicate_url(&post.media.url))),
-		"gif" => duplicate_gif_key(post),
-		"video" if redgifs::is_redgifs_domain(&post.domain) => duplicate_gif_key(post),
-		_ => None,
+fn push_normalized_duplicate_key(keys: &mut Vec<String>, prefix: &str, url: &str) {
+	let normalized = normalize_duplicate_url(url);
+	if !normalized.is_empty() {
+		keys.push(format!("{prefix}:{normalized}"));
 	}
+}
+
+fn duplicate_submission_keys(post: &Post) -> Vec<String> {
+	let mut keys = Vec::new();
+	match post.post_type.as_str() {
+		"gallery" if !post.gallery.is_empty() => {
+			let url_parts = post.gallery.iter().map(|image| normalize_duplicate_url(&image.url)).collect::<Vec<_>>();
+			let url_key = url_parts.join("|");
+			if url_parts.iter().all(|part| !part.is_empty()) {
+				keys.push(format!("gallery:{url_key}"));
+			}
+			let preview_parts = post.gallery.iter().map(|image| normalize_duplicate_url(&image.preview_url)).collect::<Vec<_>>();
+			let preview_key = preview_parts.join("|");
+			if preview_parts.iter().all(|part| !part.is_empty()) && preview_key != url_key {
+				keys.push(format!("gallery-preview:{preview_key}"));
+			}
+		}
+		"image" => {
+			push_normalized_duplicate_key(&mut keys, "image", &post.media.url);
+			push_normalized_duplicate_key(&mut keys, "image-preview", &post.media.preview_url);
+			push_normalized_duplicate_key(&mut keys, "image-thumbnail", &post.thumbnail.url);
+			if !post.media.content_fingerprint.is_empty() {
+				keys.push(format!("image-content:{}", post.media.content_fingerprint));
+			}
+		}
+		"gif" => {
+			if let Some(key) = duplicate_gif_key(post) {
+				keys.push(key);
+			}
+		}
+		"video" if redgifs::is_redgifs_domain(&post.domain) => {
+			if let Some(key) = duplicate_gif_key(post) {
+				keys.push(key);
+			}
+		}
+		_ => {}
+	}
+	keys
 }
 
 fn duplicate_gif_key(post: &Post) -> Option<String> {
@@ -1111,6 +1150,9 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 		utils::store_post_flairs(&posts);
 
 		filter_posts(&mut posts, filters);
+		if should_refill_duplicates {
+			utils::hydrate_image_content_fingerprints(&mut posts).await;
+		}
 		all_posts.extend(posts);
 
 		if should_refill_duplicates {
@@ -1305,6 +1347,37 @@ mod tests {
 		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
 		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "Second title");
 		assert_eq!(collapsed[0].collapsed_duplicates[0].display_community, "r/sub_two");
+	}
+
+	#[test]
+	fn collapses_matching_image_content_fingerprints() {
+		let mut first = test_post("one", "First title", "sub_one", "", "image", "https://i.redd.it/first.jpg", &[]);
+		first.media.preview_url = "/preview/pre/first.jpg?width=640&format=pjpg&auto=webp&s=one".to_string();
+		first.thumbnail.url = "/thumb/a/first.jpg".to_string();
+		first.media.content_fingerprint = "same-preview-content".to_string();
+		let mut second = test_post("two", "Second title", "sub_two", "", "image", "https://i.redd.it/second.jpg", &[]);
+		second.media.preview_url = "/preview/pre/second.jpg?width=640&format=pjpg&auto=webp&s=two".to_string();
+		second.thumbnail.url = "/thumb/b/second.jpg".to_string();
+		second.media.content_fingerprint = "same-preview-content".to_string();
+
+		let collapsed = collapse_duplicate_submissions(vec![first, second]);
+
+		assert_eq!(collapsed.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "Second title");
+	}
+
+	#[test]
+	fn collapses_matching_image_thumbnail_urls() {
+		let mut first = test_post("one", "First title", "sub_one", "", "image", "https://i.redd.it/first.jpg", &[]);
+		first.thumbnail.url = "/thumb/a/shared.jpg".to_string();
+		let mut second = test_post("two", "Second title", "sub_two", "", "image", "https://i.redd.it/second.jpg", &[]);
+		second.thumbnail.url = "/thumb/a/shared.jpg?ignored=1".to_string();
+
+		let collapsed = collapse_duplicate_submissions(vec![first, second]);
+
+		assert_eq!(collapsed.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
 	}
 
 	#[test]

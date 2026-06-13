@@ -319,6 +319,7 @@ pub struct Media {
 	pub url: String,
 	pub preview_url: String,
 	pub preview_srcset: String,
+	pub content_fingerprint: String,
 	pub hls_url: String,
 	pub dash_url: String,
 	pub width: i64,
@@ -341,6 +342,7 @@ impl Media {
 			url: String::new(),
 			preview_url: String::new(),
 			preview_srcset: String::new(),
+			content_fingerprint: String::new(),
 			hls_url: String::new(),
 			dash_url: String::new(),
 			width: 0,
@@ -515,6 +517,7 @@ impl Media {
 				url: format_url(url_val.as_str().unwrap_or_default()),
 				preview_url,
 				preview_srcset,
+				content_fingerprint: String::new(),
 				hls_url,
 				dash_url,
 				width,
@@ -1001,6 +1004,7 @@ impl Post {
 					url: format_url(val(post, "thumbnail").as_str()),
 					preview_url: String::new(),
 					preview_srcset: String::new(),
+					content_fingerprint: String::new(),
 					hls_url: String::new(),
 					dash_url: String::new(),
 					width: data["thumbnail_width"].as_i64().unwrap_or_default(),
@@ -2441,6 +2445,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			url: format_url(val(post, "thumbnail").as_str()),
 			preview_url: String::new(),
 			preview_srcset: String::new(),
+			content_fingerprint: String::new(),
 			hls_url: String::new(),
 			dash_url: String::new(),
 			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
@@ -2632,6 +2637,10 @@ const REDDIT_DELETED_IMAGE_PLACEHOLDER_HEIGHT: i64 = 60;
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_BODY_LEN: usize = 1048;
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_MAX_PROBE_BYTES: usize = 4096;
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_PROBE_TIMEOUT_SECS: u64 = 4;
+const REDDIT_IMAGE_FINGERPRINT_MAX_BYTES: usize = 768 * 1024;
+const REDDIT_IMAGE_FINGERPRINT_TIMEOUT_SECS: u64 = 3;
+const REDDIT_IMAGE_FINGERPRINT_MAX_POSTS: usize = 96;
+const REDDIT_IMAGE_FINGERPRINT_CONCURRENCY: usize = 8;
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_SHA256: [u8; 32] = [
 	0x35, 0xa0, 0x93, 0x2c, 0x61, 0xe0, 0x9a, 0x8c, 0x1c, 0xad, 0x9e, 0xec, 0x75, 0xb6, 0x7a, 0x03, 0x60, 0x20, 0x56, 0x46, 0x3e, 0xd2, 0x10, 0x31, 0x0d, 0x2a, 0x09, 0xcf,
 	0x0b, 0x00, 0x2e, 0xd5,
@@ -2648,6 +2657,19 @@ fn is_deleted_reddit_placeholder_url(url: &str) -> bool {
 
 fn deleted_placeholder_probe_timeout() -> StdDuration {
 	StdDuration::from_secs(REDDIT_DELETED_IMAGE_PLACEHOLDER_PROBE_TIMEOUT_SECS)
+}
+
+fn image_fingerprint_timeout() -> StdDuration {
+	StdDuration::from_secs(REDDIT_IMAGE_FINGERPRINT_TIMEOUT_SECS)
+}
+
+fn sha256_hex(body: &[u8]) -> String {
+	let digest = Sha256::digest(body);
+	let mut hex = String::with_capacity(digest.len() * 2);
+	for byte in digest {
+		hex.push_str(&format!("{byte:02x}"));
+	}
+	hex
 }
 
 fn deleted_placeholder_dimensions(width: i64, height: i64) -> bool {
@@ -2677,6 +2699,96 @@ fn local_proxy_path_to_reddit_image_upstream(path: &str, query: Option<&str>) ->
 	}
 
 	None
+}
+
+fn reddit_image_fingerprint_probe_url(media: &Media) -> Option<String> {
+	[&media.preview_url, &media.url].into_iter().find_map(|url| reddit_image_url_to_upstream(url))
+}
+
+#[cached(size = 4096, time = 10800)]
+async fn reddit_image_content_fingerprint(url: String) -> Option<String> {
+	let upstream = reddit_image_url_to_upstream(&url)?;
+	let Ok(parsed_uri) = upstream.parse::<Uri>() else {
+		return None;
+	};
+
+	let mut builder = Request::get(parsed_uri);
+	{
+		let client = OAUTH_CLIENT.load_full();
+		builder = builder.header("User-Agent", client.user_agent());
+	}
+	let Ok(request) = builder.body(Body::empty()) else {
+		return None;
+	};
+
+	let response = match tokio::time::timeout(image_fingerprint_timeout(), CLIENT.request(request)).await {
+		Ok(Ok(response)) if response.status().is_success() => response,
+		_ => return None,
+	};
+
+	if !response
+		.headers()
+		.get(CONTENT_TYPE)
+		.and_then(|value| value.to_str().ok())
+		.is_some_and(|value| value.starts_with("image/"))
+	{
+		return None;
+	}
+
+	if response
+		.headers()
+		.get(CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<usize>().ok())
+		.is_some_and(|length| length > REDDIT_IMAGE_FINGERPRINT_MAX_BYTES)
+	{
+		return None;
+	}
+
+	let body = match tokio::time::timeout(image_fingerprint_timeout(), read_response_bytes_limited(response, REDDIT_IMAGE_FINGERPRINT_MAX_BYTES)).await {
+		Ok(Ok(body)) if !body.is_empty() => body,
+		_ => return None,
+	};
+
+	Some(sha256_hex(&body))
+}
+
+pub async fn hydrate_image_content_fingerprints(posts: &mut [Post]) {
+	if cfg!(test) {
+		return;
+	}
+
+	let candidates = posts
+		.iter()
+		.enumerate()
+		.filter(|(_, post)| post.post_type == "image" && post.media.content_fingerprint.is_empty())
+		.filter_map(|(index, post)| reddit_image_fingerprint_probe_url(&post.media).map(|url| (index, url)))
+		.take(REDDIT_IMAGE_FINGERPRINT_MAX_POSTS)
+		.collect::<Vec<_>>();
+
+	let mut pending = JoinSet::new();
+	let mut results = Vec::new();
+
+	for (index, url) in candidates {
+		pending.spawn(async move { (index, reddit_image_content_fingerprint(url).await) });
+		if pending.len() >= REDDIT_IMAGE_FINGERPRINT_CONCURRENCY {
+			if let Some(Ok(result)) = pending.join_next().await {
+				results.push(result);
+			}
+		}
+	}
+
+	while let Some(joined) = pending.join_next().await {
+		if let Ok(result) = joined {
+			results.push(result);
+		}
+	}
+
+	for (index, fingerprint) in results {
+		if let (Some(post), Some(fingerprint)) = (posts.get_mut(index), fingerprint) {
+			post.media.content_fingerprint = fingerprint;
+		}
+	}
 }
 
 fn reddit_image_url_to_upstream(url: &str) -> Option<String> {
@@ -5974,6 +6086,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
 		preview_url: String::new(),
 		preview_srcset: String::new(),
+		content_fingerprint: String::new(),
 		hls_url: String::new(),
 		dash_url: String::new(),
 		width: 130,
@@ -5992,6 +6105,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
 		preview_url: String::new(),
 		preview_srcset: String::new(),
+		content_fingerprint: String::new(),
 		hls_url: String::new(),
 		dash_url: String::new(),
 		width: 0,
@@ -6010,6 +6124,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
 		preview_url: String::new(),
 		preview_srcset: String::new(),
+		content_fingerprint: String::new(),
 		hls_url: String::new(),
 		dash_url: String::new(),
 		width: 1080,
