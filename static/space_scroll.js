@@ -19,7 +19,7 @@ const POST_MEDIA_FIT_BOTTOM_GAP = 8;
 const POST_MEDIA_CONTINUATION_PEEK_LINES = 1.5;
 const POST_MEDIA_CONTINUATION_PEEK_MIN_HEIGHT = 32;
 const POST_MEDIA_FIT_MIN_HEIGHT = 96;
-const POST_MEDIA_STRETCHED_HEADER_TOLERANCE = 160;
+const POST_MEDIA_STRETCHED_HEADER_TOLERANCE = 64;
 const POST_CONTINUATION_SELECTOR = ".post_body, .post_poll, .post_following_comments, .post_duplicates";
 const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notification";
 let postMediaFitFrame = null;
@@ -104,6 +104,19 @@ function getContinuationElements(post) {
         .filter(hasContinuationContent);
 }
 
+function getContinuationStartElement(post, mediaElements) {
+    if (mediaElements.length > 1) {
+        return getMediaFitGroup(mediaElements[1]);
+    }
+
+    const continuationElements = getContinuationElements(post);
+    if (continuationElements.length > 0) {
+        return continuationElements[0];
+    }
+
+    return null;
+}
+
 function getContinuationPeekHeight(post, continuationElements) {
     const sampleElement = continuationElements[0] || post;
     const styles = window.getComputedStyle(sampleElement);
@@ -163,6 +176,17 @@ function getStableTopOverheadHeight(post, mediaGroupElement, actualTopOverheadHe
     return stableTopOverheadHeight;
 }
 
+function getContinuationGapHeight(mediaGroupElement, continuationStartElement) {
+    if (continuationStartElement === null) {
+        return 0;
+    }
+
+    return Math.max(
+        0,
+        continuationStartElement.getBoundingClientRect().top - mediaGroupElement.getBoundingClientRect().bottom,
+    );
+}
+
 function getContinuationFitHeight(post, mediaElement, mediaElements, availablePostHeight, baseMaxHeight) {
     const postRect = post.getBoundingClientRect();
     const mediaRect = mediaElement.getBoundingClientRect();
@@ -171,6 +195,7 @@ function getContinuationFitHeight(post, mediaElement, mediaElements, availablePo
     const mediaGroupRect = mediaGroupElement.getBoundingClientRect();
     const continuationElements = getContinuationElements(post);
     const hasContinuation = mediaElements.length > 1 || continuationElements.length > 0;
+    const continuationStartElement = getContinuationStartElement(post, mediaElements);
 
     if (!hasContinuation) {
         return null;
@@ -179,27 +204,32 @@ function getContinuationFitHeight(post, mediaElement, mediaElements, availablePo
     const actualTopOverheadHeight = Math.max(0, mediaGroupRect.top - postRect.top);
     const topOverheadHeight = getStableTopOverheadHeight(post, mediaGroupElement, actualTopOverheadHeight);
     const mediaChromeHeight = Math.max(0, mediaGroupRect.height - mediaHeight);
+    const continuationGapHeight = getContinuationGapHeight(mediaGroupElement, continuationStartElement);
     const continuationPeekHeight = getContinuationPeekHeight(post, continuationElements);
 
     return Math.min(
         baseMaxHeight,
         Math.max(
             POST_MEDIA_FIT_MIN_HEIGHT,
-            availablePostHeight - topOverheadHeight - mediaChromeHeight - continuationPeekHeight,
+            availablePostHeight - topOverheadHeight - mediaChromeHeight - continuationGapHeight - continuationPeekHeight,
         ),
     );
 }
 
-function getContinuationOverflow(post, mediaElement, availablePostHeight) {
+function getContinuationOverflow(post, mediaElement, mediaElements, availablePostHeight) {
     const mediaGroupElement = getMediaFitGroup(mediaElement);
     const postRect = post.getBoundingClientRect();
     const mediaGroupRect = mediaGroupElement.getBoundingClientRect();
     const actualTopOverheadHeight = Math.max(0, mediaGroupRect.top - postRect.top);
     const topOverheadHeight = getStableTopOverheadHeight(post, mediaGroupElement, actualTopOverheadHeight);
+    const continuationElements = getContinuationElements(post);
+    const continuationStartElement = getContinuationStartElement(post, mediaElements);
+    const continuationStartHeight = continuationStartElement === null
+        ? topOverheadHeight + mediaGroupRect.height
+        : Math.max(0, continuationStartElement.getBoundingClientRect().top - postRect.top);
 
-    return topOverheadHeight
-        + mediaGroupRect.height
-        + getContinuationPeekHeight(post, getContinuationElements(post))
+    return continuationStartHeight
+        + getContinuationPeekHeight(post, continuationElements)
         - availablePostHeight;
 }
 
@@ -242,10 +272,10 @@ function fitPostMediaToViewport(post) {
 
     post.style.setProperty("--post-media-fit-height", `${Math.floor(fitHeight)}px`);
 
-    for (let pass = 0; pass < 2; pass += 1) {
+    for (let pass = 0; pass < 4; pass += 1) {
         const overflow = continuationFitHeight === null
             ? post.getBoundingClientRect().height - availablePostHeight
-            : getContinuationOverflow(post, mediaElement, availablePostHeight);
+            : getContinuationOverflow(post, mediaElement, mediaElements, availablePostHeight);
         if (overflow <= 1) {
             break;
         }

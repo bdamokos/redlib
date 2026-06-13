@@ -1837,6 +1837,7 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 }
 
 .post_media_content {
+    align-self: start;
     max-width: calc(100% - 40px);
     grid-area: post_media;
     margin: 15px auto 5px auto;
@@ -1847,6 +1848,7 @@ form[data-subscription-form][data-subscription-pending="true"] button {
 
 /* Wraps video + duration/RedGifs meta so grid auto-placement cannot pull meta beside the title */
 .post_media_column {
+    align-self: start;
     grid-area: post_media;
     display: flex;
     flex-direction: column;
@@ -2099,6 +2101,7 @@ a.redgifs_uploader_mismatch {
 }
 
 .gallery {
+    align-self: start;
     grid-area: post_media;
     display: grid;
     gap: 16px;
