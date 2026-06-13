@@ -35,6 +35,13 @@ function getScrollTargets() {
     );
 }
 
+function getViewportAdvanceHeight() {
+    const paddingTop = getScrollPaddingTop();
+    const viewportHeight = window.innerHeight;
+
+    return Math.max(1, viewportHeight - paddingTop);
+}
+
 function isInteractiveElement(element) {
     if (!(element instanceof Element)) {
         return false;
@@ -84,8 +91,12 @@ function getKeyName(event) {
     return typeof event.key === "string" ? event.key.toLowerCase() : "";
 }
 
+function isSpaceNavigationKey(event) {
+    return getKeyName(event) === " " || event.code === "Space" || event.code === "Spacebar";
+}
+
 function getScrollNavigationDirection(event) {
-    if (event.key === " " || event.code === "Space") {
+    if (isSpaceNavigationKey(event)) {
         return event.shiftKey ? -1 : 1;
     }
 
@@ -121,7 +132,7 @@ function getPaginationLink(accessKey) {
 }
 
 document.addEventListener("keydown", (event) => {
-    const isSpaceKey = event.key === " " || event.code === "Space";
+    const isSpaceKey = isSpaceNavigationKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
     const isScrollNavigationKey = scrollDirection !== 0;
@@ -152,6 +163,14 @@ document.addEventListener("keydown", (event) => {
         : findAdjacentScrollTarget(targets, window.scrollY + scrollPaddingTop, scrollDirection);
 
     if (targetPost === null) {
+        if (isSpaceKey) {
+            event.preventDefault();
+            window.scrollTo({
+                top: Math.max(0, window.scrollY + (getViewportAdvanceHeight() * scrollDirection)),
+                behavior: "auto",
+            });
+        }
+
         return;
     }
 
