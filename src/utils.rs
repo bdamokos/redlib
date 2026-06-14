@@ -2638,9 +2638,10 @@ const REDDIT_DELETED_IMAGE_PLACEHOLDER_BODY_LEN: usize = 1048;
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_MAX_PROBE_BYTES: usize = 4096;
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_PROBE_TIMEOUT_SECS: u64 = 4;
 const REDDIT_IMAGE_FINGERPRINT_MAX_BYTES: usize = 768 * 1024;
-const REDDIT_IMAGE_FINGERPRINT_TIMEOUT_SECS: u64 = 3;
-const REDDIT_IMAGE_FINGERPRINT_MAX_POSTS: usize = 96;
-const REDDIT_IMAGE_FINGERPRINT_CONCURRENCY: usize = 8;
+const REDDIT_VIDEO_FINGERPRINT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const REDDIT_MEDIA_FINGERPRINT_TIMEOUT_SECS: u64 = 3;
+const REDDIT_MEDIA_FINGERPRINT_MAX_POSTS: usize = 96;
+const REDDIT_MEDIA_FINGERPRINT_CONCURRENCY: usize = 8;
 const REDDIT_DELETED_IMAGE_PLACEHOLDER_SHA256: [u8; 32] = [
 	0x35, 0xa0, 0x93, 0x2c, 0x61, 0xe0, 0x9a, 0x8c, 0x1c, 0xad, 0x9e, 0xec, 0x75, 0xb6, 0x7a, 0x03, 0x60, 0x20, 0x56, 0x46, 0x3e, 0xd2, 0x10, 0x31, 0x0d, 0x2a, 0x09, 0xcf,
 	0x0b, 0x00, 0x2e, 0xd5,
@@ -2659,8 +2660,8 @@ fn deleted_placeholder_probe_timeout() -> StdDuration {
 	StdDuration::from_secs(REDDIT_DELETED_IMAGE_PLACEHOLDER_PROBE_TIMEOUT_SECS)
 }
 
-fn image_fingerprint_timeout() -> StdDuration {
-	StdDuration::from_secs(REDDIT_IMAGE_FINGERPRINT_TIMEOUT_SECS)
+fn media_fingerprint_timeout() -> StdDuration {
+	StdDuration::from_secs(REDDIT_MEDIA_FINGERPRINT_TIMEOUT_SECS)
 }
 
 fn sha256_hex(body: &[u8]) -> String {
@@ -2705,13 +2706,35 @@ fn local_proxy_path_to_reddit_image_upstream(path: &str, query: Option<&str>) ->
 	None
 }
 
+fn local_proxy_path_to_reddit_video_upstream(path: &str) -> Option<String> {
+	let path = path.strip_prefix("/vid/")?;
+	let (video_id, file) = path.split_once('/')?;
+	let quality = file.split('?').next().unwrap_or(file).strip_suffix(".mp4").unwrap_or(file);
+	if video_id.is_empty() || !quality.bytes().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	Some(format!("https://v.redd.it/{video_id}/DASH_{quality}.mp4?source=fallback"))
+}
+
 fn reddit_image_fingerprint_probe_url(media: &Media) -> Option<String> {
 	[&media.preview_url, &media.url].into_iter().find_map(|url| reddit_image_url_to_upstream(url))
 }
 
 #[cached(size = 4096, time = 10800)]
 async fn reddit_image_content_fingerprint(url: String) -> Option<String> {
-	let upstream = reddit_image_url_to_upstream(&url)?;
+	reddit_media_content_fingerprint(url, REDDIT_IMAGE_FINGERPRINT_MAX_BYTES, |content_type| content_type.starts_with("image/")).await
+}
+
+#[cached(size = 4096, time = 10800)]
+async fn reddit_video_content_fingerprint(url: String) -> Option<String> {
+	reddit_media_content_fingerprint(url, REDDIT_VIDEO_FINGERPRINT_MAX_BYTES, |content_type| {
+		content_type.starts_with("video/") || content_type == "image/gif"
+	})
+	.await
+}
+
+async fn reddit_media_content_fingerprint(url: String, max_bytes: usize, content_type_allowed: fn(&str) -> bool) -> Option<String> {
+	let upstream = reddit_media_url_to_upstream(&url)?;
 	let Ok(parsed_uri) = upstream.parse::<Uri>() else {
 		return None;
 	};
@@ -2725,7 +2748,7 @@ async fn reddit_image_content_fingerprint(url: String) -> Option<String> {
 		return None;
 	};
 
-	let response = match tokio::time::timeout(image_fingerprint_timeout(), CLIENT.request(request)).await {
+	let response = match tokio::time::timeout(media_fingerprint_timeout(), CLIENT.request(request)).await {
 		Ok(Ok(response)) if response.status().is_success() => response,
 		_ => return None,
 	};
@@ -2734,7 +2757,7 @@ async fn reddit_image_content_fingerprint(url: String) -> Option<String> {
 		.headers()
 		.get(CONTENT_TYPE)
 		.and_then(|value| value.to_str().ok())
-		.is_some_and(|value| value.starts_with("image/"))
+		.is_some_and(|value| content_type_allowed(&value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase()))
 	{
 		return None;
 	}
@@ -2744,12 +2767,12 @@ async fn reddit_image_content_fingerprint(url: String) -> Option<String> {
 		.get(CONTENT_LENGTH)
 		.and_then(|value| value.to_str().ok())
 		.and_then(|value| value.parse::<usize>().ok())
-		.is_some_and(|length| length > REDDIT_IMAGE_FINGERPRINT_MAX_BYTES)
+		.is_some_and(|length| length > max_bytes)
 	{
 		return None;
 	}
 
-	let body = match tokio::time::timeout(image_fingerprint_timeout(), read_response_bytes_limited(response, REDDIT_IMAGE_FINGERPRINT_MAX_BYTES)).await {
+	let body = match tokio::time::timeout(media_fingerprint_timeout(), read_response_bytes_limited(response, max_bytes)).await {
 		Ok(Ok(body)) if !body.is_empty() => body,
 		_ => return None,
 	};
@@ -2757,7 +2780,27 @@ async fn reddit_image_content_fingerprint(url: String) -> Option<String> {
 	Some(sha256_hex(&body))
 }
 
-pub async fn hydrate_image_content_fingerprints(posts: &mut [Post]) {
+enum RedditMediaFingerprintProbe {
+	Image(String),
+	Video(String),
+}
+
+fn reddit_media_fingerprint_probe(post: &Post) -> Option<RedditMediaFingerprintProbe> {
+	match post.post_type.as_str() {
+		"image" => reddit_image_fingerprint_probe_url(&post.media).map(RedditMediaFingerprintProbe::Image),
+		"gif" => [&post.media.url, &post.media.video_preview_fallback_url]
+			.into_iter()
+			.find_map(|url| reddit_media_url_to_upstream(url))
+			.map(RedditMediaFingerprintProbe::Video),
+		"video" => [&post.media.video_preview_fallback_url, &post.media.url]
+			.into_iter()
+			.find_map(|url| reddit_media_url_to_upstream(url))
+			.map(RedditMediaFingerprintProbe::Video),
+		_ => None,
+	}
+}
+
+pub async fn hydrate_media_content_fingerprints(posts: &mut [Post]) {
 	if cfg!(test) {
 		return;
 	}
@@ -2765,17 +2808,23 @@ pub async fn hydrate_image_content_fingerprints(posts: &mut [Post]) {
 	let candidates = posts
 		.iter()
 		.enumerate()
-		.filter(|(_, post)| post.post_type == "image" && post.media.content_fingerprint.is_empty())
-		.filter_map(|(index, post)| reddit_image_fingerprint_probe_url(&post.media).map(|url| (index, url)))
-		.take(REDDIT_IMAGE_FINGERPRINT_MAX_POSTS)
+		.filter(|(_, post)| post.media.content_fingerprint.is_empty())
+		.filter_map(|(index, post)| reddit_media_fingerprint_probe(post).map(|probe| (index, probe)))
+		.take(REDDIT_MEDIA_FINGERPRINT_MAX_POSTS)
 		.collect::<Vec<_>>();
 
 	let mut pending = JoinSet::new();
 	let mut results = Vec::new();
 
-	for (index, url) in candidates {
-		pending.spawn(async move { (index, reddit_image_content_fingerprint(url).await) });
-		if pending.len() >= REDDIT_IMAGE_FINGERPRINT_CONCURRENCY {
+	for (index, probe) in candidates {
+		pending.spawn(async move {
+			let fingerprint = match probe {
+				RedditMediaFingerprintProbe::Image(url) => reddit_image_content_fingerprint(url).await,
+				RedditMediaFingerprintProbe::Video(url) => reddit_video_content_fingerprint(url).await,
+			};
+			(index, fingerprint)
+		});
+		if pending.len() >= REDDIT_MEDIA_FINGERPRINT_CONCURRENCY {
 			if let Some(Ok(result)) = pending.join_next().await {
 				results.push(result);
 			}
@@ -2793,6 +2842,24 @@ pub async fn hydrate_image_content_fingerprints(posts: &mut [Post]) {
 			post.media.content_fingerprint = fingerprint;
 		}
 	}
+}
+
+fn reddit_media_url_to_upstream(url: &str) -> Option<String> {
+	let normalized = if url.contains('"') || url.contains('<') || url.contains('>') {
+		url.to_string()
+	} else {
+		decode_html(url).unwrap_or_else(|_| url.to_string())
+	};
+
+	if let Ok(parsed) = Url::parse(&normalized) {
+		if matches!(parsed.domain(), Some("i.redd.it" | "preview.redd.it" | "external-preview.redd.it" | "v.redd.it")) {
+			return Some(normalized);
+		}
+		return local_proxy_path_to_reddit_image_upstream(parsed.path(), parsed.query()).or_else(|| local_proxy_path_to_reddit_video_upstream(parsed.path()));
+	}
+
+	let (path, query) = normalized.split_once('?').map_or((normalized.as_str(), None), |(path, query)| (path, Some(query)));
+	local_proxy_path_to_reddit_image_upstream(path, query).or_else(|| local_proxy_path_to_reddit_video_upstream(path))
 }
 
 pub(crate) fn reddit_image_url_to_upstream(url: &str) -> Option<String> {
@@ -6112,6 +6179,14 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 	assert_eq!(
 		reddit_image_url_to_upstream("https://redlib.example/preview/pre/1jgvmac4sg4h1.jpg?width=640"),
 		Some("https://preview.redd.it/1jgvmac4sg4h1.jpg?width=640".to_string())
+	);
+	assert_eq!(
+		reddit_media_url_to_upstream("/preview/pre/clip.gif?format=mp4&s=hash"),
+		Some("https://preview.redd.it/clip.gif?format=mp4&s=hash".to_string())
+	);
+	assert_eq!(
+		reddit_media_url_to_upstream("/vid/example/720.mp4"),
+		Some("https://v.redd.it/example/DASH_720.mp4?source=fallback".to_string())
 	);
 	assert!(media_may_be_deleted_placeholder(&Media {
 		url: "/img/1jgvmac4sg4h1.jpg".to_string(),

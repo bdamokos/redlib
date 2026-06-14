@@ -1376,7 +1376,7 @@ pub fn pick_next_remembered_subreddit_to_refresh() -> Option<FeedSource> {
 	pick_next_remembered_feed_to_refresh()
 }
 
-fn source_should_hydrate_image_fingerprints(source: &FeedSource) -> bool {
+fn source_should_hydrate_media_fingerprints(source: &FeedSource) -> bool {
 	matches!(source, FeedSource::Subreddit { name, .. } if name.to_lowercase().starts_with("u_"))
 }
 
@@ -1385,8 +1385,8 @@ async fn refresh_remembered_feed(source: &FeedSource) {
 	let listing_result = match Post::fetch(&source.build_path(), false).await {
 		Ok((posts, after)) => {
 			let mut posts = source.filter_posts(posts);
-			if source_should_hydrate_image_fingerprints(source) {
-				crate::utils::hydrate_image_content_fingerprints(&mut posts).await;
+			if source_should_hydrate_media_fingerprints(source) {
+				crate::utils::hydrate_media_content_fingerprints(&mut posts).await;
 			}
 			Ok((posts, after))
 		}
@@ -1611,8 +1611,8 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		}
 	};
 	let mut posts = source.filter_posts(posts);
-	if source_should_hydrate_image_fingerprints(&source) {
-		crate::utils::hydrate_image_content_fingerprints(&mut posts).await;
+	if source_should_hydrate_media_fingerprints(&source) {
+		crate::utils::hydrate_media_content_fingerprints(&mut posts).await;
 	}
 	if matches!(&source, FeedSource::UserComments { .. }) {
 		posts = crate::user::hydrate_following_comment_context(posts).await;

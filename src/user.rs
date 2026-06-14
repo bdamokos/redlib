@@ -615,10 +615,23 @@ fn duplicate_submission_keys(post: &Post) -> Vec<String> {
 			if let Some(key) = duplicate_gif_key(post) {
 				keys.push(key);
 			}
+			if !post.media.content_fingerprint.is_empty() {
+				keys.push(format!("media-content:{}", post.media.content_fingerprint));
+			}
 		}
-		"video" if redgifs::is_redgifs_domain(&post.domain) => {
-			if let Some(key) = duplicate_gif_key(post) {
-				keys.push(key);
+		"video" => {
+			if redgifs::is_redgifs_domain(&post.domain) {
+				if let Some(key) = duplicate_gif_key(post) {
+					keys.push(key);
+				}
+			} else {
+				push_normalized_duplicate_key(&mut keys, "video", &post.media.url);
+				if let Some(embed_src) = extract_embed_src(&post.media.embed_code) {
+					push_normalized_duplicate_key(&mut keys, "video", &embed_src);
+				}
+			}
+			if !post.media.content_fingerprint.is_empty() {
+				keys.push(format!("media-content:{}", post.media.content_fingerprint));
 			}
 		}
 		_ => {}
@@ -641,6 +654,10 @@ fn duplicate_gif_key(post: &Post) -> Option<String> {
 pub(crate) fn video_aggregate_key(post: &Post) -> Option<String> {
 	if post.media.duration_seconds <= 0 {
 		return None;
+	}
+
+	if matches!(post.post_type.as_str(), "gif" | "video") && !post.media.content_fingerprint.is_empty() {
+		return Some(format!("media-content:{}", post.media.content_fingerprint));
 	}
 
 	let redgifs_video_id = post
@@ -1169,7 +1186,7 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 
 		filter_posts(&mut posts, filters);
 		if should_refill_duplicates {
-			utils::hydrate_image_content_fingerprints(&mut posts).await;
+			utils::hydrate_media_content_fingerprints(&mut posts).await;
 		}
 		all_posts.extend(posts);
 
@@ -1556,6 +1573,20 @@ mod tests {
 	}
 
 	#[test]
+	fn collapses_matching_gif_content_fingerprints() {
+		let mut first = test_post("one", "GIF one", "sub_one", "", "gif", "/preview/pre/first.gif?format=mp4&s=one", &[]);
+		first.media.content_fingerprint = "same-video-preview-content".to_string();
+		let mut second = test_post("two", "GIF two", "sub_two", "", "gif", "/preview/pre/second.gif?format=mp4&s=two", &[]);
+		second.media.content_fingerprint = "same-video-preview-content".to_string();
+
+		let collapsed = collapse_duplicate_submissions(vec![first, second]);
+
+		assert_eq!(collapsed.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "GIF two");
+	}
+
+	#[test]
 	fn collapses_matching_embedded_gif_posts() {
 		let posts = vec![
 			test_embed_gif_post("one", "Embed one", "sub_one", "https://www.redgifs.com/ifr/mediumpurplesoggyconure/"),
@@ -1576,6 +1607,20 @@ mod tests {
 
 		let mut second = test_post("two", "Video two", "sub_two", "", "video", "/redgifs/zanyjudiciousrook/", &[]);
 		second.domain = "redgifs.com".to_string();
+
+		let collapsed = collapse_duplicate_submissions(vec![first, second]);
+
+		assert_eq!(collapsed.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates.len(), 1);
+		assert_eq!(collapsed[0].collapsed_duplicates[0].title, "Video two");
+	}
+
+	#[test]
+	fn collapses_matching_video_content_fingerprints() {
+		let mut first = test_post("one", "Video one", "sub_one", "", "video", "/vid/first/720.mp4", &[]);
+		first.media.content_fingerprint = "same-video-content".to_string();
+		let mut second = test_post("two", "Video two", "sub_two", "", "video", "/vid/second/720.mp4", &[]);
+		second.media.content_fingerprint = "same-video-content".to_string();
 
 		let collapsed = collapse_duplicate_submissions(vec![first, second]);
 
@@ -2210,6 +2255,25 @@ mod tests {
 		let username = "demo_user_video_dedupe";
 		let first = test_video_post("one", "Video one", "https://v.redd.it/example/DASH_720.mp4?source=fallback", 31);
 		let second = test_video_post("two", "Video two", "https://v.redd.it/example/DASH_720.mp4?foo=bar", 31);
+
+		super::update_user_video_stats(username, &[first, second]);
+
+		assert_eq!(
+			super::cached_user_video_stats(username),
+			Some(super::UserVideoStats {
+				average_duration_seconds: 31,
+				video_count: 1,
+			})
+		);
+	}
+
+	#[test]
+	fn video_stats_deduplicate_matching_content_fingerprints() {
+		let username = "demo_user_video_content_dedupe";
+		let mut first = test_video_post("one", "Video one", "https://v.redd.it/first/DASH_720.mp4?source=fallback", 31);
+		first.media.content_fingerprint = "same-video-content".to_string();
+		let mut second = test_video_post("two", "Video two", "https://v.redd.it/second/DASH_720.mp4?source=fallback", 90);
+		second.media.content_fingerprint = "same-video-content".to_string();
 
 		super::update_user_video_stats(username, &[first, second]);
 
