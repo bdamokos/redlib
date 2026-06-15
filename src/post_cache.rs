@@ -1065,6 +1065,8 @@ fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
 		|| normalized.contains("private")
 		|| normalized == "gated"
 		|| normalized.contains("gated")
+		|| normalized.contains("403")
+		|| normalized.contains("forbidden")
 		|| normalized.contains("404")
 		|| normalized.contains("not found")
 		|| normalized.contains("no posts found")
@@ -4074,6 +4076,22 @@ mod tests {
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		let entry = remembered.get("rust").unwrap();
 		let banned_until = entry.banned_until.expect("permanent backoff");
+		let remaining = banned_until.saturating_duration_since(Instant::now());
+		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
+		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
+	}
+
+	#[test]
+	fn failure_recording_uses_long_backoff_for_forbidden_failures() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("u_forbidden");
+		record_plain_subreddit_refresh_failure("u_forbidden", r#"Reddit error 403 "null": "Forbidden""#, RefreshOrigin::Daemon);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("u_forbidden").unwrap();
+		let banned_until = entry.banned_until.expect("forbidden backoff");
 		let remaining = banned_until.saturating_duration_since(Instant::now());
 		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
 		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
