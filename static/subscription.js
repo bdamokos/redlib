@@ -494,7 +494,25 @@
         syncAllForms();
     };
 
+    const togglePrimarySubscription = () => {
+        const form = document.querySelector(
+            "#user_subscription form[data-subscription-form], #sub_subscription form[data-subscription-form]",
+        );
+        if (!form || form.dataset.subscriptionPending === "true") {
+            return false;
+        }
+
+        bindForm(form);
+        if (typeof form.requestSubmit === "function") {
+            form.requestSubmit();
+        } else {
+            form.querySelector("button")?.click();
+        }
+        return true;
+    };
+
     window.initializeSubscriptionForms = initializeSubscriptionForms;
+    window.togglePrimarySubscription = togglePrimarySubscription;
 
     window.addEventListener("focus", syncAllForms);
     document.addEventListener("visibilitychange", () => {

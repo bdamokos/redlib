@@ -466,6 +466,10 @@ function getPaginationAccessKey(event) {
     return null;
 }
 
+function isFollowShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "f";
+}
+
 function getPaginationAccessKeyForDirection(direction) {
     if (direction > 0) {
         return "N";
@@ -492,16 +496,24 @@ function getPaginationLinkForDirection(direction) {
 
 document.addEventListener("keydown", (event) => {
     const isSpaceKey = isSpaceNavigationKey(event);
+    const isFollowShortcut = isFollowShortcutKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
     const isScrollNavigationKey = scrollDirection !== 0;
     const isPaginationKey = paginationLink !== null;
 
-    if (event.defaultPrevented || (!isScrollNavigationKey && !isPaginationKey) || event.altKey || event.ctrlKey || event.metaKey) {
+    if (event.defaultPrevented || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut) || event.altKey || event.ctrlKey || event.metaKey) {
         return;
     }
 
     if (isInteractiveElement(event.target) || isInteractiveElement(document.activeElement)) {
+        return;
+    }
+
+    if (isFollowShortcut) {
+        if (window.togglePrimarySubscription?.() === true) {
+            event.preventDefault();
+        }
         return;
     }
 
