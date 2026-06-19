@@ -22,6 +22,7 @@ const POST_MEDIA_FIT_MIN_HEIGHT = 96;
 const POST_MEDIA_STRETCHED_HEADER_TOLERANCE = 64;
 const POST_CONTINUATION_SELECTOR = ".post_body, .post_poll, .post_following_comments, .post_duplicates";
 const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notification";
+const EXPANDABLE_POST_PREVIEW_SELECTOR = ".post_preview.truncated:not(.expanded)";
 const PAGE_EDGE_TOLERANCE = 1;
 let postMediaFitFrame = null;
 
@@ -430,6 +431,30 @@ function findAdjacentScrollTarget(posts, currentTop, direction) {
     return null;
 }
 
+function isVisibleInViewport(element) {
+    const rect = element.getBoundingClientRect();
+
+    return rect.bottom > getScrollPaddingTop() + 1 && rect.top < window.innerHeight - 1;
+}
+
+function findExpandablePostPreview() {
+    const expandablePreviews = Array.from(document.querySelectorAll(EXPANDABLE_POST_PREVIEW_SELECTOR))
+        .filter(isVisibleTarget);
+    const visiblePreview = expandablePreviews.find(isVisibleInViewport);
+
+    return visiblePreview || expandablePreviews.find((preview) => preview.getBoundingClientRect().top >= getScrollPaddingTop()) || null;
+}
+
+function expandPostPreview(preview) {
+    if (!(preview instanceof Element)) {
+        return false;
+    }
+
+    preview.classList.add("expanded");
+    preview.classList.remove("truncated");
+    return true;
+}
+
 function getKeyName(event) {
     return typeof event.key === "string" ? event.key.toLowerCase() : "";
 }
@@ -470,6 +495,10 @@ function isFollowShortcutKey(event) {
     return !event.repeat && getKeyName(event) === "f";
 }
 
+function isExpandPreviewShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "m";
+}
+
 function getPaginationAccessKeyForDirection(direction) {
     if (direction > 0) {
         return "N";
@@ -497,12 +526,19 @@ function getPaginationLinkForDirection(direction) {
 document.addEventListener("keydown", (event) => {
     const isSpaceKey = isSpaceNavigationKey(event);
     const isFollowShortcut = isFollowShortcutKey(event);
+    const isExpandPreviewShortcut = isExpandPreviewShortcutKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
     const isScrollNavigationKey = scrollDirection !== 0;
     const isPaginationKey = paginationLink !== null;
 
-    if (event.defaultPrevented || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut) || event.altKey || event.ctrlKey || event.metaKey) {
+    if (
+        event.defaultPrevented
+        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut)
+        || event.altKey
+        || event.ctrlKey
+        || event.metaKey
+    ) {
         return;
     }
 
@@ -512,6 +548,13 @@ document.addEventListener("keydown", (event) => {
 
     if (isFollowShortcut) {
         if (window.togglePrimarySubscription?.() === true) {
+            event.preventDefault();
+        }
+        return;
+    }
+
+    if (isExpandPreviewShortcut) {
+        if (expandPostPreview(findExpandablePostPreview())) {
             event.preventDefault();
         }
         return;
