@@ -668,6 +668,9 @@ async fn preload_image_url(url: String) -> Result<(), String> {
 		.map_err(|e| e.to_string())?;
 	let status = response.status();
 	if !status.is_success() {
+		if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) && cacheable_image_url(&url) {
+			crate::post_cache::mark_deleted_reddit_media_url(&url);
+		}
 		return Err(format!("upstream returned {status}"));
 	}
 
@@ -771,6 +774,14 @@ fn response_should_probe_deleted_placeholder(url: &str, req: &Request<Body>, res
 		.is_some_and(|length| length <= crate::utils::deleted_reddit_placeholder_max_probe_bytes())
 }
 
+fn response_marks_missing_reddit_image(url: &str, req: &Request<Body>, res: &Response<Body>) -> bool {
+	if !cacheable_image_url(url) || req.headers().get("Range").is_some() {
+		return false;
+	}
+
+	matches!(res.status(), StatusCode::NOT_FOUND | StatusCode::GONE)
+}
+
 fn cached_image_response(entry: CachedImageResponse) -> Result<Response<Body>, String> {
 	let mut builder = Response::builder().status(entry.status).header("x-redlib-image-preload-cache", "hit");
 	if let Some(content_type) = entry.content_type {
@@ -855,6 +866,11 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 	rm("Report-To");
 
 	log_download_diagnostics("proxy_stream", url, res.status(), content_type.as_deref(), content_length, None, range.as_deref());
+
+	if response_marks_missing_reddit_image(url, req, &res) {
+		crate::post_cache::mark_deleted_reddit_media_url(url);
+		return deleted_media_response();
+	}
 
 	if response_should_probe_deleted_placeholder(url, req, &res) {
 		let (parts, body) = res.into_parts();
@@ -1329,6 +1345,21 @@ fn test_local_proxy_image_to_upstream_preserves_query() {
 		Some("https://external-preview.redd.it/example.jpg".to_string())
 	);
 	assert_eq!(local_proxy_image_to_upstream("/vid/demo/DASH_720.mp4"), None);
+}
+
+#[test]
+fn test_missing_reddit_image_responses_mark_for_invalidation() {
+	let req = Request::get("/preview/pre/example.jpg").body(Body::empty()).expect("request should build");
+	let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).expect("response should build");
+	let gone = Response::builder().status(StatusCode::GONE).body(Body::empty()).expect("response should build");
+	let forbidden = Response::builder().status(StatusCode::FORBIDDEN).body(Body::empty()).expect("response should build");
+	let ranged_req = Request::builder().header("Range", "bytes=0-1").body(Body::empty()).expect("request should build");
+
+	assert!(response_marks_missing_reddit_image("https://preview.redd.it/example.jpg?width=640", &req, &missing));
+	assert!(response_marks_missing_reddit_image("https://i.redd.it/example.jpg", &req, &gone));
+	assert!(!response_marks_missing_reddit_image("https://preview.redd.it/example.jpg?width=640", &req, &forbidden));
+	assert!(!response_marks_missing_reddit_image("https://example.com/example.jpg", &req, &missing));
+	assert!(!response_marks_missing_reddit_image("https://preview.redd.it/example.jpg?width=640", &ranged_req, &missing));
 }
 
 #[test]

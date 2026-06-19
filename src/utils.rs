@@ -441,7 +441,11 @@ impl Media {
 			// If this post contains a gallery of images
 			gallery = GalleryMedia::parse(&data["gallery_data"]["items"], &data["media_metadata"]);
 
-			("gallery", &data["url"], None, None, None, None)
+			if gallery.is_empty() {
+				("self", &data["permalink"], None, None, None, None)
+			} else {
+				("gallery", &data["url"], None, None, None, None)
+			}
 		} else if data["crosspost_parent_list"][0]["is_gallery"].as_bool().unwrap_or_default() {
 			// If this post contains a gallery of images
 			gallery = GalleryMedia::parse(
@@ -449,7 +453,11 @@ impl Media {
 				&data["crosspost_parent_list"][0]["media_metadata"],
 			);
 
-			("gallery", &data["url"], None, None, None, None)
+			if gallery.is_empty() {
+				("self", &data["permalink"], None, None, None, None)
+			} else {
+				("gallery", &data["url"], None, None, None, None)
+			}
 		} else if data["is_reddit_media_domain"].as_bool().unwrap_or_default() && data["domain"] == "i.redd.it" {
 			// If this post contains a reddit media (image) URL.
 			("image", &data["url"], None, None, None, None)
@@ -5335,6 +5343,21 @@ mod tests {
 		assert_eq!(media.url, "/vid/demo/720.mp4");
 		assert_eq!(media.hls_url, "/hls/demo/HLSPlaylist.m3u8");
 		assert_eq!(media.dash_url, "/dash/demo/DASHPlaylist.mpd");
+	}
+
+	#[test]
+	fn media_parse_treats_empty_gallery_as_self() {
+		let data = json!({
+			"is_gallery": true,
+			"permalink": "/r/demo/comments/abc123/deleted_gallery/",
+			"url": "https://www.reddit.com/gallery/abc123"
+		});
+
+		let (post_type, media, gallery) = block_on(Media::parse(&data));
+
+		assert_eq!(post_type, "self");
+		assert_eq!(media.url, "/r/demo/comments/abc123/deleted_gallery/");
+		assert!(gallery.is_empty());
 	}
 
 	#[test]
