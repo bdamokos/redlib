@@ -1235,40 +1235,6 @@ fn contextual_listing_posts_from_feed_page(
 	}
 }
 
-async fn live_feed_shell_loading_message(
-	req: &Request<Body>,
-	preferences: &Preferences,
-	front_page: &str,
-	front_page_is_default: bool,
-	has_saved_feeds: bool,
-	sub_name: &str,
-	sort: &str,
-) -> Option<String> {
-	let query = req.uri().query().unwrap_or_default().to_string();
-	let cache_page = param(&format!("?{}", query), "cache_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
-	let filters = get_filters(req);
-	let sources = build_front_page_session_sources(preferences, front_page, front_page_is_default, has_saved_feeds, sub_name, sort);
-	if sources.is_empty() {
-		return None;
-	}
-	let feed_session_id = crate::post_cache::begin_feed_session(
-		FeedSessionRequest {
-			sources,
-			filters,
-			quarantine: true,
-			query_fingerprint: listing_query_fingerprint(&query),
-			bundle_followed_user_comments: is_following_front_page(front_page),
-			merge_sort: following_feed_merge_sort(front_page, sort),
-			..Default::default()
-		},
-		cache_page,
-		crate::post_cache::POSTS_PER_PAGE,
-	)
-	.await;
-
-	crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).map(|status| status.status_message)
-}
-
 fn build_aggregate_sources(preferences: &Preferences, front_page: &str, sort: &str, reddit_query: &str) -> Vec<AggregateFeedSource> {
 	let subscriptions = if is_following_front_page(front_page) {
 		followed_user_subscriptions(preferences)
@@ -1749,15 +1715,14 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let loading_message = if is_video_length_sort(&sort) {
 		"Loading videos...".to_string()
 	} else if contextual_front_page {
-		live_feed_shell_loading_message(&req, &prefs, &front_page, front_page_is_default, aggregate_front_page, &sub_name, &sort)
-			.await
-			.unwrap_or_else(|| {
-				if front_page_is_following {
-					"Loading followed users in the background.".to_string()
-				} else {
-					"Loading followed feeds in the background.".to_string()
-				}
-			})
+		// The contextual front page is rendered server-side below. Starting a shell-only
+		// feed session here makes that renderer join an already-backgrounded session
+		// and can paint an unstable partial page after a fresh deploy.
+		if front_page_is_following {
+			"Loading followed users in the background.".to_string()
+		} else {
+			"Loading followed feeds in the background.".to_string()
+		}
 	} else {
 		"Loading posts...".to_string()
 	};

@@ -46,6 +46,7 @@
             const banner = document.querySelector(".feed_status_banner");
             let lastRefreshToken = null;
             let lastFragmentHtml = null;
+            let postsHavePainted = false;
             let timerId = null;
 
             const showErrorState = () => {
@@ -64,6 +65,13 @@
             const hasVisiblePosts = () => {
                 const currentPosts = container.querySelector("#posts");
                 return !!currentPosts?.querySelector(".post");
+            };
+
+            const syncPaintedPostsState = () => {
+                if (hasVisiblePosts()) {
+                    postsHavePainted = true;
+                }
+                return postsHavePainted;
             };
 
             const updateFeedContent = (html) => {
@@ -90,11 +98,13 @@
                 if (shouldInitialFillPosts) {
                     currentPosts.innerHTML = nextPosts.innerHTML;
                     refreshDynamicContent(currentPosts);
+                    postsHavePainted = hasVisiblePosts();
                 }
 
                 if ((!currentPosts || !nextPosts) && !hasVisiblePosts()) {
                     container.replaceChildren(...nextRoot.childNodes);
                     refreshDynamicContent(container);
+                    postsHavePainted = hasVisiblePosts();
                 }
 
                 lastFragmentHtml = html;
@@ -120,7 +130,7 @@
                 }
 
                 const shouldRefreshFragment =
-                    !hasVisiblePosts() && (lastRefreshToken === null || lastRefreshToken !== status.refresh_token);
+                    !syncPaintedPostsState() && (lastRefreshToken === null || lastRefreshToken !== status.refresh_token);
 
                 if (shouldRefreshFragment) {
                     const fragmentResponse = await fetchWithTimeout(fragmentUrl, {
