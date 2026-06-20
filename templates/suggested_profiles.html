@@ -16,7 +16,7 @@
 	<header class="suggested_profiles_header panel">
 		<div>
 			<p class="suggested_profiles_kicker">Based on followed profiles</p>
-			<h1>Profiles that post in similar subreddits</h1>
+			<h1>Profiles from the same subreddits</h1>
 		</div>
 		<div class="suggested_profiles_stats" aria-label="Suggestion source summary">
 			<div>
@@ -29,11 +29,11 @@
 			</div>
 			<div>
 				<strong>{{ report.compared_profile_count }}</strong>
-				<span>candidate profiles checked</span>
+				<span>authors compared</span>
 			</div>
 			<div>
 				<strong>{{ report.cached_profile_count }}</strong>
-				<span>cached authors</span>
+				<span>cached authors available</span>
 			</div>
 		</div>
 	</header>
@@ -60,7 +60,7 @@
 	{% else if report.suggestions.is_empty() %}
 	<section class="suggested_profiles_empty panel">
 		<h2>No similar cached profiles yet</h2>
-		<p>Need cached authors who post in the same subreddits as your followed profiles.</p>
+		<p>No other cached authors were found posting in those same subreddits.</p>
 	</section>
 	{% else %}
 	<section class="suggested_profile_grid" data-suggested-profile-group>
@@ -102,7 +102,7 @@
 					{% for subreddit in suggestion.overlap_subreddits %}
 					<li>
 						<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }}</a>
-						<span>profile {{ subreddit.profile_count }} · followed {{ subreddit.followed_count }}</span>
+						<span>candidate {{ subreddit.profile_count }} · followed {{ subreddit.followed_count }}</span>
 					</li>
 					{% endfor %}
 				</ul>

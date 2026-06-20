@@ -9,6 +9,7 @@ use std::sync::{LazyLock, Mutex};
 const SUGGESTED_PROFILE_TOP_SUBREDDITS: usize = 16;
 const SUGGESTED_PROFILE_REASON_LIMIT: usize = 5;
 const SUGGESTED_PROFILE_MIN_POSTS: usize = 2;
+const SUGGESTED_PROFILE_SUBREDDIT_USER_LIMIT: usize = 120;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CatalogSourceKey {
@@ -424,16 +425,50 @@ pub(crate) fn suggested_profiles(
 	let followed_norm = followed_weights.values().map(|weight| weight * weight).sum::<f64>().sqrt();
 	let followed_subreddit_counts = followed_counts.clone();
 
+	let mut candidate_counts_by_profile: HashMap<String, HashMap<String, usize>> = HashMap::new();
+	let mut cached_profile_names = catalog.author_community_counts.keys().cloned().collect::<HashSet<_>>();
+
+	for (profile, counts) in &catalog.author_community_counts {
+		if followed_profiles.contains(profile) || excluded_profiles.contains(profile) {
+			continue;
+		}
+
+		let profile_counts = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
+		if profile_counts.iter().all(|(subreddit, _)| !followed_weights.contains_key(subreddit)) {
+			continue;
+		}
+
+		let candidate_counts = candidate_counts_by_profile.entry(profile.clone()).or_default();
+		for (subreddit, count) in profile_counts {
+			let entry = candidate_counts.entry(subreddit).or_default();
+			*entry = (*entry).max(count);
+		}
+	}
+	drop(catalog);
+
+	for (subreddit, _) in &followed_top {
+		for (profile, count) in crate::utils::cached_subreddit_users(subreddit).into_iter().take(SUGGESTED_PROFILE_SUBREDDIT_USER_LIMIT) {
+			let profile = normalize_profile_name(&profile);
+			if profile.is_empty() || profile == "[deleted]" {
+				continue;
+			}
+			cached_profile_names.insert(profile.clone());
+			if followed_profiles.contains(&profile) || excluded_profiles.contains(&profile) || count == 0 {
+				continue;
+			}
+
+			let subreddit_counts = candidate_counts_by_profile.entry(profile).or_default();
+			let entry = subreddit_counts.entry(subreddit.clone()).or_default();
+			*entry = (*entry).max(count as usize);
+		}
+	}
+
 	let mut suggestions = Vec::new();
 	let mut compared_profile_count = 0usize;
 
 	if followed_norm > 0.0 {
-		for (profile, counts) in &catalog.author_community_counts {
-			if followed_profiles.contains(profile) || excluded_profiles.contains(profile) {
-				continue;
-			}
-
-			let profile_counts = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
+		for (profile, counts) in candidate_counts_by_profile {
+			let profile_counts = sorted_subreddit_counts(&counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
 			let cached_posts = profile_counts.iter().map(|(_, count)| *count).sum::<usize>();
 			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
 				continue;
@@ -500,7 +535,7 @@ pub(crate) fn suggested_profiles(
 	SuggestedProfilesReport {
 		followed_profile_count: followed_profiles.len(),
 		followed_profiles_with_cache,
-		cached_profile_count: catalog.author_community_counts.len(),
+		cached_profile_count: cached_profile_names.len(),
 		compared_profile_count,
 		followed_subreddits: followed_top
 			.into_iter()
@@ -748,5 +783,42 @@ mod tests {
 
 		assert_eq!(report.followed_profiles_with_cache, 1);
 		assert_eq!(report.suggestions[0].name, "bob");
+	}
+
+	#[test]
+	fn suggested_profiles_use_subreddit_author_cache_for_candidates() {
+		let _guard = test_lock();
+		reset_catalog();
+		crate::utils::clear_test_caches();
+
+		let side_cache = HashMap::from([(
+			"alice".to_string(),
+			vec![("rare_alpha_for_suggestions".to_string(), 4), ("rare_beta_for_suggestions".to_string(), 2)],
+		)]);
+		crate::utils::store_subreddit_users(
+			"rare_alpha_for_suggestions",
+			&[
+				test_post("bob-alpha-1", "rare_alpha_for_suggestions", "bob", 300),
+				test_post("bob-alpha-2", "rare_alpha_for_suggestions", "bob", 290),
+				test_post("alice-alpha", "rare_alpha_for_suggestions", "alice", 280),
+			],
+		);
+		crate::utils::store_subreddit_users(
+			"rare_beta_for_suggestions",
+			&[
+				test_post("bob-beta", "rare_beta_for_suggestions", "bob", 270),
+				test_post("carol-beta", "rare_beta_for_suggestions", "carol", 260),
+			],
+		);
+
+		let report = suggested_profiles(&["alice".to_string()], &side_cache, &HashSet::new(), 10);
+
+		assert_eq!(report.followed_profiles_with_cache, 1);
+		assert_eq!(report.compared_profile_count, 1);
+		assert_eq!(report.suggestions[0].name, "bob");
+		assert_eq!(report.suggestions[0].matched_posts, 3);
+		assert!(!report.suggestions.iter().any(|entry| entry.name == "alice"));
+
+		crate::utils::clear_test_caches();
 	}
 }

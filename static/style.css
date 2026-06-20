@@ -2940,12 +2940,12 @@ input[type="submit"] {
 }
 
 .suggested_profiles_header {
-    align-items: center;
+    align-items: flex-start;
     background: var(--outside);
     border-radius: 5px;
-    display: grid;
+    display: flex;
+    flex-direction: column;
     gap: 18px;
-    grid-template-columns: minmax(0, 1fr) auto;
     padding: 18px 20px;
 }
 
@@ -2953,6 +2953,7 @@ input[type="submit"] {
     font-size: 28px;
     font-weight: 700;
     line-height: 1.15;
+    max-width: 680px;
 }
 
 .suggested_profiles_kicker {
@@ -2968,6 +2969,7 @@ input[type="submit"] {
     display: grid;
     gap: 12px;
     grid-template-columns: repeat(4, minmax(70px, 1fr));
+    width: 100%;
 }
 
 .suggested_profiles_stats div {
@@ -3151,10 +3153,6 @@ input[type="submit"] {
 }
 
 @media screen and (max-width: 760px) {
-    .suggested_profiles_header {
-        grid-template-columns: 1fr;
-    }
-
     .suggested_profiles_stats {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
