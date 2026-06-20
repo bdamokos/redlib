@@ -42,10 +42,10 @@
 	<section class="suggested_profiles_signal">
 		<span>Your followed profiles post most in</span>
 		{% for subreddit in report.followed_subreddits %}
-		<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }} <small>{{ subreddit.followed_count }} posts</small></a>
-		{% endfor %}
-	</section>
-	{% endif %}
+			<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }} <small>{{ subreddit.followed_count }} posts</small></a>
+			{% endfor %}
+		</section>
+		{% endif %}
 
 	{% if report.followed_profile_count == 0 %}
 	<section class="suggested_profiles_empty panel">
@@ -74,11 +74,15 @@
 							<span>{{ suggestion.score_percent }}%</span>
 							<small>match</small>
 						</div>
+						</div>
+						<p class="suggested_profile_meta">
+							{% if suggestion.overlap_subreddits.len() == 1 %}
+							One-subreddit overlap: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts match.
+							{% else %}
+							{{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} subreddits.
+							{% endif %}
+						</p>
 					</div>
-					<p class="suggested_profile_meta">
-						{{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} subreddits.
-					</p>
-				</div>
 				<form
 					class="suggested_profile_follow"
 					action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
@@ -130,10 +134,13 @@
 				{% if suggestion.redgifs_profile_count > 0 %}
 				<span class="suggested_profile_signal_rg"><strong>{{ suggestion.redgifs_profile_count }}</strong> RedGifs {% if suggestion.redgifs_profile_count == 1 %}profile{% else %}profiles{% endif %}</span>
 				{% endif %}
-				{% if suggestion.media_posts.len() > 0 %}
-				<span><strong>{{ suggestion.media_posts.len() }}</strong> media previews</span>
-				{% endif %}
-			</div>
+					{% if suggestion.media_posts.len() > 0 %}
+					<span><strong>{{ suggestion.media_posts.len() }}</strong> media previews</span>
+					{% endif %}
+					{% if suggestion.overlap_subreddits.len() == 1 %}
+					<span class="suggested_profile_signal_narrow"><strong>narrow</strong> subreddit match</span>
+					{% endif %}
+				</div>
 
 			<div class="suggested_profile_body">
 				<div class="suggested_profile_overlap_header">
@@ -141,10 +148,10 @@
 				</div>
 				<ul class="suggested_profile_overlap">
 					{% for subreddit in suggestion.overlap_subreddits %}
-					<li>
-						<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }}</a>
-						<span>candidate {{ subreddit.profile_count }} · followed {{ subreddit.followed_count }}</span>
-					</li>
+						<li>
+							<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }}</a>
+							<span>candidate {{ subreddit.profile_count }} · followed {{ subreddit.followed_count }} · {{ subreddit.followed_profile_count }} profiles</span>
+						</li>
 					{% endfor %}
 				</ul>
 			</div>

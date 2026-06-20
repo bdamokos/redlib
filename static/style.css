@@ -3229,6 +3229,11 @@ input[type="submit"] {
     color: color-mix(in srgb, oklch(66% 0.17 32) 82%, var(--text) 18%);
 }
 
+.suggested_profile_signals .suggested_profile_signal_narrow {
+    background: color-mix(in srgb, var(--accent) 8%, var(--outside));
+    color: color-mix(in srgb, var(--visited) 72%, var(--accent) 28%);
+}
+
 .suggested_profile_overlap_header {
     align-items: center;
     display: flex;

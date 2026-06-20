@@ -11,6 +11,11 @@ const SUGGESTED_PROFILE_REASON_LIMIT: usize = 5;
 const SUGGESTED_PROFILE_MIN_POSTS: usize = 2;
 const SUGGESTED_PROFILE_SUBREDDIT_USER_LIMIT: usize = 120;
 const SUGGESTED_PROFILE_MEDIA_LIMIT: usize = 3;
+const SUGGESTED_PROFILE_SELF_SUBREDDIT_FACTOR: f64 = 0.30;
+const SUGGESTED_PROFILE_SINGLE_SOURCE_FACTOR: f64 = 0.55;
+const SUGGESTED_PROFILE_TWO_SOURCE_FACTOR: f64 = 0.75;
+const SUGGESTED_PROFILE_SINGLE_OVERLAP_FACTOR: f64 = 0.60;
+const SUGGESTED_PROFILE_TWO_OVERLAP_FACTOR: f64 = 0.85;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CatalogSourceKey {
@@ -44,6 +49,7 @@ pub struct CatalogUserSidebarStats {
 pub struct SuggestedProfileSubreddit {
 	pub name: String,
 	pub followed_count: usize,
+	pub followed_profile_count: usize,
 	pub profile_count: usize,
 }
 
@@ -171,6 +177,29 @@ fn suggested_profile_weight(count: usize) -> f64 {
 	(count as f64).sqrt()
 }
 
+fn suggested_profile_source_factor(subreddit: &str, followed_profiles: &HashSet<String>, followed_profile_identities: &HashSet<String>, followed_profile_count: usize) -> f64 {
+	let subreddit_identity = crate::utils::creator_identity_fingerprint(subreddit);
+	let is_followed_self_subreddit = followed_profiles.contains(subreddit) || (!subreddit_identity.is_empty() && followed_profile_identities.contains(&subreddit_identity));
+	if is_followed_self_subreddit && followed_profile_count <= 1 {
+		SUGGESTED_PROFILE_SELF_SUBREDDIT_FACTOR
+	} else if followed_profile_count <= 1 {
+		SUGGESTED_PROFILE_SINGLE_SOURCE_FACTOR
+	} else if followed_profile_count == 2 {
+		SUGGESTED_PROFILE_TWO_SOURCE_FACTOR
+	} else {
+		1.0
+	}
+}
+
+fn suggested_profile_overlap_factor(overlap_count: usize) -> f64 {
+	match overlap_count {
+		0 => 0.0,
+		1 => SUGGESTED_PROFILE_SINGLE_OVERLAP_FACTOR,
+		2 => SUGGESTED_PROFILE_TWO_OVERLAP_FACTOR,
+		_ => 1.0,
+	}
+}
+
 fn normalize_profile_name(name: &str) -> String {
 	let trimmed = name.trim();
 	let without_prefix = trimmed.strip_prefix("u_").or_else(|| trimmed.strip_prefix("u/")).unwrap_or(trimmed);
@@ -195,6 +224,40 @@ fn suggested_profile_media_source(post: &Post) -> Option<(String, &'static str)>
 	}
 }
 
+fn suggested_profile_media_key_url(url: &str) -> Option<String> {
+	let trimmed = url.trim();
+	if trimmed.is_empty() {
+		return None;
+	}
+	let without_fragment = trimmed.split_once('#').map_or(trimmed, |(value, _)| value);
+	let without_query = without_fragment.split_once('?').map_or(without_fragment, |(value, _)| value);
+	Some(without_query.trim_end_matches('/').to_ascii_lowercase())
+}
+
+fn suggested_profile_media_key(post: &Post, fallback_url: &str) -> String {
+	let mut candidates = Vec::new();
+	candidates.push(post.media.content_fingerprint.as_str());
+	candidates.push(post.media.url.as_str());
+	if post.post_type == "gallery" {
+		if let Some(image) = post.gallery.first() {
+			candidates.push(image.url.as_str());
+			candidates.push(image.preview_url.as_str());
+		}
+	}
+	candidates.push(post.media.poster.as_str());
+	candidates.push(post.media.preview_url.as_str());
+	candidates.push(post.thumbnail.url.as_str());
+	if let Some(out_url) = &post.out_url {
+		candidates.push(out_url.as_str());
+	}
+	candidates.push(fallback_url);
+
+	candidates
+		.into_iter()
+		.find_map(suggested_profile_media_key_url)
+		.unwrap_or_else(|| fallback_url.trim().to_ascii_lowercase())
+}
+
 fn suggested_profile_media_posts(username: &str, limit: usize) -> Vec<SuggestedProfileMediaPost> {
 	let username = normalize_profile_name(username);
 	if username.is_empty() || limit == 0 {
@@ -214,22 +277,37 @@ fn suggested_profile_media_posts(username: &str, limit: usize) -> Vec<SuggestedP
 				return None;
 			}
 			let (image_url, media_type) = suggested_profile_media_source(&record.post)?;
-			Some(SuggestedProfileMediaPost {
-				title: record.post.title.clone(),
-				permalink: record.post.permalink.clone(),
-				subreddit: record.post.community.clone(),
-				image_url,
-				media_type: media_type.to_string(),
-				duration: record.post.media.duration.clone(),
-				nsfw: record.post.flags.nsfw,
-				spoiler: record.post.flags.spoiler,
-				created_ts: record.created_ts,
-			})
+			let media_key = suggested_profile_media_key(&record.post, &image_url);
+			Some((
+				media_key,
+				SuggestedProfileMediaPost {
+					title: record.post.title.clone(),
+					permalink: record.post.permalink.clone(),
+					subreddit: record.post.community.clone(),
+					image_url,
+					media_type: media_type.to_string(),
+					duration: record.post.media.duration.clone(),
+					nsfw: record.post.flags.nsfw,
+					spoiler: record.post.flags.spoiler,
+					created_ts: record.created_ts,
+				},
+			))
 		})
 		.collect::<Vec<_>>();
-	posts.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.permalink.cmp(&left.permalink)));
-	posts.truncate(limit);
-	posts
+	posts.sort_by(|(_, left), (_, right)| right.created_ts.cmp(&left.created_ts).then_with(|| right.permalink.cmp(&left.permalink)));
+
+	let mut seen_media = HashSet::new();
+	let mut unique_posts = Vec::new();
+	for (media_key, post) in posts {
+		if !seen_media.insert(media_key) {
+			continue;
+		}
+		unique_posts.push(post);
+		if unique_posts.len() >= limit {
+			break;
+		}
+	}
+	unique_posts
 }
 
 fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
@@ -453,6 +531,11 @@ pub(crate) fn suggested_profiles(
 		.map(|name| normalize_profile_name(name))
 		.filter(|name| !name.is_empty())
 		.collect::<HashSet<_>>();
+	let followed_profile_identities = followed_profiles
+		.iter()
+		.map(|profile| crate::utils::creator_identity_fingerprint(profile))
+		.filter(|profile| !profile.is_empty())
+		.collect::<HashSet<_>>();
 
 	if followed_profiles.is_empty() || limit == 0 {
 		let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
@@ -465,6 +548,7 @@ pub(crate) fn suggested_profiles(
 
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	let mut followed_counts: HashMap<String, usize> = HashMap::new();
+	let mut followed_profile_counts: HashMap<String, usize> = HashMap::new();
 	let mut followed_profiles_with_cache = 0usize;
 
 	for profile in &followed_profiles {
@@ -486,6 +570,7 @@ pub(crate) fn suggested_profiles(
 		}
 		followed_profiles_with_cache += 1;
 		for (subreddit, count) in profile_counts {
+			*followed_profile_counts.entry(subreddit.clone()).or_default() += 1;
 			*followed_counts.entry(subreddit).or_default() += count;
 		}
 	}
@@ -493,10 +578,15 @@ pub(crate) fn suggested_profiles(
 	let followed_top = sorted_subreddit_counts(&followed_counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
 	let followed_weights = followed_top
 		.iter()
-		.map(|(subreddit, count)| (subreddit.clone(), suggested_profile_weight(*count)))
+		.map(|(subreddit, count)| {
+			let source_count = *followed_profile_counts.get(subreddit).unwrap_or(&0);
+			let source_factor = suggested_profile_source_factor(subreddit, &followed_profiles, &followed_profile_identities, source_count);
+			(subreddit.clone(), suggested_profile_weight(*count) * source_factor)
+		})
 		.collect::<HashMap<_, _>>();
 	let followed_norm = followed_weights.values().map(|weight| weight * weight).sum::<f64>().sqrt();
 	let followed_subreddit_counts = followed_counts.clone();
+	let followed_subreddit_profile_counts = followed_profile_counts.clone();
 
 	let mut candidate_counts_by_profile: HashMap<String, HashMap<String, usize>> = HashMap::new();
 	let mut cached_profile_names = catalog.author_community_counts.keys().cloned().collect::<HashSet<_>>();
@@ -565,6 +655,7 @@ pub(crate) fn suggested_profiles(
 				overlap_subreddits.push(SuggestedProfileSubreddit {
 					name: subreddit.clone(),
 					followed_count: *followed_subreddit_counts.get(subreddit).unwrap_or(&0),
+					followed_profile_count: *followed_subreddit_profile_counts.get(subreddit).unwrap_or(&0),
 					profile_count: *count,
 				});
 			}
@@ -573,16 +664,17 @@ pub(crate) fn suggested_profiles(
 				continue;
 			}
 
+			let overlap_count = overlap_subreddits.len();
 			overlap_subreddits.sort_by(|left, right| {
-				let left_contribution = left.followed_count.saturating_mul(left.profile_count);
-				let right_contribution = right.followed_count.saturating_mul(right.profile_count);
+				let left_contribution = left.followed_count.saturating_mul(left.profile_count).saturating_mul(left.followed_profile_count.max(1));
+				let right_contribution = right.followed_count.saturating_mul(right.profile_count).saturating_mul(right.followed_profile_count.max(1));
 				right_contribution.cmp(&left_contribution).then_with(|| left.name.cmp(&right.name))
 			});
 			overlap_subreddits.truncate(SUGGESTED_PROFILE_REASON_LIMIT);
 
 			let similarity = dot / (followed_norm * candidate_norm_sq.sqrt());
 			let confidence = (cached_posts as f64 / 8.0).min(1.0);
-			let score = similarity * confidence;
+			let score = similarity * confidence * suggested_profile_overlap_factor(overlap_count);
 			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
 
 			suggestions.push(SuggestedProfileEntry {
@@ -626,6 +718,7 @@ pub(crate) fn suggested_profiles(
 			.into_iter()
 			.take(SUGGESTED_PROFILE_REASON_LIMIT)
 			.map(|(name, followed_count)| SuggestedProfileSubreddit {
+				followed_profile_count: *followed_subreddit_profile_counts.get(&name).unwrap_or(&0),
 				name,
 				followed_count,
 				profile_count: 0,
@@ -780,6 +873,26 @@ mod tests {
 		post
 	}
 
+	fn test_posts(prefix: &str, subreddit: &str, author: &str, count: usize, newest_ts: u64) -> Vec<Post> {
+		(0..count)
+			.map(|idx| test_post(&format!("{prefix}-{idx}"), subreddit, author, newest_ts.saturating_sub(idx as u64)))
+			.collect()
+	}
+
+	#[test]
+	fn suggested_profile_source_factor_matches_punctuated_creator_subreddit() {
+		let followed_profiles = HashSet::from(["julesari__".to_string()]);
+		let followed_profile_identities = followed_profiles
+			.iter()
+			.map(|profile| crate::utils::creator_identity_fingerprint(profile))
+			.collect::<HashSet<_>>();
+
+		assert_eq!(
+			super::suggested_profile_source_factor("julesari", &followed_profiles, &followed_profile_identities, 1),
+			super::SUGGESTED_PROFILE_SELF_SUBREDDIT_FACTOR
+		);
+	}
+
 	#[test]
 	fn source_membership_retention_requires_last_source_removal() {
 		let _guard = test_lock();
@@ -855,6 +968,47 @@ mod tests {
 		assert!(!report.suggestions.iter().any(|entry| entry.name == "alice"));
 		assert!(report.suggestions[0].overlap_subreddits.iter().any(|entry| entry.name == "rust"));
 		assert!(report.suggestions[0].overlap_subreddits.iter().any(|entry| entry.name == "programming"));
+	}
+
+	#[test]
+	fn suggested_profiles_downrank_single_creator_subreddit_matches() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_julesari__", FeedSort::New),
+			&test_posts("julesari-self", "julesari", "julesari__", 39, 1_000),
+		);
+		for (idx, profile) in ["alice", "carol", "dave"].iter().enumerate() {
+			let mut posts = test_posts(&format!("{profile}-chastity"), "chastitycouples", profile, 4, 900 - idx as u64 * 20);
+			posts.extend(test_posts(&format!("{profile}-modern"), "newmoderncouples", profile, 4, 880 - idx as u64 * 20));
+			apply_source_refresh(&FeedSource::subreddit(&format!("u_{profile}"), FeedSort::New), &posts);
+		}
+		apply_source_refresh(
+			&FeedSource::subreddit("julesari", FeedSort::New),
+			&test_posts("zealous", "julesari", "zealousgamblno", 14, 700),
+		);
+		let mut broad_match = test_posts("broad-chastity", "chastitycouples", "ensemble_match", 4, 650);
+		broad_match.extend(test_posts("broad-modern", "newmoderncouples", "ensemble_match", 4, 640));
+		apply_source_refresh(&FeedSource::subreddit("chastitycouples", FeedSort::New), &broad_match);
+
+		let report = suggested_profiles(
+			&["u_julesari__".to_string(), "alice".to_string(), "carol".to_string(), "dave".to_string()],
+			&HashMap::new(),
+			&HashSet::new(),
+			10,
+		);
+
+		let broad_pos = report.suggestions.iter().position(|entry| entry.name == "ensemble_match").expect("broad match");
+		let narrow_pos = report.suggestions.iter().position(|entry| entry.name == "zealousgamblno").expect("narrow match");
+		let broad = &report.suggestions[broad_pos];
+		let narrow = &report.suggestions[narrow_pos];
+
+		assert!(broad_pos < narrow_pos, "{broad:?} should rank ahead of {narrow:?}");
+		assert!(broad.score_percent > narrow.score_percent, "{broad:?} should score ahead of {narrow:?}");
+		assert_eq!(narrow.overlap_subreddits.len(), 1);
+		assert_eq!(narrow.overlap_subreddits[0].name, "julesari");
+		assert_eq!(narrow.overlap_subreddits[0].followed_profile_count, 1);
 	}
 
 	#[test]
@@ -960,6 +1114,37 @@ mod tests {
 		assert_eq!(suggestion.avg_video_length, Some(("1:00".to_string(), "from 2 seen videos · 2 rg profiles".to_string())));
 		assert_eq!(suggestion.video_count, 2);
 		assert_eq!(suggestion.redgifs_profile_count, 2);
+
+		crate::user::clear_test_caches();
+		reset_catalog();
+	}
+
+	#[test]
+	fn suggested_profiles_media_previews_use_distinct_media_sources() {
+		let _guard = test_lock();
+		reset_catalog();
+		crate::user::clear_test_caches();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_alice", FeedSort::New),
+			&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)],
+		);
+		apply_source_refresh(
+			&FeedSource::subreddit("rust", FeedSort::New),
+			&[
+				test_image_post("bob-image-new", "rust", "bob", 280, "/img/shared.jpg?width=640"),
+				test_image_post("bob-image-duplicate", "rust", "bob", 270, "/img/shared.jpg?width=320"),
+				test_image_post("bob-image-second", "rust", "bob", 260, "/img/second.jpg"),
+				test_image_post("bob-image-third", "rust", "bob", 250, "/img/third.jpg"),
+			],
+		);
+
+		let report = suggested_profiles(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+		let suggestion = report.suggestions.first().expect("suggestion");
+		let urls = suggestion.media_posts.iter().map(|post| post.image_url.as_str()).collect::<Vec<_>>();
+
+		assert_eq!(suggestion.name, "bob");
+		assert_eq!(urls, vec!["/img/shared.jpg?width=640", "/img/second.jpg", "/img/third.jpg"]);
 
 		crate::user::clear_test_caches();
 		reset_catalog();
