@@ -15,34 +15,34 @@
 <main class="suggested_profiles_page">
 	<header class="suggested_profiles_header panel">
 		<div>
-			<p class="suggested_profiles_kicker">Cached profile graph</p>
-			<h1>Suggested Profiles</h1>
+			<p class="suggested_profiles_kicker">Based on followed profiles</p>
+			<h1>Profiles that post in similar subreddits</h1>
 		</div>
 		<div class="suggested_profiles_stats" aria-label="Suggestion source summary">
 			<div>
 				<strong>{{ report.followed_profile_count }}</strong>
-				<span>followed</span>
+				<span>followed profiles</span>
 			</div>
 			<div>
 				<strong>{{ report.followed_profiles_with_cache }}</strong>
-				<span>with cache</span>
+				<span>with subreddit history</span>
 			</div>
 			<div>
 				<strong>{{ report.compared_profile_count }}</strong>
-				<span>compared</span>
+				<span>candidate profiles checked</span>
 			</div>
 			<div>
 				<strong>{{ report.cached_profile_count }}</strong>
-				<span>cached</span>
+				<span>cached authors</span>
 			</div>
 		</div>
 	</header>
 
 	{% if report.followed_subreddits.len() > 0 %}
 	<section class="suggested_profiles_signal">
-		<span>Signal</span>
+		<span>Your followed profiles post most in</span>
 		{% for subreddit in report.followed_subreddits %}
-		<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }} <small>{{ subreddit.followed_count }}</small></a>
+		<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }} <small>{{ subreddit.followed_count }} posts</small></a>
 		{% endfor %}
 	</section>
 	{% endif %}
@@ -50,17 +50,17 @@
 	{% if report.followed_profile_count == 0 %}
 	<section class="suggested_profiles_empty panel">
 		<h2>No followed profiles yet</h2>
-		<p>Profile suggestions appear after you follow at least one user profile.</p>
+		<p>Follow one or more user profiles first.</p>
 	</section>
 	{% else if report.followed_profiles_with_cache == 0 %}
 	<section class="suggested_profiles_empty panel">
-		<h2>No followed profile history is cached yet</h2>
-		<p>Open followed profiles or let the cache daemon refresh them before comparing profile communities.</p>
+		<h2>No subreddit history for followed profiles yet</h2>
+		<p>Open the profiles you follow or wait for the cache to refresh them.</p>
 	</section>
 	{% else if report.suggestions.is_empty() %}
 	<section class="suggested_profiles_empty panel">
-		<h2>No matching cached profiles yet</h2>
-		<p>Suggestions use cached authors only, so the list will grow as followed feeds and subreddit feeds refresh.</p>
+		<h2>No similar cached profiles yet</h2>
+		<p>Need cached authors who post in the same subreddits as your followed profiles.</p>
 	</section>
 	{% else %}
 	<section class="suggested_profile_grid" data-suggested-profile-group>
@@ -68,7 +68,7 @@
 		<article class="suggested_profile_card">
 			<div class="suggested_profile_rank">
 				<span>{{ suggestion.score_percent }}%</span>
-				<small>match</small>
+				<small>subreddit match</small>
 			</div>
 			<div class="suggested_profile_body">
 				<div class="suggested_profile_title_row">
@@ -95,13 +95,14 @@
 					</form>
 				</div>
 				<p class="suggested_profile_meta">
-					{{ suggestion.matched_posts }} shared cached posts across {{ suggestion.cached_posts }} cached profile posts
+					Posts in {{ suggestion.overlap_subreddits.len() }} matching subreddits; {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts are in those subreddits.
 				</p>
+				<span class="suggested_profile_overlap_label">Matching subreddits</span>
 				<ul class="suggested_profile_overlap">
 					{% for subreddit in suggestion.overlap_subreddits %}
 					<li>
 						<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }}</a>
-						<span>{{ subreddit.profile_count }} / {{ subreddit.followed_count }}</span>
+						<span>profile {{ subreddit.profile_count }} · followed {{ subreddit.followed_count }}</span>
 					</li>
 					{% endfor %}
 				</ul>

@@ -2986,6 +2986,7 @@ input[type="submit"] {
 
 .suggested_profiles_stats span,
 .suggested_profile_meta,
+.suggested_profile_overlap_label,
 .suggested_profiles_empty p {
     color: var(--visited);
 }
@@ -3097,6 +3098,12 @@ input[type="submit"] {
 .suggested_profile_meta {
     font-size: 13px;
     line-height: 1.35;
+}
+
+.suggested_profile_overlap_label {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
 }
 
 .suggested_profile_overlap {
