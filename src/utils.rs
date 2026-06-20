@@ -1283,6 +1283,10 @@ static SUBREDDIT_FLAIR_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditFlai
 static USER_SUBREDDIT_CACHE: LazyLock<Mutex<HashMap<String, CachedUserSubreddits>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SUBREDDIT_USER_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditUsers>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn subreddit_cache_key(subreddit: &str) -> String {
+	subreddit.trim().to_lowercase()
+}
+
 pub fn user_profile_details(subreddit: &Value) -> UserProfileDetails {
 	let blurb = subreddit["public_description"].as_str().unwrap_or_default().trim().to_string();
 	let bio_html = rewrite_urls(subreddit["description_html"].as_str().unwrap_or_default()).trim().to_string();
@@ -1548,7 +1552,7 @@ pub fn cached_user_subreddits(username: &str) -> Vec<(String, u32)> {
 }
 
 pub fn store_subreddit_users(subreddit: &str, posts: &[Post]) {
-	let subreddit = subreddit.trim();
+	let subreddit = subreddit_cache_key(subreddit);
 	if subreddit.is_empty() {
 		return;
 	}
@@ -1557,7 +1561,7 @@ pub fn store_subreddit_users(subreddit: &str, posts: &[Post]) {
 		return;
 	};
 	let now = Instant::now();
-	let entry = cache.entry(subreddit.to_string()).or_insert_with(|| CachedSubredditUsers {
+	let entry = cache.entry(subreddit).or_insert_with(|| CachedSubredditUsers {
 		users: HashMap::new(),
 		cached_at: now,
 	});
@@ -1582,7 +1586,7 @@ pub fn store_subreddit_users(subreddit: &str, posts: &[Post]) {
 }
 
 pub fn cached_subreddit_users(subreddit: &str) -> Vec<(String, u32)> {
-	let subreddit = subreddit.trim();
+	let subreddit = subreddit_cache_key(subreddit);
 	if subreddit.is_empty() {
 		return Vec::new();
 	}
@@ -1590,7 +1594,7 @@ pub fn cached_subreddit_users(subreddit: &str) -> Vec<(String, u32)> {
 	let Ok(mut cache) = SUBREDDIT_USER_CACHE.lock() else {
 		return Vec::new();
 	};
-	let Some(entry) = cache.get_mut(subreddit) else {
+	let Some(entry) = cache.get_mut(&subreddit) else {
 		return Vec::new();
 	};
 	entry.cached_at = Instant::now();
@@ -1664,22 +1668,27 @@ pub(crate) fn restore_persisted_state(flair_entries: Vec<PersistedSubredditFlair
 		})
 		.collect::<HashMap<_, _>>();
 
-	let restored_users = user_entries
-		.into_iter()
-		.filter_map(|entry| {
-			let subreddit = entry.subreddit.trim().to_string();
-			if subreddit.is_empty() {
-				return None;
+	let mut restored_users: HashMap<String, CachedSubredditUsers> = HashMap::new();
+	for entry in user_entries {
+		let subreddit = subreddit_cache_key(&entry.subreddit);
+		if subreddit.is_empty() {
+			continue;
+		}
+
+		let cached_at = unix_to_instant(entry.cached_at_unix, now_unix);
+		let restored = restored_users.entry(subreddit).or_insert_with(|| CachedSubredditUsers { users: HashMap::new(), cached_at });
+		if cached_at > restored.cached_at {
+			restored.cached_at = cached_at;
+		}
+
+		for (user, count) in entry.users {
+			let user = user.trim();
+			if user.is_empty() {
+				continue;
 			}
-			Some((
-				subreddit,
-				CachedSubredditUsers {
-					users: entry.users.into_iter().collect(),
-					cached_at: unix_to_instant(entry.cached_at_unix, now_unix),
-				},
-			))
-		})
-		.collect::<HashMap<_, _>>();
+			*restored.users.entry(user.to_string()).or_insert(0) += count;
+		}
+	}
 
 	if let Ok(mut cache) = SUBREDDIT_FLAIR_CACHE.lock() {
 		cache.extend(restored_flairs);
@@ -5075,12 +5084,14 @@ impl_template_str_eq!(User);
 #[cfg(test)]
 mod tests {
 	use super::{
-		cache_author_watched_links_from_posts, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links, coomer_lookup_links_with_checker,
-		decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links, extract_linktree_creator_links,
-		extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration, hydrate_post_author_links_from_cache, read_sharded_cookie,
-		redgifs_uploader_matches_author, refresh_post_times, rewrite_urls, store_author_links, time, user_profile_details, write_sharded_cookie, Author, Awards,
-		CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media, Post, Preferences,
+		cache_author_watched_links_from_posts, cached_subreddit_users, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links,
+		coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links,
+		extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration,
+		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links,
+		store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair,
+		FlairSubscription, GalleryMedia, Media, Post, Preferences,
 	};
+	use crate::cache_persistence::PersistedSubredditUsersEntry;
 	use crate::utils::ParentComment;
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
@@ -5458,6 +5469,48 @@ mod tests {
 		assert_eq!(links[0].host, "fansly.com");
 		assert_eq!(links[1].host, "onlyfans.com");
 		assert!(links.iter().all(|link| !link.url.contains("privacy")));
+	}
+
+	#[test]
+	fn subreddit_user_cache_lookup_is_case_insensitive() {
+		clear_test_caches();
+
+		let mut post = Post::default();
+		post.author.name = "Alice".to_string();
+		store_subreddit_users("BDSMGW", &[post]);
+
+		assert_eq!(cached_subreddit_users("bdsmgw"), vec![("Alice".to_string(), 1)]);
+
+		clear_test_caches();
+	}
+
+	#[test]
+	fn restored_subreddit_user_cache_merges_mixed_case_keys() {
+		clear_test_caches();
+		restore_persisted_state(
+			Vec::new(),
+			vec![
+				PersistedSubredditUsersEntry {
+					subreddit: "BDSMGW".to_string(),
+					users: vec![("Alice".to_string(), 1), ("Bob".to_string(), 2)],
+					cached_at_unix: 1_000,
+				},
+				PersistedSubredditUsersEntry {
+					subreddit: "bdsmgw".to_string(),
+					users: vec![("Alice".to_string(), 3), ("Carol".to_string(), 1)],
+					cached_at_unix: 1_001,
+				},
+			],
+			1_001,
+			1_001,
+		);
+
+		assert_eq!(
+			cached_subreddit_users("bdsmgw"),
+			vec![("Alice".to_string(), 4), ("Bob".to_string(), 2), ("Carol".to_string(), 1)]
+		);
+
+		clear_test_caches();
 	}
 
 	#[test]
