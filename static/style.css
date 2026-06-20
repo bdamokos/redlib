@@ -3306,9 +3306,19 @@ input[type="submit"] {
     background: color-mix(in srgb, var(--accent) 18%, var(--post));
 }
 
+.suggested_profiles_more.is-loading a {
+    opacity: 0.72;
+    pointer-events: none;
+}
+
 .suggested_profiles_more span {
     color: var(--visited);
     font-size: 13px;
+}
+
+.suggested_profiles_more.has-error span {
+    color: var(--accent);
+    font-weight: 600;
 }
 
 .suggested_profiles_empty {

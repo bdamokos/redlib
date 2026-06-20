@@ -11,6 +11,11 @@
 {% call utils::search("".to_owned(), "") %}
 {% endblock %}
 
+{% block head %}
+	{% call super() %}
+	<script src="{{ crate::utils::static_asset_href("suggested_profiles.js") }}" defer></script>
+{% endblock %}
+
 {% block body %}
 <main class="suggested_profiles_page">
 	<header class="suggested_profiles_header panel">
@@ -65,7 +70,7 @@
 	{% else %}
 	<section class="suggested_profile_grid" data-suggested-profile-group>
 		{% for suggestion in report.suggestions %}
-		<article class="suggested_profile_card{% if suggestion.redgifs_profile_count >= 3 %} suggested_profile_card_rg_high{% else if suggestion.redgifs_profile_count == 2 %} suggested_profile_card_rg_multi{% endif %}">
+		<article class="suggested_profile_card{% if suggestion.redgifs_profile_count >= 3 %} suggested_profile_card_rg_high{% else if suggestion.redgifs_profile_count == 2 %} suggested_profile_card_rg_multi{% endif %}" data-suggested-profile="{{ suggestion.name }}">
 			<div class="suggested_profile_top">
 				<div class="suggested_profile_identity">
 					<div class="suggested_profile_title_row">
@@ -160,9 +165,9 @@
 		{% endfor %}
 	</section>
 	{% if has_more_suggestions %}
-	<nav class="suggested_profiles_more" aria-label="More suggested profiles">
+	<nav class="suggested_profiles_more" aria-label="More suggested profiles" data-suggested-profiles-more>
 		<a href="{{ self.load_more_path() }}">Load {{ self.next_batch_size() }} more profiles</a>
-		<span>{{ report.suggestions.len() }} shown</span>
+		<span data-suggested-profiles-status>{{ report.suggestions.len() }} shown</span>
 	</nav>
 	{% endif %}
 	{% endif %}

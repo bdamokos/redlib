@@ -197,6 +197,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"browser_session.js" => resource(include_str!("../static/browser_session.js"), "text/javascript", false).await,
 		"author_links.js" => resource(include_str!("../static/author_links.js"), "text/javascript", false).await,
 		"subscription.js" => resource(include_str!("../static/subscription.js"), "text/javascript", false).await,
+		"suggested_profiles.js" => resource(include_str!("../static/suggested_profiles.js"), "text/javascript", false).await,
 		"feed_status.js" => resource(include_str!("../static/feed_status.js"), "text/javascript", false).await,
 		"page_fragment.js" => resource(include_str!("../static/page_fragment.js"), "text/javascript", false).await,
 		"dynamic_content.js" => resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).await,
@@ -395,6 +396,9 @@ async fn main() {
 	app
 		.at("/subscription.js")
 		.get(|_| resource(include_str!("../static/subscription.js"), "text/javascript", false).boxed());
+	app
+		.at("/suggested_profiles.js")
+		.get(|_| resource(include_str!("../static/suggested_profiles.js"), "text/javascript", false).boxed());
 	app
 		.at("/feed_status.js")
 		.get(|_| resource(include_str!("../static/feed_status.js"), "text/javascript", false).boxed());
