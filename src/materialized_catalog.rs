@@ -128,6 +128,8 @@ struct MaterializedCatalog {
 	source_to_post_ids: HashMap<CatalogSourceKey, HashSet<String>>,
 	author_to_post_ids: HashMap<String, HashSet<String>>,
 	author_community_counts: HashMap<String, HashMap<String, usize>>,
+	author_video_stats: HashMap<String, crate::user::UserVideoStatsAccumulator>,
+	author_media_posts: HashMap<String, Vec<SuggestedProfileMediaPost>>,
 }
 
 static MATERIALIZED_CATALOG: LazyLock<Mutex<MaterializedCatalog>> = LazyLock::new(|| Mutex::new(MaterializedCatalog::default()));
@@ -258,42 +260,29 @@ fn suggested_profile_media_key(post: &Post, fallback_url: &str) -> String {
 		.unwrap_or_else(|| fallback_url.trim().to_ascii_lowercase())
 }
 
-fn suggested_profile_media_posts(username: &str, limit: usize) -> Vec<SuggestedProfileMediaPost> {
-	let username = normalize_profile_name(username);
-	if username.is_empty() || limit == 0 {
-		return Vec::new();
+fn suggested_profile_media_candidate(record: &CatalogRecord) -> Option<(String, SuggestedProfileMediaPost)> {
+	if record.post.kind == "t1" {
+		return None;
 	}
+	let (image_url, media_type) = suggested_profile_media_source(&record.post)?;
+	let media_key = suggested_profile_media_key(&record.post, &image_url);
+	Some((
+		media_key,
+		SuggestedProfileMediaPost {
+			title: record.post.title.clone(),
+			permalink: record.post.permalink.clone(),
+			subreddit: record.post.community.clone(),
+			image_url,
+			media_type: media_type.to_string(),
+			duration: record.post.media.duration.clone(),
+			nsfw: record.post.flags.nsfw,
+			spoiler: record.post.flags.spoiler,
+			created_ts: record.created_ts,
+		},
+	))
+}
 
-	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	let Some(post_ids) = catalog.author_to_post_ids.get(&username) else {
-		return Vec::new();
-	};
-
-	let mut posts = post_ids
-		.iter()
-		.filter_map(|post_id| catalog.posts_by_id.get(post_id))
-		.filter_map(|record| {
-			if record.post.kind == "t1" {
-				return None;
-			}
-			let (image_url, media_type) = suggested_profile_media_source(&record.post)?;
-			let media_key = suggested_profile_media_key(&record.post, &image_url);
-			Some((
-				media_key,
-				SuggestedProfileMediaPost {
-					title: record.post.title.clone(),
-					permalink: record.post.permalink.clone(),
-					subreddit: record.post.community.clone(),
-					image_url,
-					media_type: media_type.to_string(),
-					duration: record.post.media.duration.clone(),
-					nsfw: record.post.flags.nsfw,
-					spoiler: record.post.flags.spoiler,
-					created_ts: record.created_ts,
-				},
-			))
-		})
-		.collect::<Vec<_>>();
+fn suggested_profile_unique_media_posts(mut posts: Vec<(String, SuggestedProfileMediaPost)>, limit: usize) -> Vec<SuggestedProfileMediaPost> {
 	posts.sort_by(|(_, left), (_, right)| right.created_ts.cmp(&left.created_ts).then_with(|| right.permalink.cmp(&left.permalink)));
 
 	let mut seen_media = HashSet::new();
@@ -308,6 +297,22 @@ fn suggested_profile_media_posts(username: &str, limit: usize) -> Vec<SuggestedP
 		}
 	}
 	unique_posts
+}
+
+fn suggested_profile_media_posts(username: &str, limit: usize) -> Vec<SuggestedProfileMediaPost> {
+	let username = normalize_profile_name(username);
+	if username.is_empty() || limit == 0 {
+		return Vec::new();
+	}
+
+	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let Some(posts) = catalog.author_media_posts.get(&username) else {
+		return Vec::new();
+	};
+
+	let mut posts = posts.clone();
+	posts.truncate(limit);
+	posts
 }
 
 fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
@@ -326,6 +331,10 @@ fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
 	catalog.source_to_post_ids.clear();
 	catalog.author_to_post_ids.clear();
 	catalog.author_community_counts.clear();
+	catalog.author_video_stats.clear();
+	catalog.author_media_posts.clear();
+
+	let mut author_media_candidates: HashMap<String, Vec<(String, SuggestedProfileMediaPost)>> = HashMap::new();
 
 	for (post_id, record) in &catalog.posts_by_id {
 		for source_key in &record.source_keys {
@@ -334,6 +343,10 @@ fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
 
 		if !record.author_lc.is_empty() {
 			catalog.author_to_post_ids.entry(record.author_lc.clone()).or_default().insert(post_id.clone());
+			catalog.author_video_stats.entry(record.author_lc.clone()).or_default().observe_post(&record.post);
+			if let Some(candidate) = suggested_profile_media_candidate(record) {
+				author_media_candidates.entry(record.author_lc.clone()).or_default().push(candidate);
+			}
 		}
 
 		if !record.author_lc.is_empty() && !record.community_lc.is_empty() && !record.community_lc.starts_with("u_") {
@@ -343,6 +356,13 @@ fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
 				.or_default()
 				.entry(record.community_lc.clone())
 				.or_default() += 1;
+		}
+	}
+
+	for (author, posts) in author_media_candidates {
+		let posts = suggested_profile_unique_media_posts(posts, SUGGESTED_PROFILE_MEDIA_LIMIT);
+		if !posts.is_empty() {
+			catalog.author_media_posts.insert(author, posts);
 		}
 	}
 }
@@ -735,16 +755,7 @@ pub(crate) fn catalog_video_stats(username: &str) -> Option<crate::user::UserVid
 	}
 
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	let post_ids = catalog.author_to_post_ids.get(&username)?;
-
-	let mut stats = crate::user::UserVideoStatsAccumulator::default();
-
-	for post_id in post_ids {
-		let Some(record) = catalog.posts_by_id.get(post_id) else {
-			continue;
-		};
-		stats.observe_post(&record.post);
-	}
+	let stats = catalog.author_video_stats.get(&username)?.clone();
 
 	if stats.avg_video_length().is_some() {
 		Some(stats)
