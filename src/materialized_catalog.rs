@@ -10,6 +10,7 @@ const SUGGESTED_PROFILE_TOP_SUBREDDITS: usize = 16;
 const SUGGESTED_PROFILE_REASON_LIMIT: usize = 5;
 const SUGGESTED_PROFILE_MIN_POSTS: usize = 2;
 const SUGGESTED_PROFILE_SUBREDDIT_USER_LIMIT: usize = 120;
+const SUGGESTED_PROFILE_MEDIA_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CatalogSourceKey {
@@ -52,7 +53,24 @@ pub struct SuggestedProfileEntry {
 	pub score_percent: u32,
 	pub cached_posts: usize,
 	pub matched_posts: usize,
+	pub avg_video_length: Option<(String, String)>,
+	pub video_count: usize,
+	pub redgifs_profile_count: usize,
+	pub media_posts: Vec<SuggestedProfileMediaPost>,
 	pub overlap_subreddits: Vec<SuggestedProfileSubreddit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuggestedProfileMediaPost {
+	pub title: String,
+	pub permalink: String,
+	pub subreddit: String,
+	pub image_url: String,
+	pub media_type: String,
+	pub duration: String,
+	pub nsfw: bool,
+	pub spoiler: bool,
+	pub created_ts: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -157,6 +175,61 @@ fn normalize_profile_name(name: &str) -> String {
 	let trimmed = name.trim();
 	let without_prefix = trimmed.strip_prefix("u_").or_else(|| trimmed.strip_prefix("u/")).unwrap_or(trimmed);
 	without_prefix.trim().to_lowercase()
+}
+
+fn first_non_empty(values: &[&str]) -> Option<String> {
+	values.iter().map(|value| value.trim()).find(|value| !value.is_empty()).map(ToString::to_string)
+}
+
+fn suggested_profile_media_source(post: &Post) -> Option<(String, &'static str)> {
+	match post.post_type.as_str() {
+		"image" => first_non_empty(&[&post.media.preview_url, &post.media.url, &post.thumbnail.url]).map(|url| (url, "image")),
+		"gif" => first_non_empty(&[&post.media.poster, &post.thumbnail.url, &post.media.preview_url, &post.media.url]).map(|url| (url, "gif")),
+		"video" => first_non_empty(&[&post.media.poster, &post.thumbnail.url, &post.media.preview_url]).map(|url| (url, "video")),
+		"gallery" => post
+			.gallery
+			.first()
+			.and_then(|image| first_non_empty(&[&image.preview_url, &image.url, &post.thumbnail.url]))
+			.map(|url| (url, "gallery")),
+		_ => None,
+	}
+}
+
+fn suggested_profile_media_posts(username: &str, limit: usize) -> Vec<SuggestedProfileMediaPost> {
+	let username = normalize_profile_name(username);
+	if username.is_empty() || limit == 0 {
+		return Vec::new();
+	}
+
+	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let Some(post_ids) = catalog.author_to_post_ids.get(&username) else {
+		return Vec::new();
+	};
+
+	let mut posts = post_ids
+		.iter()
+		.filter_map(|post_id| catalog.posts_by_id.get(post_id))
+		.filter_map(|record| {
+			if record.post.kind == "t1" {
+				return None;
+			}
+			let (image_url, media_type) = suggested_profile_media_source(&record.post)?;
+			Some(SuggestedProfileMediaPost {
+				title: record.post.title.clone(),
+				permalink: record.post.permalink.clone(),
+				subreddit: record.post.community.clone(),
+				image_url,
+				media_type: media_type.to_string(),
+				duration: record.post.media.duration.clone(),
+				nsfw: record.post.flags.nsfw,
+				spoiler: record.post.flags.spoiler,
+				created_ts: record.created_ts,
+			})
+		})
+		.collect::<Vec<_>>();
+	posts.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.permalink.cmp(&left.permalink)));
+	posts.truncate(limit);
+	posts
 }
 
 fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
@@ -517,6 +590,10 @@ pub(crate) fn suggested_profiles(
 				score_percent,
 				cached_posts,
 				matched_posts,
+				avg_video_length: None,
+				video_count: 0,
+				redgifs_profile_count: 0,
+				media_posts: Vec::new(),
 				overlap_subreddits,
 			});
 		}
@@ -531,6 +608,14 @@ pub(crate) fn suggested_profiles(
 			.then_with(|| left.name.cmp(&right.name))
 	});
 	suggestions.truncate(limit);
+
+	for suggestion in &mut suggestions {
+		let video_signal = crate::user::cached_video_signal(&suggestion.name);
+		suggestion.avg_video_length = video_signal.avg_video_length;
+		suggestion.video_count = video_signal.video_count;
+		suggestion.redgifs_profile_count = video_signal.redgifs_profile_count;
+		suggestion.media_posts = suggested_profile_media_posts(&suggestion.name, SUGGESTED_PROFILE_MEDIA_LIMIT);
+	}
 
 	SuggestedProfilesReport {
 		followed_profile_count: followed_profiles.len(),
@@ -671,6 +756,28 @@ mod tests {
 			bookmarked: false,
 			bookmark_new_comments: None,
 		}
+	}
+
+	fn test_image_post(id: &str, subreddit: &str, author: &str, created_ts: u64, image_url: &str) -> Post {
+		let mut post = test_post(id, subreddit, author, created_ts);
+		post.post_type = "image".to_string();
+		post.media.url = image_url.to_string();
+		post.media.preview_url = image_url.to_string();
+		post.media.width = 640;
+		post.media.height = 480;
+		post
+	}
+
+	fn test_video_post(id: &str, subreddit: &str, author: &str, created_ts: u64, redgifs_user: &str, duration_seconds: i64) -> Post {
+		let mut post = test_post(id, subreddit, author, created_ts);
+		post.post_type = "video".to_string();
+		post.domain = "redgifs.com".to_string();
+		post.media.url = format!("/redgifs/{id}");
+		post.media.poster = format!("/redgifs/{id}-poster.jpg");
+		post.media.duration_seconds = duration_seconds;
+		post.media.duration = crate::utils::format_video_duration(duration_seconds);
+		post.media.redgifs_username = redgifs_user.to_string();
+		post
 	}
 
 	#[test]
@@ -820,5 +927,41 @@ mod tests {
 		assert!(!report.suggestions.iter().any(|entry| entry.name == "alice"));
 
 		crate::utils::clear_test_caches();
+	}
+
+	#[test]
+	fn suggested_profiles_include_cached_media_and_video_signals() {
+		let _guard = test_lock();
+		reset_catalog();
+		crate::user::clear_test_caches();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_alice", FeedSort::New),
+			&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)],
+		);
+		apply_source_refresh(
+			&FeedSource::subreddit("rust", FeedSort::New),
+			&[
+				test_image_post("bob-image-new", "rust", "bob", 280, "/img/bob-new.jpg"),
+				test_video_post("bob-video-one", "rust", "bob", 270, "creator_one", 30),
+				test_video_post("bob-video-two", "rust", "bob", 260, "creator_two", 90),
+				test_image_post("bob-image-old", "rust", "bob", 250, "/img/bob-old.jpg"),
+			],
+		);
+
+		let report = suggested_profiles(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+		let suggestion = report.suggestions.first().expect("suggestion");
+
+		assert_eq!(suggestion.name, "bob");
+		assert_eq!(suggestion.media_posts.len(), 3);
+		assert_eq!(suggestion.media_posts[0].title, "Post bob-image-new");
+		assert_eq!(suggestion.media_posts[0].image_url, "/img/bob-new.jpg");
+		assert_eq!(suggestion.media_posts[1].media_type, "video");
+		assert_eq!(suggestion.avg_video_length, Some(("1:00".to_string(), "from 2 seen videos · 2 rg profiles".to_string())));
+		assert_eq!(suggestion.video_count, 2);
+		assert_eq!(suggestion.redgifs_profile_count, 2);
+
+		crate::user::clear_test_caches();
+		reset_catalog();
 	}
 }

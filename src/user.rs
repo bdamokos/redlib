@@ -49,6 +49,13 @@ struct UserVideoStats {
 	video_count: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserVideoSignal {
+	pub avg_video_length: Option<(String, String)>,
+	pub video_count: usize,
+	pub redgifs_profile_count: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UserVideoStatsAccumulator {
 	video_durations: HashMap<String, i64>,
@@ -80,6 +87,10 @@ impl UserVideoStatsAccumulator {
 
 	fn video_count(&self) -> usize {
 		self.video_durations.len()
+	}
+
+	fn redgifs_profile_count(&self) -> usize {
+		self.seen_redgifs_users.len()
 	}
 
 	fn total_duration_seconds(&self) -> i64 {
@@ -874,9 +885,13 @@ fn cached_user_video_stats(username: &str) -> Option<UserVideoStats> {
 }
 
 pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
+	cached_video_signal(username).avg_video_length
+}
+
+pub fn cached_video_signal(username: &str) -> UserVideoSignal {
 	let cache_key = normalize_user_video_stats_cache_key(username);
 	if cache_key.is_empty() {
-		return None;
+		return UserVideoSignal::default();
 	}
 
 	let mut stats = if let Ok(mut cache) = USER_VIDEO_STATS_CACHE.lock() {
@@ -895,7 +910,11 @@ pub fn cached_avg_video_length(username: &str) -> Option<(String, String)> {
 		stats.merge(catalog_stats);
 	}
 
-	stats.avg_video_length()
+	UserVideoSignal {
+		avg_video_length: stats.avg_video_length(),
+		video_count: stats.video_count(),
+		redgifs_profile_count: stats.redgifs_profile_count(),
+	}
 }
 
 pub fn hydrate_posts_avg_video_length_from_cache(posts: &mut [Post]) {

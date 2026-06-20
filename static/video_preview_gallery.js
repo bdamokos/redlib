@@ -56,12 +56,81 @@
         return layer ? layer.querySelector(".video_preview_fallback_video") : null;
     }
 
+    function isInitialPausedFrame(video) {
+        return Boolean(video && video.paused && video.currentTime <= 0.05);
+    }
+
     function layerHasPreviewContent(layer) {
         return Boolean(layer.dataset.previewSrc || layer.dataset.previewFallbackActive === "true");
     }
 
+    function suppressInitialPreviewControls(host, video) {
+        if (!host || !video || video.dataset.previewControlsSuppressed === "true") {
+            return;
+        }
+
+        video.dataset.previewControlsSuppressed = "true";
+        video.dataset.previewHadControls = video.hasAttribute("controls") ? "true" : "false";
+        if (video.hasAttribute("controls")) {
+            video.removeAttribute("controls");
+        }
+
+        if (!video.hasAttribute("tabindex")) {
+            video.dataset.previewAddedTabindex = "true";
+            video.setAttribute("tabindex", "0");
+        }
+        if (!video.hasAttribute("aria-label")) {
+            video.dataset.previewAddedAriaLabel = "true";
+            video.setAttribute("aria-label", "Play video");
+        }
+
+        host.dataset.previewControlsSuppressed = "true";
+    }
+
+    function restoreInitialPreviewControls(host, video) {
+        if (host) {
+            delete host.dataset.previewControlsSuppressed;
+        }
+        if (!video || video.dataset.previewControlsSuppressed !== "true") {
+            return;
+        }
+
+        if (video.dataset.previewHadControls === "true") {
+            video.setAttribute("controls", "");
+        }
+        if (video.dataset.previewAddedTabindex === "true") {
+            video.removeAttribute("tabindex");
+        }
+        if (video.dataset.previewAddedAriaLabel === "true") {
+            video.removeAttribute("aria-label");
+        }
+
+        delete video.dataset.previewControlsSuppressed;
+        delete video.dataset.previewHadControls;
+        delete video.dataset.previewAddedTabindex;
+        delete video.dataset.previewAddedAriaLabel;
+    }
+
+    function syncInitialPreviewControls(host, shouldSuppress) {
+        var video = previewVideo(host);
+        if (!video) {
+            return;
+        }
+
+        if (shouldSuppress) {
+            suppressInitialPreviewControls(host, video);
+        } else {
+            restoreInitialPreviewControls(host, video);
+        }
+    }
+
+    function previewControlsSuppressed(host) {
+        return Boolean(host && host.dataset.previewControlsSuppressed === "true");
+    }
+
     function hideAnimatedPreview(host) {
         var layer = previewLayer(host);
+        syncInitialPreviewControls(host, false);
         if (!layer) {
             return;
         }
@@ -77,9 +146,26 @@
             return;
         }
 
-        var shouldShow = layerHasPreviewContent(layer) && video.paused && video.currentTime <= 0.05;
+        var initialPausedFrame = isInitialPausedFrame(video);
+        var shouldShow = layerHasPreviewContent(layer) && initialPausedFrame;
         layer.hidden = !shouldShow;
         layer.classList.toggle("is-visible", shouldShow);
+        syncInitialPreviewControls(host, initialPausedFrame);
+    }
+
+    function playFromInitialPreview(host) {
+        var video = previewVideo(host);
+        if (!video || !previewControlsSuppressed(host)) {
+            return;
+        }
+
+        hideAnimatedPreview(host);
+
+        var player = video._dashjs_player;
+        var playPromise = player && typeof player.play === "function" ? player.play() : video.play();
+        if (playPromise && typeof playPromise.catch === "function") {
+            playPromise.catch(function () {});
+        }
     }
 
     function desktopPreviewFallbackAllowed() {
@@ -191,6 +277,21 @@
         }
 
         host.dataset.previewLifecycleBound = "true";
+        host.addEventListener("click", function () {
+            playFromInitialPreview(host);
+        });
+        host.addEventListener("keydown", function (event) {
+            if (event.key !== "Enter" && event.key !== " ") {
+                return;
+            }
+            if (!previewControlsSuppressed(host)) {
+                return;
+            }
+
+            event.preventDefault();
+            playFromInitialPreview(host);
+        });
+
         var video = previewVideo(host);
         if (!video) {
             return;

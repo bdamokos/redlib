@@ -24,6 +24,7 @@ const POST_CONTINUATION_SELECTOR = ".post_body, .post_poll, .post_following_comm
 const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notification";
 const EXPANDABLE_POST_PREVIEW_SELECTOR = ".post_preview.truncated:not(.expanded)";
 const PAGE_EDGE_TOLERANCE = 1;
+const POST_MEDIA_FIT_READY_ATTR = "data-post-media-fit-ready";
 let postMediaFitFrame = null;
 
 function parsePostMediaLength(value, fallback) {
@@ -235,8 +236,20 @@ function getContinuationOverflow(post, mediaElement, mediaElements, availablePos
         - availablePostHeight;
 }
 
-function fitPostMediaToViewport(post) {
+function markPostMediaFitReady(post) {
+    post.setAttribute(POST_MEDIA_FIT_READY_ATTR, "true");
+}
+
+function isPostMediaFitReady(post) {
+    return post.getAttribute(POST_MEDIA_FIT_READY_ATTR) === "true";
+}
+
+function fitPostMediaToViewport(post, options = {}) {
     if (!(post instanceof HTMLElement)) {
+        return;
+    }
+
+    if (!options.force && isPostMediaFitReady(post)) {
         return;
     }
 
@@ -269,6 +282,7 @@ function fitPostMediaToViewport(post) {
     );
 
     if (continuationFitHeight === null && mediaHeight > 0 && postRect.height <= availablePostHeight + 1) {
+        markPostMediaFitReady(post);
         return;
     }
 
@@ -290,6 +304,8 @@ function fitPostMediaToViewport(post) {
         fitHeight = Math.max(POST_MEDIA_FIT_MIN_HEIGHT, fitHeight - Math.ceil(overflow));
         post.style.setProperty("--post-media-fit-height", `${Math.floor(fitHeight)}px`);
     }
+
+    markPostMediaFitReady(post);
 }
 
 function getPostsFromRoot(root) {
@@ -305,24 +321,24 @@ function getPostsFromRoot(root) {
     return Array.from(container.querySelectorAll(".post"));
 }
 
-function resizeSinglePostMediaToViewport(root = document) {
-    getPostsFromRoot(root).forEach(fitPostMediaToViewport);
+function resizeSinglePostMediaToViewport(root = document, options = {}) {
+    getPostsFromRoot(root).forEach((post) => fitPostMediaToViewport(post, options));
 }
 
-function scheduleSinglePostMediaResize(root = document) {
+function scheduleSinglePostMediaResize(root = document, options = {}) {
     if (postMediaFitFrame !== null) {
         window.cancelAnimationFrame(postMediaFitFrame);
     }
 
     postMediaFitFrame = window.requestAnimationFrame(() => {
         postMediaFitFrame = null;
-        resizeSinglePostMediaToViewport(root);
+        resizeSinglePostMediaToViewport(root, options);
     });
 }
 
 function handlePostMediaLoaded(event) {
     const post = event.target instanceof Element ? event.target.closest(".post") : null;
-    if (post !== null) {
+    if (post !== null && !isPostMediaFitReady(post)) {
         scheduleSinglePostMediaResize(post);
     }
 }
@@ -608,7 +624,7 @@ document.addEventListener("keydown", (event) => {
 
 window.resizeSinglePostMediaToViewport = resizeSinglePostMediaToViewport;
 document.addEventListener("DOMContentLoaded", () => resizeSinglePostMediaToViewport(document));
-window.addEventListener("resize", () => scheduleSinglePostMediaResize(document));
-window.addEventListener("orientationchange", () => scheduleSinglePostMediaResize(document));
+window.addEventListener("resize", () => scheduleSinglePostMediaResize(document, { force: true }));
+window.addEventListener("orientationchange", () => scheduleSinglePostMediaResize(document, { force: true }));
 document.addEventListener("load", handlePostMediaLoaded, true);
 document.addEventListener("loadedmetadata", handlePostMediaLoaded, true);

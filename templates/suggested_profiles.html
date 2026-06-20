@@ -65,39 +65,80 @@
 	{% else %}
 	<section class="suggested_profile_grid" data-suggested-profile-group>
 		{% for suggestion in report.suggestions %}
-		<article class="suggested_profile_card">
-			<div class="suggested_profile_rank">
-				<span>{{ suggestion.score_percent }}%</span>
-				<small>subreddit match</small>
-			</div>
-			<div class="suggested_profile_body">
-				<div class="suggested_profile_title_row">
-					<h2><a href="{{ self.profile_path(suggestion.name.as_str()) }}">u/{{ suggestion.name }}</a></h2>
-					<form
-						class="suggested_profile_follow"
-						action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
-						method="POST"
-						data-subscription-form
-						data-subscription-target="suggested-user:u_{{ suggestion.name }}"
-						data-subscription-state="unsubscribed"
-						data-state-on="subscribed"
-						data-state-off="unsubscribed"
-						data-subscribe-action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
-						data-unsubscribe-action="{{ self.unsubscribe_path(suggestion.name.as_str()) }}"
-						data-subscribe-label="Follow"
-						data-unsubscribe-label="Unfollow"
-						data-subscribe-class="subscribe"
-						data-unsubscribe-class="unsubscribe"
-						data-cookie-mode="list"
-						data-cookie-name="subscriptions"
-						data-cookie-values="u_{{ suggestion.name }}">
-						<button class="subscribe" type="submit">Follow</button>
-					</form>
+		<article class="suggested_profile_card{% if suggestion.redgifs_profile_count >= 3 %} suggested_profile_card_rg_high{% else if suggestion.redgifs_profile_count == 2 %} suggested_profile_card_rg_multi{% endif %}">
+			<div class="suggested_profile_top">
+				<div class="suggested_profile_identity">
+					<div class="suggested_profile_title_row">
+						<h2><a href="{{ self.profile_path(suggestion.name.as_str()) }}">u/{{ suggestion.name }}</a></h2>
+						<div class="suggested_profile_rank">
+							<span>{{ suggestion.score_percent }}%</span>
+							<small>match</small>
+						</div>
+					</div>
+					<p class="suggested_profile_meta">
+						{{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} subreddits.
+					</p>
 				</div>
-				<p class="suggested_profile_meta">
-					Posts in {{ suggestion.overlap_subreddits.len() }} matching subreddits; {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts are in those subreddits.
-				</p>
-				<span class="suggested_profile_overlap_label">Matching subreddits</span>
+				<form
+					class="suggested_profile_follow"
+					action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+					method="POST"
+					data-subscription-form
+					data-subscription-target="suggested-user:u_{{ suggestion.name }}"
+					data-subscription-state="unsubscribed"
+					data-state-on="subscribed"
+					data-state-off="unsubscribed"
+					data-subscribe-action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+					data-unsubscribe-action="{{ self.unsubscribe_path(suggestion.name.as_str()) }}"
+					data-subscribe-label="Follow"
+					data-unsubscribe-label="Unfollow"
+					data-subscribe-class="subscribe"
+					data-unsubscribe-class="unsubscribe"
+					data-cookie-mode="list"
+					data-cookie-name="subscriptions"
+					data-cookie-values="u_{{ suggestion.name }}">
+					<button class="subscribe" type="submit">Follow</button>
+				</form>
+			</div>
+
+			{% if suggestion.media_posts.len() > 0 %}
+			<div class="suggested_profile_media_grid" aria-label="Recent cached media posts">
+				{% for media in suggestion.media_posts %}
+				<a
+					class="suggested_profile_media_item{% if (media.nsfw && prefs.blur_nsfw=="on") || (media.spoiler && prefs.blur_spoiler=="on") %} suggested_profile_media_item_blurred{% endif %}"
+					href="{{ media.permalink }}"
+					title="{{ media.title }}">
+					<img loading="lazy" src="{{ media.image_url }}" alt="{{ media.title }}">
+					<span class="suggested_profile_media_badge">{{ media.media_type }}</span>
+					{% if !media.duration.is_empty() %}
+					<span class="suggested_profile_media_duration">{{ media.duration }}</span>
+					{% endif %}
+					<span class="suggested_profile_media_subreddit">r/{{ media.subreddit }}</span>
+				</a>
+				{% endfor %}
+			</div>
+			{% endif %}
+
+			<div class="suggested_profile_signals">
+				<span><strong>{{ suggestion.matched_posts }}</strong> matching posts</span>
+				{% if let Some(avg_video_length) = suggestion.avg_video_length %}
+				<span title="{{ avg_video_length.1 }}"><strong>{{ avg_video_length.0 }}</strong> avg video</span>
+				{% endif %}
+				{% if suggestion.video_count > 0 %}
+				<span><strong>{{ suggestion.video_count }}</strong> cached {% if suggestion.video_count == 1 %}video{% else %}videos{% endif %}</span>
+				{% endif %}
+				{% if suggestion.redgifs_profile_count > 0 %}
+				<span class="suggested_profile_signal_rg"><strong>{{ suggestion.redgifs_profile_count }}</strong> RedGifs {% if suggestion.redgifs_profile_count == 1 %}profile{% else %}profiles{% endif %}</span>
+				{% endif %}
+				{% if suggestion.media_posts.len() > 0 %}
+				<span><strong>{{ suggestion.media_posts.len() }}</strong> media previews</span>
+				{% endif %}
+			</div>
+
+			<div class="suggested_profile_body">
+				<div class="suggested_profile_overlap_header">
+					<span class="suggested_profile_overlap_label">Matching subreddits</span>
+				</div>
 				<ul class="suggested_profile_overlap">
 					{% for subreddit in suggestion.overlap_subreddits %}
 					<li>
