@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% import "utils.html" as utils %}
+
+{% block title %}Suggested Profiles{% endblock %}
+
+{% block subscriptions %}
+{% call utils::sub_list("__suggested_profiles__", "") %}
+{% endblock %}
+
+{% block search %}
+{% call utils::search("".to_owned(), "") %}
+{% endblock %}
+
+{% block body %}
+<main class="suggested_profiles_page">
+	<header class="suggested_profiles_header panel">
+		<div>
+			<p class="suggested_profiles_kicker">Cached profile graph</p>
+			<h1>Suggested Profiles</h1>
+		</div>
+		<div class="suggested_profiles_stats" aria-label="Suggestion source summary">
+			<div>
+				<strong>{{ report.followed_profile_count }}</strong>
+				<span>followed</span>
+			</div>
+			<div>
+				<strong>{{ report.followed_profiles_with_cache }}</strong>
+				<span>with cache</span>
+			</div>
+			<div>
+				<strong>{{ report.compared_profile_count }}</strong>
+				<span>compared</span>
+			</div>
+			<div>
+				<strong>{{ report.cached_profile_count }}</strong>
+				<span>cached</span>
+			</div>
+		</div>
+	</header>
+
+	{% if report.followed_subreddits.len() > 0 %}
+	<section class="suggested_profiles_signal">
+		<span>Signal</span>
+		{% for subreddit in report.followed_subreddits %}
+		<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }} <small>{{ subreddit.followed_count }}</small></a>
+		{% endfor %}
+	</section>
+	{% endif %}
+
+	{% if report.followed_profile_count == 0 %}
+	<section class="suggested_profiles_empty panel">
+		<h2>No followed profiles yet</h2>
+		<p>Profile suggestions appear after you follow at least one user profile.</p>
+	</section>
+	{% else if report.followed_profiles_with_cache == 0 %}
+	<section class="suggested_profiles_empty panel">
+		<h2>No followed profile history is cached yet</h2>
+		<p>Open followed profiles or let the cache daemon refresh them before comparing profile communities.</p>
+	</section>
+	{% else if report.suggestions.is_empty() %}
+	<section class="suggested_profiles_empty panel">
+		<h2>No matching cached profiles yet</h2>
+		<p>Suggestions use cached authors only, so the list will grow as followed feeds and subreddit feeds refresh.</p>
+	</section>
+	{% else %}
+	<section class="suggested_profile_grid" data-suggested-profile-group>
+		{% for suggestion in report.suggestions %}
+		<article class="suggested_profile_card">
+			<div class="suggested_profile_rank">
+				<span>{{ suggestion.score_percent }}%</span>
+				<small>match</small>
+			</div>
+			<div class="suggested_profile_body">
+				<div class="suggested_profile_title_row">
+					<h2><a href="{{ self.profile_path(suggestion.name.as_str()) }}">u/{{ suggestion.name }}</a></h2>
+					<form
+						class="suggested_profile_follow"
+						action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+						method="POST"
+						data-subscription-form
+						data-subscription-target="suggested-user:u_{{ suggestion.name }}"
+						data-subscription-state="unsubscribed"
+						data-state-on="subscribed"
+						data-state-off="unsubscribed"
+						data-subscribe-action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+						data-unsubscribe-action="{{ self.unsubscribe_path(suggestion.name.as_str()) }}"
+						data-subscribe-label="Follow"
+						data-unsubscribe-label="Unfollow"
+						data-subscribe-class="subscribe"
+						data-unsubscribe-class="unsubscribe"
+						data-cookie-mode="list"
+						data-cookie-name="subscriptions"
+						data-cookie-values="u_{{ suggestion.name }}">
+						<button class="subscribe" type="submit">Follow</button>
+					</form>
+				</div>
+				<p class="suggested_profile_meta">
+					{{ suggestion.matched_posts }} shared cached posts across {{ suggestion.cached_posts }} cached profile posts
+				</p>
+				<ul class="suggested_profile_overlap">
+					{% for subreddit in suggestion.overlap_subreddits %}
+					<li>
+						<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }}</a>
+						<span>{{ subreddit.profile_count }} / {{ subreddit.followed_count }}</span>
+					</li>
+					{% endfor %}
+				</ul>
+			</div>
+		</article>
+		{% endfor %}
+	</section>
+	{% endif %}
+</main>
+{% endblock %}

@@ -65,6 +65,7 @@
 			<p>MAIN FEEDS</p>
 			<a href="/">Home</a>
 			<a href="/bookmarks" {% if current == "__bookmarks__" %}class="selected"{% endif %}>Bookmarks</a>
+			<a href="/suggested-profiles" {% if current == "__suggested_profiles__" %}class="selected"{% endif %}>Suggested Profiles</a>
 			{% if prefs.has_followed_users() %}
 				<a href="/following" {% if current == "__following__" %}class="selected"{% endif %}>Following</a>
 			{% endif %}

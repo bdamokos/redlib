@@ -15,7 +15,8 @@ use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
-	bookmarks, cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, user, video_mode_api, video_preview,
+	bookmarks, cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, suggested_profiles, user,
+	video_mode_api, video_preview,
 };
 use url::Url;
 
@@ -506,6 +507,7 @@ async fn main() {
 	app.at("/bookmarks").get(|r| bookmarks::page(r).boxed());
 	app.at("/bookmarks/add").post(|r| bookmarks::add(r).boxed());
 	app.at("/bookmarks/remove").post(|r| bookmarks::remove(r).boxed());
+	app.at("/suggested-profiles").get(|r| suggested_profiles::page(r).boxed());
 	app.at("/subreddit-fragment").get(|r| subreddit::community_fragment(r).boxed());
 	app.at("/subreddit-fragment/:sort").get(|r| subreddit::community_fragment(r).boxed());
 	app.at("/subreddit-fragment/following").get(|r| subreddit::community_fragment(r).boxed());

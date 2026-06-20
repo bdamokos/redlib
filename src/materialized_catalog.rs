@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
+const SUGGESTED_PROFILE_TOP_SUBREDDITS: usize = 16;
+const SUGGESTED_PROFILE_REASON_LIMIT: usize = 5;
+const SUGGESTED_PROFILE_MIN_POSTS: usize = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CatalogSourceKey {
 	Subreddit(String),
@@ -32,6 +36,32 @@ pub struct TimelineEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CatalogUserSidebarStats {
 	pub subreddit_counts: Vec<(String, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SuggestedProfileSubreddit {
+	pub name: String,
+	pub followed_count: usize,
+	pub profile_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SuggestedProfileEntry {
+	pub name: String,
+	pub score_percent: u32,
+	pub cached_posts: usize,
+	pub matched_posts: usize,
+	pub overlap_subreddits: Vec<SuggestedProfileSubreddit>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SuggestedProfilesReport {
+	pub followed_profile_count: usize,
+	pub followed_profiles_with_cache: usize,
+	pub cached_profile_count: usize,
+	pub compared_profile_count: usize,
+	pub followed_subreddits: Vec<SuggestedProfileSubreddit>,
+	pub suggestions: Vec<SuggestedProfileEntry>,
 }
 
 #[cfg(test)]
@@ -105,6 +135,27 @@ fn catalog_record(post: &Post) -> CatalogRecord {
 		author_lc: post.author.name.trim().to_lowercase(),
 		source_keys: HashSet::new(),
 	}
+}
+
+fn sorted_subreddit_counts(counts: &HashMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
+	let mut entries = counts
+		.iter()
+		.filter(|(subreddit, count)| !subreddit.is_empty() && !subreddit.starts_with("u_") && **count > 0)
+		.map(|(subreddit, count)| (subreddit.clone(), *count))
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+	entries.truncate(limit);
+	entries
+}
+
+fn suggested_profile_weight(count: usize) -> f64 {
+	(count as f64).sqrt()
+}
+
+fn normalize_profile_name(name: &str) -> String {
+	let trimmed = name.trim();
+	let without_prefix = trimmed.strip_prefix("u_").or_else(|| trimmed.strip_prefix("u/")).unwrap_or(trimmed);
+	without_prefix.trim().to_lowercase()
 }
 
 fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
@@ -312,6 +363,158 @@ pub(crate) fn catalog_user_sidebar_stats(username: &str) -> Option<CatalogUserSi
 	(!subreddit_counts.is_empty()).then_some(CatalogUserSidebarStats { subreddit_counts })
 }
 
+pub(crate) fn suggested_profiles(
+	followed_profiles: &[String],
+	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
+	excluded_profiles: &HashSet<String>,
+	limit: usize,
+) -> SuggestedProfilesReport {
+	let followed_profiles = followed_profiles
+		.iter()
+		.map(|name| normalize_profile_name(name))
+		.filter(|name| !name.is_empty())
+		.collect::<HashSet<_>>();
+	let excluded_profiles = excluded_profiles
+		.iter()
+		.map(|name| normalize_profile_name(name))
+		.filter(|name| !name.is_empty())
+		.collect::<HashSet<_>>();
+
+	if followed_profiles.is_empty() || limit == 0 {
+		let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+		return SuggestedProfilesReport {
+			followed_profile_count: followed_profiles.len(),
+			cached_profile_count: catalog.author_community_counts.len(),
+			..SuggestedProfilesReport::default()
+		};
+	}
+
+	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let mut followed_counts: HashMap<String, usize> = HashMap::new();
+	let mut followed_profiles_with_cache = 0usize;
+
+	for profile in &followed_profiles {
+		let mut counts = catalog.author_community_counts.get(profile).cloned().unwrap_or_default();
+		if let Some(cached_subreddits) = followed_profile_subreddits.get(profile) {
+			for (subreddit, count) in cached_subreddits {
+				let subreddit = subreddit.trim().to_lowercase();
+				if subreddit.is_empty() || subreddit.starts_with("u_") || *count == 0 {
+					continue;
+				}
+				let count = (*count) as usize;
+				let entry = counts.entry(subreddit).or_default();
+				*entry = (*entry).max(count);
+			}
+		}
+		let profile_counts = sorted_subreddit_counts(&counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
+		if profile_counts.is_empty() {
+			continue;
+		}
+		followed_profiles_with_cache += 1;
+		for (subreddit, count) in profile_counts {
+			*followed_counts.entry(subreddit).or_default() += count;
+		}
+	}
+
+	let followed_top = sorted_subreddit_counts(&followed_counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
+	let followed_weights = followed_top
+		.iter()
+		.map(|(subreddit, count)| (subreddit.clone(), suggested_profile_weight(*count)))
+		.collect::<HashMap<_, _>>();
+	let followed_norm = followed_weights.values().map(|weight| weight * weight).sum::<f64>().sqrt();
+	let followed_subreddit_counts = followed_counts.clone();
+
+	let mut suggestions = Vec::new();
+	let mut compared_profile_count = 0usize;
+
+	if followed_norm > 0.0 {
+		for (profile, counts) in &catalog.author_community_counts {
+			if followed_profiles.contains(profile) || excluded_profiles.contains(profile) {
+				continue;
+			}
+
+			let profile_counts = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
+			let cached_posts = profile_counts.iter().map(|(_, count)| *count).sum::<usize>();
+			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
+				continue;
+			}
+
+			compared_profile_count += 1;
+
+			let mut dot = 0.0;
+			let mut candidate_norm_sq = 0.0;
+			let mut matched_posts = 0usize;
+			let mut overlap_subreddits = Vec::new();
+
+			for (subreddit, count) in &profile_counts {
+				let candidate_weight = suggested_profile_weight(*count);
+				candidate_norm_sq += candidate_weight * candidate_weight;
+				let Some(followed_weight) = followed_weights.get(subreddit) else {
+					continue;
+				};
+				dot += followed_weight * candidate_weight;
+				matched_posts += *count;
+				overlap_subreddits.push(SuggestedProfileSubreddit {
+					name: subreddit.clone(),
+					followed_count: *followed_subreddit_counts.get(subreddit).unwrap_or(&0),
+					profile_count: *count,
+				});
+			}
+
+			if dot <= 0.0 || candidate_norm_sq <= 0.0 || matched_posts == 0 {
+				continue;
+			}
+
+			overlap_subreddits.sort_by(|left, right| {
+				let left_contribution = left.followed_count.saturating_mul(left.profile_count);
+				let right_contribution = right.followed_count.saturating_mul(right.profile_count);
+				right_contribution.cmp(&left_contribution).then_with(|| left.name.cmp(&right.name))
+			});
+			overlap_subreddits.truncate(SUGGESTED_PROFILE_REASON_LIMIT);
+
+			let similarity = dot / (followed_norm * candidate_norm_sq.sqrt());
+			let confidence = (cached_posts as f64 / 8.0).min(1.0);
+			let score = similarity * confidence;
+			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
+
+			suggestions.push(SuggestedProfileEntry {
+				name: profile.clone(),
+				score_percent,
+				cached_posts,
+				matched_posts,
+				overlap_subreddits,
+			});
+		}
+	}
+
+	suggestions.sort_by(|left, right| {
+		right
+			.score_percent
+			.cmp(&left.score_percent)
+			.then_with(|| right.matched_posts.cmp(&left.matched_posts))
+			.then_with(|| right.cached_posts.cmp(&left.cached_posts))
+			.then_with(|| left.name.cmp(&right.name))
+	});
+	suggestions.truncate(limit);
+
+	SuggestedProfilesReport {
+		followed_profile_count: followed_profiles.len(),
+		followed_profiles_with_cache,
+		cached_profile_count: catalog.author_community_counts.len(),
+		compared_profile_count,
+		followed_subreddits: followed_top
+			.into_iter()
+			.take(SUGGESTED_PROFILE_REASON_LIMIT)
+			.map(|(name, followed_count)| SuggestedProfileSubreddit {
+				name,
+				followed_count,
+				profile_count: 0,
+			})
+			.collect(),
+		suggestions,
+	}
+}
+
 pub(crate) fn catalog_video_stats(username: &str) -> Option<crate::user::UserVideoStatsAccumulator> {
 	let username = username.trim().to_lowercase();
 	if username.is_empty() {
@@ -366,10 +569,10 @@ impl PersistedCatalogSourceKey {
 
 #[cfg(test)]
 mod tests {
-	use super::{apply_source_refresh, catalog_user_sidebar_stats, query_source_candidates, reset_catalog, restore_catalog, snapshot_catalog};
+	use super::{apply_source_refresh, catalog_user_sidebar_stats, query_source_candidates, reset_catalog, restore_catalog, snapshot_catalog, suggested_profiles};
 	use crate::post_cache::{FeedSort, FeedSource};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, ParentComment, Post};
-	use std::collections::HashSet;
+	use std::collections::{HashMap, HashSet};
 	use std::sync::MutexGuard;
 
 	fn test_lock() -> MutexGuard<'static, ()> {
@@ -480,5 +683,70 @@ mod tests {
 
 		let stats = catalog_user_sidebar_stats("alice").expect("sidebar stats");
 		assert_eq!(stats.subreddit_counts, vec![("programming".to_string(), 1), ("rust".to_string(), 1)]);
+	}
+
+	#[test]
+	fn suggested_profiles_rank_cached_authors_by_followed_overlap() {
+		let _guard = test_lock();
+		reset_catalog();
+		let followed = vec![
+			test_post("alice-rust-1", "rust", "alice", 300),
+			test_post("alice-rust-2", "rust", "alice", 290),
+			test_post("alice-programming", "programming", "alice", 280),
+		];
+		let close_match = vec![
+			test_post("bob-rust", "rust", "bob", 270),
+			test_post("bob-programming", "programming", "bob", 260),
+			test_post("bob-cargo", "cargo", "bob", 250),
+		];
+		let loose_match = vec![test_post("charlie-rust", "rust", "charlie", 240), test_post("charlie-music", "music", "charlie", 230)];
+
+		apply_source_refresh(&FeedSource::subreddit("u_alice", FeedSort::New), &followed);
+		apply_source_refresh(&FeedSource::subreddit("rust", FeedSort::New), &close_match);
+		apply_source_refresh(&FeedSource::subreddit("programming", FeedSort::New), &loose_match);
+
+		let report = suggested_profiles(&["u_alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+
+		assert_eq!(report.followed_profile_count, 1);
+		assert_eq!(report.followed_profiles_with_cache, 1);
+		assert_eq!(report.suggestions[0].name, "bob");
+		assert!(!report.suggestions.iter().any(|entry| entry.name == "alice"));
+		assert!(report.suggestions[0].overlap_subreddits.iter().any(|entry| entry.name == "rust"));
+		assert!(report.suggestions[0].overlap_subreddits.iter().any(|entry| entry.name == "programming"));
+	}
+
+	#[test]
+	fn suggested_profiles_respect_filtered_profiles() {
+		let _guard = test_lock();
+		reset_catalog();
+		apply_source_refresh(
+			&FeedSource::subreddit("u_alice", FeedSort::New),
+			&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)],
+		);
+		apply_source_refresh(
+			&FeedSource::subreddit("rust", FeedSort::New),
+			&[test_post("bob-rust", "rust", "bob", 280), test_post("bob-programming", "programming", "bob", 270)],
+		);
+
+		let excluded = HashSet::from(["u_bob".to_string()]);
+		let report = suggested_profiles(&["alice".to_string()], &HashMap::new(), &excluded, 10);
+
+		assert!(report.suggestions.is_empty());
+	}
+
+	#[test]
+	fn suggested_profiles_use_followed_profile_side_cache_for_seed() {
+		let _guard = test_lock();
+		reset_catalog();
+		apply_source_refresh(
+			&FeedSource::subreddit("rust", FeedSort::New),
+			&[test_post("bob-rust", "rust", "bob", 280), test_post("bob-programming", "programming", "bob", 270)],
+		);
+
+		let side_cache = HashMap::from([("alice".to_string(), vec![("rust".to_string(), 4), ("programming".to_string(), 2)])]);
+		let report = suggested_profiles(&["alice".to_string()], &side_cache, &HashSet::new(), 10);
+
+		assert_eq!(report.followed_profiles_with_cache, 1);
+		assert_eq!(report.suggestions[0].name, "bob");
 	}
 }

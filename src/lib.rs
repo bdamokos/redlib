@@ -17,6 +17,7 @@ pub mod server;
 pub mod settings;
 pub mod site_icon;
 pub mod subreddit;
+pub mod suggested_profiles;
 pub mod user;
 pub mod utils;
 pub mod video_mode;
