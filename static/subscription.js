@@ -2,6 +2,8 @@
     const nativeSubmit = HTMLFormElement.prototype.submit;
     const maxCookieShards = 16;
     const maxBookmarks = 200;
+    const preferenceChannelName = "redlib-preferences";
+    const preferenceChannel = "BroadcastChannel" in window ? new BroadcastChannel(preferenceChannelName) : null;
     const oneYearFromNow = () => new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString();
     const getForms = () => Array.from(document.querySelectorAll("form[data-subscription-form]"));
 
@@ -69,50 +71,6 @@
         }
         return highest;
     };
-
-    const listTokensFromRaw = (raw) =>
-        raw
-            .split("+")
-            .map((item) => item.trim())
-            .filter(Boolean);
-
-    const normalizeListCookieString = (raw) => {
-        const tokens = listTokensFromRaw(raw);
-        const map = new Map(tokens.map((t) => [t.toLowerCase(), t]));
-        return Array.from(map.values())
-            .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }))
-            .join("+");
-    };
-
-    const listCookieStringsEqual = (a, b) => normalizeListCookieString(a) === normalizeListCookieString(b);
-
-    const sortFlairEntries = (entries) =>
-        entries
-            .map((entry) => ({ subreddit: entry.subreddit, flair: entry.flair }))
-            .sort((left, right) => {
-                const subredditOrder = left.subreddit.localeCompare(right.subreddit, undefined, { sensitivity: "base" });
-                if (subredditOrder !== 0) {
-                    return subredditOrder;
-                }
-                return left.flair.localeCompare(right.flair, undefined, { sensitivity: "base" });
-            });
-
-    const canonicalFlairCookieString = (raw) => {
-        if (!raw) {
-            return "";
-        }
-        try {
-            const entries = JSON.parse(base64UrlDecode(raw));
-            if (!Array.isArray(entries)) {
-                return raw;
-            }
-            return base64UrlEncode(JSON.stringify(sortFlairEntries(entries)));
-        } catch (_error) {
-            return raw;
-        }
-    };
-
-    const flairCookieStringsEqual = (a, b) => canonicalFlairCookieString(a) === canonicalFlairCookieString(b);
 
     const normalizeBookmarkEntries = (entries) =>
         entries
@@ -188,20 +146,6 @@
                 const staleName = staleIndex === 0 ? baseName : `${baseName}${staleIndex}`;
                 removeCookie(staleName);
             }
-        }
-    };
-
-    const readListCookie = (baseName) => listTokensFromRaw(readShardedCookie(baseName));
-
-    const readFlairCookie = () => {
-        const encoded = readShardedCookie("flair_subscriptions");
-        if (!encoded) {
-            return [];
-        }
-        try {
-            return JSON.parse(base64UrlDecode(encoded));
-        } catch (_error) {
-            return [];
         }
     };
 
@@ -287,47 +231,102 @@
         }
     };
 
-    const toggleTarget = (target) => {
+    const cookieValuesForForm = (form) =>
+        (form.dataset.cookieValues || "")
+            .split(/[|+]/)
+            .map((item) => item.trim())
+            .filter(Boolean);
+
+    const sameValues = (left, right) => {
+        if (left.length !== right.length) {
+            return false;
+        }
+        const normalizedLeft = left.map((value) => value.toLowerCase()).sort();
+        const normalizedRight = right.map((value) => value.toLowerCase()).sort();
+        return normalizedLeft.every((value, index) => value === normalizedRight[index]);
+    };
+
+    const preferenceIntent = (form) => ({
+        mode: form.dataset.cookieMode || "list",
+        cookieName: form.dataset.cookieName || "subscriptions",
+        values: cookieValuesForForm(form),
+        subreddit: form.dataset.cookieSubreddit || "",
+        flair: form.dataset.cookieFlair || "",
+    });
+
+    const formMatchesIntent = (form, intent) => {
+        const mode = form.dataset.cookieMode || "list";
+        if (mode !== intent.mode) {
+            return false;
+        }
+        if (mode === "flair") {
+            return form.dataset.cookieSubreddit === intent.subreddit && form.dataset.cookieFlair === intent.flair;
+        }
+        if (mode === "bookmarks") {
+            return false;
+        }
+        return (form.dataset.cookieName || "subscriptions") === intent.cookieName && sameValues(cookieValuesForForm(form), intent.values || []);
+    };
+
+    const updateFormForIntent = (form, isEnabling) => {
+        const stateOn = form.dataset.stateOn || "subscribed";
+        const stateOff = form.dataset.stateOff || "unsubscribed";
+        updateFormState(form, isEnabling ? stateOn : stateOff);
+        removeSettingsFeedItem(form);
+    };
+
+    const applyCounterpartListIntent = (intent, isEnabling) => {
+        if (!isEnabling || intent.mode !== "list") {
+            return;
+        }
+        const counterpart =
+            intent.cookieName === "subscriptions" ? "filters" : intent.cookieName === "filters" ? "subscriptions" : "";
+        if (!counterpart) {
+            return;
+        }
+
         for (const form of getForms()) {
-            if (form.dataset.subscriptionTarget !== target) {
+            const mode = form.dataset.cookieMode || "list";
+            if (mode !== "list" || (form.dataset.cookieName || "subscriptions") !== counterpart) {
                 continue;
             }
-            const stateOn = form.dataset.stateOn || "subscribed";
-            const stateOff = form.dataset.stateOff || "unsubscribed";
-            const nextState = form.dataset.subscriptionState === stateOn ? stateOff : stateOn;
-            updateFormState(form, nextState);
+            if (!sameValues(cookieValuesForForm(form), intent.values || [])) {
+                continue;
+            }
+            updateFormForIntent(form, false);
+        }
+    };
+
+    const applyPreferenceIntent = (intent, isEnabling) => {
+        for (const form of getForms()) {
+            if (formMatchesIntent(form, intent)) {
+                updateFormForIntent(form, isEnabling);
+            }
+        }
+        applyCounterpartListIntent(intent, isEnabling);
+    };
+
+    const broadcastPreferenceIntent = (intent, isEnabling) => {
+        const message = { type: "preference-intent", intent, isEnabling, time: Date.now() };
+        preferenceChannel?.postMessage(message);
+        try {
+            localStorage.setItem(`${preferenceChannelName}-updated`, JSON.stringify(message));
+        } catch (_error) {
+            // Ignore storage failures; BroadcastChannel handles modern browsers.
         }
     };
 
     const currentCookieState = (form) => {
         const cookieMode = form.dataset.cookieMode || "list";
-        const cookieName = form.dataset.cookieName || "subscriptions";
         const stateOn = form.dataset.stateOn || "subscribed";
         const stateOff = form.dataset.stateOff || "unsubscribed";
 
-        if (cookieMode === "flair") {
-            const subreddit = form.dataset.cookieSubreddit;
-            const flair = form.dataset.cookieFlair;
-            const enabled = readFlairCookie().some((entry) => entry.subreddit === subreddit && entry.flair === flair);
-            return enabled ? stateOn : stateOff;
-        }
-
-        if (cookieMode === "bookmarks") {
-            const bookmarkId = form.dataset.bookmarkId;
-            const enabled = readBookmarksCookie().some((entry) => entry.i === bookmarkId);
-            return enabled ? stateOn : stateOff;
-        }
-
-        const cookieValues = (form.dataset.cookieValues || "")
-            .split(/[|+]/)
-            .map((item) => item.trim())
-            .filter(Boolean);
-        if (cookieValues.length === 0) {
+        if (cookieMode !== "bookmarks") {
             return form.dataset.subscriptionState || stateOff;
         }
 
-        const values = readListCookie(cookieName).map((value) => value.toLowerCase());
-        const enabled = cookieValues.every((value) => values.includes(value.toLowerCase()));
+        const bookmarkId = form.dataset.bookmarkId;
+        const enabled = readBookmarksCookie().some((entry) => entry.i === bookmarkId);
         return enabled ? stateOn : stateOff;
     };
 
@@ -338,86 +337,6 @@
             }
             updateFormState(form, currentCookieState(form));
         }
-    };
-
-    const mutateCookies = (form) => {
-        const cookieMode = form.dataset.cookieMode || "list";
-        const cookieName = form.dataset.cookieName || "subscriptions";
-        const stateOn = form.dataset.stateOn || "subscribed";
-        const isEnabling = form.dataset.subscriptionState !== stateOn;
-
-        if (cookieMode === "flair") {
-            const subreddit = form.dataset.cookieSubreddit;
-            const flair = form.dataset.cookieFlair;
-            if (!subreddit || !flair) {
-                throw new Error("Missing flair subscription metadata");
-            }
-
-            readModifyWriteSharded(
-                "flair_subscriptions",
-                (beforeRaw) => {
-                    let entries = [];
-                    if (beforeRaw) {
-                        try {
-                            entries = JSON.parse(base64UrlDecode(beforeRaw));
-                        } catch (_error) {
-                            entries = [];
-                        }
-                    }
-                    if (!Array.isArray(entries)) {
-                        entries = [];
-                    }
-                    entries = entries.filter((entry) => !(entry.subreddit === subreddit && entry.flair === flair));
-                    if (isEnabling) {
-                        entries.push({ subreddit, flair });
-                    }
-                    if (entries.length === 0) {
-                        return "";
-                    }
-                    return base64UrlEncode(JSON.stringify(sortFlairEntries(entries)));
-                },
-                flairCookieStringsEqual,
-            );
-            return;
-        }
-
-        if (cookieMode === "bookmarks") {
-            if (!form.dataset.bookmarkId) {
-                throw new Error("Missing bookmark metadata");
-            }
-            return;
-        }
-
-        const cookieValues = (form.dataset.cookieValues || "")
-            .split(/[|+]/)
-            .map((item) => item.trim())
-            .filter(Boolean);
-        if (cookieValues.length === 0) {
-            throw new Error("Missing cookie values");
-        }
-
-        readModifyWriteSharded(
-            cookieName,
-            (beforeRaw) => {
-                const values = listTokensFromRaw(beforeRaw);
-                const normalized = new Map(values.map((value) => [value.toLowerCase(), value]));
-
-                for (const value of cookieValues) {
-                    const key = value.toLowerCase();
-                    if (isEnabling) {
-                        normalized.set(key, value);
-                    } else {
-                        normalized.delete(key);
-                    }
-                }
-
-                const sorted = Array.from(normalized.values()).sort((left, right) =>
-                    left.localeCompare(right, undefined, { sensitivity: "base" }),
-                );
-                return sorted.join("+");
-            },
-            listCookieStringsEqual,
-        );
     };
 
     const bindForm = (form) => {
@@ -439,11 +358,9 @@
             const requestAction = form.action;
 
             try {
-                if (form.dataset.cookieMode !== "bookmarks") {
-                    syncTargetStateFromCookies(target);
-                    mutateCookies(form);
-                    toggleTarget(target);
-                }
+                const stateOn = form.dataset.stateOn || "subscribed";
+                const isEnabling = form.dataset.subscriptionState !== stateOn;
+                const intent = preferenceIntent(form);
 
                 const response = await fetch(requestAction, {
                     method: form.method || "POST",
@@ -464,6 +381,9 @@
 
                 if (form.dataset.cookieMode === "bookmarks") {
                     syncTargetStateFromCookies(target);
+                } else {
+                    applyPreferenceIntent(intent, isEnabling);
+                    broadcastPreferenceIntent(intent, isEnabling);
                 }
             } catch (_error) {
                 form.action = requestAction;
@@ -518,6 +438,24 @@
     document.addEventListener("visibilitychange", () => {
         if (!document.hidden) {
             syncAllForms();
+        }
+    });
+    preferenceChannel?.addEventListener("message", (event) => {
+        if (event.data?.type === "preference-intent") {
+            applyPreferenceIntent(event.data.intent, event.data.isEnabling);
+        }
+    });
+    window.addEventListener("storage", (event) => {
+        if (event.key !== `${preferenceChannelName}-updated` || !event.newValue) {
+            return;
+        }
+        try {
+            const message = JSON.parse(event.newValue);
+            if (message.type === "preference-intent") {
+                applyPreferenceIntent(message.intent, message.isEnabling);
+            }
+        } catch (_error) {
+            // Ignore malformed storage events from older tabs.
         }
     });
     document.addEventListener("DOMContentLoaded", () => initializeSubscriptionForms(document));

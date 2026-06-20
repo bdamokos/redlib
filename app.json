@@ -80,6 +80,15 @@
     "REDLIB_CACHE_DIR": {
       "required": false
     },
+    "REDLIB_PREFS_DB": {
+      "required": false
+    },
+    "REDLIB_PREFS_MAX_AGE_DAYS": {
+      "required": false
+    },
+    "REDLIB_PREFS_TOUCH_INTERVAL_SECS": {
+      "required": false
+    },
     "REDLIB_INSTANCE_SCRAPE_ENABLED": {
       "required": false
     },

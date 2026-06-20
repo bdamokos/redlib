@@ -199,7 +199,10 @@ Stream logs from the Redlib container:
 docker logs -f redlib
 ```
 
-The maintained compose files in this repository mount a named Docker volume called `redlib-cache` at `/var/lib/redlib/cache`. That volume persists the remembered plain-subreddit cache across image rebuilds and container recreation.
+The maintained compose files in this repository mount named Docker volumes for durable runtime state:
+
+- `redlib-cache` at `/var/lib/redlib/cache` persists remembered plain-subreddit cache snapshots.
+- `redlib-state` at `/var/lib/redlib/state` persists server-side preference storage across image rebuilds and container recreation.
 
 To clear the persisted cache volume on demand:
 
@@ -449,6 +452,9 @@ Assign a default value for each instance-specific setting by passing environment
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS).                                                     |
 | `CACHE_DIR`               | String          | `/var/lib/redlib/cache`| Directory used for persisted subreddit cache snapshots.                                                    |
+| `PREFS_DB`                | String          | `/var/lib/redlib/state/preferences.sqlite3` | SQLite database used for server-side preference storage.                                      |
+| `PREFS_MAX_AGE_DAYS`      | Integer         | `365`                  | Evicts server-side preference records that have not been visited for this many days.                       |
+| `PREFS_TOUCH_INTERVAL_SECS` | Integer       | `3600`                 | Minimum interval between persisted `last_visit` updates for an active preference record.                   |
 | `INSTANCE_SCRAPE_ENABLED` | `["on", "off"]` | `off`                  | Enables direct-request fallback scraping from public stock Redlib instances when Reddit rate limits apply. |
 | `INSTANCE_SCRAPE_SOURCES` | CSV of origins  | (empty)                | Optional override list of Redlib origins. If unset, Redlib uses the public `redlib-instances` JSON catalog and refreshes health every 3 days. |
 | `INSTANCE_SCRAPE_TIMEOUT_SECS` | Integer     | `6`                    | Per-request timeout for external Redlib scrape fallback and instance-health probes.                        |

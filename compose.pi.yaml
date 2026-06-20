@@ -21,8 +21,10 @@ services:
       REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL: "${REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL:-0}"
       REDLIB_VIDEO_PREVIEW_ANIMATION_MAX_WIDTH: "${REDLIB_VIDEO_PREVIEW_ANIMATION_MAX_WIDTH:-360}"
       REDLIB_CACHE_DIR: "${REDLIB_CACHE_DIR:-/var/lib/redlib/cache}"
+      REDLIB_PREFS_DB: "${REDLIB_PREFS_DB:-/var/lib/redlib/state/preferences.sqlite3}"
     volumes:
       - redlib-cache:/var/lib/redlib/cache
+      - redlib-state:/var/lib/redlib/state
     networks:
       - redlib
     healthcheck:
@@ -36,3 +38,5 @@ networks:
 volumes:
   redlib-cache:
     name: redlib-cache
+  redlib-state:
+    name: redlib-state

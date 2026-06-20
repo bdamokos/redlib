@@ -2152,8 +2152,60 @@ impl Preferences {
 		self.filters_lc = self.filters.iter().map(|v| v.to_ascii_lowercase()).collect();
 	}
 
-	/// Build preferences from cookies
+	pub(crate) fn prepare_for_runtime(&mut self) {
+		self.available_themes = AVAILABLE_THEMES.clone();
+		self.rebuild_indexes();
+	}
+
+	pub(crate) fn prepare_for_storage(&self) -> Self {
+		let mut prefs = self.clone();
+		prefs.available_themes = Vec::new();
+		prefs.subscriptions_lc = HashSet::new();
+		prefs.filters_lc = HashSet::new();
+		prefs
+	}
+
+	pub(crate) fn setting_value(&self, name: &str) -> Option<String> {
+		match name {
+			"theme" => Some(self.theme.clone()),
+			"front_page" => Some(self.front_page.clone()),
+			"layout" => Some(self.layout.clone()),
+			"wide" => Some(self.wide.clone()),
+			"blur_spoiler" => Some(self.blur_spoiler.clone()),
+			"show_nsfw" => Some(self.show_nsfw.clone()),
+			"blur_nsfw" => Some(self.blur_nsfw.clone()),
+			"hide_hls_notification" => Some(self.hide_hls_notification.clone()),
+			"image_quality" => Some(self.image_quality.clone()),
+			"video_quality" => Some(self.video_quality.clone()),
+			"hide_sidebar_and_summary" => Some(self.hide_sidebar_and_summary.clone()),
+			"use_dash" => Some(self.use_dash.clone()),
+			"use_hls" => Some(self.use_hls.clone()),
+			"autoplay_videos" => Some(self.autoplay_videos.clone()),
+			"video_previews" => Some(self.video_previews.clone()),
+			"fixed_navbar" => Some(self.fixed_navbar.clone()),
+			"disable_visit_reddit_confirmation" => Some(self.disable_visit_reddit_confirmation.clone()),
+			"comment_sort" => Some(self.comment_sort.clone()),
+			"post_sort" => Some(self.post_sort.clone()),
+			"subscriptions" => Some(self.subscriptions.join("+")),
+			"filters" => Some(self.filters.join("+")),
+			"flair_subscriptions" => encode_flair_subscriptions(&self.flair_subscriptions).ok(),
+			"hide_awards" => Some(self.hide_awards.clone()),
+			"hide_score" => Some(self.hide_score.clone()),
+			"remove_default_feeds" => Some(self.remove_default_feeds.clone()),
+			_ => None,
+		}
+	}
+
+	/// Build preferences from the request's server-side state, falling back to legacy cookies.
 	pub fn new(req: &Request<Body>) -> Self {
+		if let Some(prefs) = crate::prefs_store::request_preferences(req) {
+			return prefs;
+		}
+		Self::from_cookies(req)
+	}
+
+	/// Build preferences from legacy cookies and config defaults.
+	pub(crate) fn from_cookies(req: &Request<Body>) -> Self {
 		let mut prefs = Self {
 			available_themes: AVAILABLE_THEMES.clone(),
 			theme: setting(req, "theme"),
@@ -2579,6 +2631,10 @@ pub fn flair_subscription_action_url(subreddit: &str, action: &str, flair: &str,
 
 /// Retrieve the value of a setting by name
 pub fn setting(req: &Request<Body>, name: &str) -> String {
+	if let Some(value) = crate::prefs_store::stored_setting(req, name) {
+		return value;
+	}
+
 	if matches!(name, "subscriptions" | "filters" | "flair_subscriptions") {
 		let value = read_sharded_cookie(req, name);
 		if !value.is_empty() {

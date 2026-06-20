@@ -1,12 +1,12 @@
 #![allow(clippy::cmp_owned)]
 
-use crate::{config, instance_scrape, seen_posts, utils, video_mode};
+use crate::{config, instance_scrape, prefs_store, seen_posts, utils, video_mode};
 // CRATES
 use crate::cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditMetadataEntry, PersistedSubredditNsfwEntry};
 use crate::post_cache::{FeedSessionRequest, FeedSort, FeedSource};
 use crate::utils::{
-	catch_random, clear_sharded_cookie, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect,
-	rewrite_urls, setting, template, val, write_sharded_cookie, FlairSubscription, Post, Preferences, Subreddit,
+	catch_random, deflate_compress, deflate_decompress, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting,
+	template, val, FlairSubscription, Post, Preferences, Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
@@ -4486,9 +4486,9 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 
 	let query = req.uri().query().unwrap_or_default().to_string();
 
-	let preferences = Preferences::new(&req);
-	let mut sub_list = preferences.subscriptions;
-	let mut filters = preferences.filters;
+	let mut preferences = Preferences::new(&req);
+	let mut sub_list = preferences.subscriptions.clone();
+	let mut filters = preferences.filters.clone();
 	let canonical_parts = canonical_subreddit_parts(&query);
 
 	// Retrieve list of posts for these subreddits to extract display names
@@ -4560,17 +4560,10 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		redirect(&path)
 	};
 
-	if sub_list.is_empty() {
-		clear_sharded_cookie(&mut response, &req, "subscriptions");
-	} else {
-		write_sharded_cookie(&mut response, &req, "subscriptions", &sub_list.join("+"));
-	}
-
-	if filters.is_empty() {
-		clear_sharded_cookie(&mut response, &req, "filters");
-	} else {
-		write_sharded_cookie(&mut response, &req, "filters", &filters.join("+"));
-	}
+	preferences.subscriptions = sub_list;
+	preferences.filters = filters;
+	preferences.prepare_for_runtime();
+	prefs_store::save_preferences(&mut response, &req, &preferences)?;
 
 	Ok(response)
 }
@@ -4595,7 +4588,8 @@ pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, S
 		canonical_subreddit
 	};
 
-	let mut flair_subscriptions = Preferences::new(&req).flair_subscriptions;
+	let mut preferences = Preferences::new(&req);
+	let mut flair_subscriptions = preferences.flair_subscriptions.clone();
 	let target = FlairSubscription { subreddit, flair: flair.clone() };
 
 	if action.contains(&"subscribe".to_string()) {
@@ -4627,11 +4621,9 @@ pub async fn flair_subscriptions(req: Request<Body>) -> Result<Response<Body>, S
 		redirect(&path)
 	};
 
-	if flair_subscriptions.is_empty() {
-		clear_sharded_cookie(&mut response, &req, "flair_subscriptions");
-	} else {
-		write_sharded_cookie(&mut response, &req, "flair_subscriptions", &utils::encode_flair_subscriptions(&flair_subscriptions)?);
-	}
+	preferences.flair_subscriptions = flair_subscriptions;
+	preferences.prepare_for_runtime();
+	prefs_store::save_preferences(&mut response, &req, &preferences)?;
 
 	Ok(response)
 }

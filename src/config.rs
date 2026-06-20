@@ -122,6 +122,15 @@ pub struct Config {
 	#[serde(rename = "REDLIB_CACHE_DIR")]
 	pub(crate) cache_dir: Option<String>,
 
+	#[serde(rename = "REDLIB_PREFS_DB")]
+	pub(crate) prefs_db: Option<String>,
+
+	#[serde(rename = "REDLIB_PREFS_MAX_AGE_DAYS")]
+	pub(crate) prefs_max_age_days: Option<String>,
+
+	#[serde(rename = "REDLIB_PREFS_TOUCH_INTERVAL_SECS")]
+	pub(crate) prefs_touch_interval_secs: Option<String>,
+
 	#[serde(rename = "REDLIB_INSTANCE_SCRAPE_ENABLED")]
 	pub(crate) instance_scrape_enabled: Option<String>,
 
@@ -182,6 +191,9 @@ impl Config {
 			default_remove_default_feeds: parse("REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS"),
 			reddit_transport: parse("REDLIB_REDDIT_TRANSPORT"),
 			cache_dir: parse("REDLIB_CACHE_DIR"),
+			prefs_db: parse("REDLIB_PREFS_DB"),
+			prefs_max_age_days: parse("REDLIB_PREFS_MAX_AGE_DAYS"),
+			prefs_touch_interval_secs: parse("REDLIB_PREFS_TOUCH_INTERVAL_SECS"),
 			instance_scrape_enabled: parse("REDLIB_INSTANCE_SCRAPE_ENABLED"),
 			instance_scrape_sources: parse("REDLIB_INSTANCE_SCRAPE_SOURCES"),
 			instance_scrape_timeout_secs: parse("REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS"),
@@ -219,6 +231,9 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS" => config.default_remove_default_feeds.clone(),
 		"REDLIB_REDDIT_TRANSPORT" => config.reddit_transport.clone(),
 		"REDLIB_CACHE_DIR" => config.cache_dir.clone(),
+		"REDLIB_PREFS_DB" => config.prefs_db.clone(),
+		"REDLIB_PREFS_MAX_AGE_DAYS" => config.prefs_max_age_days.clone(),
+		"REDLIB_PREFS_TOUCH_INTERVAL_SECS" => config.prefs_touch_interval_secs.clone(),
 		"REDLIB_INSTANCE_SCRAPE_ENABLED" => config.instance_scrape_enabled.clone(),
 		"REDLIB_INSTANCE_SCRAPE_SOURCES" => config.instance_scrape_sources.clone(),
 		"REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS" => config.instance_scrape_timeout_secs.clone(),

@@ -10,6 +10,7 @@ pub mod oauth;
 pub mod oauth_resources;
 pub mod post;
 pub mod post_cache;
+pub mod prefs_store;
 pub mod redgifs;
 pub mod search;
 pub mod seen_posts;

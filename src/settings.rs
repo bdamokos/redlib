@@ -3,13 +3,11 @@
 use std::collections::HashMap;
 
 // CRATES
-use crate::server::ResponseExt;
-use crate::utils::{clear_sharded_cookie, deflate_decompress, param, preferences_from_bincode, redirect, template, write_sharded_cookie, Preferences};
+use crate::prefs_store;
+use crate::utils::{decode_flair_subscriptions, deflate_decompress, param, preferences_from_bincode, redirect, template, Preferences};
 use askama::Template;
-use cookie::Cookie;
 use futures_lite::StreamExt;
 use hyper::{Body, Request, Response};
-use time::{Duration, OffsetDateTime};
 use tokio::time::timeout;
 use url::form_urlencoded;
 
@@ -65,16 +63,10 @@ pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 
 /// Set cookies using response "Set-Cookie" header
 pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
+	let mut prefs = Preferences::new(&req);
+
 	// Split the body into parts
 	let (parts, mut body) = req.into_parts();
-
-	// Grab existing cookies
-	let _cookies: Vec<Cookie<'_>> = parts
-		.headers
-		.get_all("Cookie")
-		.iter()
-		.filter_map(|header| Cookie::parse(header.to_str().unwrap_or_default()).ok())
-		.collect();
 
 	// Aggregate the body...
 	// let whole_body = hyper::body::aggregate(req).await.map_err(|e| e.to_string())?;
@@ -86,41 +78,23 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 		.await
 		.map_err(|e| e.to_string())?;
 
-	let form = url::form_urlencoded::parse(&body_bytes).collect::<HashMap<_, _>>();
+	let form = url::form_urlencoded::parse(&body_bytes).into_owned().collect::<HashMap<_, _>>();
+	apply_standard_preferences(&mut prefs, &form, true);
 
 	let mut response = redirect(&settings_redirect_path("saved"));
-
-	for &name in &PREFS {
-		match form.get(name) {
-			Some(value) => response.insert_cookie(
-				Cookie::build((name.to_owned(), value.clone()))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			),
-			None => response.remove_cookie(name.to_string()),
-		};
-	}
+	let req = Request::from_parts(parts, Body::empty());
+	prefs_store::save_preferences(&mut response, &req, &prefs)?;
 
 	Ok(response)
 }
 
-fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
+fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Result<Response<Body>, String> {
 	// Split the body into parts
 	let (parts, _) = req.into_parts();
 
-	// Grab existing cookies
-	let _cookies: Vec<Cookie<'_>> = parts
-		.headers
-		.get_all("Cookie")
-		.iter()
-		.filter_map(|header| Cookie::parse(header.to_str().unwrap_or_default()).ok())
-		.collect();
-
 	let query = parts.uri.query().unwrap_or_default().to_string();
 
-	let form = url::form_urlencoded::parse(query.as_bytes()).collect::<HashMap<_, _>>();
+	let form = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect::<HashMap<_, _>>();
 
 	let path = match form.get("redirect") {
 		Some(value) => {
@@ -135,51 +109,14 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	};
 
 	let mut response = redirect(&path);
-
-	for name in PREFS {
-		match form.get(name) {
-			Some(value) => response.insert_cookie(
-				Cookie::build((name.to_owned(), value.clone()))
-					.path("/")
-					.http_only(true)
-					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
-					.into(),
-			),
-			None => {
-				if remove_cookies {
-					response.remove_cookie(name.to_string());
-				}
-			}
-		};
-	}
-
-	// Get subscriptions/filters to restore from query string
-	let subscriptions = form.get("subscriptions");
-	let filters = form.get("filters");
-	let flair_subscriptions = form.get("flair_subscriptions");
 	let req = Request::from_parts(parts, Body::empty());
+	let mut prefs = if remove_cookies { default_preferences() } else { Preferences::new(&req) };
 
-	// If there are subscriptions to restore set them and delete any old subscriptions cookies, otherwise delete them all
-	if let Some(subscriptions) = subscriptions {
-		write_sharded_cookie(&mut response, &req, "subscriptions", subscriptions);
-	} else {
-		clear_sharded_cookie(&mut response, &req, "subscriptions");
-	}
+	apply_standard_preferences(&mut prefs, &form, remove_cookies);
+	apply_feed_preferences(&mut prefs, &form, remove_cookies)?;
+	prefs_store::save_preferences(&mut response, &req, &prefs)?;
 
-	// If there are filters to restore set them and delete any old filters cookies, otherwise delete them all
-	if let Some(filters) = filters {
-		write_sharded_cookie(&mut response, &req, "filters", filters);
-	} else {
-		clear_sharded_cookie(&mut response, &req, "filters");
-	}
-
-	if let Some(flair_subscriptions) = flair_subscriptions {
-		write_sharded_cookie(&mut response, &req, "flair_subscriptions", flair_subscriptions);
-	} else {
-		clear_sharded_cookie(&mut response, &req, "flair_subscriptions");
-	}
-
-	response
+	Ok(response)
 }
 
 fn settings_redirect_path(status: &str) -> String {
@@ -192,11 +129,11 @@ fn settings_status(req: &Request<Body>) -> Option<String> {
 
 /// Set cookies using response "Set-Cookie" header
 pub async fn restore(req: Request<Body>) -> Result<Response<Body>, String> {
-	Ok(set_cookies_method(req, true))
+	set_cookies_method(req, true)
 }
 
 pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
-	Ok(set_cookies_method(req, false))
+	set_cookies_method(req, false)
 }
 
 pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -225,20 +162,86 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 		.map_err(|e| format!("Failed to deserialize preferences: {e}"))?
 		.map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;
 
-	prefs.available_themes = vec![];
+	prefs.prepare_for_runtime();
 
-	// Avoid redirecting the *browser* to a massive URL (can exceed URL limits for large subscription lists).
-	// Instead, internally reuse the existing restore logic to set cookies, and redirect the client to a short URL.
-	let restore_uri = format!("/settings/restore?redirect=settings%3Fstatus%3Dimported&{}", prefs.to_urlencoded()?);
-	let restore_req = Request::from_parts(
-		{
-			let mut parts = parts;
-			parts.uri = restore_uri.parse().map_err(|e| format!("Failed to build restore URI: {e}"))?;
-			parts
-		},
-		Body::empty(),
-	);
-	Ok(set_cookies_method(restore_req, true))
+	let restore_req = Request::from_parts(parts, Body::empty());
+	let mut response = redirect(&settings_redirect_path("imported"));
+	prefs_store::save_preferences(&mut response, &restore_req, &prefs)?;
+	Ok(response)
+}
+
+fn default_preferences() -> Preferences {
+	let req = Request::builder().uri("/").body(Body::empty()).expect("empty request should build");
+	Preferences::from_cookies(&req)
+}
+
+fn apply_standard_preferences(prefs: &mut Preferences, form: &HashMap<String, String>, reset_missing: bool) {
+	let defaults = reset_missing.then(default_preferences);
+	for name in PREFS {
+		if let Some(value) = form.get(name) {
+			apply_standard_preference(prefs, name, value);
+		} else if let Some(defaults) = &defaults {
+			if let Some(value) = defaults.setting_value(name) {
+				apply_standard_preference(prefs, name, &value);
+			}
+		}
+	}
+	prefs.prepare_for_runtime();
+}
+
+fn apply_standard_preference(prefs: &mut Preferences, name: &str, value: &str) {
+	match name {
+		"theme" => prefs.theme = value.to_string(),
+		"front_page" => prefs.front_page = value.to_string(),
+		"layout" => prefs.layout = value.to_string(),
+		"wide" => prefs.wide = value.to_string(),
+		"comment_sort" => prefs.comment_sort = value.to_string(),
+		"post_sort" => prefs.post_sort = value.to_string(),
+		"blur_spoiler" => prefs.blur_spoiler = value.to_string(),
+		"show_nsfw" => prefs.show_nsfw = value.to_string(),
+		"blur_nsfw" => prefs.blur_nsfw = value.to_string(),
+		"use_dash" => prefs.use_dash = value.to_string(),
+		"use_hls" => prefs.use_hls = value.to_string(),
+		"hide_hls_notification" => prefs.hide_hls_notification = value.to_string(),
+		"autoplay_videos" => prefs.autoplay_videos = value.to_string(),
+		"video_previews" => prefs.video_previews = value.to_string(),
+		"hide_sidebar_and_summary" => prefs.hide_sidebar_and_summary = value.to_string(),
+		"fixed_navbar" => prefs.fixed_navbar = value.to_string(),
+		"hide_awards" => prefs.hide_awards = value.to_string(),
+		"hide_score" => prefs.hide_score = value.to_string(),
+		"disable_visit_reddit_confirmation" => prefs.disable_visit_reddit_confirmation = value.to_string(),
+		"image_quality" => prefs.image_quality = value.to_string(),
+		"video_quality" => prefs.video_quality = value.to_string(),
+		"remove_default_feeds" => prefs.remove_default_feeds = value.to_string(),
+		_ => {}
+	}
+}
+
+fn apply_feed_preferences(prefs: &mut Preferences, form: &HashMap<String, String>, reset_missing: bool) -> Result<(), String> {
+	if let Some(subscriptions) = form.get("subscriptions") {
+		prefs.subscriptions = plus_list(subscriptions);
+	} else if reset_missing {
+		prefs.subscriptions.clear();
+	}
+
+	if let Some(filters) = form.get("filters") {
+		prefs.filters = plus_list(filters);
+	} else if reset_missing {
+		prefs.filters.clear();
+	}
+
+	if let Some(flair_subscriptions) = form.get("flair_subscriptions") {
+		prefs.flair_subscriptions = decode_flair_subscriptions(flair_subscriptions)?;
+	} else if reset_missing {
+		prefs.flair_subscriptions.clear();
+	}
+
+	prefs.prepare_for_runtime();
+	Ok(())
+}
+
+fn plus_list(value: &str) -> Vec<String> {
+	value.split('+').map(str::trim).filter(|item| !item.is_empty()).map(ToString::to_string).collect()
 }
 
 #[cfg(test)]

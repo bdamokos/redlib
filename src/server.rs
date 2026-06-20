@@ -356,12 +356,14 @@ impl Server {
 						Ok(found) => {
 							let mut parammed = req;
 							parammed.set_params(found.params().clone());
+							let prefs_actions = crate::prefs_store::prepare_request(&mut parammed);
 
 							// Run the route's function
 							let func = (found.handler().to_owned().to_owned())(parammed);
 							async move {
 								match func.await {
 									Ok(mut res) => {
+										prefs_actions.apply(&mut res);
 										res.headers_mut().extend(def_headers);
 										if is_head {
 											*res.body_mut() = Body::empty();
