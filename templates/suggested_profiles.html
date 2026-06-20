@@ -112,7 +112,8 @@
 					class="suggested_profile_media_item{% if (media.nsfw && prefs.blur_nsfw=="on") || (media.spoiler && prefs.blur_spoiler=="on") %} suggested_profile_media_item_blurred{% endif %}"
 					href="{{ media.permalink }}"
 					title="{{ media.title }}">
-					<img loading="lazy" src="{{ media.image_url }}" alt="{{ media.title }}">
+					<img loading="lazy" decoding="async" fetchpriority="low" data-lazy-src="{{ media.image_url }}" alt="{{ media.title }}">
+					<noscript><img loading="lazy" src="{{ media.image_url }}" alt="{{ media.title }}"></noscript>
 					<span class="suggested_profile_media_badge">{{ media.media_type }}</span>
 					{% if !media.duration.is_empty() %}
 					<span class="suggested_profile_media_duration">{{ media.duration }}</span>

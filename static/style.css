@@ -3161,6 +3161,10 @@ input[type="submit"] {
     width: 100%;
 }
 
+.suggested_profile_media_item img[data-lazy-src]:not([src]) {
+    opacity: 0;
+}
+
 .suggested_profile_media_item:hover img {
     transform: scale(1.025);
 }

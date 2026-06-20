@@ -2,8 +2,10 @@ const AUTO_MODE = "auto";
 const FAST_BYTES_PER_MS = 250;
 const EAGER_IMAGE_COUNT = 2;
 const LAZY_PRELOAD_MARGIN = "3000px 0px";
+const DEFERRED_SRC_PRELOAD_MARGIN = "900px 0px";
 
 let lazyImageObserver = null;
+let deferredSrcObserver = null;
 let autoUpgradeDecided = false;
 
 function getImageMode() {
@@ -11,7 +13,7 @@ function getImageMode() {
 }
 
 function contentImages(root = document) {
-  return Array.from(root.querySelectorAll("img[data-full-src], .post_media_image img, .gallery img"));
+  return Array.from(root.querySelectorAll("img[data-full-src], img[data-lazy-src], .post_media_image img, .gallery img"));
 }
 
 function qualityBadge() {
@@ -80,6 +82,39 @@ function setEager(img, highPriority = false) {
   }
 }
 
+function activateDeferredSrc(img, highPriority = false) {
+  const lazySrc = img.dataset.lazySrc;
+  if (lazySrc && !img.hasAttribute("src")) {
+    img.src = lazySrc;
+    img.dataset.lazyLoaded = "true";
+  }
+
+  setEager(img, highPriority);
+}
+
+function deferredSrcPreloadObserver() {
+  if (deferredSrcObserver || !("IntersectionObserver" in window)) {
+    return deferredSrcObserver;
+  }
+
+  deferredSrcObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) {
+        return;
+      }
+
+      const img = entry.target;
+      activateDeferredSrc(img);
+      deferredSrcObserver.unobserve(img);
+    });
+  }, {
+    rootMargin: DEFERRED_SRC_PRELOAD_MARGIN,
+    threshold: 0,
+  });
+
+  return deferredSrcObserver;
+}
+
 function lazyPreloadObserver() {
   if (lazyImageObserver || !("IntersectionObserver" in window)) {
     return lazyImageObserver;
@@ -106,6 +141,7 @@ function lazyPreloadObserver() {
 function primeLazyImages(root = document) {
   const images = contentImages(root);
   const observer = lazyPreloadObserver();
+  const deferredObserver = deferredSrcPreloadObserver();
 
   images.forEach((img, index) => {
     if (img.dataset.networkImagePrimed === "true") {
@@ -113,6 +149,15 @@ function primeLazyImages(root = document) {
     }
 
     img.dataset.networkImagePrimed = "true";
+
+    if (img.dataset.lazySrc) {
+      if (deferredObserver) {
+        deferredObserver.observe(img);
+      } else {
+        activateDeferredSrc(img, index === 0);
+      }
+      return;
+    }
 
     if (index < EAGER_IMAGE_COUNT || !observer) {
       setEager(img, index === 0);
