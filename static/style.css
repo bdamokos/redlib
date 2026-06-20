@@ -3280,6 +3280,33 @@ input[type="submit"] {
     white-space: nowrap;
 }
 
+.suggested_profiles_more {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    margin-bottom: 20px;
+}
+
+.suggested_profiles_more a {
+    background: color-mix(in srgb, var(--accent) 12%, var(--post));
+    border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+    border-radius: 5px;
+    color: var(--accent);
+    font-weight: 700;
+    padding: 9px 14px;
+    text-decoration: none;
+}
+
+.suggested_profiles_more a:hover {
+    background: color-mix(in srgb, var(--accent) 18%, var(--post));
+}
+
+.suggested_profiles_more span {
+    color: var(--visited);
+    font-size: 13px;
+}
+
 .suggested_profiles_empty {
     background: var(--outside);
     border-radius: 5px;
@@ -3314,6 +3341,15 @@ input[type="submit"] {
     .suggested_profile_follow .subscribe,
     .suggested_profile_follow .unsubscribe {
         width: 100%;
+    }
+
+    .suggested_profiles_more {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .suggested_profiles_more a {
+        text-align: center;
     }
 }
 

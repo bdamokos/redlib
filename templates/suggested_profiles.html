@@ -158,6 +158,12 @@
 		</article>
 		{% endfor %}
 	</section>
+	{% if has_more_suggestions %}
+	<nav class="suggested_profiles_more" aria-label="More suggested profiles">
+		<a href="{{ self.load_more_path() }}">Load {{ self.next_batch_size() }} more profiles</a>
+		<span>{{ report.suggestions.len() }} shown</span>
+	</nav>
+	{% endif %}
 	{% endif %}
 </main>
 {% endblock %}
