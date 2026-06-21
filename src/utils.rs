@@ -3317,6 +3317,7 @@ static PROFILE_SOCIAL_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 static LINKTREE_NEXT_DATA_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>"#).unwrap());
 static ALLMYLINKS_DATA_X_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bdata-x-url="([^"]+)""#).unwrap());
 static ALLMYLINKS_TITLE_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\btitle="(https?://[^"]+)""#).unwrap());
+static PERCENT_ENCODED_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)https?%3A%2F%2F[^\s<>"']+"#).unwrap());
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
@@ -3760,7 +3761,10 @@ async fn nested_creator_links(link: &ExternalLink) -> Vec<ExternalLink> {
 	let Some(host) = normalize_external_page_host(&link.url) else {
 		return Vec::new();
 	};
-	if !matches!(host.as_str(), "linktr.ee" | "www.linktr.ee" | "allmylinks.com" | "www.allmylinks.com") {
+	if !matches!(
+		host.as_str(),
+		"linktr.ee" | "www.linktr.ee" | "allmylinks.com" | "www.allmylinks.com" | "beacons.ai" | "www.beacons.ai" | "beacons.page" | "www.beacons.page"
+	) {
 		return Vec::new();
 	}
 	let Ok(html) = fetch_external_page_html(link.url.clone(), 4).await else {
@@ -3770,6 +3774,7 @@ async fn nested_creator_links(link: &ExternalLink) -> Vec<ExternalLink> {
 	match host.as_str() {
 		"linktr.ee" | "www.linktr.ee" => extract_linktree_creator_links(&html),
 		"allmylinks.com" | "www.allmylinks.com" => extract_allmylinks_creator_links(&html),
+		"beacons.ai" | "www.beacons.ai" | "beacons.page" | "www.beacons.page" => extract_beacons_creator_links(&html),
 		_ => Vec::new(),
 	}
 }
@@ -3863,6 +3868,36 @@ fn extract_allmylinks_creator_links(html: &str) -> Vec<ExternalLink> {
 			if is_creator_link_host(&link.host) {
 				append_external_links(&mut links, vec![link]);
 			}
+		}
+	}
+
+	links
+}
+
+fn extract_beacons_creator_links(html: &str) -> Vec<ExternalLink> {
+	extract_creator_links_from_embedded_page_text(html)
+}
+
+fn extract_creator_links_from_embedded_page_text(html: &str) -> Vec<ExternalLink> {
+	let mut links = Vec::new();
+	let normalized = html.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/").replace("&amp;", "&");
+
+	for link in extract_external_links(&[normalized.as_str()]) {
+		if is_creator_link_host(&link.host) {
+			append_external_links(&mut links, vec![link]);
+		}
+	}
+
+	for capture in PERCENT_ENCODED_URL_REGEX.captures_iter(html) {
+		let Some(raw_url) = capture.get(0).map(|value| value.as_str()) else {
+			continue;
+		};
+		let decoded = percent_decode_str(raw_url).decode_utf8_lossy();
+		let Some(link) = build_external_link(&decoded) else {
+			continue;
+		};
+		if is_creator_link_host(&link.host) {
+			append_external_links(&mut links, vec![link]);
 		}
 	}
 
@@ -5086,7 +5121,7 @@ mod tests {
 	use super::{
 		cache_author_watched_links_from_posts, cached_subreddit_users, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links,
 		coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links,
-		extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration,
+		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration,
 		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links,
 		store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair,
 		FlairSubscription, GalleryMedia, Media, Post, Preferences,
@@ -5692,6 +5727,45 @@ mod tests {
 		assert_eq!(links.len(), 2);
 		assert_eq!(links[0].host, "fansly.com");
 		assert_eq!(links[1].host, "onlyfans.com");
+	}
+
+	#[test]
+	fn extracts_hidden_adult_links_from_beacons_page_data() {
+		let html = r#"
+			<script id="__NEXT_DATA__" type="application/json">
+				{"props":{"pageProps":{"isAdult":true,"activeGates":["age"],"gates":[{"type":"age","minimumAge":18}],"links":[
+					{"url":"https:\/\/onlyfans.com\/peggintheestallion"},
+					{"url":"https:\/\/fansly.com\/peggintheestallion"},
+					{"url":"https:\/\/twitter.com\/peggin"}
+				]}}}
+			</script>
+		"#;
+
+		let links = extract_beacons_creator_links(html);
+
+		assert_eq!(links.len(), 2);
+		assert_eq!(links[0].host, "fansly.com");
+		assert_eq!(links[0].url, "https://fansly.com/peggintheestallion");
+		assert_eq!(links[1].host, "onlyfans.com");
+		assert_eq!(links[1].url, "https://onlyfans.com/peggintheestallion");
+	}
+
+	#[test]
+	fn extracts_percent_encoded_creator_links_from_beacons_payloads() {
+		let html = r#"
+			<a href="/link?target=https%3A%2F%2Fonlyfans.com%2Fhidden_creator%3Futm_source%3Dbeacons">OF</a>
+			<script>{"redirectUrl":"https%3A%2F%2Ffansly.com%2Fuser%2F640681284019953664"}</script>
+		"#;
+
+		let links = extract_beacons_creator_links(html);
+
+		assert_eq!(links.len(), 2);
+		assert!(links
+			.iter()
+			.any(|link| link.host == "fansly.com" && link.url == "https://fansly.com/user/640681284019953664"));
+		assert!(links
+			.iter()
+			.any(|link| link.host == "onlyfans.com" && link.url == "https://onlyfans.com/hidden_creator?utm_source=beacons"));
 	}
 
 	#[test]
