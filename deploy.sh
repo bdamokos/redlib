@@ -223,6 +223,13 @@ build_and_push() {
 	docker push "$image_ref_push"
 }
 
+cleanup_local_target() {
+	if [[ -d target ]]; then
+		echo "Removing local Cargo target directory..."
+		rm -rf target
+	fi
+}
+
 deploy_remote() {
 	local remote_image_ref="$REGISTRY_HOST_PULL/$IMAGE_NAME:$IMAGE_TAG"
 	local deploy_git_hash
@@ -337,6 +344,7 @@ start_ssh_multiplexing
 
 if [[ "$DEPLOY_ONLY" == false ]]; then
 	build_and_push
+	cleanup_local_target
 else
 	echo "Skipping build and push."
 fi
