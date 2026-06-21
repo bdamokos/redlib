@@ -22,6 +22,7 @@ use url::Url;
 
 const TARGET_POST_COUNT: usize = 25;
 const MAX_DUPLICATE_FILL_REQUESTS: usize = 4;
+const MAX_FILTERED_PAGE_ADVANCE: usize = 3;
 const USER_SORT_OPTIONS: [&str; 4] = ["hot", "new", "top", "controversial"];
 const USER_METADATA_CACHE_SIZE: usize = 1000;
 const USER_METADATA_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
@@ -988,29 +989,6 @@ pub(crate) fn display_community(community: &str) -> String {
 	}
 }
 
-fn path_with_after(path: &str, after: &str) -> Result<String, String> {
-	let mut url = Url::parse(&format!("https://redlib.local{path}")).map_err(|err| err.to_string())?;
-	let mut query_pairs: Vec<(String, String)> = url
-		.query_pairs()
-		.filter(|(key, _)| key != "after")
-		.map(|(key, value)| (key.into_owned(), value.into_owned()))
-		.collect();
-
-	if !after.is_empty() {
-		query_pairs.push(("after".to_string(), after.to_string()));
-	}
-
-	url.set_query(None);
-	{
-		let mut serializer = url.query_pairs_mut();
-		for (key, value) in query_pairs {
-			serializer.append_pair(&key, &value);
-		}
-	}
-
-	Ok(url[url::Position::BeforePath..].to_string())
-}
-
 fn default_user_sort(req: &Request<Body>) -> String {
 	let default_sort = setting(req, "post_sort");
 	if USER_SORT_OPTIONS.contains(&default_sort.as_str()) {
@@ -1037,6 +1015,19 @@ fn build_url_from_query_pairs(path: &str, query_pairs: &[(String, String)]) -> S
 	} else {
 		format!("{path}?{query}")
 	}
+}
+
+fn query_with_cache_page(query: &str, cache_page: usize) -> String {
+	let mut serializer = form_urlencoded::Serializer::new(String::new());
+	serializer.extend_pairs(
+		form_urlencoded::parse(query.as_bytes())
+			.into_owned()
+			.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
+	);
+	if cache_page > 0 {
+		serializer.append_pair("cache_page", &cache_page.to_string());
+	}
+	serializer.finish()
 }
 
 fn now_unix() -> u64 {
@@ -1205,13 +1196,14 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 	let mut all_posts = Vec::new();
 	let mut fetched_raw_posts = false;
 	let mut requests = 0;
+	let mut filtered_page_advances = 0;
 
 	let after = loop {
 		let (mut posts, next_after) = Post::fetch(&request_path, false).await?;
 		fetched_raw_posts |= !posts.is_empty();
 		utils::store_post_flairs(&posts);
 
-		filter_posts(&mut posts, filters);
+		let (_, page_all_posts_filtered) = filter_posts(&mut posts, filters);
 		if should_refill_duplicates {
 			utils::hydrate_media_content_fingerprints(&mut posts).await;
 		}
@@ -1221,12 +1213,19 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 			all_posts = collapse_duplicate_submissions(all_posts);
 		}
 
-		let should_continue = should_refill_duplicates && all_posts.len() < TARGET_POST_COUNT && !next_after.is_empty() && requests < MAX_DUPLICATE_FILL_REQUESTS;
+		let should_continue_for_duplicates = should_refill_duplicates && all_posts.len() < TARGET_POST_COUNT && requests < MAX_DUPLICATE_FILL_REQUESTS;
+		// A page can be non-empty on Reddit but empty after local filters; advance a few cursors
+		// so one filtered page does not look like the end of the listing.
+		let should_continue_for_filtered_page = all_posts.is_empty() && page_all_posts_filtered && filtered_page_advances < MAX_FILTERED_PAGE_ADVANCE;
+		let should_continue = !next_after.is_empty() && (should_continue_for_duplicates || should_continue_for_filtered_page);
 		if !should_continue {
 			break next_after;
 		}
 
-		request_path = path_with_after(path, &next_after)?;
+		if should_continue_for_filtered_page {
+			filtered_page_advances += 1;
+		}
+		request_path = utils::listing_path_with_after(path, &next_after)?;
 		requests += 1;
 	};
 
@@ -3003,10 +3002,31 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			}
 			fallback_notice = join_notices(&status_notice, instance_scrape::scrape_notice());
 			(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
-		} else if let Some((mut posts, after, has_prev, has_next)) = cached_listing_page {
-			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+		} else if let Some((mut posts, mut after, mut has_prev, mut has_next)) = cached_listing_page {
+			let mut cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+			let mut all_posts_filtered;
+			let mut filtered_page_advances = 0;
+			// Mirror live cursor skipping for cached user listing pages.
+			loop {
+				let (_, page_all_posts_filtered) = filter_posts(&mut posts, &filters);
+				all_posts_filtered = page_all_posts_filtered;
+				if !page_all_posts_filtered || !has_next || !after.is_empty() || filtered_page_advances >= MAX_FILTERED_PAGE_ADVANCE {
+					break;
+				}
+
+				let next_cache_page = cache_page + 1;
+				let next_query = query_with_cache_page(query, next_cache_page);
+				let Some((next_posts, next_after, next_has_prev, next_has_next)) = cached_user_listing_posts(&username, &listing, &sort, &next_query) else {
+					break;
+				};
+				posts = next_posts;
+				after = next_after;
+				has_prev = next_has_prev;
+				has_next = next_has_next;
+				cache_page = next_cache_page;
+				filtered_page_advances += 1;
+			}
 			utils::hydrate_post_author_links_from_cache(&mut posts);
-			let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
 			let prev = if has_prev {
 				let prev_page = cache_page.saturating_sub(1).to_string();
 				let prev_url = format!("/user/{username}/submitted");

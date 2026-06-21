@@ -32,6 +32,7 @@ const FOLLOWING_FRONT_PAGE: &str = "following";
 const FOLLOWING_ROUTE: &str = "/following";
 const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
+const MAX_FILTERED_PAGE_ADVANCE: usize = 3;
 const MAX_AGGREGATE_FILL_ROUNDS: usize = 3;
 const AFTER_PATH_HEADROOM: usize = 128;
 const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 100;
@@ -53,6 +54,13 @@ struct CachedSubredditMetadata {
 struct CachedSubredditNsfwStatus {
 	is_nsfw: bool,
 	fetched_at: Instant,
+}
+
+struct FilteredListingFetch {
+	posts: Vec<Post>,
+	raw_posts: Vec<Post>,
+	after: String,
+	all_posts_filtered: bool,
 }
 
 // STRUCTS
@@ -1271,6 +1279,44 @@ fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str, be
 		.finish();
 
 	format!("/r/{}/{sort}.json?{query}", chunk.replace('+', "%2B"))
+}
+
+async fn fetch_listing_skipping_filtered_pages(path: &str, quarantined: bool, filters: &HashSet<String>) -> Result<FilteredListingFetch, String> {
+	let mut request_path = path.to_string();
+	let mut raw_posts = Vec::new();
+	let mut fetched_any_raw_posts = false;
+	let mut last_after = String::new();
+
+	// A page can be non-empty on Reddit but empty after local filters; advance a few cursors
+	// so one filtered page does not look like the end of the listing.
+	for advance_count in 0..=MAX_FILTERED_PAGE_ADVANCE {
+		let (page_raw_posts, next_after) = Post::fetch(&request_path, quarantined).await?;
+		fetched_any_raw_posts |= !page_raw_posts.is_empty();
+		raw_posts.extend(page_raw_posts.clone());
+
+		let mut posts = page_raw_posts;
+		let (_, page_all_posts_filtered) = filter_posts(&mut posts, filters);
+		last_after = next_after.clone();
+
+		if !page_all_posts_filtered || next_after.is_empty() || advance_count == MAX_FILTERED_PAGE_ADVANCE {
+			let all_posts_filtered = fetched_any_raw_posts && posts.is_empty();
+			return Ok(FilteredListingFetch {
+				posts,
+				raw_posts,
+				after: next_after,
+				all_posts_filtered,
+			});
+		}
+
+		request_path = utils::listing_path_with_after(path, &next_after)?;
+	}
+
+	Ok(FilteredListingFetch {
+		posts: Vec::new(),
+		raw_posts,
+		after: last_after,
+		all_posts_filtered: fetched_any_raw_posts,
+	})
 }
 
 fn feed_page_url(current_url: &str, session_id: &str, page: usize) -> String {
@@ -2553,16 +2599,42 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		)
 	} else {
 		// For single subreddits with sort=new, serve from the per-sub cache before any live Reddit listing fetch.
-		if let Some((mut posts, after, has_prev, has_next)) = cached_subreddit_page {
+		if let Some((mut posts, mut after, mut has_prev, mut has_next)) = cached_subreddit_page {
 			info!("post_cache: serving r/{} page {} from cache", sub_name, cache_page);
-			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+			let mut rendered_cache_page = cache_page;
+			let mut all_posts_filtered;
+			let mut filtered_page_advances = 0;
+			// Mirror live cursor skipping for remembered cache pages.
+			loop {
+				let (_, page_all_posts_filtered) = filter_posts(&mut posts, &filters);
+				all_posts_filtered = page_all_posts_filtered;
+				if !page_all_posts_filtered || !has_next || !after.is_empty() || filtered_page_advances >= MAX_FILTERED_PAGE_ADVANCE {
+					break;
+				}
+
+				let next_cache_page = rendered_cache_page + 1;
+				let Some((next_posts, next_after, next_has_prev, next_has_next)) =
+					crate::post_cache::get_cached_subreddit_page(&sub_name, next_cache_page, crate::post_cache::POSTS_PER_PAGE)
+				else {
+					break;
+				};
+				posts = next_posts;
+				after = next_after;
+				has_prev = next_has_prev;
+				has_next = next_has_next;
+				rendered_cache_page = next_cache_page;
+				filtered_page_advances += 1;
+			}
 			filter_posts_by_flair(&mut posts, &active_flair_filter);
 			let no_posts = posts.is_empty();
 			let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 			utils::hydrate_post_author_links_from_cache(&mut posts);
 
 			let prev_page_url = if has_prev {
-				update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None)])
+				update_url_query(
+					&url,
+					&[("cache_page", Some(&rendered_cache_page.saturating_sub(1).to_string())), ("before", None), ("after", None)],
+				)
 			} else {
 				String::new()
 			};
@@ -2570,7 +2642,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				// Last cached page: link to Reddit's after-based pagination.
 				update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
 			} else if has_next {
-				update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None)])
+				update_url_query(&url, &[("cache_page", Some(&(rendered_cache_page + 1).to_string())), ("before", None), ("after", None)])
 			} else {
 				String::new()
 			};
@@ -2622,17 +2694,21 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			crate::post_cache::mark_plain_subreddit_refresh_started(&sub_name);
 		}
 
-		match Post::fetch(&path, quarantined).await {
-			Ok((mut posts, after)) => {
+		match fetch_listing_skipping_filtered_pages(&path, quarantined, &filters).await {
+			Ok(FilteredListingFetch {
+				mut posts,
+				raw_posts,
+				after,
+				all_posts_filtered,
+			}) => {
 				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-					crate::post_cache::publish_plain_subreddit_refresh(&sub_name, posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					crate::post_cache::publish_plain_subreddit_refresh(&sub_name, raw_posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
 				} else {
-					utils::store_post_flairs(&posts);
+					utils::store_post_flairs(&raw_posts);
 				}
 				if is_single_sub {
-					utils::store_subreddit_users(&sub_name, &posts);
+					utils::store_subreddit_users(&sub_name, &raw_posts);
 				}
-				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				filter_posts_by_flair(&mut posts, &active_flair_filter);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
@@ -2719,27 +2795,56 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
 					crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
 					if msg.contains("oauth_unavailable") {
-						if let Some((mut posts, after, has_prev, has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(
+						if let Some((mut posts, mut after, mut has_prev, mut has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(
 							&sub_name,
 							cache_page,
 							crate::post_cache::POSTS_PER_PAGE,
 							crate::post_cache::CacheServeMode::AllowStaleOnOauthOutage,
 						) {
-							let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+							let mut rendered_cache_page = cache_page;
+							let mut all_posts_filtered;
+							let mut filtered_page_advances = 0;
+							// Mirror live cursor skipping when serving stale cache during OAuth outages.
+							loop {
+								let (_, page_all_posts_filtered) = filter_posts(&mut posts, &filters);
+								all_posts_filtered = page_all_posts_filtered;
+								if !page_all_posts_filtered || !has_next || !after.is_empty() || filtered_page_advances >= MAX_FILTERED_PAGE_ADVANCE {
+									break;
+								}
+
+								let next_cache_page = rendered_cache_page + 1;
+								let Some((next_posts, next_after, next_has_prev, next_has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(
+									&sub_name,
+									next_cache_page,
+									crate::post_cache::POSTS_PER_PAGE,
+									crate::post_cache::CacheServeMode::AllowStaleOnOauthOutage,
+								) else {
+									break;
+								};
+								posts = next_posts;
+								after = next_after;
+								has_prev = next_has_prev;
+								has_next = next_has_next;
+								rendered_cache_page = next_cache_page;
+								filtered_page_advances += 1;
+							}
 							filter_posts_by_flair(&mut posts, &active_flair_filter);
 							let no_posts = posts.is_empty();
 							let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 							utils::hydrate_post_author_links_from_cache(&mut posts);
 
 							let prev_page_url = if has_prev {
-								update_url_query(&url, &[("cache_page", Some(&(cache_page - 1).to_string())), ("before", None), ("after", None)])
+								update_url_query(
+									&url,
+									&[("cache_page", Some(&rendered_cache_page.saturating_sub(1).to_string())), ("before", None), ("after", None)],
+								)
 							} else {
 								String::new()
 							};
 							let next_page_url = if has_next && !after.is_empty() {
 								update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
 							} else if has_next {
-								update_url_query(&url, &[("cache_page", Some(&(cache_page + 1).to_string())), ("before", None), ("after", None)])
+								update_url_query(&url, &[("cache_page", Some(&(rendered_cache_page + 1).to_string())), ("before", None), ("after", None)])
 							} else {
 								String::new()
 							};

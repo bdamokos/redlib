@@ -14,6 +14,15 @@ use log::{info, warn};
 use regex::Regex;
 use std::sync::LazyLock;
 
+const MAX_FILTERED_PAGE_ADVANCE: usize = 3;
+
+struct FilteredSearchFetch {
+	posts: Vec<Post>,
+	raw_posts: Vec<Post>,
+	after: String,
+	all_posts_filtered: bool,
+}
+
 // STRUCTS
 #[derive(Clone, PartialEq)]
 struct SearchParams {
@@ -141,6 +150,43 @@ fn search_params_from_request(path: &str, query: &str, after: String, typed: Str
 		restrict_sr: param(path, "restrict_sr").unwrap_or_default(),
 		typed,
 	}
+}
+
+async fn fetch_search_skipping_filtered_pages(path: &str, quarantined: bool, filters: &std::collections::HashSet<String>) -> Result<FilteredSearchFetch, String> {
+	let mut request_path = path.to_string();
+	let mut raw_posts = Vec::new();
+	let mut fetched_any_raw_posts = false;
+	let mut last_after = String::new();
+
+	// A page can be non-empty on Reddit but empty after local filters; advance a few cursors
+	// so one filtered page does not look like the end of the listing.
+	for advance_count in 0..=MAX_FILTERED_PAGE_ADVANCE {
+		let (page_raw_posts, next_after) = Post::fetch(&request_path, quarantined).await?;
+		fetched_any_raw_posts |= !page_raw_posts.is_empty();
+		raw_posts.extend(page_raw_posts.clone());
+		let mut posts = page_raw_posts;
+		let (_, page_all_posts_filtered) = filter_posts(&mut posts, filters);
+		last_after = next_after.clone();
+
+		if !page_all_posts_filtered || next_after.is_empty() || advance_count == MAX_FILTERED_PAGE_ADVANCE {
+			let all_posts_filtered = fetched_any_raw_posts && posts.is_empty();
+			return Ok(FilteredSearchFetch {
+				posts,
+				raw_posts,
+				after: next_after,
+				all_posts_filtered,
+			});
+		}
+
+		request_path = utils::listing_path_with_after(path, &next_after)?;
+	}
+
+	Ok(FilteredSearchFetch {
+		posts: Vec::new(),
+		raw_posts,
+		after: last_after,
+		all_posts_filtered: fetched_any_raw_posts,
+	})
 }
 
 // SERVICES
@@ -303,10 +349,14 @@ pub async fn find_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 			no_posts: false,
 		})
 	} else {
-		match Post::fetch(&path, quarantined).await {
-			Ok((mut posts, after)) => {
-				utils::store_post_flairs(&posts);
-				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+		match fetch_search_skipping_filtered_pages(&path, quarantined, &filters).await {
+			Ok(FilteredSearchFetch {
+				mut posts,
+				raw_posts,
+				after,
+				all_posts_filtered,
+			}) => {
+				utils::store_post_flairs(&raw_posts);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				utils::hydrate_post_author_links_from_cache(&mut posts);

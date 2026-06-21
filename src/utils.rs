@@ -2447,6 +2447,29 @@ pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, b
 	}
 }
 
+pub fn listing_path_with_after(path: &str, after: &str) -> Result<String, String> {
+	let mut url = Url::parse(&format!("https://redlib.local{path}")).map_err(|err| err.to_string())?;
+	let mut query_pairs: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(key, _)| key != "after" && key != "before")
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect();
+
+	if !after.is_empty() {
+		query_pairs.push(("after".to_string(), after.to_string()));
+	}
+
+	url.set_query(None);
+	{
+		let mut serializer = url.query_pairs_mut();
+		for (key, value) in query_pairs {
+			serializer.append_pair(&key, &value);
+		}
+	}
+
+	Ok(url[url::Position::BeforePath..].to_string())
+}
+
 pub fn refresh_post_time(post: &mut Post) {
 	if post.created_ts > 0 {
 		let (rel_time, created) = time(post.created_ts as f64);
@@ -6234,7 +6257,7 @@ mod tests {
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
 	}
 
 	#[test]
