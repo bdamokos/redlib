@@ -1803,6 +1803,7 @@ pub struct Preferences {
 	#[revision(start = 4)]
 	pub video_previews: String,
 	#[revision(start = 5)]
+	#[serde(default = "default_on_string")]
 	pub direct_redgifs_media: String,
 	#[revision(start = 1)]
 	pub fixed_navbar: String,
@@ -2128,6 +2129,10 @@ static AVAILABLE_THEMES: LazyLock<Vec<String>> = LazyLock::new(|| {
 	}
 	themes
 });
+
+fn default_on_string() -> String {
+	"on".to_string()
+}
 
 struct DeployGitFooter {
 	short: String,
