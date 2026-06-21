@@ -3,8 +3,93 @@
     const moreSelector = "[data-suggested-profiles-more]";
     const cardSelector = "[data-suggested-profile]";
     const statusSelector = "[data-suggested-profiles-status]";
+    const activeCardClass = "is-keyboard-active";
+    let keyboardNavigationBound = false;
 
     const cardKey = (card) => (card.dataset.suggestedProfile || "").toLowerCase();
+    const cards = () => Array.from(document.querySelectorAll(cardSelector));
+
+    const isTextInputTarget = (target) =>
+        target instanceof HTMLElement &&
+        Boolean(target.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']"));
+
+    const clearActiveCards = () => {
+        for (const card of cards()) {
+            card.classList.remove(activeCardClass);
+        }
+    };
+
+    const focusCard = (card) => {
+        if (!card) {
+            return;
+        }
+
+        clearActiveCards();
+        card.classList.add(activeCardClass);
+        card.focus({ preventScroll: true });
+        card.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+    };
+
+    const activeCardIndex = (profileCards) => {
+        const focusedCard = document.activeElement?.closest?.(cardSelector);
+        if (focusedCard) {
+            return profileCards.indexOf(focusedCard);
+        }
+
+        const activeCard = document.querySelector(`${cardSelector}.${activeCardClass}`);
+        if (activeCard) {
+            return profileCards.indexOf(activeCard);
+        }
+
+        return -1;
+    };
+
+    const visibleCardIndex = (profileCards) => {
+        const viewportAnchor = Math.max(0, Math.round(window.innerHeight * 0.18));
+        const firstVisibleIndex = profileCards.findIndex((card) => card.getBoundingClientRect().bottom > viewportAnchor);
+        return firstVisibleIndex >= 0 ? firstVisibleIndex : profileCards.length - 1;
+    };
+
+    const navigateCards = (direction) => {
+        const profileCards = cards();
+        if (profileCards.length === 0) {
+            return;
+        }
+
+        const activeIndex = activeCardIndex(profileCards);
+        const currentIndex = activeIndex >= 0 ? activeIndex : visibleCardIndex(profileCards);
+        const targetIndex = activeIndex >= 0 ? currentIndex + direction : currentIndex + Math.min(direction, 0);
+        const nextIndex = Math.max(0, Math.min(profileCards.length - 1, targetIndex));
+        focusCard(profileCards[nextIndex]);
+    };
+
+    const handleKeydown = (event) => {
+        if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || isTextInputTarget(event.target)) {
+            return;
+        }
+
+        const key = event.key.toLowerCase();
+        if (key === "j") {
+            event.preventDefault();
+            navigateCards(1);
+        } else if (key === "k") {
+            event.preventDefault();
+            navigateCards(-1);
+        }
+    };
+
+    const initializeCardNavigation = (root = document) => {
+        for (const card of Array.from(root.querySelectorAll(cardSelector))) {
+            if (!card.hasAttribute("tabindex")) {
+                card.setAttribute("tabindex", "-1");
+            }
+        }
+
+        if (!keyboardNavigationBound) {
+            keyboardNavigationBound = true;
+            document.addEventListener("keydown", handleKeydown);
+        }
+    };
 
     const setStatus = (nav, message) => {
         const status = nav.querySelector(statusSelector);
@@ -129,6 +214,8 @@
     };
 
     function initialize(root = document) {
+        initializeCardNavigation(root);
+
         for (const link of Array.from(root.querySelectorAll(`${moreSelector} a`))) {
             if (link.dataset.suggestedProfilesBound === "true") {
                 continue;

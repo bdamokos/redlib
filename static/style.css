@@ -3086,10 +3086,20 @@ input[type="submit"] {
     flex-direction: column;
     min-width: 0;
     overflow: hidden;
+    scroll-margin-block: 18vh;
 }
 
 .suggested_profile_card:hover {
     background: color-mix(in srgb, var(--post) 86%, var(--foreground) 14%);
+}
+
+.suggested_profile_card:focus {
+    outline: none;
+}
+
+.suggested_profile_card.is-keyboard-active,
+.suggested_profile_card:focus-visible {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 62%, transparent);
 }
 
 .suggested_profile_card_rg_multi,
@@ -3099,6 +3109,22 @@ input[type="submit"] {
 
 .suggested_profile_card_rg_high {
     box-shadow: inset 0 0 0 1px color-mix(in srgb, oklch(66% 0.17 32) 68%, transparent);
+}
+
+.suggested_profile_card_rg_multi.is-keyboard-active,
+.suggested_profile_card_rg_multi:focus-visible,
+.suggested_profile_card_rg_high.is-keyboard-active,
+.suggested_profile_card_rg_high:focus-visible {
+    box-shadow:
+        inset 0 0 0 1px color-mix(in srgb, oklch(72% 0.13 83) 62%, transparent),
+        0 0 0 2px color-mix(in srgb, var(--accent) 62%, transparent);
+}
+
+.suggested_profile_card_rg_high.is-keyboard-active,
+.suggested_profile_card_rg_high:focus-visible {
+    box-shadow:
+        inset 0 0 0 1px color-mix(in srgb, oklch(66% 0.17 32) 68%, transparent),
+        0 0 0 2px color-mix(in srgb, var(--accent) 62%, transparent);
 }
 
 .suggested_profile_top {
