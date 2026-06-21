@@ -515,6 +515,55 @@ function isExpandPreviewShortcutKey(event) {
     return !event.repeat && getKeyName(event) === "m";
 }
 
+function isOpenPostContextShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "u";
+}
+
+function isUserPage() {
+    return /^\/(?:user|u)\//.test(window.location.pathname);
+}
+
+function findCurrentViewedPost() {
+    const posts = getPostsFromRoot(document).filter(isVisibleTarget);
+    const viewportTop = getScrollPaddingTop();
+    const viewportBottom = window.innerHeight;
+    const visiblePosts = posts.filter((post) => {
+        const rect = post.getBoundingClientRect();
+
+        return rect.bottom > viewportTop + 1 && rect.top < viewportBottom - 1;
+    });
+
+    const containingViewportTop = visiblePosts
+        .filter((post) => {
+            const rect = post.getBoundingClientRect();
+
+            return rect.top <= viewportTop + 1 && rect.bottom > viewportTop + 1;
+        })
+        .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
+
+    return containingViewportTop[0] || visiblePosts[0] || posts.find((post) => post.getBoundingClientRect().top >= viewportTop) || null;
+}
+
+function getPostContextLink(post) {
+    if (!(post instanceof Element)) {
+        return null;
+    }
+
+    const selector = isUserPage() ? ".post_subreddit[href^='/r/']" : ".post_author[href]";
+
+    return post.querySelector(selector);
+}
+
+function openCurrentPostContext() {
+    const link = getPostContextLink(findCurrentViewedPost());
+    if (!(link instanceof HTMLAnchorElement) || link.getAttribute("href") === "") {
+        return false;
+    }
+
+    window.open(link.href, "_blank", "noopener");
+    return true;
+}
+
 function getPaginationAccessKeyForDirection(direction) {
     if (direction > 0) {
         return "N";
@@ -543,6 +592,7 @@ document.addEventListener("keydown", (event) => {
     const isSpaceKey = isSpaceNavigationKey(event);
     const isFollowShortcut = isFollowShortcutKey(event);
     const isExpandPreviewShortcut = isExpandPreviewShortcutKey(event);
+    const isOpenPostContextShortcut = isOpenPostContextShortcutKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
     const isScrollNavigationKey = scrollDirection !== 0;
@@ -550,7 +600,7 @@ document.addEventListener("keydown", (event) => {
 
     if (
         event.defaultPrevented
-        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut)
+        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut)
         || event.altKey
         || event.ctrlKey
         || event.metaKey
@@ -571,6 +621,13 @@ document.addEventListener("keydown", (event) => {
 
     if (isExpandPreviewShortcut) {
         if (expandPostPreview(findExpandablePostPreview())) {
+            event.preventDefault();
+        }
+        return;
+    }
+
+    if (isOpenPostContextShortcut) {
+        if (openCurrentPostContext()) {
             event.preventDefault();
         }
         return;
