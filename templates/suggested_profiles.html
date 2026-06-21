@@ -23,6 +23,11 @@
 			<p class="suggested_profiles_kicker">Based on followed profiles</p>
 			<h1>Profiles from the same subreddits</h1>
 		</div>
+		<nav class="suggested_profiles_mode" aria-label="Suggested profile scoring mode">
+			<span>Scoring</span>
+			<a href="{{ self.overlap_mode_path() }}" class="{% if self.is_overlap_mode() %}active{% endif %}"{% if self.is_overlap_mode() %} aria-current="page"{% endif %}>Overlap</a>
+			<a href="{{ self.vector_mode_path() }}" class="{% if self.is_vector_mode() %}active{% endif %}"{% if self.is_vector_mode() %} aria-current="page"{% endif %}>Vector</a>
+		</nav>
 		<div class="suggested_profiles_stats" aria-label="Suggestion source summary">
 			<div>
 				<strong>{{ report.followed_profile_count }}</strong>
@@ -46,6 +51,9 @@
 	{% if report.followed_subreddits.len() > 0 %}
 	<section class="suggested_profiles_signal">
 		<span>Your followed profiles post most in</span>
+		{% if self.is_vector_mode() && report.taste_centroid_count > 1 %}
+			<span class="suggested_profiles_centroid_count">{{ report.taste_centroid_count }} taste centroids</span>
+		{% endif %}
 		{% for subreddit in report.followed_subreddits %}
 			<a href="/r/{{ subreddit.name }}">r/{{ subreddit.name }} <small>{{ subreddit.followed_count }} posts</small></a>
 			{% endfor %}
@@ -81,10 +89,14 @@
 						</div>
 						</div>
 						<p class="suggested_profile_meta">
+							{% if self.is_vector_mode() %}
+							Vector similarity: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} taste-vector subreddits.
+							{% else %}
 							{% if suggestion.overlap_subreddits.len() == 1 %}
 							One-subreddit overlap: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts match.
 							{% else %}
 							{{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} subreddits.
+							{% endif %}
 							{% endif %}
 						</p>
 					</div>

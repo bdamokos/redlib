@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 const SUGGESTED_PROFILE_TOP_SUBREDDITS: usize = 16;
+const SUGGESTED_PROFILE_VECTOR_SUBREDDITS: usize = 32;
 const SUGGESTED_PROFILE_REASON_LIMIT: usize = 5;
 const SUGGESTED_PROFILE_MIN_POSTS: usize = 2;
 const SUGGESTED_PROFILE_SUBREDDIT_USER_LIMIT: usize = 120;
@@ -16,6 +17,15 @@ const SUGGESTED_PROFILE_SINGLE_SOURCE_FACTOR: f64 = 0.55;
 const SUGGESTED_PROFILE_TWO_SOURCE_FACTOR: f64 = 0.75;
 const SUGGESTED_PROFILE_SINGLE_OVERLAP_FACTOR: f64 = 0.60;
 const SUGGESTED_PROFILE_TWO_OVERLAP_FACTOR: f64 = 0.85;
+const SUGGESTED_PROFILE_VECTOR_SINGLE_OVERLAP_FACTOR: f64 = 0.45;
+const SUGGESTED_PROFILE_VECTOR_TWO_OVERLAP_FACTOR: f64 = 0.80;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SuggestedProfileScoringMode {
+	#[default]
+	Overlap,
+	Vector,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CatalogSourceKey {
@@ -85,6 +95,7 @@ pub struct SuggestedProfilesReport {
 	pub followed_profiles_with_cache: usize,
 	pub cached_profile_count: usize,
 	pub compared_profile_count: usize,
+	pub taste_centroid_count: usize,
 	pub followed_subreddits: Vec<SuggestedProfileSubreddit>,
 	pub suggestions: Vec<SuggestedProfileEntry>,
 }
@@ -202,6 +213,182 @@ fn suggested_profile_overlap_factor(overlap_count: usize) -> f64 {
 	}
 }
 
+fn suggested_profile_vector_breadth_factor(overlap_count: usize) -> f64 {
+	match overlap_count {
+		0 => 0.0,
+		1 => SUGGESTED_PROFILE_VECTOR_SINGLE_OVERLAP_FACTOR,
+		2 => SUGGESTED_PROFILE_VECTOR_TWO_OVERLAP_FACTOR,
+		_ => 1.0,
+	}
+}
+
+fn suggested_profile_vector_count_weight(count: usize) -> f64 {
+	((count as f64) + 1.0).ln()
+}
+
+fn suggested_profile_vector_idf(total_profiles: usize, subreddit_profile_count: usize) -> f64 {
+	let total = total_profiles.max(1) as f64;
+	let subreddit_profiles = subreddit_profile_count.max(1) as f64;
+	(((total + 1.0) / (subreddit_profiles + 1.0)).ln() + 0.35).clamp(0.20, 2.75)
+}
+
+fn normalize_suggested_profile_vector(vector: &mut HashMap<String, f64>) -> f64 {
+	let norm = vector.values().map(|weight| weight * weight).sum::<f64>().sqrt();
+	if norm > 0.0 {
+		for weight in vector.values_mut() {
+			*weight /= norm;
+		}
+	}
+	norm
+}
+
+fn suggested_profile_vector(
+	counts: &HashMap<String, usize>,
+	subreddit_weights: &HashMap<String, f64>,
+	limit: usize,
+) -> HashMap<String, f64> {
+	let mut vector = HashMap::new();
+	for (subreddit, count) in sorted_subreddit_counts(counts, limit) {
+		let Some(subreddit_weight) = subreddit_weights.get(&subreddit) else {
+			continue;
+		};
+		let weight = suggested_profile_vector_count_weight(count) * subreddit_weight;
+		if weight > 0.0 {
+			vector.insert(subreddit, weight);
+		}
+	}
+	vector
+}
+
+fn suggested_profile_dot(left: &HashMap<String, f64>, right: &HashMap<String, f64>) -> f64 {
+	let (small, large) = if left.len() <= right.len() { (left, right) } else { (right, left) };
+	small.iter().filter_map(|(key, left_weight)| large.get(key).map(|right_weight| left_weight * right_weight)).sum()
+}
+
+fn suggested_profile_centroid(vectors: &[HashMap<String, f64>], indexes: &[usize]) -> HashMap<String, f64> {
+	let mut centroid = HashMap::new();
+	for index in indexes {
+		for (subreddit, weight) in &vectors[*index] {
+			*centroid.entry(subreddit.clone()).or_default() += weight;
+		}
+	}
+	if !indexes.is_empty() {
+		for weight in centroid.values_mut() {
+			*weight /= indexes.len() as f64;
+		}
+	}
+	normalize_suggested_profile_vector(&mut centroid);
+	centroid
+}
+
+fn suggested_profile_vector_assignments(vectors: &[HashMap<String, f64>], centroids: &[HashMap<String, f64>]) -> Vec<usize> {
+	vectors
+		.iter()
+		.map(|vector| {
+			centroids
+				.iter()
+				.enumerate()
+				.max_by(|(_, left), (_, right)| {
+					suggested_profile_dot(vector, left)
+						.partial_cmp(&suggested_profile_dot(vector, right))
+						.unwrap_or(std::cmp::Ordering::Equal)
+				})
+				.map(|(index, _)| index)
+				.unwrap_or(0)
+		})
+		.collect()
+}
+
+fn suggested_profile_vector_mean_distance(vectors: &[HashMap<String, f64>], assignments: &[usize], centroids: &[HashMap<String, f64>]) -> f64 {
+	if vectors.is_empty() {
+		return 0.0;
+	}
+	vectors
+		.iter()
+		.enumerate()
+		.map(|(index, vector)| 1.0 - suggested_profile_dot(vector, &centroids[assignments[index]]))
+		.sum::<f64>()
+		/ vectors.len() as f64
+}
+
+fn suggested_profile_kmeans_centroids(vectors: &[HashMap<String, f64>], k: usize) -> Vec<HashMap<String, f64>> {
+	if vectors.is_empty() || k <= 1 {
+		return vec![suggested_profile_centroid(vectors, &(0..vectors.len()).collect::<Vec<_>>())];
+	}
+
+	let mut centroids = vec![vectors[0].clone()];
+	while centroids.len() < k {
+		let mut best_index = 0usize;
+		let mut best_distance = -1.0f64;
+		for (index, vector) in vectors.iter().enumerate() {
+			let nearest_similarity = centroids.iter().map(|centroid| suggested_profile_dot(vector, centroid)).fold(0.0, f64::max);
+			let distance = 1.0 - nearest_similarity;
+			if distance > best_distance {
+				best_distance = distance;
+				best_index = index;
+			}
+		}
+		centroids.push(vectors[best_index].clone());
+	}
+
+	for _ in 0..20 {
+		let assignments = suggested_profile_vector_assignments(vectors, &centroids);
+		let mut next_centroids = Vec::with_capacity(k);
+		for cluster in 0..k {
+			let indexes = assignments
+				.iter()
+				.enumerate()
+				.filter_map(|(index, assignment)| (*assignment == cluster).then_some(index))
+				.collect::<Vec<_>>();
+			next_centroids.push(if indexes.is_empty() {
+				centroids[cluster].clone()
+			} else {
+				suggested_profile_centroid(vectors, &indexes)
+			});
+		}
+		if next_centroids == centroids {
+			break;
+		}
+		centroids = next_centroids;
+	}
+
+	centroids
+}
+
+fn suggested_profile_taste_centroids(vectors: &[HashMap<String, f64>]) -> Vec<HashMap<String, f64>> {
+	if vectors.is_empty() {
+		return Vec::new();
+	}
+	let max_k = if vectors.len() >= 24 {
+		4
+	} else if vectors.len() >= 12 {
+		3
+	} else if vectors.len() >= 6 {
+		2
+	} else {
+		1
+	}
+	.min(vectors.len());
+
+	let mut best_centroids = Vec::new();
+	let mut best_score = f64::INFINITY;
+	for k in 1..=max_k {
+		let centroids = if k == 1 {
+			vec![suggested_profile_centroid(vectors, &(0..vectors.len()).collect::<Vec<_>>())]
+		} else {
+			suggested_profile_kmeans_centroids(vectors, k)
+		};
+		let assignments = suggested_profile_vector_assignments(vectors, &centroids);
+		let mean_distance = suggested_profile_vector_mean_distance(vectors, &assignments, &centroids);
+		let penalized_score = mean_distance + (k.saturating_sub(1) as f64 * 0.025);
+		if penalized_score < best_score {
+			best_score = penalized_score;
+			best_centroids = centroids;
+		}
+	}
+	best_centroids
+}
+
 fn normalize_profile_name(name: &str) -> String {
 	let trimmed = name.trim();
 	let without_prefix = trimmed.strip_prefix("u_").or_else(|| trimmed.strip_prefix("u/")).unwrap_or(trimmed);
@@ -313,6 +500,16 @@ fn suggested_profile_media_posts(username: &str, limit: usize) -> Vec<SuggestedP
 	let mut posts = posts.clone();
 	posts.truncate(limit);
 	posts
+}
+
+fn decorate_suggested_profiles(suggestions: &mut [SuggestedProfileEntry]) {
+	for suggestion in suggestions {
+		let video_signal = crate::user::cached_video_signal(&suggestion.name);
+		suggestion.avg_video_length = video_signal.avg_video_length;
+		suggestion.video_count = video_signal.video_count;
+		suggestion.redgifs_profile_count = video_signal.redgifs_profile_count;
+		suggestion.media_posts = suggested_profile_media_posts(&suggestion.name, SUGGESTED_PROFILE_MEDIA_LIMIT);
+	}
 }
 
 fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
@@ -535,7 +732,30 @@ pub(crate) fn catalog_user_sidebar_stats(username: &str) -> Option<CatalogUserSi
 	(!subreddit_counts.is_empty()).then_some(CatalogUserSidebarStats { subreddit_counts })
 }
 
+#[cfg(test)]
 pub(crate) fn suggested_profiles(
+	followed_profiles: &[String],
+	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
+	excluded_profiles: &HashSet<String>,
+	limit: usize,
+) -> SuggestedProfilesReport {
+	suggested_profiles_with_mode(followed_profiles, followed_profile_subreddits, excluded_profiles, limit, SuggestedProfileScoringMode::Overlap)
+}
+
+pub(crate) fn suggested_profiles_with_mode(
+	followed_profiles: &[String],
+	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
+	excluded_profiles: &HashSet<String>,
+	limit: usize,
+	mode: SuggestedProfileScoringMode,
+) -> SuggestedProfilesReport {
+	match mode {
+		SuggestedProfileScoringMode::Overlap => suggested_profiles_overlap(followed_profiles, followed_profile_subreddits, excluded_profiles, limit),
+		SuggestedProfileScoringMode::Vector => suggested_profiles_vector_mode(followed_profiles, followed_profile_subreddits, excluded_profiles, limit),
+	}
+}
+
+fn suggested_profiles_overlap(
 	followed_profiles: &[String],
 	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
 	excluded_profiles: &HashSet<String>,
@@ -556,7 +776,6 @@ pub(crate) fn suggested_profiles(
 		.map(|profile| crate::utils::creator_identity_fingerprint(profile))
 		.filter(|profile| !profile.is_empty())
 		.collect::<HashSet<_>>();
-
 	if followed_profiles.is_empty() || limit == 0 {
 		let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 		return SuggestedProfilesReport {
@@ -721,19 +940,256 @@ pub(crate) fn suggested_profiles(
 	});
 	suggestions.truncate(limit);
 
-	for suggestion in &mut suggestions {
-		let video_signal = crate::user::cached_video_signal(&suggestion.name);
-		suggestion.avg_video_length = video_signal.avg_video_length;
-		suggestion.video_count = video_signal.video_count;
-		suggestion.redgifs_profile_count = video_signal.redgifs_profile_count;
-		suggestion.media_posts = suggested_profile_media_posts(&suggestion.name, SUGGESTED_PROFILE_MEDIA_LIMIT);
-	}
+	decorate_suggested_profiles(&mut suggestions);
 
 	SuggestedProfilesReport {
 		followed_profile_count: followed_profiles.len(),
 		followed_profiles_with_cache,
 		cached_profile_count: cached_profile_names.len(),
 		compared_profile_count,
+		taste_centroid_count: usize::from(followed_profiles_with_cache > 0),
+		followed_subreddits: followed_top
+			.into_iter()
+			.take(SUGGESTED_PROFILE_REASON_LIMIT)
+			.map(|(name, followed_count)| SuggestedProfileSubreddit {
+				followed_profile_count: *followed_subreddit_profile_counts.get(&name).unwrap_or(&0),
+				name,
+				followed_count,
+				profile_count: 0,
+			})
+			.collect(),
+		suggestions,
+	}
+}
+
+fn suggested_profiles_vector_mode(
+	followed_profiles: &[String],
+	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
+	excluded_profiles: &HashSet<String>,
+	limit: usize,
+) -> SuggestedProfilesReport {
+	let followed_profiles = followed_profiles
+		.iter()
+		.map(|name| normalize_profile_name(name))
+		.filter(|name| !name.is_empty())
+		.collect::<HashSet<_>>();
+	let excluded_profiles = excluded_profiles
+		.iter()
+		.map(|name| normalize_profile_name(name))
+		.filter(|name| !name.is_empty())
+		.collect::<HashSet<_>>();
+	let followed_profile_identities = followed_profiles
+		.iter()
+		.map(|profile| crate::utils::creator_identity_fingerprint(profile))
+		.filter(|profile| !profile.is_empty())
+		.collect::<HashSet<_>>();
+	let mut followed_profile_names = followed_profiles.iter().cloned().collect::<Vec<_>>();
+	followed_profile_names.sort();
+
+	if followed_profiles.is_empty() || limit == 0 {
+		let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+		return SuggestedProfilesReport {
+			followed_profile_count: followed_profiles.len(),
+			cached_profile_count: catalog.author_community_counts.len(),
+			..SuggestedProfilesReport::default()
+		};
+	}
+
+	let (mut profile_counts_by_profile, mut cached_profile_names) = {
+		let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+		let mut profile_counts_by_profile = HashMap::new();
+		for (profile, counts) in &catalog.author_community_counts {
+			let counts = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS)
+				.into_iter()
+				.collect::<HashMap<_, _>>();
+			if !counts.is_empty() {
+				profile_counts_by_profile.insert(profile.clone(), counts);
+			}
+		}
+		(profile_counts_by_profile, catalog.author_community_counts.keys().cloned().collect::<HashSet<_>>())
+	};
+
+	for profile in &followed_profile_names {
+		let Some(cached_subreddits) = followed_profile_subreddits.get(profile) else {
+			continue;
+		};
+		let counts = profile_counts_by_profile.entry(profile.clone()).or_default();
+		for (subreddit, count) in cached_subreddits {
+			let subreddit = subreddit.trim().to_lowercase();
+			if subreddit.is_empty() || subreddit.starts_with("u_") || *count == 0 {
+				continue;
+			}
+			let entry = counts.entry(subreddit).or_default();
+			*entry = (*entry).max(*count as usize);
+		}
+	}
+
+	let mut followed_counts: HashMap<String, usize> = HashMap::new();
+	let mut followed_profile_counts: HashMap<String, usize> = HashMap::new();
+	let mut followed_profiles_with_cache = 0usize;
+
+	for profile in &followed_profile_names {
+		let Some(counts) = profile_counts_by_profile.get(profile) else {
+			continue;
+		};
+		let profile_counts = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
+		if profile_counts.is_empty() {
+			continue;
+		}
+		followed_profiles_with_cache += 1;
+		for (subreddit, count) in profile_counts {
+			*followed_profile_counts.entry(subreddit.clone()).or_default() += 1;
+			*followed_counts.entry(subreddit).or_default() += count;
+		}
+	}
+
+	let followed_top = sorted_subreddit_counts(&followed_counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
+
+	for (subreddit, _) in &followed_top {
+		for (profile, count) in crate::utils::cached_subreddit_users(subreddit).into_iter().take(SUGGESTED_PROFILE_SUBREDDIT_USER_LIMIT) {
+			let profile = normalize_profile_name(&profile);
+			if profile.is_empty() || profile == "[deleted]" {
+				continue;
+			}
+			cached_profile_names.insert(profile.clone());
+			if followed_profiles.contains(&profile) || excluded_profiles.contains(&profile) || count == 0 {
+				continue;
+			}
+
+			let subreddit_counts = profile_counts_by_profile.entry(profile).or_default();
+			let entry = subreddit_counts.entry(subreddit.clone()).or_default();
+			*entry = (*entry).max(count as usize);
+		}
+	}
+
+	let mut subreddit_profile_counts: HashMap<String, usize> = HashMap::new();
+	for counts in profile_counts_by_profile.values() {
+		for (subreddit, _) in sorted_subreddit_counts(counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS) {
+			*subreddit_profile_counts.entry(subreddit).or_default() += 1;
+		}
+	}
+
+	let total_profiles = profile_counts_by_profile.len().max(1);
+	let subreddit_weights = subreddit_profile_counts
+		.iter()
+		.map(|(subreddit, subreddit_profile_count)| {
+			let source_count = *followed_profile_counts.get(subreddit).unwrap_or(&0);
+			let source_factor = if source_count > 0 {
+				suggested_profile_source_factor(subreddit, &followed_profiles, &followed_profile_identities, source_count)
+			} else {
+				1.0
+			};
+			(subreddit.clone(), suggested_profile_vector_idf(total_profiles, *subreddit_profile_count) * source_factor)
+		})
+		.collect::<HashMap<_, _>>();
+
+	let mut followed_vectors = Vec::new();
+	for profile in &followed_profile_names {
+		let Some(counts) = profile_counts_by_profile.get(profile) else {
+			continue;
+		};
+		let mut vector = suggested_profile_vector(counts, &subreddit_weights, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
+		if normalize_suggested_profile_vector(&mut vector) <= 0.0 {
+			continue;
+		}
+		followed_vectors.push(vector);
+	}
+	let centroids = suggested_profile_taste_centroids(&followed_vectors);
+
+	let followed_subreddit_counts = followed_counts.clone();
+	let followed_subreddit_profile_counts = followed_profile_counts.clone();
+	let mut suggestions = Vec::new();
+	let mut compared_profile_count = 0usize;
+
+	if !centroids.is_empty() {
+		for (profile, counts) in profile_counts_by_profile {
+			if followed_profiles.contains(&profile) || excluded_profiles.contains(&profile) || profile == "[deleted]" {
+				continue;
+			}
+
+			let profile_counts = sorted_subreddit_counts(&counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
+			let cached_posts = profile_counts.iter().map(|(_, count)| *count).sum::<usize>();
+			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
+				continue;
+			}
+
+			let mut candidate_vector = suggested_profile_vector(&counts, &subreddit_weights, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
+			if normalize_suggested_profile_vector(&mut candidate_vector) <= 0.0 {
+				continue;
+			}
+			compared_profile_count += 1;
+
+			let (similarity, best_centroid) = centroids
+				.iter()
+				.map(|centroid| (suggested_profile_dot(centroid, &candidate_vector), centroid))
+				.max_by(|(left, _), (right, _)| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+				.unwrap_or((0.0, &centroids[0]));
+			if similarity <= 0.0 {
+				continue;
+			}
+
+			let mut matched_posts = 0usize;
+			let mut overlap_subreddits = Vec::new();
+			for (subreddit, count) in &profile_counts {
+				if !best_centroid.contains_key(subreddit) {
+					continue;
+				}
+				matched_posts += *count;
+				overlap_subreddits.push(SuggestedProfileSubreddit {
+					name: subreddit.clone(),
+					followed_count: *followed_subreddit_counts.get(subreddit).unwrap_or(&0),
+					followed_profile_count: *followed_subreddit_profile_counts.get(subreddit).unwrap_or(&0),
+					profile_count: *count,
+				});
+			}
+
+			if matched_posts == 0 {
+				continue;
+			}
+
+			let overlap_count = overlap_subreddits.len();
+			overlap_subreddits.sort_by(|left, right| {
+				let left_contribution = left.followed_count.saturating_mul(left.profile_count).saturating_mul(left.followed_profile_count.max(1));
+				let right_contribution = right.followed_count.saturating_mul(right.profile_count).saturating_mul(right.followed_profile_count.max(1));
+				right_contribution.cmp(&left_contribution).then_with(|| left.name.cmp(&right.name))
+			});
+			overlap_subreddits.truncate(SUGGESTED_PROFILE_REASON_LIMIT);
+
+			let confidence = (cached_posts as f64 / 12.0).sqrt().min(1.0);
+			let score = similarity * confidence * suggested_profile_vector_breadth_factor(overlap_count);
+			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
+
+			suggestions.push(SuggestedProfileEntry {
+				name: profile.clone(),
+				score_percent,
+				cached_posts,
+				matched_posts,
+				avg_video_length: None,
+				video_count: 0,
+				redgifs_profile_count: 0,
+				media_posts: Vec::new(),
+				overlap_subreddits,
+			});
+		}
+	}
+
+	suggestions.sort_by(|left, right| {
+		right
+			.score_percent
+			.cmp(&left.score_percent)
+			.then_with(|| right.matched_posts.cmp(&left.matched_posts))
+			.then_with(|| right.cached_posts.cmp(&left.cached_posts))
+			.then_with(|| left.name.cmp(&right.name))
+	});
+	suggestions.truncate(limit);
+	decorate_suggested_profiles(&mut suggestions);
+
+	SuggestedProfilesReport {
+		followed_profile_count: followed_profiles.len(),
+		followed_profiles_with_cache,
+		cached_profile_count: cached_profile_names.len(),
+		compared_profile_count,
+		taste_centroid_count: centroids.len(),
 		followed_subreddits: followed_top
 			.into_iter()
 			.take(SUGGESTED_PROFILE_REASON_LIMIT)
@@ -793,7 +1249,10 @@ impl PersistedCatalogSourceKey {
 
 #[cfg(test)]
 mod tests {
-	use super::{apply_source_refresh, catalog_user_sidebar_stats, query_source_candidates, reset_catalog, restore_catalog, snapshot_catalog, suggested_profiles};
+	use super::{
+		apply_source_refresh, catalog_user_sidebar_stats, query_source_candidates, reset_catalog, restore_catalog, snapshot_catalog, suggested_profiles, suggested_profiles_with_mode,
+		SuggestedProfileScoringMode,
+	};
 	use crate::post_cache::{FeedSort, FeedSource};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, ParentComment, Post};
 	use std::collections::{HashMap, HashSet};
@@ -1020,6 +1479,74 @@ mod tests {
 		assert_eq!(narrow.overlap_subreddits.len(), 1);
 		assert_eq!(narrow.overlap_subreddits[0].name, "julesari");
 		assert_eq!(narrow.overlap_subreddits[0].followed_profile_count, 1);
+	}
+
+	#[test]
+	fn suggested_profiles_vector_downweights_common_one_subreddit_matches() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		let mut followed = test_posts("alice-common", "common_feed", "alice", 6, 1_000);
+		followed.extend(test_posts("alice-rare-one", "rare_one", "alice", 4, 980));
+		followed.extend(test_posts("alice-rare-two", "rare_two", "alice", 4, 960));
+		apply_source_refresh(&FeedSource::subreddit("u_alice", FeedSort::New), &followed);
+
+		for idx in 0..8 {
+			apply_source_refresh(
+				&FeedSource::subreddit(&format!("u_filler_{idx}"), FeedSort::New),
+				&test_posts(&format!("filler-{idx}"), "common_feed", &format!("filler_{idx}"), 4, 900 - idx),
+			);
+		}
+
+		apply_source_refresh(
+			&FeedSource::subreddit("common_feed", FeedSort::New),
+			&test_posts("common-only", "common_feed", "common_only", 12, 700),
+		);
+		let mut specialist = test_posts("specialist-one", "rare_one", "rare_specialist", 2, 680);
+		specialist.extend(test_posts("specialist-two", "rare_two", "rare_specialist", 2, 670));
+		apply_source_refresh(&FeedSource::subreddit("rare_one", FeedSort::New), &specialist);
+
+		let report = suggested_profiles_with_mode(
+			&["alice".to_string()],
+			&HashMap::new(),
+			&HashSet::new(),
+			10,
+			SuggestedProfileScoringMode::Vector,
+		);
+
+		let specialist_pos = report.suggestions.iter().position(|entry| entry.name == "rare_specialist").expect("rare specialist");
+		let common_pos = report.suggestions.iter().position(|entry| entry.name == "common_only").expect("common only");
+		let specialist = &report.suggestions[specialist_pos];
+		let common = &report.suggestions[common_pos];
+
+		assert!(specialist_pos < common_pos, "{specialist:?} should rank ahead of {common:?}");
+		assert!(specialist.score_percent > common.score_percent, "{specialist:?} should score ahead of {common:?}");
+		assert_eq!(common.overlap_subreddits.len(), 1);
+		assert_eq!(common.overlap_subreddits[0].name, "common_feed");
+	}
+
+	#[test]
+	fn suggested_profiles_vector_uses_multiple_centroids_for_split_tastes() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		let mut followed = Vec::new();
+		let mut side_cache = HashMap::new();
+		for index in 0..3 {
+			let profile = format!("codefollowed{index}");
+			side_cache.insert(profile.clone(), vec![("rust".to_string(), 5), ("programming".to_string(), 5)]);
+			followed.push(profile);
+		}
+		for index in 0..3 {
+			let profile = format!("foodfollowed{index}");
+			side_cache.insert(profile.clone(), vec![("baking".to_string(), 5), ("cooking".to_string(), 5)]);
+			followed.push(profile);
+		}
+
+		let report = suggested_profiles_with_mode(&followed, &side_cache, &HashSet::new(), 10, SuggestedProfileScoringMode::Vector);
+
+		assert_eq!(report.followed_profiles_with_cache, 6);
+		assert!(report.taste_centroid_count > 1, "{report:?}");
 	}
 
 	#[test]

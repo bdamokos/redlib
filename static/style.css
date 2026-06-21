@@ -2970,6 +2970,42 @@ input[type="submit"] {
     text-transform: uppercase;
 }
 
+.suggested_profiles_mode {
+    align-items: center;
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.suggested_profiles_mode span {
+    color: var(--visited);
+    font-size: 12px;
+    font-weight: 700;
+    margin-right: 2px;
+    text-transform: uppercase;
+}
+
+.suggested_profiles_mode a {
+    background: var(--post);
+    border: var(--panel-border);
+    border-radius: 5px;
+    color: var(--visited);
+    font-weight: 700;
+    line-height: 1;
+    padding: 8px 10px;
+    text-decoration: none;
+}
+
+.suggested_profiles_mode a:hover {
+    color: var(--text);
+}
+
+.suggested_profiles_mode a.active {
+    background: color-mix(in srgb, var(--accent) 14%, var(--post));
+    border-color: color-mix(in srgb, var(--accent) 44%, transparent);
+    color: var(--accent);
+}
+
 .suggested_profiles_stats {
     display: grid;
     gap: 12px;
@@ -3012,6 +3048,15 @@ input[type="submit"] {
     font-size: 12px;
     font-weight: 700;
     text-transform: uppercase;
+}
+
+.suggested_profiles_signal > .suggested_profiles_centroid_count {
+    background: color-mix(in srgb, var(--accent) 10%, var(--outside));
+    border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+    border-radius: 999px;
+    color: var(--visited);
+    padding: 6px 10px;
+    text-transform: none;
 }
 
 .suggested_profiles_signal a {

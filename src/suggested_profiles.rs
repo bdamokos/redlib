@@ -1,4 +1,4 @@
-use crate::materialized_catalog::SuggestedProfilesReport;
+use crate::materialized_catalog::{SuggestedProfileScoringMode, SuggestedProfilesReport};
 use crate::utils::{get_filters, param, template, Preferences};
 use askama::Template;
 use hyper::{Body, Request, Response};
@@ -15,6 +15,7 @@ struct SuggestedProfilesTemplate {
 	url: String,
 	redirect_url: String,
 	report: SuggestedProfilesReport,
+	scoring_mode: SuggestedProfileScoringMode,
 	suggestion_limit: usize,
 	next_suggestion_limit: usize,
 	has_more_suggestions: bool,
@@ -36,7 +37,23 @@ impl SuggestedProfilesTemplate {
 	}
 
 	fn load_more_path(&self) -> String {
-		format!("/suggested-profiles?limit={}", self.next_suggestion_limit)
+		page_path_for_limit(self.next_suggestion_limit, self.scoring_mode)
+	}
+
+	fn overlap_mode_path(&self) -> String {
+		page_path_for_limit(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Overlap)
+	}
+
+	fn vector_mode_path(&self) -> String {
+		page_path_for_limit(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Vector)
+	}
+
+	fn is_overlap_mode(&self) -> bool {
+		self.scoring_mode == SuggestedProfileScoringMode::Overlap
+	}
+
+	fn is_vector_mode(&self) -> bool {
+		self.scoring_mode == SuggestedProfileScoringMode::Vector
 	}
 
 	fn next_batch_size(&self) -> usize {
@@ -75,12 +92,36 @@ fn requested_suggestion_limit(req: &Request<Body>) -> usize {
 		.unwrap_or(SUGGESTED_PROFILE_DEFAULT_LIMIT)
 }
 
-fn redirect_url_for_limit(limit: usize) -> String {
-	if limit <= SUGGESTED_PROFILE_DEFAULT_LIMIT {
-		"suggested-profiles".to_string()
-	} else {
-		format!("suggested-profiles%3Flimit%3D{limit}")
+fn requested_scoring_mode(req: &Request<Body>) -> SuggestedProfileScoringMode {
+	let query = format!("?{}", req.uri().query().unwrap_or_default());
+	match param(&query, "mode").as_deref() {
+		Some("vector") => SuggestedProfileScoringMode::Vector,
+		_ => SuggestedProfileScoringMode::Overlap,
 	}
+}
+
+fn page_path_for_limit(limit: usize, mode: SuggestedProfileScoringMode) -> String {
+	let mut params = Vec::new();
+	if mode == SuggestedProfileScoringMode::Vector {
+		params.push("mode=vector".to_string());
+	}
+	if limit > SUGGESTED_PROFILE_DEFAULT_LIMIT {
+		params.push(format!("limit={limit}"));
+	}
+	if params.is_empty() {
+		"/suggested-profiles".to_string()
+	} else {
+		format!("/suggested-profiles?{}", params.join("&"))
+	}
+}
+
+fn redirect_url_for_limit(limit: usize, mode: SuggestedProfileScoringMode) -> String {
+	let path = page_path_for_limit(limit, mode);
+	path
+		.trim_start_matches('/')
+		.replace('?', "%3F")
+		.replace('=', "%3D")
+		.replace('&', "%26")
 }
 
 pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -90,20 +131,22 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 	let followed_subreddits = followed_profile_subreddit_cache(&followed);
 	let excluded = filtered_profiles(&filters);
 	let suggestion_limit = requested_suggestion_limit(&req);
+	let scoring_mode = requested_scoring_mode(&req);
 	let fetch_limit = if suggestion_limit < SUGGESTED_PROFILE_MAX_LIMIT {
 		suggestion_limit + 1
 	} else {
 		suggestion_limit
 	};
-	let mut report = crate::materialized_catalog::suggested_profiles(&followed, &followed_subreddits, &excluded, fetch_limit);
+	let mut report = crate::materialized_catalog::suggested_profiles_with_mode(&followed, &followed_subreddits, &excluded, fetch_limit, scoring_mode);
 	let has_more_suggestions = report.suggestions.len() > suggestion_limit && suggestion_limit < SUGGESTED_PROFILE_MAX_LIMIT;
 	report.suggestions.truncate(suggestion_limit);
 
 	Ok(template(&SuggestedProfilesTemplate {
 		prefs,
 		url: "/suggested-profiles".to_string(),
-		redirect_url: redirect_url_for_limit(suggestion_limit),
+		redirect_url: redirect_url_for_limit(suggestion_limit, scoring_mode),
 		report,
+		scoring_mode,
 		suggestion_limit,
 		next_suggestion_limit: (suggestion_limit + SUGGESTED_PROFILE_INCREMENT).min(SUGGESTED_PROFILE_MAX_LIMIT),
 		has_more_suggestions,
@@ -136,5 +179,27 @@ mod tests {
 	#[test]
 	fn requested_suggestion_limit_clamps_high_values_to_maximum() {
 		assert_eq!(requested_suggestion_limit(&request_for("/suggested-profiles?limit=999")), SUGGESTED_PROFILE_MAX_LIMIT);
+	}
+
+	#[test]
+	fn requested_scoring_mode_defaults_to_overlap() {
+		assert_eq!(requested_scoring_mode(&request_for("/suggested-profiles")), SuggestedProfileScoringMode::Overlap);
+		assert_eq!(requested_scoring_mode(&request_for("/suggested-profiles?mode=unknown")), SuggestedProfileScoringMode::Overlap);
+	}
+
+	#[test]
+	fn requested_scoring_mode_accepts_vector() {
+		assert_eq!(requested_scoring_mode(&request_for("/suggested-profiles?mode=vector")), SuggestedProfileScoringMode::Vector);
+	}
+
+	#[test]
+	fn page_paths_preserve_vector_mode_for_load_more() {
+		assert_eq!(page_path_for_limit(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Overlap), "/suggested-profiles");
+		assert_eq!(page_path_for_limit(80, SuggestedProfileScoringMode::Overlap), "/suggested-profiles?limit=80");
+		assert_eq!(
+			page_path_for_limit(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Vector),
+			"/suggested-profiles?mode=vector"
+		);
+		assert_eq!(page_path_for_limit(80, SuggestedProfileScoringMode::Vector), "/suggested-profiles?mode=vector&limit=80");
 	}
 }
