@@ -19,6 +19,7 @@ const SUGGESTED_PROFILE_SINGLE_OVERLAP_FACTOR: f64 = 0.60;
 const SUGGESTED_PROFILE_TWO_OVERLAP_FACTOR: f64 = 0.85;
 const SUGGESTED_PROFILE_VECTOR_SINGLE_OVERLAP_FACTOR: f64 = 0.45;
 const SUGGESTED_PROFILE_VECTOR_TWO_OVERLAP_FACTOR: f64 = 0.80;
+const SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD: usize = 4;
 const AUTHOR_HISTORY_MAX_POST_AGE_SECS: u64 = 180 * 24 * 60 * 60;
 const AUTHOR_HISTORY_MAX_POSTS_PER_AUTHOR: usize = 160;
 const AUTHOR_HISTORY_GLOBAL_MAX_POSTS: usize = 60_000;
@@ -111,6 +112,13 @@ pub(crate) struct PersistedAuthorHistoryEntry {
 	pub posts: Vec<PersistedAuthorHistoryPost>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedRejectedAuthorRedgifsProfileEntry {
+	pub author: String,
+	pub redgifs_profile_count: usize,
+	pub seen_at_unix: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SuggestedProfilesReport {
 	pub followed_profile_count: usize,
@@ -164,6 +172,7 @@ struct MaterializedCatalog {
 	author_video_stats: HashMap<String, crate::user::UserVideoStatsAccumulator>,
 	author_media_posts: HashMap<String, Vec<SuggestedProfileMediaPost>>,
 	author_history: HashMap<String, HashMap<String, PersistedAuthorHistoryPost>>,
+	rejected_author_redgifs_profiles: HashMap<String, PersistedRejectedAuthorRedgifsProfileEntry>,
 }
 
 static MATERIALIZED_CATALOG: LazyLock<Mutex<MaterializedCatalog>> = LazyLock::new(|| Mutex::new(MaterializedCatalog::default()));
@@ -577,8 +586,107 @@ fn decorate_suggested_profiles(suggestions: &mut [SuggestedProfileEntry]) {
 	}
 }
 
+fn suggested_profile_is_rejected_for_redgifs_profile_count(username: &str) -> bool {
+	if rejected_author_redgifs_profile_count(username) >= SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD {
+		return true;
+	}
+	let redgifs_profile_count = crate::user::cached_video_signal(username).redgifs_profile_count;
+	if redgifs_profile_count < SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD {
+		return false;
+	}
+	remember_rejected_author_redgifs_profile_count(username, redgifs_profile_count);
+	true
+}
+
+fn rejected_author_redgifs_profile_count_locked(catalog: &MaterializedCatalog, username: &str) -> usize {
+	let username = normalize_profile_name(username);
+	if username.is_empty() {
+		return 0;
+	}
+	catalog
+		.rejected_author_redgifs_profiles
+		.get(&username)
+		.map(|entry| entry.redgifs_profile_count)
+		.unwrap_or_default()
+}
+
+pub(crate) fn rejected_author_redgifs_profile_count(username: &str) -> usize {
+	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	rejected_author_redgifs_profile_count_locked(&catalog, username)
+}
+
+fn remember_rejected_author_redgifs_profile_count(username: &str, redgifs_profile_count: usize) {
+	if redgifs_profile_count < SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD {
+		return;
+	}
+	let username = normalize_profile_name(username);
+	if username.is_empty() || username == "[deleted]" {
+		return;
+	}
+
+	let now_unix = crate::cache_persistence::unix_now();
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let had_indexed_data = catalog.author_history.remove(&username).is_some()
+		|| catalog.author_to_post_ids.contains_key(&username)
+		|| catalog.author_community_counts.contains_key(&username)
+		|| catalog.author_video_stats.contains_key(&username)
+		|| catalog.author_media_posts.contains_key(&username);
+	catalog
+		.rejected_author_redgifs_profiles
+		.entry(username.clone())
+		.and_modify(|entry| {
+			entry.redgifs_profile_count = entry.redgifs_profile_count.max(redgifs_profile_count);
+			entry.seen_at_unix = now_unix;
+		})
+		.or_insert_with(|| PersistedRejectedAuthorRedgifsProfileEntry {
+			author: username,
+			redgifs_profile_count,
+			seen_at_unix: now_unix,
+		});
+	if had_indexed_data {
+		rebuild_indexes(&mut catalog);
+	}
+	crate::cache_persistence::mark_dirty();
+}
+
+fn redgifs_profile_count_for_history_posts(posts: &HashMap<String, PersistedAuthorHistoryPost>) -> usize {
+	posts
+		.values()
+		.filter_map(|post| {
+			let slug = crate::utils::normalize_creator_identity_slug(&post.redgifs_username);
+			(!slug.is_empty()).then_some(slug)
+		})
+		.collect::<HashSet<_>>()
+		.len()
+}
+
+fn reject_author_history_with_many_redgifs_profiles_locked(catalog: &mut MaterializedCatalog, now_unix: u64) {
+	let rejected_authors = catalog
+		.author_history
+		.iter()
+		.filter_map(|(author, posts)| {
+			let redgifs_profile_count = redgifs_profile_count_for_history_posts(posts);
+			(redgifs_profile_count >= SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD).then_some((author.clone(), redgifs_profile_count))
+		})
+		.collect::<Vec<_>>();
+
+	for (author, redgifs_profile_count) in rejected_authors {
+		catalog.author_history.remove(&author);
+		catalog.rejected_author_redgifs_profiles.insert(
+			author.clone(),
+			PersistedRejectedAuthorRedgifsProfileEntry {
+				author,
+				redgifs_profile_count,
+				seen_at_unix: now_unix,
+			},
+		);
+	}
+}
+
 fn prune_author_history_locked(catalog: &mut MaterializedCatalog, now_unix: u64) {
 	let cutoff_unix = now_unix.saturating_sub(AUTHOR_HISTORY_MAX_POST_AGE_SECS);
+
+	catalog.rejected_author_redgifs_profiles.retain(|_, entry| entry.seen_at_unix >= cutoff_unix);
 
 	for posts in catalog.author_history.values_mut() {
 		posts.retain(|_, post| author_history_activity_ts(post) >= cutoff_unix);
@@ -629,12 +737,17 @@ fn record_author_history_from_posts_locked(catalog: &mut MaterializedCatalog, po
 		if author.is_empty() || author == "[deleted]" {
 			continue;
 		}
+		if let Some(rejected) = catalog.rejected_author_redgifs_profiles.get_mut(&author) {
+			rejected.seen_at_unix = now_unix;
+			continue;
+		}
 		let Some(history_post) = author_history_post_from_post(post, now_unix) else {
 			continue;
 		};
 		catalog.author_history.entry(author).or_default().insert(history_post.post_id.clone(), history_post);
 	}
 	prune_author_history_locked(catalog, now_unix);
+	reject_author_history_with_many_redgifs_profiles_locked(catalog, now_unix);
 }
 
 pub(crate) fn record_author_history_from_posts(posts: &[Post]) {
@@ -674,7 +787,9 @@ fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
 			catalog.source_to_post_ids.entry(source_key.clone()).or_default().insert(post_id.clone());
 		}
 
-		if !record.author_lc.is_empty() {
+		let author_is_rejected = rejected_author_redgifs_profile_count_locked(catalog, &record.author_lc) >= SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD;
+
+		if !record.author_lc.is_empty() && !author_is_rejected {
 			catalog.author_to_post_ids.entry(record.author_lc.clone()).or_default().insert(post_id.clone());
 			catalog.author_video_stats.entry(record.author_lc.clone()).or_default().observe_post(&record.post);
 			if let Some(candidate) = suggested_profile_media_candidate(record) {
@@ -682,7 +797,7 @@ fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
 			}
 		}
 
-		if !record.author_lc.is_empty() && !record.community_lc.is_empty() && !record.community_lc.starts_with("u_") {
+		if !record.author_lc.is_empty() && !author_is_rejected && !record.community_lc.is_empty() && !record.community_lc.starts_with("u_") {
 			*catalog
 				.author_community_counts
 				.entry(record.author_lc.clone())
@@ -1051,6 +1166,9 @@ fn suggested_profiles_overlap(
 
 	if followed_norm > 0.0 {
 		for (profile, counts) in candidate_counts_by_profile {
+			if suggested_profile_is_rejected_for_redgifs_profile_count(&profile) {
+				continue;
+			}
 			let profile_counts = sorted_subreddit_counts(&counts, SUGGESTED_PROFILE_TOP_SUBREDDITS);
 			let cached_posts = profile_counts.iter().map(|(_, count)| *count).sum::<usize>();
 			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
@@ -1285,6 +1403,9 @@ fn suggested_profiles_vector_mode(
 			if followed_profiles.contains(&profile) || excluded_profiles.contains(&profile) || profile == "[deleted]" {
 				continue;
 			}
+			if suggested_profile_is_rejected_for_redgifs_profile_count(&profile) {
+				continue;
+			}
 
 			let profile_counts = sorted_subreddit_counts(&counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
 			let cached_posts = profile_counts.iter().map(|(_, count)| *count).sum::<usize>();
@@ -1402,6 +1523,7 @@ pub(crate) fn catalog_video_stats(username: &str) -> Option<crate::user::UserVid
 pub(crate) fn snapshot_persisted_author_history(now_unix: u64) -> Vec<PersistedAuthorHistoryEntry> {
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	prune_author_history_locked(&mut catalog, now_unix);
+	reject_author_history_with_many_redgifs_profiles_locked(&mut catalog, now_unix);
 	rebuild_indexes(&mut catalog);
 
 	let mut entries = catalog
@@ -1431,6 +1553,9 @@ pub(crate) fn restore_persisted_author_history(entries: Vec<PersistedAuthorHisto
 		if author.is_empty() || author == "[deleted]" {
 			continue;
 		}
+		if rejected_author_redgifs_profile_count_locked(&catalog, &author) >= SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD {
+			continue;
+		}
 		let posts = catalog.author_history.entry(author).or_default();
 		for post in entry.posts {
 			if post.post_id.trim().is_empty() || post.subreddit.trim().is_empty() || post.subreddit.starts_with("u_") {
@@ -1438,6 +1563,58 @@ pub(crate) fn restore_persisted_author_history(entries: Vec<PersistedAuthorHisto
 			}
 			posts.insert(post.post_id.clone(), post);
 		}
+	}
+
+	prune_author_history_locked(&mut catalog, now_unix);
+	reject_author_history_with_many_redgifs_profiles_locked(&mut catalog, now_unix);
+	rebuild_indexes(&mut catalog);
+}
+
+pub(crate) fn snapshot_persisted_rejected_author_redgifs_profiles(now_unix: u64) -> Vec<PersistedRejectedAuthorRedgifsProfileEntry> {
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	prune_author_history_locked(&mut catalog, now_unix);
+	reject_author_history_with_many_redgifs_profiles_locked(&mut catalog, now_unix);
+	rebuild_indexes(&mut catalog);
+
+	let mut entries = catalog
+		.rejected_author_redgifs_profiles
+		.values()
+		.filter(|entry| {
+			!entry.author.trim().is_empty()
+				&& entry.redgifs_profile_count >= SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD
+				&& now_unix.saturating_sub(entry.seen_at_unix) <= AUTHOR_HISTORY_MAX_POST_AGE_SECS
+		})
+		.cloned()
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| left.author.cmp(&right.author));
+	entries
+}
+
+pub(crate) fn restore_persisted_rejected_author_redgifs_profiles(entries: Vec<PersistedRejectedAuthorRedgifsProfileEntry>, _saved_at_unix: u64, now_unix: u64) {
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	catalog.rejected_author_redgifs_profiles.clear();
+
+	for entry in entries {
+		let author = normalize_profile_name(&entry.author);
+		if author.is_empty() || author == "[deleted]" {
+			continue;
+		}
+		if entry.redgifs_profile_count < SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD {
+			continue;
+		}
+		if now_unix.saturating_sub(entry.seen_at_unix) > AUTHOR_HISTORY_MAX_POST_AGE_SECS {
+			continue;
+		}
+
+		catalog.author_history.remove(&author);
+		catalog.rejected_author_redgifs_profiles.insert(
+			author.clone(),
+			PersistedRejectedAuthorRedgifsProfileEntry {
+				author,
+				redgifs_profile_count: entry.redgifs_profile_count,
+				seen_at_unix: entry.seen_at_unix,
+			},
+		);
 	}
 
 	prune_author_history_locked(&mut catalog, now_unix);
@@ -1509,8 +1686,9 @@ impl PersistedCatalogSourceKey {
 #[cfg(test)]
 mod tests {
 	use super::{
-		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_source_candidates, record_author_history_from_posts, reset_catalog,
-		restore_catalog, restore_persisted_author_history, snapshot_catalog, snapshot_persisted_author_history, suggested_profiles, suggested_profiles_with_mode,
+		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_source_candidates, record_author_history_from_posts,
+		rejected_author_redgifs_profile_count, reset_catalog, restore_catalog, restore_persisted_author_history, restore_persisted_rejected_author_redgifs_profiles,
+		snapshot_catalog, snapshot_persisted_author_history, snapshot_persisted_rejected_author_redgifs_profiles, suggested_profiles, suggested_profiles_with_mode,
 		SuggestedProfileScoringMode,
 	};
 	use crate::post_cache::{FeedSort, FeedSource};
@@ -1976,6 +2154,76 @@ mod tests {
 		assert_eq!(suggestion.redgifs_profile_count, 2);
 
 		crate::user::clear_test_caches();
+		reset_catalog();
+	}
+
+	#[test]
+	fn suggested_profiles_filter_candidates_with_four_redgifs_profiles() {
+		let _guard = test_lock();
+		reset_catalog();
+		crate::user::clear_test_caches();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_alice", FeedSort::New),
+			&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)],
+		);
+		apply_source_refresh(
+			&FeedSource::subreddit("rust", FeedSort::New),
+			&[
+				test_video_post("bad-rust-one", "rust", "bad_rg", 280, "rg_one", 30),
+				test_video_post("bad-rust-two", "rust", "bad_rg", 270, "rg_two", 35),
+				test_video_post("bad-programming-three", "programming", "bad_rg", 260, "rg_three", 40),
+				test_video_post("bad-programming-four", "programming", "bad_rg", 250, "rg_four", 45),
+				test_post("good-rust", "rust", "good_match", 240),
+				test_post("good-programming", "programming", "good_match", 230),
+			],
+		);
+
+		assert_eq!(rejected_author_redgifs_profile_count("bad_rg"), 4);
+		assert!(catalog_user_sidebar_stats("bad_rg").is_none());
+
+		for mode in [SuggestedProfileScoringMode::Overlap, SuggestedProfileScoringMode::Vector] {
+			let report = suggested_profiles_with_mode(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10, mode);
+			assert!(report.suggestions.iter().any(|entry| entry.name == "good_match"), "{mode:?}: {report:?}");
+			assert!(!report.suggestions.iter().any(|entry| entry.name == "bad_rg"), "{mode:?}: {report:?}");
+		}
+
+		apply_source_refresh(&FeedSource::subreddit("rust", FeedSort::New), &[]);
+		assert!(query_source_candidates(&[FeedSource::subreddit("rust", FeedSort::New)], &HashSet::new()).is_empty());
+		assert_eq!(rejected_author_redgifs_profile_count("bad_rg"), 4);
+		assert!(catalog_user_sidebar_stats("bad_rg").is_none());
+		assert_eq!(catalog_user_sidebar_stats("good_match").expect("good retained stats").subreddit_counts.len(), 2);
+
+		crate::user::clear_test_caches();
+		reset_catalog();
+	}
+
+	#[test]
+	fn rejected_redgifs_profile_marker_snapshot_round_trips() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		record_author_history_from_posts(&[
+			test_video_post("bad-one", "rust", "bad_rg", 280, "rg_one", 30),
+			test_video_post("bad-two", "rust", "bad_rg", 270, "rg_two", 35),
+			test_video_post("bad-three", "programming", "bad_rg", 260, "rg_three", 40),
+			test_video_post("bad-four", "programming", "bad_rg", 250, "rg_four", 45),
+		]);
+
+		let now_unix = crate::cache_persistence::unix_now();
+		let rejected_snapshot = snapshot_persisted_rejected_author_redgifs_profiles(now_unix);
+		let history_snapshot = snapshot_persisted_author_history(now_unix);
+		assert!(history_snapshot.iter().all(|entry| entry.author != "bad_rg"));
+		assert_eq!(rejected_snapshot.len(), 1);
+		assert_eq!(rejected_snapshot[0].author, "bad_rg");
+		assert_eq!(rejected_snapshot[0].redgifs_profile_count, 4);
+
+		reset_catalog();
+		restore_persisted_rejected_author_redgifs_profiles(rejected_snapshot, now_unix, now_unix);
+		restore_persisted_author_history(history_snapshot, now_unix, now_unix);
+
+		assert_eq!(rejected_author_redgifs_profile_count("bad_rg"), 4);
+		assert!(catalog_user_sidebar_stats("bad_rg").is_none());
 		reset_catalog();
 	}
 

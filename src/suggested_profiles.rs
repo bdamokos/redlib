@@ -117,11 +117,7 @@ fn page_path_for_limit(limit: usize, mode: SuggestedProfileScoringMode) -> Strin
 
 fn redirect_url_for_limit(limit: usize, mode: SuggestedProfileScoringMode) -> String {
 	let path = page_path_for_limit(limit, mode);
-	path
-		.trim_start_matches('/')
-		.replace('?', "%3F")
-		.replace('=', "%3D")
-		.replace('&', "%26")
+	path.trim_start_matches('/').replace('?', "%3F").replace('=', "%3D").replace('&', "%26")
 }
 
 pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -184,7 +180,10 @@ mod tests {
 	#[test]
 	fn requested_scoring_mode_defaults_to_overlap() {
 		assert_eq!(requested_scoring_mode(&request_for("/suggested-profiles")), SuggestedProfileScoringMode::Overlap);
-		assert_eq!(requested_scoring_mode(&request_for("/suggested-profiles?mode=unknown")), SuggestedProfileScoringMode::Overlap);
+		assert_eq!(
+			requested_scoring_mode(&request_for("/suggested-profiles?mode=unknown")),
+			SuggestedProfileScoringMode::Overlap
+		);
 	}
 
 	#[test]
@@ -194,7 +193,10 @@ mod tests {
 
 	#[test]
 	fn page_paths_preserve_vector_mode_for_load_more() {
-		assert_eq!(page_path_for_limit(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Overlap), "/suggested-profiles");
+		assert_eq!(
+			page_path_for_limit(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Overlap),
+			"/suggested-profiles"
+		);
 		assert_eq!(page_path_for_limit(80, SuggestedProfileScoringMode::Overlap), "/suggested-profiles?limit=80");
 		assert_eq!(
 			page_path_for_limit(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Vector),

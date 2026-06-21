@@ -10,7 +10,8 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-const SNAPSHOT_VERSION: u8 = 3;
+const SNAPSHOT_VERSION: u8 = 4;
+const LEGACY_SNAPSHOT_VERSION_V3: u8 = 3;
 const LEGACY_SNAPSHOT_VERSION_V2: u8 = 2;
 const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v2.bin";
 const SOURCE_CACHE_DIR_NAME: &str = "sources.v2";
@@ -298,6 +299,20 @@ struct PersistedCacheSnapshot {
 	subreddit_flairs: Vec<PersistedSubredditFlairsEntry>,
 	subreddit_users: Vec<PersistedSubredditUsersEntry>,
 	author_history: Vec<crate::materialized_catalog::PersistedAuthorHistoryEntry>,
+	rejected_author_redgifs_profiles: Vec<crate::materialized_catalog::PersistedRejectedAuthorRedgifsProfileEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCacheSnapshotV3 {
+	version: u8,
+	saved_at_unix: u64,
+	source_entries: Vec<PersistedSourceCacheEntry>,
+	remembered_subreddits: Vec<PersistedRememberedSubredditEntry>,
+	subreddit_metadata: Vec<PersistedSubredditMetadataEntry>,
+	subreddit_nsfw: Vec<PersistedSubredditNsfwEntry>,
+	subreddit_flairs: Vec<PersistedSubredditFlairsEntry>,
+	subreddit_users: Vec<PersistedSubredditUsersEntry>,
+	author_history: Vec<crate::materialized_catalog::PersistedAuthorHistoryEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -440,6 +455,7 @@ fn load_snapshot() -> Result<(), String> {
 	let snapshot = deserialize_snapshot(&bytes)?;
 	let now_unix = unix_now();
 	post_cache::restore_persisted_state(snapshot.source_entries, snapshot.remembered_subreddits, snapshot.saved_at_unix, now_unix);
+	crate::materialized_catalog::restore_persisted_rejected_author_redgifs_profiles(snapshot.rejected_author_redgifs_profiles, snapshot.saved_at_unix, now_unix);
 	crate::materialized_catalog::restore_persisted_author_history(snapshot.author_history, snapshot.saved_at_unix, now_unix);
 	subreddit::restore_persisted_state(snapshot.subreddit_metadata, snapshot.subreddit_nsfw, snapshot.saved_at_unix, now_unix);
 	utils::restore_persisted_state(snapshot.subreddit_flairs, snapshot.subreddit_users, snapshot.saved_at_unix, now_unix);
@@ -448,6 +464,8 @@ fn load_snapshot() -> Result<(), String> {
 
 fn write_snapshot() -> Result<(), String> {
 	let now_unix = unix_now();
+	let author_history = crate::materialized_catalog::snapshot_persisted_author_history(now_unix);
+	let rejected_author_redgifs_profiles = crate::materialized_catalog::snapshot_persisted_rejected_author_redgifs_profiles(now_unix);
 	let snapshot = PersistedCacheSnapshot {
 		version: SNAPSHOT_VERSION,
 		saved_at_unix: now_unix,
@@ -457,7 +475,8 @@ fn write_snapshot() -> Result<(), String> {
 		subreddit_nsfw: subreddit::snapshot_persisted_nsfw(now_unix),
 		subreddit_flairs: utils::snapshot_persisted_subreddit_flairs(now_unix),
 		subreddit_users: utils::snapshot_persisted_subreddit_users(now_unix),
-		author_history: crate::materialized_catalog::snapshot_persisted_author_history(now_unix),
+		author_history,
+		rejected_author_redgifs_profiles,
 	};
 
 	let bytes = serialize_snapshot(&snapshot)?;
@@ -492,6 +511,24 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 			Ok(snapshot)
 		}
 		Err(current_error) => {
+			if let Ok(legacy) = bincode::deserialize::<PersistedCacheSnapshotV3>(bytes) {
+				if legacy.version != LEGACY_SNAPSHOT_VERSION_V3 {
+					return Err(format!("unsupported snapshot version {}", legacy.version));
+				}
+				return Ok(PersistedCacheSnapshot {
+					version: SNAPSHOT_VERSION,
+					saved_at_unix: legacy.saved_at_unix,
+					source_entries: legacy.source_entries,
+					remembered_subreddits: legacy.remembered_subreddits,
+					subreddit_metadata: legacy.subreddit_metadata,
+					subreddit_nsfw: legacy.subreddit_nsfw,
+					subreddit_flairs: legacy.subreddit_flairs,
+					subreddit_users: legacy.subreddit_users,
+					author_history: legacy.author_history,
+					rejected_author_redgifs_profiles: Vec::new(),
+				});
+			}
+
 			let legacy: PersistedCacheSnapshotV2 = bincode::deserialize(bytes).map_err(|_| current_error.to_string())?;
 			if legacy.version != LEGACY_SNAPSHOT_VERSION_V2 {
 				return Err(format!("unsupported snapshot version {}", legacy.version));
@@ -506,6 +543,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				subreddit_flairs: legacy.subreddit_flairs,
 				subreddit_users: legacy.subreddit_users,
 				author_history: Vec::new(),
+				rejected_author_redgifs_profiles: Vec::new(),
 			})
 		}
 	}
@@ -548,13 +586,28 @@ impl PersistedRefreshOrigin {
 mod tests {
 	use super::{
 		deserialize_catalog_snapshot, deserialize_snapshot, serialize_catalog_snapshot, serialize_snapshot, PersistedCacheSnapshot, PersistedCacheSnapshotV2,
-		PersistedCatalogSnapshotFile, LEGACY_SNAPSHOT_VERSION_V2, SNAPSHOT_VERSION,
+		PersistedCacheSnapshotV3, PersistedCatalogSnapshotFile, LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3, SNAPSHOT_VERSION,
 	};
 	use crate::materialized_catalog::PersistedCatalogSnapshot;
 
 	fn empty_snapshot() -> PersistedCacheSnapshot {
 		PersistedCacheSnapshot {
 			version: SNAPSHOT_VERSION,
+			saved_at_unix: 1_000_000,
+			source_entries: Vec::new(),
+			remembered_subreddits: Vec::new(),
+			subreddit_metadata: Vec::new(),
+			subreddit_nsfw: Vec::new(),
+			subreddit_flairs: Vec::new(),
+			subreddit_users: Vec::new(),
+			author_history: Vec::new(),
+			rejected_author_redgifs_profiles: Vec::new(),
+		}
+	}
+
+	fn empty_legacy_v3_snapshot() -> PersistedCacheSnapshotV3 {
+		PersistedCacheSnapshotV3 {
+			version: LEGACY_SNAPSHOT_VERSION_V3,
 			saved_at_unix: 1_000_000,
 			source_entries: Vec::new(),
 			remembered_subreddits: Vec::new(),
@@ -596,6 +649,19 @@ mod tests {
 		assert_eq!(decoded.saved_at_unix, snapshot.saved_at_unix);
 		assert!(decoded.source_entries.is_empty());
 		assert!(decoded.author_history.is_empty());
+		assert!(decoded.rejected_author_redgifs_profiles.is_empty());
+	}
+
+	#[test]
+	fn legacy_v3_snapshot_deserializes_with_empty_rejected_author_redgifs_profiles() {
+		let snapshot = empty_legacy_v3_snapshot();
+		let bytes = bincode::serialize(&snapshot).expect("serialize legacy snapshot");
+		let decoded = deserialize_snapshot(&bytes).expect("deserialize legacy snapshot");
+
+		assert_eq!(decoded.version, SNAPSHOT_VERSION);
+		assert_eq!(decoded.saved_at_unix, snapshot.saved_at_unix);
+		assert!(decoded.author_history.is_empty());
+		assert!(decoded.rejected_author_redgifs_profiles.is_empty());
 	}
 
 	#[test]
@@ -607,6 +673,7 @@ mod tests {
 		assert_eq!(decoded.version, SNAPSHOT_VERSION);
 		assert_eq!(decoded.saved_at_unix, snapshot.saved_at_unix);
 		assert!(decoded.author_history.is_empty());
+		assert!(decoded.rejected_author_redgifs_profiles.is_empty());
 	}
 
 	#[test]
