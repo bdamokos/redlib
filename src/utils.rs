@@ -359,6 +359,26 @@ impl Media {
 		}
 	}
 
+	fn redgifs_render_url(path: &str, prefs: &Preferences) -> String {
+		if prefs.direct_redgifs_media == "off" {
+			path.to_string()
+		} else {
+			redgifs::direct_media_url_from_path(path).unwrap_or_else(|| path.to_string())
+		}
+	}
+
+	pub fn display_video_url(&self, prefs: &Preferences) -> String {
+		Self::redgifs_render_url(&self.url, prefs)
+	}
+
+	pub fn display_poster_url(&self, prefs: &Preferences) -> String {
+		Self::redgifs_render_url(&self.poster, prefs)
+	}
+
+	pub fn display_video_preview_fallback_url(&self, prefs: &Preferences) -> String {
+		Self::redgifs_render_url(&self.video_preview_fallback_url, prefs)
+	}
+
 	fn resolved_dimensions(width: Option<i64>, height: Option<i64>, fallback_width: i64, fallback_height: i64) -> (i64, i64) {
 		match (width.filter(|value| *value > 0), height.filter(|value| *value > 0)) {
 			(Some(width), Some(height)) => (width, height),
@@ -384,7 +404,14 @@ impl Media {
 		let redgifs_duration_seconds = redgifs_bundle.as_ref().map(|paths| paths.duration_seconds()).unwrap_or_default();
 		let redgifs_username = redgifs_bundle.as_ref().map(|paths| paths.username().to_string()).unwrap_or_default();
 		let redgifs_preview_fallback_url = redgifs_bundle.as_ref().map(|paths| paths.mobile_video_path().to_string()).unwrap_or_default();
-		let redgifs_url = redgifs_id.as_ref().map(|id| Value::String(format!("https://www.redgifs.com/watch/{id}")));
+		let redgifs_url = redgifs_id.as_ref().map(|id| {
+			Value::String(
+				redgifs_bundle
+					.as_ref()
+					.map(|paths| paths.video_path().to_string())
+					.unwrap_or_else(|| format!("/redgifs/{id}")),
+			)
+		});
 
 		let embed_code = if redgifs_url.is_some() { String::new() } else { raw_embed_code };
 
@@ -1741,7 +1768,7 @@ pub struct Params {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 4)]
+#[revisioned(revision = 5)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -1775,6 +1802,8 @@ pub struct Preferences {
 	pub autoplay_videos: String,
 	#[revision(start = 4)]
 	pub video_previews: String,
+	#[revision(start = 5)]
+	pub direct_redgifs_media: String,
 	#[revision(start = 1)]
 	pub fixed_navbar: String,
 	#[revision(start = 1)]
@@ -1853,6 +1882,7 @@ impl From<LegacyPreferencesV1> for Preferences {
 			use_hls: value.use_hls,
 			autoplay_videos: value.autoplay_videos,
 			video_previews: "on".to_string(),
+			direct_redgifs_media: "on".to_string(),
 			fixed_navbar: value.fixed_navbar,
 			disable_visit_reddit_confirmation: value.disable_visit_reddit_confirmation,
 			comment_sort: value.comment_sort,
@@ -1917,6 +1947,7 @@ impl From<LegacyPreferencesV0> for Preferences {
 			use_hls: value.use_hls,
 			autoplay_videos: value.autoplay_videos,
 			video_previews: "on".to_string(),
+			direct_redgifs_media: "on".to_string(),
 			fixed_navbar: value.fixed_navbar,
 			disable_visit_reddit_confirmation: String::new(),
 			comment_sort: value.comment_sort,
@@ -2191,6 +2222,7 @@ impl Preferences {
 			"use_hls" => Some(self.use_hls.clone()),
 			"autoplay_videos" => Some(self.autoplay_videos.clone()),
 			"video_previews" => Some(self.video_previews.clone()),
+			"direct_redgifs_media" => Some(self.direct_redgifs_media.clone()),
 			"fixed_navbar" => Some(self.fixed_navbar.clone()),
 			"disable_visit_reddit_confirmation" => Some(self.disable_visit_reddit_confirmation.clone()),
 			"comment_sort" => Some(self.comment_sort.clone()),
@@ -2232,6 +2264,7 @@ impl Preferences {
 			video_quality: setting(req, "video_quality"),
 			autoplay_videos: setting(req, "autoplay_videos"),
 			video_previews: setting_or_default(req, "video_previews", "on".to_string()),
+			direct_redgifs_media: setting_or_default(req, "direct_redgifs_media", "on".to_string()),
 			fixed_navbar: setting_or_default(req, "fixed_navbar", "on".to_string()),
 			disable_visit_reddit_confirmation: setting(req, "disable_visit_reddit_confirmation"),
 			comment_sort: setting(req, "comment_sort"),
@@ -6076,6 +6109,29 @@ mod tests {
 	}
 
 	#[test]
+	fn redgifs_media_display_urls_are_direct_by_default_and_proxy_when_disabled() {
+		let media = Media {
+			url: "/redgifs/FamiliarFrizzyChevrotain.mp4".to_string(),
+			poster: "/redgifs/FamiliarFrizzyChevrotain-poster.jpg".to_string(),
+			video_preview_fallback_url: "/redgifs/FamiliarFrizzyChevrotain-mobile.mp4".to_string(),
+			..Media::empty()
+		};
+
+		let mut prefs = Preferences::default();
+		assert_eq!(media.display_video_url(&prefs), "https://media.redgifs.com/FamiliarFrizzyChevrotain.mp4");
+		assert_eq!(media.display_poster_url(&prefs), "https://media.redgifs.com/FamiliarFrizzyChevrotain-poster.jpg");
+		assert_eq!(
+			media.display_video_preview_fallback_url(&prefs),
+			"https://media.redgifs.com/FamiliarFrizzyChevrotain-mobile.mp4"
+		);
+
+		prefs.direct_redgifs_media = "off".to_string();
+		assert_eq!(media.display_video_url(&prefs), "/redgifs/FamiliarFrizzyChevrotain.mp4");
+		assert_eq!(media.display_poster_url(&prefs), "/redgifs/FamiliarFrizzyChevrotain-poster.jpg");
+		assert_eq!(media.display_video_preview_fallback_url(&prefs), "/redgifs/FamiliarFrizzyChevrotain-mobile.mp4");
+	}
+
+	#[test]
 	fn gallery_media_decodes_html_escaped_preview_urls() {
 		let items = json!([
 			{
@@ -6162,6 +6218,7 @@ mod tests {
 			use_hls: "on".to_owned(),
 			autoplay_videos: "on".to_owned(),
 			video_previews: "on".to_owned(),
+			direct_redgifs_media: "on".to_owned(),
 			fixed_navbar: "on".to_owned(),
 			disable_visit_reddit_confirmation: "on".to_owned(),
 			comment_sort: "confidence".to_owned(),

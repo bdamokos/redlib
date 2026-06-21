@@ -136,7 +136,7 @@ fn content_security_policy() -> String {
 	}
 
 	format!(
-		"default-src 'none'; font-src 'self'; script-src 'self' blob:; manifest-src 'self'; media-src 'self' data: blob: about:; style-src 'self' 'unsafe-inline'; base-uri 'none'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; connect-src {}; worker-src blob:; frame-src https://*.redgifs.com https://*.gfycat.com https://*.imgur.com https://*.redd.it;",
+		"default-src 'none'; font-src 'self'; script-src 'self' blob:; manifest-src 'self'; media-src 'self' data: blob: about: https://media.redgifs.com; style-src 'self' 'unsafe-inline'; base-uri 'none'; img-src 'self' data: https://media.redgifs.com; form-action 'self'; frame-ancestors 'none'; connect-src {}; worker-src blob:; frame-src https://*.redgifs.com https://*.gfycat.com https://*.imgur.com https://*.redd.it;",
 		connect_src.join(" ")
 	)
 }

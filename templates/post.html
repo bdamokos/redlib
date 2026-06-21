@@ -40,7 +40,7 @@
     {% else if post.post_type == "video" || post.post_type == "gif" %}
     <meta property="twitter:card" content="video">
     <meta property="og:type" content="video">
-    <meta property="og:video" content="{{ post.media.url }}">
+    <meta property="og:video" content="{{ post.media.display_video_url(prefs) }}">
     <meta property="og:video:type" content="video/mp4">
     {% else %}
     <meta property="og:type" content="website">

@@ -222,7 +222,7 @@
 
 			{% if post.media.download_name != "" %}
 			<li>
-				<a href="{{ post.media.url }}" download="{{ post.media.download_name }}">
+				<a href="{{ post.media.display_video_url(prefs) }}" download="{{ post.media.download_name }}">
 					<span class="mobile_item">dl</span>
 					<span class="desktop_item">download</span>
 				</a>
@@ -668,7 +668,7 @@
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
 			data-preview-render-mode="animation"
 			data-post-id="{{ post.id }}"
-			data-poster-url="{{ post.media.poster }}"
+			data-poster-url="{{ post.media.display_poster_url(prefs) }}"
 			data-duration-seconds="{{ post.media.duration_seconds }}"
 			data-width="{{ post.media.width }}"
 			data-height="{{ post.media.height }}"
@@ -677,7 +677,7 @@
 			data-media-url="{{ post.media.video_preview_job_hint }}"
 			{% endif %}
 			{% if !post.media.video_preview_fallback_url.is_empty() %}
-			data-preview-fallback-video-url="{{ post.media.video_preview_fallback_url }}"
+			data-preview-fallback-video-url="{{ post.media.display_video_preview_fallback_url(prefs) }}"
 			{% endif %}
 			{% endif %}
 		>
@@ -690,7 +690,7 @@
 			<video
 				id="vid_{{ post.id }}"
 				class="post_media_video short{% if use_dash %} video-dash{% endif %}{% if str_eq(prefs.autoplay_videos, "on") %} autoplay{% endif -%}"
-				poster="{{ post.media.poster }}"
+				poster="{{ post.media.display_poster_url(prefs) }}"
 				preload="metadata"
 				playsinline
 				controls
@@ -713,8 +713,8 @@
 				{% if use_hls -%}
 				<source src="{{ post.media.hls_url }}" type="application/vnd.apple.mpegurl" />
 				{% endif -%}
-				<source src="{{ post.media.url }}" type="video/mp4" />
-				<a href="{{ post.media.url }}">Video</a>
+				<source src="{{ post.media.display_video_url(prefs) }}" type="video/mp4" />
+				<a href="{{ post.media.display_video_url(prefs) }}">Video</a>
 			</video>
 			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
 			<div class="video_preview_layer" aria-hidden="true">

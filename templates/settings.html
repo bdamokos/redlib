@@ -122,23 +122,33 @@
 						%}>
 				</div>
 				{% endif %}
-				<div class="prefs-group">
-					<label for="autoplay_videos">Autoplay videos</label>
-					<input type="hidden" value="off" name="autoplay_videos">
-					<input type="checkbox" name="autoplay_videos" id="autoplay_videos" {% if prefs.autoplay_videos=="on"
-						%}checked{% endif %}>
-				</div>
-				<div class="prefs-group">
-					<label for="video_previews">Generate animated video previews</label>
-					<input type="hidden" value="off" name="video_previews">
-					<input type="checkbox" name="video_previews" id="video_previews" {% if prefs.video_previews=="on"
-						%}checked{% endif %}>
-				</div>
-				<div class="prefs-group">
-					<label for="fixed_navbar">Keep navbar fixed</label>
-					<input type="hidden" value="off" name="fixed_navbar">
-					<input type="checkbox" name="fixed_navbar" {% if prefs.fixed_navbar=="on" %}checked{% endif %}>
-				</div>
+					<div class="prefs-group">
+						<label for="autoplay_videos">Autoplay videos</label>
+						<input type="hidden" value="off" name="autoplay_videos">
+						<input type="checkbox" name="autoplay_videos" id="autoplay_videos" {% if prefs.autoplay_videos=="on"
+							%}checked{% endif %}>
+					</div>
+					<div class="prefs-group">
+						<label for="video_previews">Generate animated video previews</label>
+						<input type="hidden" value="off" name="video_previews">
+						<input type="checkbox" name="video_previews" id="video_previews" {% if prefs.video_previews=="on"
+							%}checked{% endif %}>
+					</div>
+					<div class="prefs-group">
+						<label for="direct_redgifs_media">Load RedGifs media directly</label>
+						<details class="feeds">
+							<summary>Why?</summary>
+							<div class="feed_list helper">Direct RedGifs media avoids routing video and poster downloads through Redlib. Turn this off to use Redlib's proxy for RedGifs media.</div>
+						</details>
+						<input type="hidden" value="off" name="direct_redgifs_media">
+						<input type="checkbox" name="direct_redgifs_media" id="direct_redgifs_media" {% if prefs.direct_redgifs_media!="off"
+							%}checked{% endif %}>
+					</div>
+					<div class="prefs-group">
+						<label for="fixed_navbar">Keep navbar fixed</label>
+						<input type="hidden" value="off" name="fixed_navbar">
+						<input type="checkbox" name="fixed_navbar" {% if prefs.fixed_navbar=="on" %}checked{% endif %}>
+					</div>
 				<div class="prefs-group">
 					<label for="hide_sidebar_and_summary">Hide the summary and sidebar</label>
 					<input type="hidden" value="off" name="hide_sidebar_and_summary">
