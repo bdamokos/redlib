@@ -519,6 +519,10 @@ function isOpenPostContextShortcutKey(event) {
     return !event.repeat && getKeyName(event) === "u";
 }
 
+function isFilterPostAuthorShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "x";
+}
+
 function isUserPage() {
     return /^\/(?:user|u)\//.test(window.location.pathname);
 }
@@ -552,6 +556,38 @@ function getPostContextLink(post) {
     const selector = isUserPage() ? ".post_subreddit[href^='/r/']" : ".post_author[href]";
 
     return post.querySelector(selector);
+}
+
+function getPostAuthorFilterValue(post) {
+    if (!(post instanceof Element)) {
+        return "";
+    }
+
+    const authorLink = post.querySelector(".post_author[href]");
+    if (!(authorLink instanceof HTMLAnchorElement)) {
+        return "";
+    }
+
+    const match = authorLink.pathname.match(/^\/(?:u|user)\/([^/?#]+)/);
+    if (match === null) {
+        return "";
+    }
+
+    const username = decodeURIComponent(match[1]).trim();
+    if (username === "" || username === "[deleted]") {
+        return "";
+    }
+
+    return `u_${username}`;
+}
+
+function filterCurrentPostAuthor() {
+    const filterValue = getPostAuthorFilterValue(findCurrentViewedPost());
+    if (filterValue === "" || typeof window.filterPreferenceValue !== "function") {
+        return false;
+    }
+
+    return window.filterPreferenceValue(filterValue) === true;
 }
 
 function openCurrentPostContext() {
@@ -595,6 +631,7 @@ document.addEventListener("keydown", (event) => {
     const isFollowShortcut = isFollowShortcutKey(event);
     const isExpandPreviewShortcut = isExpandPreviewShortcutKey(event);
     const isOpenPostContextShortcut = isOpenPostContextShortcutKey(event);
+    const isFilterPostAuthorShortcut = isFilterPostAuthorShortcutKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
     const isScrollNavigationKey = scrollDirection !== 0;
@@ -602,7 +639,7 @@ document.addEventListener("keydown", (event) => {
 
     if (
         event.defaultPrevented
-        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut)
+        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut && !isFilterPostAuthorShortcut)
         || event.altKey
         || event.ctrlKey
         || event.metaKey
@@ -623,6 +660,13 @@ document.addEventListener("keydown", (event) => {
 
     if (isExpandPreviewShortcut) {
         if (expandPostPreview(findExpandablePostPreview())) {
+            event.preventDefault();
+        }
+        return;
+    }
+
+    if (isFilterPostAuthorShortcut) {
+        if (filterCurrentPostAuthor()) {
             event.preventDefault();
         }
         return;

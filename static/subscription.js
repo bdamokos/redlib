@@ -431,8 +431,76 @@
         return true;
     };
 
+    const hiddenListPreferenceForm = (value, cookieName, actionName, labels) => {
+        const existing = getForms().find((form) => {
+            const intent = preferenceIntent(form);
+            return intent.mode === "list" && intent.cookieName === cookieName && sameValues(intent.values, [value]);
+        });
+        if (existing) {
+            return existing;
+        }
+
+        const encodedValue = encodeURIComponent(value);
+        const encodedRedirect = encodeURIComponent(`${window.location.pathname}${window.location.search}`);
+        const form = document.createElement("form");
+        form.hidden = true;
+        form.method = "POST";
+        form.action = `/r/${encodedValue}/${actionName}?redirect=${encodedRedirect}&canonical=${encodedValue}`;
+        form.dataset.subscriptionForm = "";
+        form.dataset.subscriptionTarget = `${actionName}:${value}`;
+        form.dataset.subscriptionState = labels.stateOff;
+        form.dataset.stateOn = labels.stateOn;
+        form.dataset.stateOff = labels.stateOff;
+        form.dataset.subscribeAction = `/r/${encodedValue}/${actionName}?redirect=${encodedRedirect}&canonical=${encodedValue}`;
+        form.dataset.unsubscribeAction = `/r/${encodedValue}/un${actionName}?redirect=${encodedRedirect}&canonical=${encodedValue}`;
+        form.dataset.subscribeLabel = labels.subscribeLabel;
+        form.dataset.unsubscribeLabel = labels.unsubscribeLabel;
+        form.dataset.subscribeClass = labels.subscribeClass;
+        form.dataset.unsubscribeClass = labels.unsubscribeClass;
+        form.dataset.cookieMode = "list";
+        form.dataset.cookieName = cookieName;
+        form.dataset.cookieValues = value;
+
+        const button = document.createElement("button");
+        button.type = "submit";
+        button.className = labels.subscribeClass;
+        button.textContent = labels.subscribeLabel;
+        form.append(button);
+        document.body.append(form);
+
+        return form;
+    };
+
+    const filterPreferenceValue = (value) => {
+        if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+            return false;
+        }
+
+        const form = hiddenListPreferenceForm(value, "filters", "filter", {
+            stateOn: "filtered",
+            stateOff: "unfiltered",
+            subscribeLabel: "Filter",
+            unsubscribeLabel: "Unfilter",
+            subscribeClass: "filter",
+            unsubscribeClass: "unfilter",
+        });
+        bindForm(form);
+
+        if (currentCookieState(form) === (form.dataset.stateOn || "filtered")) {
+            return false;
+        }
+
+        if (typeof form.requestSubmit === "function") {
+            form.requestSubmit();
+        } else {
+            form.querySelector("button")?.click();
+        }
+        return true;
+    };
+
     window.initializeSubscriptionForms = initializeSubscriptionForms;
     window.togglePrimarySubscription = togglePrimarySubscription;
+    window.filterPreferenceValue = filterPreferenceValue;
 
     window.addEventListener("focus", syncAllForms);
     document.addEventListener("visibilitychange", () => {
