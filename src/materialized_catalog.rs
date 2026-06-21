@@ -19,6 +19,9 @@ const SUGGESTED_PROFILE_SINGLE_OVERLAP_FACTOR: f64 = 0.60;
 const SUGGESTED_PROFILE_TWO_OVERLAP_FACTOR: f64 = 0.85;
 const SUGGESTED_PROFILE_VECTOR_SINGLE_OVERLAP_FACTOR: f64 = 0.45;
 const SUGGESTED_PROFILE_VECTOR_TWO_OVERLAP_FACTOR: f64 = 0.80;
+const AUTHOR_HISTORY_MAX_POST_AGE_SECS: u64 = 180 * 24 * 60 * 60;
+const AUTHOR_HISTORY_MAX_POSTS_PER_AUTHOR: usize = 160;
+const AUTHOR_HISTORY_GLOBAL_MAX_POSTS: usize = 60_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SuggestedProfileScoringMode {
@@ -76,7 +79,7 @@ pub struct SuggestedProfileEntry {
 	pub overlap_subreddits: Vec<SuggestedProfileSubreddit>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuggestedProfileMediaPost {
 	pub title: String,
 	pub permalink: String,
@@ -87,6 +90,25 @@ pub struct SuggestedProfileMediaPost {
 	pub nsfw: bool,
 	pub spoiler: bool,
 	pub created_ts: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedAuthorHistoryPost {
+	pub post_id: String,
+	pub subreddit: String,
+	pub created_ts: u64,
+	pub seen_at_unix: u64,
+	pub media_key: String,
+	pub media_post: Option<SuggestedProfileMediaPost>,
+	pub video_key: Option<String>,
+	pub video_duration_seconds: i64,
+	pub redgifs_username: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedAuthorHistoryEntry {
+	pub author: String,
+	pub posts: Vec<PersistedAuthorHistoryPost>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -141,6 +163,7 @@ struct MaterializedCatalog {
 	author_community_counts: HashMap<String, HashMap<String, usize>>,
 	author_video_stats: HashMap<String, crate::user::UserVideoStatsAccumulator>,
 	author_media_posts: HashMap<String, Vec<SuggestedProfileMediaPost>>,
+	author_history: HashMap<String, HashMap<String, PersistedAuthorHistoryPost>>,
 }
 
 static MATERIALIZED_CATALOG: LazyLock<Mutex<MaterializedCatalog>> = LazyLock::new(|| Mutex::new(MaterializedCatalog::default()));
@@ -242,11 +265,7 @@ fn normalize_suggested_profile_vector(vector: &mut HashMap<String, f64>) -> f64 
 	norm
 }
 
-fn suggested_profile_vector(
-	counts: &HashMap<String, usize>,
-	subreddit_weights: &HashMap<String, f64>,
-	limit: usize,
-) -> HashMap<String, f64> {
+fn suggested_profile_vector(counts: &HashMap<String, usize>, subreddit_weights: &HashMap<String, f64>, limit: usize) -> HashMap<String, f64> {
 	let mut vector = HashMap::new();
 	for (subreddit, count) in sorted_subreddit_counts(counts, limit) {
 		let Some(subreddit_weight) = subreddit_weights.get(&subreddit) else {
@@ -262,7 +281,10 @@ fn suggested_profile_vector(
 
 fn suggested_profile_dot(left: &HashMap<String, f64>, right: &HashMap<String, f64>) -> f64 {
 	let (small, large) = if left.len() <= right.len() { (left, right) } else { (right, left) };
-	small.iter().filter_map(|(key, left_weight)| large.get(key).map(|right_weight| left_weight * right_weight)).sum()
+	small
+		.iter()
+		.filter_map(|(key, left_weight)| large.get(key).map(|right_weight| left_weight * right_weight))
+		.sum()
 }
 
 fn suggested_profile_centroid(vectors: &[HashMap<String, f64>], indexes: &[usize]) -> HashMap<String, f64> {
@@ -447,26 +469,69 @@ fn suggested_profile_media_key(post: &Post, fallback_url: &str) -> String {
 		.unwrap_or_else(|| fallback_url.trim().to_ascii_lowercase())
 }
 
-fn suggested_profile_media_candidate(record: &CatalogRecord) -> Option<(String, SuggestedProfileMediaPost)> {
-	if record.post.kind == "t1" {
+fn suggested_profile_media_candidate_from_post(post: &Post, created_ts: u64) -> Option<(String, SuggestedProfileMediaPost)> {
+	if post.kind == "t1" {
 		return None;
 	}
-	let (image_url, media_type) = suggested_profile_media_source(&record.post)?;
-	let media_key = suggested_profile_media_key(&record.post, &image_url);
+	let (image_url, media_type) = suggested_profile_media_source(post)?;
+	let media_key = suggested_profile_media_key(post, &image_url);
 	Some((
 		media_key,
 		SuggestedProfileMediaPost {
-			title: record.post.title.clone(),
-			permalink: record.post.permalink.clone(),
-			subreddit: record.post.community.clone(),
+			title: post.title.clone(),
+			permalink: post.permalink.clone(),
+			subreddit: post.community.clone(),
 			image_url,
 			media_type: media_type.to_string(),
-			duration: record.post.media.duration.clone(),
-			nsfw: record.post.flags.nsfw,
-			spoiler: record.post.flags.spoiler,
-			created_ts: record.created_ts,
+			duration: post.media.duration.clone(),
+			nsfw: post.flags.nsfw,
+			spoiler: post.flags.spoiler,
+			created_ts,
 		},
 	))
+}
+
+fn suggested_profile_media_candidate(record: &CatalogRecord) -> Option<(String, SuggestedProfileMediaPost)> {
+	suggested_profile_media_candidate_from_post(&record.post, record.created_ts)
+}
+
+fn suggested_profile_media_post_references_reddit_asset(post: &SuggestedProfileMediaPost, asset_key: &str) -> bool {
+	crate::utils::reddit_image_asset_key(&post.image_url).is_some_and(|key| key == asset_key)
+}
+
+fn author_history_activity_ts(post: &PersistedAuthorHistoryPost) -> u64 {
+	post.created_ts.max(post.seen_at_unix)
+}
+
+fn author_history_post_from_post(post: &Post, now_unix: u64) -> Option<PersistedAuthorHistoryPost> {
+	if post.id.trim().is_empty() || post.author.name.trim().is_empty() || post.author.name == "[deleted]" {
+		return None;
+	}
+	let subreddit = post.community.trim().to_lowercase();
+	if subreddit.is_empty() || subreddit.starts_with("u_") || crate::utils::is_deleted_reddit_placeholder_post(post) {
+		return None;
+	}
+
+	let (media_key, media_post) = suggested_profile_media_candidate_from_post(post, post.created_ts)
+		.map(|(key, post)| (key, Some(post)))
+		.unwrap_or_else(|| (String::new(), None));
+	let redgifs_username = if matches!(post.post_type.as_str(), "video" | "gif") {
+		post.media.redgifs_username.clone()
+	} else {
+		String::new()
+	};
+
+	Some(PersistedAuthorHistoryPost {
+		post_id: post.id.clone(),
+		subreddit,
+		created_ts: post.created_ts,
+		seen_at_unix: now_unix,
+		media_key,
+		media_post,
+		video_key: crate::user::video_aggregate_key(post),
+		video_duration_seconds: post.media.duration_seconds,
+		redgifs_username,
+	})
 }
 
 fn suggested_profile_unique_media_posts(mut posts: Vec<(String, SuggestedProfileMediaPost)>, limit: usize) -> Vec<SuggestedProfileMediaPost> {
@@ -512,6 +577,77 @@ fn decorate_suggested_profiles(suggestions: &mut [SuggestedProfileEntry]) {
 	}
 }
 
+fn prune_author_history_locked(catalog: &mut MaterializedCatalog, now_unix: u64) {
+	let cutoff_unix = now_unix.saturating_sub(AUTHOR_HISTORY_MAX_POST_AGE_SECS);
+
+	for posts in catalog.author_history.values_mut() {
+		posts.retain(|_, post| author_history_activity_ts(post) >= cutoff_unix);
+		if posts.len() <= AUTHOR_HISTORY_MAX_POSTS_PER_AUTHOR {
+			continue;
+		}
+
+		let mut keep_ids = posts.keys().cloned().collect::<Vec<_>>();
+		keep_ids.sort_by(|left, right| {
+			let left_post = posts.get(left).expect("left post exists");
+			let right_post = posts.get(right).expect("right post exists");
+			author_history_activity_ts(right_post)
+				.cmp(&author_history_activity_ts(left_post))
+				.then_with(|| right.cmp(left))
+		});
+		keep_ids.truncate(AUTHOR_HISTORY_MAX_POSTS_PER_AUTHOR);
+		let keep_ids = keep_ids.into_iter().collect::<HashSet<_>>();
+		posts.retain(|post_id, _| keep_ids.contains(post_id));
+	}
+
+	catalog.author_history.retain(|_, posts| !posts.is_empty());
+
+	let total_posts = catalog.author_history.values().map(HashMap::len).sum::<usize>();
+	if total_posts <= AUTHOR_HISTORY_GLOBAL_MAX_POSTS {
+		return;
+	}
+
+	let mut posts_by_age = Vec::with_capacity(total_posts);
+	for (author, posts) in &catalog.author_history {
+		for (post_id, post) in posts {
+			posts_by_age.push((author_history_activity_ts(post), author.clone(), post_id.clone()));
+		}
+	}
+	posts_by_age.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
+
+	let remove_count = total_posts.saturating_sub(AUTHOR_HISTORY_GLOBAL_MAX_POSTS);
+	for (_, author, post_id) in posts_by_age.into_iter().take(remove_count) {
+		if let Some(posts) = catalog.author_history.get_mut(&author) {
+			posts.remove(&post_id);
+		}
+	}
+	catalog.author_history.retain(|_, posts| !posts.is_empty());
+}
+
+fn record_author_history_from_posts_locked(catalog: &mut MaterializedCatalog, posts: &[Post], now_unix: u64) {
+	for post in posts {
+		let author = post.author.name.trim().to_lowercase();
+		if author.is_empty() || author == "[deleted]" {
+			continue;
+		}
+		let Some(history_post) = author_history_post_from_post(post, now_unix) else {
+			continue;
+		};
+		catalog.author_history.entry(author).or_default().insert(history_post.post_id.clone(), history_post);
+	}
+	prune_author_history_locked(catalog, now_unix);
+}
+
+pub(crate) fn record_author_history_from_posts(posts: &[Post]) {
+	if posts.is_empty() {
+		return;
+	}
+	let now_unix = crate::cache_persistence::unix_now();
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	record_author_history_from_posts_locked(&mut catalog, posts, now_unix);
+	rebuild_indexes(&mut catalog);
+	crate::cache_persistence::mark_dirty();
+}
+
 fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
 	catalog.timeline_new = catalog
 		.posts_by_id
@@ -553,6 +689,42 @@ fn rebuild_indexes(catalog: &mut MaterializedCatalog) {
 				.or_default()
 				.entry(record.community_lc.clone())
 				.or_default() += 1;
+		}
+	}
+
+	for (author, posts) in &catalog.author_history {
+		if author.is_empty() {
+			continue;
+		}
+		for (post_id, post) in posts {
+			if catalog.posts_by_id.contains_key(post_id) {
+				continue;
+			}
+
+			catalog.author_to_post_ids.entry(author.clone()).or_default().insert(post_id.clone());
+			if !post.subreddit.is_empty() && !post.subreddit.starts_with("u_") {
+				*catalog
+					.author_community_counts
+					.entry(author.clone())
+					.or_default()
+					.entry(post.subreddit.clone())
+					.or_default() += 1;
+			}
+
+			if post.video_key.is_some() || !post.redgifs_username.is_empty() {
+				catalog
+					.author_video_stats
+					.entry(author.clone())
+					.or_default()
+					.observe_video_signal(post.video_key.clone(), post.video_duration_seconds, &post.redgifs_username);
+			}
+
+			if let Some(media_post) = &post.media_post {
+				author_media_candidates
+					.entry(author.clone())
+					.or_default()
+					.push((post.media_key.clone(), media_post.clone()));
+			}
 		}
 	}
 
@@ -613,6 +785,9 @@ pub(crate) fn apply_source_refresh(source: &FeedSource, posts: &[Post]) {
 	};
 
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	if !posts.is_empty() {
+		record_author_history_from_posts_locked(&mut catalog, posts, crate::cache_persistence::unix_now());
+	}
 	let prior_post_ids = catalog.source_to_post_ids.get(&source_key).cloned().unwrap_or_default();
 	let mut current_post_ids = HashSet::new();
 
@@ -739,7 +914,13 @@ pub(crate) fn suggested_profiles(
 	excluded_profiles: &HashSet<String>,
 	limit: usize,
 ) -> SuggestedProfilesReport {
-	suggested_profiles_with_mode(followed_profiles, followed_profile_subreddits, excluded_profiles, limit, SuggestedProfileScoringMode::Overlap)
+	suggested_profiles_with_mode(
+		followed_profiles,
+		followed_profile_subreddits,
+		excluded_profiles,
+		limit,
+		SuggestedProfileScoringMode::Overlap,
+	)
 }
 
 pub(crate) fn suggested_profiles_with_mode(
@@ -999,9 +1180,7 @@ fn suggested_profiles_vector_mode(
 		let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 		let mut profile_counts_by_profile = HashMap::new();
 		for (profile, counts) in &catalog.author_community_counts {
-			let counts = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS)
-				.into_iter()
-				.collect::<HashMap<_, _>>();
+			let counts = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS).into_iter().collect::<HashMap<_, _>>();
 			if !counts.is_empty() {
 				profile_counts_by_profile.insert(profile.clone(), counts);
 			}
@@ -1220,6 +1399,86 @@ pub(crate) fn catalog_video_stats(username: &str) -> Option<crate::user::UserVid
 	}
 }
 
+pub(crate) fn snapshot_persisted_author_history(now_unix: u64) -> Vec<PersistedAuthorHistoryEntry> {
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	prune_author_history_locked(&mut catalog, now_unix);
+	rebuild_indexes(&mut catalog);
+
+	let mut entries = catalog
+		.author_history
+		.iter()
+		.filter(|(author, posts)| !author.trim().is_empty() && !posts.is_empty())
+		.map(|(author, posts)| {
+			let mut posts = posts.values().cloned().collect::<Vec<_>>();
+			posts.sort_by(|left, right| {
+				author_history_activity_ts(right)
+					.cmp(&author_history_activity_ts(left))
+					.then_with(|| right.post_id.cmp(&left.post_id))
+			});
+			PersistedAuthorHistoryEntry { author: author.clone(), posts }
+		})
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| left.author.cmp(&right.author));
+	entries
+}
+
+pub(crate) fn restore_persisted_author_history(entries: Vec<PersistedAuthorHistoryEntry>, _saved_at_unix: u64, now_unix: u64) {
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	catalog.author_history.clear();
+
+	for entry in entries {
+		let author = normalize_profile_name(&entry.author);
+		if author.is_empty() || author == "[deleted]" {
+			continue;
+		}
+		let posts = catalog.author_history.entry(author).or_default();
+		for post in entry.posts {
+			if post.post_id.trim().is_empty() || post.subreddit.trim().is_empty() || post.subreddit.starts_with("u_") {
+				continue;
+			}
+			posts.insert(post.post_id.clone(), post);
+		}
+	}
+
+	prune_author_history_locked(&mut catalog, now_unix);
+	rebuild_indexes(&mut catalog);
+}
+
+pub(crate) fn mark_deleted_reddit_media_asset(deleted_asset_key: &str) -> usize {
+	let mut removed_media_posts = 0usize;
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+
+	for posts in catalog.author_history.values_mut() {
+		for post in posts.values_mut() {
+			let references_deleted_asset = post
+				.media_post
+				.as_ref()
+				.is_some_and(|media_post| suggested_profile_media_post_references_reddit_asset(media_post, deleted_asset_key));
+			if references_deleted_asset {
+				post.media_key.clear();
+				post.media_post = None;
+				removed_media_posts += 1;
+			}
+		}
+	}
+
+	if removed_media_posts > 0 {
+		rebuild_indexes(&mut catalog);
+		crate::cache_persistence::mark_dirty();
+	}
+
+	removed_media_posts
+}
+
+pub(crate) fn reset_source_catalog_preserving_author_history() {
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	catalog.posts_by_id.clear();
+	catalog.timeline_new.clear();
+	catalog.source_to_post_ids.clear();
+	rebuild_indexes(&mut catalog);
+}
+
+#[cfg(test)]
 pub(crate) fn reset_catalog() {
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	*catalog = MaterializedCatalog::default();
@@ -1250,7 +1509,8 @@ impl PersistedCatalogSourceKey {
 #[cfg(test)]
 mod tests {
 	use super::{
-		apply_source_refresh, catalog_user_sidebar_stats, query_source_candidates, reset_catalog, restore_catalog, snapshot_catalog, suggested_profiles, suggested_profiles_with_mode,
+		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_source_candidates, record_author_history_from_posts, reset_catalog,
+		restore_catalog, restore_persisted_author_history, snapshot_catalog, snapshot_persisted_author_history, suggested_profiles, suggested_profiles_with_mode,
 		SuggestedProfileScoringMode,
 	};
 	use crate::post_cache::{FeedSort, FeedSource};
@@ -1396,6 +1656,74 @@ mod tests {
 	}
 
 	#[test]
+	fn retained_author_history_survives_source_eviction_for_suggestions() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		let followed = vec![test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)];
+		let candidate = vec![test_post("bob-rust", "rust", "bob", 280), test_post("bob-programming", "programming", "bob", 270)];
+		let candidate_source = FeedSource::subreddit("rust", FeedSort::New);
+
+		apply_source_refresh(&FeedSource::subreddit("u_alice", FeedSort::New), &followed);
+		apply_source_refresh(&candidate_source, &candidate);
+		apply_source_refresh(&candidate_source, &[]);
+
+		assert!(query_source_candidates(&[candidate_source], &HashSet::new()).is_empty());
+		let report = suggested_profiles(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+
+		let suggestion = report.suggestions.first().expect("retained suggestion");
+		assert_eq!(suggestion.name, "bob");
+		assert_eq!(suggestion.cached_posts, 2);
+		assert_eq!(suggestion.matched_posts, 2);
+		assert_eq!(catalog_user_sidebar_stats("bob").expect("retained sidebar stats").subreddit_counts.len(), 2);
+	}
+
+	#[test]
+	fn retained_author_history_media_is_pruned_when_reddit_asset_is_deleted() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_alice", FeedSort::New),
+			&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)],
+		);
+		let candidate_source = FeedSource::subreddit("rust", FeedSort::New);
+		apply_source_refresh(
+			&candidate_source,
+			&[
+				test_image_post("bob-image", "rust", "bob", 280, "https://preview.redd.it/deleted.jpg?width=640&format=pjpg"),
+				test_post("bob-programming", "programming", "bob", 270),
+			],
+		);
+		apply_source_refresh(&candidate_source, &[]);
+
+		let before = suggested_profiles(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+		assert_eq!(before.suggestions[0].media_posts.len(), 1);
+
+		assert_eq!(mark_deleted_reddit_media_asset("preview.redd.it/deleted.jpg"), 1);
+
+		let after = suggested_profiles(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+		assert_eq!(after.suggestions[0].name, "bob");
+		assert!(after.suggestions[0].media_posts.is_empty());
+		assert_eq!(after.suggestions[0].cached_posts, 2);
+	}
+
+	#[test]
+	fn retained_author_history_snapshot_round_trips() {
+		let _guard = test_lock();
+		reset_catalog();
+		record_author_history_from_posts(&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)]);
+
+		let now_unix = crate::cache_persistence::unix_now();
+		let snapshot = snapshot_persisted_author_history(now_unix);
+		reset_catalog();
+		restore_persisted_author_history(snapshot, now_unix, now_unix);
+
+		let stats = catalog_user_sidebar_stats("alice").expect("restored retained sidebar stats");
+		assert_eq!(stats.subreddit_counts, vec![("programming".to_string(), 1), ("rust".to_string(), 1)]);
+	}
+
+	#[test]
 	fn snapshot_round_trip_preserves_sidebar_stats() {
 		let _guard = test_lock();
 		reset_catalog();
@@ -1506,13 +1834,7 @@ mod tests {
 		specialist.extend(test_posts("specialist-two", "rare_two", "rare_specialist", 2, 670));
 		apply_source_refresh(&FeedSource::subreddit("rare_one", FeedSort::New), &specialist);
 
-		let report = suggested_profiles_with_mode(
-			&["alice".to_string()],
-			&HashMap::new(),
-			&HashSet::new(),
-			10,
-			SuggestedProfileScoringMode::Vector,
-		);
+		let report = suggested_profiles_with_mode(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10, SuggestedProfileScoringMode::Vector);
 
 		let specialist_pos = report.suggestions.iter().position(|entry| entry.name == "rare_specialist").expect("rare specialist");
 		let common_pos = report.suggestions.iter().position(|entry| entry.name == "common_only").expect("common only");

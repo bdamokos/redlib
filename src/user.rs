@@ -64,18 +64,26 @@ pub(crate) struct UserVideoStatsAccumulator {
 
 impl UserVideoStatsAccumulator {
 	pub(crate) fn observe_post(&mut self, post: &Post) {
-		if matches!(post.post_type.as_str(), "video" | "gif") && !post.media.redgifs_username.is_empty() {
-			let slug = utils::normalize_creator_identity_slug(&post.media.redgifs_username);
+		let redgifs_username = if matches!(post.post_type.as_str(), "video" | "gif") {
+			post.media.redgifs_username.as_str()
+		} else {
+			""
+		};
+		self.observe_video_signal(video_aggregate_key(post), post.media.duration_seconds, redgifs_username);
+	}
+
+	pub(crate) fn observe_video_signal(&mut self, video_key: Option<String>, duration_seconds: i64, redgifs_username: &str) {
+		if !redgifs_username.is_empty() {
+			let slug = utils::normalize_creator_identity_slug(redgifs_username);
 			if !slug.is_empty() {
 				self.seen_redgifs_users.insert(slug);
 			}
 		}
 
-		let Some(video_key) = video_aggregate_key(post) else {
+		let Some(video_key) = video_key else {
 			return;
 		};
-
-		self.video_durations.entry(video_key).or_insert(post.media.duration_seconds);
+		self.video_durations.entry(video_key).or_insert(duration_seconds);
 	}
 
 	pub(crate) fn merge(&mut self, other: Self) {
@@ -1226,6 +1234,7 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 		all_posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
 	}
 	utils::store_user_subreddits(username, &all_posts);
+	crate::materialized_catalog::record_author_history_from_posts(&all_posts);
 	utils::hydrate_post_author_links_from_cache(&mut all_posts);
 	update_user_video_stats(username, &all_posts);
 	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
@@ -1262,6 +1271,7 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<Vec<Post>, St
 	let (posts, after) = Post::fetch(&path, false).await?;
 	utils::store_post_flairs(&posts);
 	utils::store_user_subreddits(username, &posts);
+	crate::materialized_catalog::record_author_history_from_posts(&posts);
 	update_user_video_stats(username, &posts);
 	crate::post_cache::store_source_posts_for_cache(&source, posts.clone(), after, Some(crate::post_cache::RefreshOrigin::DirectLiveFetch));
 	Ok(posts)
@@ -2982,6 +2992,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			store_user_metadata(&username, &scraped.user);
 			utils::store_post_flairs(&scraped.posts);
 			utils::store_user_subreddits(&username, &scraped.posts);
+			crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
 			if cacheable_submitted_first_page {
 				crate::post_cache::store_source_posts_for_cache(
 					&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
@@ -3066,6 +3077,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 					store_user_metadata(&username, &scraped.user);
 					utils::store_post_flairs(&scraped.posts);
 					utils::store_user_subreddits(&username, &scraped.posts);
+					crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
 					if cacheable_submitted_first_page {
 						crate::post_cache::store_source_posts_for_cache(
 							&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),

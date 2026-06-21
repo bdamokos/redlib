@@ -1258,7 +1258,7 @@ pub(crate) fn rebuild_materialized_catalog_from_source_cache() {
 		.map(|entry| (entry.source.clone(), entry.posts.clone()))
 		.collect::<Vec<_>>();
 
-	materialized_catalog::reset_catalog();
+	materialized_catalog::reset_source_catalog_preserving_author_history();
 	for (source, posts) in sources {
 		materialized_catalog::apply_source_refresh(&source, &posts);
 	}
@@ -2161,6 +2161,7 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 	let mut updated_sources = Vec::new();
 	let mut removed_primary_media = 0;
 	let mut removed_posts = 0;
+	let removed_history_media = materialized_catalog::mark_deleted_reddit_media_asset(&deleted_asset_key);
 
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
 		for (cache_key, entry) in cache.iter_mut() {
@@ -2203,12 +2204,13 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 		crate::cache_persistence::mark_dirty();
 	}
 
-	if !updated_sources.is_empty() || updated_sessions > 0 {
+	if !updated_sources.is_empty() || updated_sessions > 0 || removed_history_media > 0 {
 		info!(
-			"post_cache: marked deleted Reddit media asset {} (sources={}, sessions={}, primary_media_removed={}, posts_removed={})",
+			"post_cache: marked deleted Reddit media asset {} (sources={}, sessions={}, history_media_removed={}, primary_media_removed={}, posts_removed={})",
 			deleted_asset_key,
 			updated_sources.len(),
 			updated_sessions,
+			removed_history_media,
 			removed_primary_media,
 			removed_posts
 		);
