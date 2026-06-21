@@ -560,7 +560,9 @@ function openCurrentPostContext() {
         return false;
     }
 
-    window.open(link.href, "_blank", "noopener");
+    const openedWindow = window.open(link.href, "_blank", "noopener");
+    openedWindow?.blur?.();
+    window.focus();
     return true;
 }
 
