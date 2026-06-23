@@ -890,6 +890,39 @@ fn query_posts_for_keys_limited(catalog: &MaterializedCatalog, allowed_keys: &Ha
 	posts
 }
 
+pub(crate) fn query_author_posts_limited(username: &str, filters: &HashSet<String>, limit: usize) -> Vec<Post> {
+	let username = normalize_profile_name(username);
+	if username.is_empty() || limit == 0 {
+		return Vec::new();
+	}
+
+	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let Some(author_post_ids) = catalog.author_to_post_ids.get(&username) else {
+		return Vec::new();
+	};
+
+	let mut posts = Vec::new();
+	for entry in &catalog.timeline_new {
+		if !author_post_ids.contains(&entry.post_id) {
+			continue;
+		}
+		let Some(record) = catalog.posts_by_id.get(&entry.post_id) else {
+			continue;
+		};
+		if filters.contains(&record.post.community) || filters.contains(&format!("u_{}", record.post.author.name)) {
+			continue;
+		}
+		if crate::utils::is_deleted_reddit_placeholder_post(&record.post) {
+			continue;
+		}
+		posts.push(record.post.clone());
+		if posts.len() >= limit {
+			break;
+		}
+	}
+	posts
+}
+
 pub fn source_is_supported(source: &FeedSource) -> bool {
 	normalize_catalog_source(source).is_some()
 }
@@ -1686,7 +1719,7 @@ impl PersistedCatalogSourceKey {
 #[cfg(test)]
 mod tests {
 	use super::{
-		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_source_candidates, record_author_history_from_posts,
+		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_author_posts_limited, query_source_candidates, record_author_history_from_posts,
 		rejected_author_redgifs_profile_count, reset_catalog, restore_catalog, restore_persisted_author_history, restore_persisted_rejected_author_redgifs_profiles,
 		snapshot_catalog, snapshot_persisted_author_history, snapshot_persisted_rejected_author_redgifs_profiles, suggested_profiles, suggested_profiles_with_mode,
 		SuggestedProfileScoringMode,
@@ -1831,6 +1864,27 @@ mod tests {
 
 		let posts = query_source_candidates(&[comments], &HashSet::new());
 		assert_eq!(posts.into_iter().map(|post| post.id).collect::<Vec<_>>(), vec!["comment-post".to_string()]);
+	}
+
+	#[test]
+	fn query_author_posts_limited_returns_full_posts_from_any_source() {
+		let _guard = test_lock();
+		reset_catalog();
+		let alice_newer = test_post("alice-rust", "rust", "Alice", 300);
+		let alice_older = test_post("alice-programming", "programming", "alice", 290);
+		let bob = test_post("bob-rust", "rust", "bob", 280);
+
+		record_author_history_from_posts(&[test_post("alice-history-only", "history", "alice", 400)]);
+		apply_source_refresh(&FeedSource::subreddit("rust", FeedSort::New), &[alice_newer, bob]);
+		apply_source_refresh(&FeedSource::subreddit("programming", FeedSort::New), &[alice_older]);
+
+		let posts = query_author_posts_limited("u/Alice", &HashSet::new(), 10);
+
+		assert_eq!(
+			posts.into_iter().map(|post| post.id).collect::<Vec<_>>(),
+			vec!["alice-rust".to_string(), "alice-programming".to_string()]
+		);
+		reset_catalog();
 	}
 
 	#[test]

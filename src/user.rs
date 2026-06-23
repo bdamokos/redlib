@@ -28,6 +28,7 @@ const USER_METADATA_CACHE_SIZE: usize = 1000;
 const USER_METADATA_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
 const USER_VIDEO_STATS_CACHE_SIZE: usize = 1000;
 const USER_VIDEO_STATS_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
+const USER_CACHE_MATERIALIZED_POST_LIMIT: usize = 160;
 const FOLLOWING_PARENT_COMMENT_BATCH_SIZE: usize = 100;
 const FOLLOWING_PARENT_COMMENT_EXPAND_THRESHOLD: usize = 320;
 
@@ -1211,13 +1212,28 @@ fn cached_user_sources_for_listing(username: &str, listing: &str) -> Vec<crate::
 	}
 }
 
-fn cached_user_posts_for_listing(username: &str, listing: &str) -> Vec<Post> {
+fn cached_post_matches_user_listing(post: &Post, listing: &str) -> bool {
+	match listing {
+		"submitted" | "videos" => post.kind != "t1",
+		"comments" => post.kind == "t1",
+		"overview" => true,
+		_ => false,
+	}
+}
+
+fn cached_user_posts_for_listing(username: &str, listing: &str, filters: &HashSet<String>) -> Vec<Post> {
 	let mut posts = cached_user_sources_for_listing(username, listing)
 		.into_iter()
 		.filter_map(|source| crate::post_cache::servable_cached_source_posts(&source))
 		.flatten()
 		.collect::<Vec<_>>();
 
+	posts.extend(crate::materialized_catalog::query_author_posts_limited(
+		username,
+		filters,
+		USER_CACHE_MATERIALIZED_POST_LIMIT,
+	));
+	posts.retain(|post| cached_post_matches_user_listing(post, listing));
 	posts.sort_by(|left, right| {
 		post_feed_activity_ts(right)
 			.cmp(&post_feed_activity_ts(left))
@@ -1265,8 +1281,7 @@ fn merge_user_posts_with_cached_posts(live_posts: Vec<Post>, mut cached_posts: V
 }
 
 fn cached_video_mode_sidebar(req: &Request<Body>, username: &str, url: &str, query: &str, filters: &HashSet<String>) -> video_mode::VideoModeSidebarData {
-	let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
-	let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
+	let cached_posts = cached_user_posts_for_listing(username, "videos", filters);
 	let cookie_value = crate::utils::read_sharded_cookie(req, video_mode::VIDEO_MODE_QUERY_COOKIE);
 	let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
 	let listing_data = video_mode::build_listing(&cached_posts, filters, &parsed_query, now_unix());
@@ -1700,6 +1715,32 @@ mod tests {
 		assert_eq!(merged.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["live", "cached"]);
 		assert_eq!(merged.cached_post_ids, vec![super::cached_post_identity(&cached_extra)]);
 		assert!(!merged.all_cached_posts_filtered);
+	}
+
+	#[test]
+	fn cached_user_posts_for_listing_uses_materialized_posts_from_subreddit_cache() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		crate::materialized_catalog::reset_catalog();
+		let mut cached = test_post("cached-sub-post", "Cached subreddit post", "loaded_sub", "", "image", "https://i.redd.it/cached.jpg", &[]);
+		cached.author.name = "OpenedUser".to_string();
+		cached.created_ts = 300;
+		let mut filtered = test_post("cached-filtered", "Cached filtered post", "blocked_sub", "", "image", "https://i.redd.it/filtered.jpg", &[]);
+		filtered.author.name = "OpenedUser".to_string();
+		filtered.created_ts = 290;
+		let mut comment = test_comment("cached-comment", "loaded_sub", "cached comment", "t3", "Cached link");
+		comment.author.name = "OpenedUser".to_string();
+		comment.created_ts = 280;
+
+		crate::materialized_catalog::apply_source_refresh(
+			&crate::post_cache::FeedSource::subreddit("loaded_sub", crate::post_cache::FeedSort::New),
+			&[cached.clone(), filtered, comment],
+		);
+
+		let filters = HashSet::from(["blocked_sub".to_string()]);
+		let posts = super::cached_user_posts_for_listing("openeduser", "submitted", &filters);
+
+		assert_eq!(posts.into_iter().map(|post| post.id).collect::<Vec<_>>(), vec!["cached-sub-post".to_string()]);
+		crate::materialized_catalog::reset_catalog();
 	}
 
 	#[test]
@@ -3092,14 +3133,14 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		}
 	} else if video_listing {
 		let (source_posts, source_posts_from_cache) = if upstream_user_unavailable {
-			(cached_user_posts_for_listing(&username, "videos"), true)
+			(cached_user_posts_for_listing(&username, "videos", &filters), true)
 		} else {
 			match cached_or_live_user_video_posts(&username).await {
 				Ok(posts) => posts,
 				Err(msg) => {
 					if let Some(notice) = user_upstream_unavailable_notice(&username, &msg) {
 						status_notice = join_notices(&status_notice, &notice);
-						(cached_user_posts_for_listing(&username, "videos"), true)
+						(cached_user_posts_for_listing(&username, "videos", &filters), true)
 					} else {
 						return Err(msg);
 					}
@@ -3177,7 +3218,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				return (posts, Vec::new(), all_live_posts_filtered);
 			}
 
-			let merged = merge_user_posts_with_cached_posts(posts, cached_user_posts_for_listing(&username, &listing), &filters);
+			let merged = merge_user_posts_with_cached_posts(posts, cached_user_posts_for_listing(&username, &listing, &filters), &filters);
 			let all_posts_filtered = if merged.posts.is_empty() {
 				all_live_posts_filtered || merged.all_cached_posts_filtered
 			} else {
@@ -3225,7 +3266,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				all_posts_filtered,
 			)
 		} else if upstream_user_unavailable {
-			let merged = merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing), &filters);
+			let merged = merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing, &filters), &filters);
 			(
 				user.clone(),
 				merged.posts,
@@ -3253,7 +3294,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				Err(msg) if user_upstream_unavailable_notice(&username, &msg).is_some() => {
 					let notice = user_upstream_unavailable_notice(&username, &msg).unwrap_or_default();
 					fallback_notice = join_notices(&fallback_notice, &notice);
-					let merged = merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing), &filters);
+					let merged = merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing, &filters), &filters);
 					(
 						user.clone(),
 						merged.posts,
