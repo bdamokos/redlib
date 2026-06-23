@@ -673,6 +673,16 @@ fn duplicate_submission_keys(post: &Post) -> Vec<String> {
 	keys
 }
 
+pub(crate) fn post_merge_keys_attr(post: &Post) -> String {
+	let mut keys = Vec::new();
+	let identity = cached_post_identity(post);
+	if !identity.is_empty() {
+		keys.push(identity);
+	}
+	keys.extend(duplicate_submission_keys(post));
+	keys.join("\t")
+}
+
 fn duplicate_gif_key(post: &Post) -> Option<String> {
 	if let Some(embed_src) = extract_embed_src(&post.media.embed_code) {
 		return Some(format!("gif:{}", normalize_duplicate_url(&embed_src)));
@@ -2121,6 +2131,7 @@ mod tests {
 		assert!(html.contains("data-fragment-url=\"/user-fragment/demo_user\""));
 		assert!(html.contains("data-error-message=\"Loading the user page is taking longer than expected.\""));
 		assert!(html.contains("data-timeout-ms=\"20000\""));
+		assert!(!html.contains("data-append-fragment-content=\"true\""));
 		assert!(html.contains("Loading user page..."));
 		assert!(html.contains("id=\"page_fragment\""));
 		assert!(html.contains("<main>"));
@@ -2165,7 +2176,10 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-fragment-url=\"/user-fragment/demo_user\""));
+		assert!(html.contains("data-append-fragment-content=\"true\""));
 		assert!(html.contains("Cached shell title"));
+		assert!(html.contains("data-post-merge-keys=\"t3:cached"));
+		assert!(html.contains("image:https://i.redd.it/cached-shell.jpg"));
 		assert!(html.contains("user_cached_post_marker"));
 		assert!(html.contains("from cache"));
 		assert!(!html.contains("<center>Loading posts...</center>"));

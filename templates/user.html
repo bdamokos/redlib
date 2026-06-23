@@ -23,6 +23,7 @@
         data-replace-selector="{{ replace_selector }}"
         data-loading-message="{{ loading_message }}"
         data-error-message="Loading the user page is taking longer than expected."
+        {% if posts.len() > 0 || all_posts_filtered || all_posts_hidden_nsfw %}data-append-fragment-content="true"{% endif %}
         data-timeout-ms="20000">
         {% if posts.len() > 0 || all_posts_filtered || all_posts_hidden_nsfw %}
         {% include "user_fragment.html" %}
