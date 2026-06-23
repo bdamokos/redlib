@@ -29,11 +29,11 @@
     {% if all_posts_hidden_nsfw %}
     <center>All posts are hidden because they are NSFW. Enable "Show NSFW posts" in settings to view.</center>
     {% endif %}
+    {% if !fallback_notice.is_empty() %}
+    <center class="user_page_notice">{{ fallback_notice }}</center>
+    {% endif %}
     {% if no_posts %}
     <center>No posts were found.</center>
-    {% endif %}
-    {% if !fallback_notice.is_empty() %}
-    <center>{{ fallback_notice }}</center>
     {% endif %}
     {% if all_posts_filtered %}
     <center>(All content on this page has been filtered)</center>
@@ -42,6 +42,9 @@
         {% for post in posts %}
         {% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
         <hr class="sep" />
+        {% if self.post_from_cache(post) %}
+        <div class="user_cached_post_marker">from cache</div>
+        {% endif %}
         {% call utils::post_in_list(post, true, redirect_url.as_str()) %}
         {% endif %}
         {% endfor %}

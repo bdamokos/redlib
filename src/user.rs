@@ -137,6 +137,7 @@ pub struct UserTemplate {
 	user: User,
 	username: String,
 	posts: Vec<Post>,
+	cached_post_ids: Vec<String>,
 	user_subreddits: Vec<UserSubredditEntry>,
 	coomer_recent_posts: Option<utils::CoomerRecentPostsPanel>,
 	fallback_notice: String,
@@ -173,6 +174,7 @@ crate::impl_template_str_eq!(UserTemplate);
 struct UserFragmentTemplate {
 	user: User,
 	posts: Vec<Post>,
+	cached_post_ids: Vec<String>,
 	user_subreddits: Vec<UserSubredditEntry>,
 	coomer_recent_posts: Option<utils::CoomerRecentPostsPanel>,
 	fallback_notice: String,
@@ -210,6 +212,16 @@ struct UserSidebarTemplate {
 impl UserFragmentTemplate {
 	pub fn str_eq(&self, x: &str, y: &str) -> bool {
 		x == y
+	}
+
+	pub fn post_from_cache(&self, post: &Post) -> bool {
+		cached_post_ids_contains(&self.cached_post_ids, post)
+	}
+}
+
+impl UserTemplate {
+	pub fn post_from_cache(&self, post: &Post) -> bool {
+		cached_post_ids_contains(&self.cached_post_ids, post)
 	}
 }
 
@@ -1017,19 +1029,6 @@ fn build_url_from_query_pairs(path: &str, query_pairs: &[(String, String)]) -> S
 	}
 }
 
-fn query_with_cache_page(query: &str, cache_page: usize) -> String {
-	let mut serializer = form_urlencoded::Serializer::new(String::new());
-	serializer.extend_pairs(
-		form_urlencoded::parse(query.as_bytes())
-			.into_owned()
-			.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
-	);
-	if cache_page > 0 {
-		serializer.append_pair("cache_page", &cache_page.to_string());
-	}
-	serializer.finish()
-}
-
 fn now_unix() -> u64 {
 	OffsetDateTime::now_utc().unix_timestamp().max(0) as u64
 }
@@ -1172,6 +1171,99 @@ fn cached_or_placeholder_user(username: &str) -> User {
 	cached_user_metadata(username).unwrap_or_else(|| placeholder_user(username))
 }
 
+fn user_upstream_unavailable_notice(username: &str, msg: &str) -> Option<String> {
+	match msg.trim() {
+		"suspended" => Some(format!("u/{username} is suspended on Reddit. Showing cached posts when available.")),
+		"banned" => Some(format!("u/{username} is banned upstream. Showing cached posts when available.")),
+		_ => None,
+	}
+}
+
+fn cached_post_identity(post: &Post) -> String {
+	if !post.id.trim().is_empty() {
+		format!("{}:{}", post.kind, post.id)
+	} else {
+		post.permalink.trim().to_string()
+	}
+}
+
+fn cached_post_ids_contains(cached_post_ids: &[String], post: &Post) -> bool {
+	let identity = cached_post_identity(post);
+	!identity.is_empty() && cached_post_ids.iter().any(|value| value == &identity)
+}
+
+#[derive(Default)]
+struct UserPostMerge {
+	posts: Vec<Post>,
+	cached_post_ids: Vec<String>,
+	all_cached_posts_filtered: bool,
+}
+
+fn cached_user_sources_for_listing(username: &str, listing: &str) -> Vec<crate::post_cache::FeedSource> {
+	let submitted = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
+	let comments = crate::post_cache::FeedSource::user_comments(format!("u_{username}"), crate::post_cache::FeedSort::New);
+
+	match listing {
+		"submitted" | "videos" => vec![submitted],
+		"comments" => vec![comments],
+		"overview" => vec![submitted, comments],
+		_ => Vec::new(),
+	}
+}
+
+fn cached_user_posts_for_listing(username: &str, listing: &str) -> Vec<Post> {
+	let mut posts = cached_user_sources_for_listing(username, listing)
+		.into_iter()
+		.filter_map(|source| crate::post_cache::servable_cached_source_posts(&source))
+		.flatten()
+		.collect::<Vec<_>>();
+
+	posts.sort_by(|left, right| {
+		post_feed_activity_ts(right)
+			.cmp(&post_feed_activity_ts(left))
+			.then_with(|| right.created_ts.cmp(&left.created_ts))
+			.then_with(|| right.id.cmp(&left.id))
+	});
+	posts
+}
+
+fn request_is_first_user_page(query: &str) -> bool {
+	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
+	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
+	let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
+	request_after.is_empty() && request_before.is_empty() && cache_page == 0
+}
+
+fn merge_user_posts_with_cached_posts(live_posts: Vec<Post>, mut cached_posts: Vec<Post>, filters: &HashSet<String>) -> UserPostMerge {
+	let cached_raw_count = cached_posts.len();
+	let (_, all_cached_posts_filtered) = filter_posts(&mut cached_posts, filters);
+
+	let mut seen = HashSet::new();
+	for post in &live_posts {
+		let identity = cached_post_identity(post);
+		if !identity.is_empty() {
+			seen.insert(identity);
+		}
+	}
+
+	let mut posts = live_posts;
+	let mut cached_post_ids = Vec::new();
+	for post in cached_posts {
+		let identity = cached_post_identity(&post);
+		if identity.is_empty() || !seen.insert(identity.clone()) {
+			continue;
+		}
+		cached_post_ids.push(identity);
+		posts.push(post);
+	}
+
+	UserPostMerge {
+		posts,
+		cached_post_ids,
+		all_cached_posts_filtered: cached_raw_count > 0 && all_cached_posts_filtered,
+	}
+}
+
 fn cached_video_mode_sidebar(req: &Request<Body>, username: &str, url: &str, query: &str, filters: &HashSet<String>) -> video_mode::VideoModeSidebarData {
 	let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
 	let cached_posts = crate::post_cache::servable_cached_source_posts(&source).unwrap_or_default();
@@ -1240,30 +1332,10 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 	Ok((all_posts, after, all_posts_filtered))
 }
 
-fn cached_user_listing_posts(username: &str, listing: &str, sort: &str, query: &str) -> Option<(Vec<Post>, String, bool, bool)> {
-	if listing != "submitted" || sort != "new" {
-		return None;
-	}
-
-	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
-	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
-	if !request_after.is_empty() || !request_before.is_empty() {
-		return None;
-	}
-
-	let cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
-
-	crate::post_cache::get_cached_source_page(
-		&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
-		cache_page,
-		crate::post_cache::POSTS_PER_PAGE,
-	)
-}
-
-async fn cached_or_live_user_video_posts(username: &str) -> Result<Vec<Post>, String> {
+async fn cached_or_live_user_video_posts(username: &str) -> Result<(Vec<Post>, bool), String> {
 	let source = crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New);
 	if let Some(posts) = crate::post_cache::servable_cached_source_posts(&source) {
-		return Ok(posts);
+		return Ok((posts, true));
 	}
 
 	let path = format!("/user/{username}/submitted.json?sort=new&limit={}&raw_json=1", crate::post_cache::per_source_limit());
@@ -1273,13 +1345,14 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<Vec<Post>, St
 	crate::materialized_catalog::record_author_history_from_posts(&posts);
 	update_user_video_stats(username, &posts);
 	crate::post_cache::store_source_posts_for_cache(&source, posts.clone(), after, Some(crate::post_cache::RefreshOrigin::DirectLiveFetch));
-	Ok(posts)
+	Ok((posts, false))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::{append_missing_following_link_posts, collapse_duplicate_submissions};
 	use askama::Template;
+	use std::collections::HashSet;
 	use url::form_urlencoded;
 
 	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, FollowingComment, Media, ParentComment, Post, Preferences};
@@ -1615,6 +1688,66 @@ mod tests {
 	}
 
 	#[test]
+	fn merge_user_posts_with_cached_posts_marks_only_cache_additions() {
+		let live = test_post("live", "Live title", "demo_sub", "", "image", "https://i.redd.it/live.jpg", &[]);
+		let cached_duplicate = test_post("live", "Cached duplicate", "demo_sub", "", "image", "https://i.redd.it/live.jpg", &[]);
+		let cached_extra = test_post("cached", "Cached title", "demo_sub", "", "image", "https://i.redd.it/cached.jpg", &[]);
+		let cached_filtered = test_post("filtered", "Filtered title", "blocked_sub", "", "image", "https://i.redd.it/filtered.jpg", &[]);
+		let filters = HashSet::from(["blocked_sub".to_string()]);
+
+		let merged = super::merge_user_posts_with_cached_posts(vec![live], vec![cached_duplicate, cached_extra.clone(), cached_filtered], &filters);
+
+		assert_eq!(merged.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["live", "cached"]);
+		assert_eq!(merged.cached_post_ids, vec![super::cached_post_identity(&cached_extra)]);
+		assert!(!merged.all_cached_posts_filtered);
+	}
+
+	#[test]
+	fn renders_from_cache_marker_for_marked_user_posts() {
+		let live = test_post("live", "Live title", "demo_sub", "", "image", "https://i.redd.it/live.jpg", &[]);
+		let cached = test_post("cached", "Cached title", "demo_sub", "", "image", "https://i.redd.it/cached.jpg", &[]);
+		let cached_post_ids = vec![super::cached_post_identity(&cached)];
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![live, cached],
+			cached_post_ids,
+			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
+			fallback_notice: "u/demo_user is suspended on Reddit. Showing cached posts when available.".to_string(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert_eq!(html.matches("user_cached_post_marker").count(), 1);
+		assert!(html.contains("from cache"));
+		assert!(html.contains("u/demo_user is suspended on Reddit"));
+		assert!(html.find("Live title").unwrap() < html.find("from cache").unwrap());
+	}
+
+	#[test]
 	fn collapses_matching_embedded_gif_posts() {
 		let posts = vec![
 			test_embed_gif_post("one", "Embed one", "sub_one", "https://www.redgifs.com/ifr/mediumpurplesoggyconure/"),
@@ -1704,6 +1837,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![post],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -1755,6 +1889,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -1793,6 +1928,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: Vec::new(),
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -1843,6 +1979,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "video", "https://v.redd.it/example", &[])],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -1917,6 +2054,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: Vec::new(),
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -1998,6 +2136,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: Vec::new(),
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -2082,6 +2221,7 @@ mod tests {
 				"t1",
 				"Thread title",
 			)],
+			cached_post_ids: Vec::new(),
 			user_subreddits: vec![
 				super::UserSubredditEntry {
 					name: "demo_sub".to_string(),
@@ -2164,6 +2304,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![post],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -2453,6 +2594,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -2493,6 +2635,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -2531,6 +2674,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: Some(crate::utils::CoomerRecentPostsPanel {
 				filtered_to_video: true,
@@ -2584,6 +2728,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[])],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: Some(crate::utils::CoomerRecentPostsPanel {
 				filtered_to_video: true,
@@ -2643,6 +2788,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![post],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -2695,6 +2841,7 @@ mod tests {
 			},
 			username: "demo_user".to_string(),
 			posts: vec![post],
+			cached_post_ids: Vec::new(),
 			user_subreddits: Vec::new(),
 			coomer_recent_posts: None,
 			fallback_notice: String::new(),
@@ -2747,6 +2894,7 @@ mod tests {
 				"t1",
 				"Thread title",
 			)],
+			cached_post_ids: Vec::new(),
 			user_subreddits: vec![super::UserSubredditEntry {
 				name: "DemoSub".to_string(),
 				count: 1,
@@ -2817,6 +2965,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		user: shell_user,
 		username: username.clone(),
 		posts: Vec::new(),
+		cached_post_ids: Vec::new(),
 		user_subreddits,
 		coomer_recent_posts: None,
 		fallback_notice: String::new(),
@@ -2869,7 +3018,6 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let sort = param(&path, "sort").unwrap_or_default();
 	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
 	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
-	let cached_listing_page = cached_user_listing_posts(&username, &listing, &sort, query);
 	let pre_scraped = if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
 		info!("user: using scrape fallback for {} because Reddit is currently rate limited", current_url);
 		match instance_scrape::scrape_user_page(&current_url).await {
@@ -2882,11 +3030,30 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	} else {
 		None
 	};
-	let user = pre_scraped
+	let mut user = pre_scraped
 		.as_ref()
 		.map(|scraped| scraped.user.clone())
 		.unwrap_or_else(|| cached_or_placeholder_user(&username));
-	let status_notice = String::new();
+	let mut status_notice = String::new();
+	let mut upstream_user_unavailable = false;
+	if pre_scraped.is_none() {
+		match tokio::time::timeout(StdDuration::from_secs(4), fetch_user_metadata_status(&username)).await {
+			Ok(Ok(fresh_user)) => {
+				user = fresh_user;
+			}
+			Ok(Err(msg)) => {
+				if let Some(notice) = user_upstream_unavailable_notice(&username, &msg) {
+					status_notice = notice;
+					upstream_user_unavailable = true;
+				} else {
+					info!("user: profile metadata unavailable for u/{username}: {msg}");
+				}
+			}
+			Err(_) => {
+				warn!("user: profile metadata timed out for u/{username}");
+			}
+		}
+	}
 	let coomer_recent_posts: Option<utils::CoomerRecentPostsPanel> = None;
 
 	if video_listing || (listing == "submitted" && sort == "new" && request_after.is_empty() && request_before.is_empty()) {
@@ -2903,6 +3070,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		UserFragmentTemplate {
 			user,
 			posts: Vec::new(),
+			cached_post_ids: Vec::new(),
 			user_subreddits: user_sidebar_subreddits(&username),
 			coomer_recent_posts,
 			fallback_notice: status_notice.clone(),
@@ -2923,7 +3091,21 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			video_mode_sidebar: empty_video_mode_sidebar(),
 		}
 	} else if video_listing {
-		let source_posts = cached_or_live_user_video_posts(&username).await?;
+		let (source_posts, source_posts_from_cache) = if upstream_user_unavailable {
+			(cached_user_posts_for_listing(&username, "videos"), true)
+		} else {
+			match cached_or_live_user_video_posts(&username).await {
+				Ok(posts) => posts,
+				Err(msg) => {
+					if let Some(notice) = user_upstream_unavailable_notice(&username, &msg) {
+						status_notice = join_notices(&status_notice, &notice);
+						(cached_user_posts_for_listing(&username, "videos"), true)
+					} else {
+						return Err(msg);
+					}
+				}
+			}
+		};
 		let cookie_value = crate::utils::read_sharded_cookie(&req, video_mode::VIDEO_MODE_QUERY_COOKIE);
 		let parsed_query = video_mode::parse_query_or_cookie(query, &cookie_value);
 		let listing_data = video_mode::build_listing(&source_posts, &filters, &parsed_query, now_unix());
@@ -2948,14 +3130,20 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		let avg_video_length = cached_avg_video_length(&username);
 		let mut posts = posts;
 		utils::hydrate_post_author_links_from_cache(&mut posts);
+		let cached_post_ids = if source_posts_from_cache {
+			posts.iter().map(cached_post_identity).filter(|identity| !identity.is_empty()).collect()
+		} else {
+			Vec::new()
+		};
 		let video_mode_sidebar = build_video_mode_sidebar(&url, &listing_data, &posts, &normalized_query);
 
 		UserFragmentTemplate {
 			user: user.clone(),
 			posts,
+			cached_post_ids,
 			user_subreddits: user_sidebar_subreddits(&username),
 			coomer_recent_posts,
-			fallback_notice: String::new(),
+			fallback_notice: status_notice.clone(),
 			sort: (String::new(), String::new()),
 			ends: (String::new(), String::new()),
 			listing,
@@ -2981,116 +3169,101 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			video_mode_sidebar,
 		}
 	} else {
-		let cacheable_submitted_first_page = listing == "submitted"
-			&& sort == "new"
-			&& param(&format!("?{query}"), "after").unwrap_or_default().is_empty()
-			&& param(&format!("?{query}"), "before").unwrap_or_default().is_empty();
+		let first_user_page = request_is_first_user_page(query);
+		let cacheable_submitted_first_page = listing == "submitted" && sort == "new" && first_user_page;
+		let cacheable_comments_first_page = listing == "comments" && sort == "new" && first_user_page;
+		let merge_cached_posts = |posts: Vec<Post>, all_live_posts_filtered: bool| -> (Vec<Post>, Vec<String>, bool) {
+			if !first_user_page {
+				return (posts, Vec::new(), all_live_posts_filtered);
+			}
+
+			let merged = merge_user_posts_with_cached_posts(posts, cached_user_posts_for_listing(&username, &listing), &filters);
+			let all_posts_filtered = if merged.posts.is_empty() {
+				all_live_posts_filtered || merged.all_cached_posts_filtered
+			} else {
+				false
+			};
+			(merged.posts, merged.cached_post_ids, all_posts_filtered)
+		};
+		let store_live_listing_cache = |posts: &[Post], after: &str| {
+			if cacheable_submitted_first_page {
+				crate::post_cache::store_source_posts_for_cache(
+					&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
+					posts.to_vec(),
+					after.to_string(),
+					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+				);
+			}
+			if cacheable_comments_first_page {
+				crate::post_cache::store_source_posts_for_cache(
+					&crate::post_cache::FeedSource::user_comments(format!("u_{username}"), crate::post_cache::FeedSort::New),
+					posts.to_vec(),
+					after.to_string(),
+					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+				);
+			}
+		};
 		let mut fallback_notice = String::new();
 		let maybe_scraped = pre_scraped;
-		let (fragment_user, posts, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some(scraped) = maybe_scraped {
+		let (fragment_user, posts, cached_post_ids, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some(scraped) = maybe_scraped {
 			store_user_metadata(&username, &scraped.user);
 			utils::store_post_flairs(&scraped.posts);
 			utils::store_user_subreddits(&username, &scraped.posts);
 			crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
-			if cacheable_submitted_first_page {
-				crate::post_cache::store_source_posts_for_cache(
-					&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
-					scraped.posts.clone(),
-					scraped.after.clone(),
-					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
-				);
-			}
+			store_live_listing_cache(&scraped.posts, &scraped.after);
+			let mut scraped_posts = scraped.posts.clone();
+			let (_, all_scraped_posts_filtered) = filter_posts(&mut scraped_posts, &filters);
+			let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(scraped_posts, all_scraped_posts_filtered);
 			fallback_notice = join_notices(&status_notice, instance_scrape::scrape_notice());
-			(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
-		} else if let Some((mut posts, mut after, mut has_prev, mut has_next)) = cached_listing_page {
-			let mut cache_page = param(&format!("?{query}"), "cache_page").and_then(|page| page.parse::<usize>().ok()).unwrap_or(0);
-			let mut all_posts_filtered;
-			let mut filtered_page_advances = 0;
-			// Mirror live cursor skipping for cached user listing pages.
-			loop {
-				let (_, page_all_posts_filtered) = filter_posts(&mut posts, &filters);
-				all_posts_filtered = page_all_posts_filtered;
-				if !page_all_posts_filtered || !has_next || !after.is_empty() || filtered_page_advances >= MAX_FILTERED_PAGE_ADVANCE {
-					break;
-				}
-
-				let next_cache_page = cache_page + 1;
-				let next_query = query_with_cache_page(query, next_cache_page);
-				let Some((next_posts, next_after, next_has_prev, next_has_next)) = cached_user_listing_posts(&username, &listing, &sort, &next_query) else {
-					break;
-				};
-				posts = next_posts;
-				after = next_after;
-				has_prev = next_has_prev;
-				has_next = next_has_next;
-				cache_page = next_cache_page;
-				filtered_page_advances += 1;
-			}
-			utils::hydrate_post_author_links_from_cache(&mut posts);
-			let prev = if has_prev {
-				let prev_page = cache_page.saturating_sub(1).to_string();
-				let prev_url = format!("/user/{username}/submitted");
-				let prev_query = form_urlencoded::Serializer::new(String::new())
-					.extend_pairs(
-						form_urlencoded::parse(query.as_bytes())
-							.into_owned()
-							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
-					)
-					.append_pair("cache_page", &prev_page)
-					.finish();
-				if prev_query.is_empty() {
-					prev_url
-				} else {
-					format!("{prev_url}?{prev_query}")
-				}
-			} else {
-				String::new()
-			};
-			let next = if has_next && !after.is_empty() {
-				let next_url = format!("/user/{username}/submitted");
-				let next_query = form_urlencoded::Serializer::new(String::new())
-					.extend_pairs(
-						form_urlencoded::parse(query.as_bytes())
-							.into_owned()
-							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
-					)
-					.append_pair("after", &after)
-					.finish();
-				if next_query.is_empty() {
-					next_url
-				} else {
-					format!("{next_url}?{next_query}")
-				}
-			} else if has_next {
-				let next_page = (cache_page + 1).to_string();
-				let next_url = format!("/user/{username}/submitted");
-				let next_query = form_urlencoded::Serializer::new(String::new())
-					.extend_pairs(
-						form_urlencoded::parse(query.as_bytes())
-							.into_owned()
-							.filter(|(key, _)| key != "after" && key != "before" && key != "cache_page"),
-					)
-					.append_pair("cache_page", &next_page)
-					.finish();
-				if next_query.is_empty() {
-					next_url
-				} else {
-					format!("{next_url}?{next_query}")
-				}
-			} else {
-				String::new()
-			};
-			(user.clone(), posts, (String::new(), String::new()), prev, next, all_posts_filtered)
+			(
+				scraped.user,
+				posts,
+				cached_post_ids,
+				(String::new(), scraped.after),
+				String::new(),
+				String::new(),
+				all_posts_filtered,
+			)
+		} else if upstream_user_unavailable {
+			let merged = merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing), &filters);
+			(
+				user.clone(),
+				merged.posts,
+				merged.cached_post_ids,
+				(String::new(), String::new()),
+				String::new(),
+				String::new(),
+				merged.all_cached_posts_filtered,
+			)
 		} else {
 			match fetch_user_listing_posts(&username, &path, &listing, &filters).await {
-				Ok((posts, after, all_posts_filtered)) => (
-					user.clone(),
-					posts,
-					(param(&path, "after").unwrap_or_default(), after),
-					String::new(),
-					String::new(),
-					all_posts_filtered,
-				),
+				Ok((posts, after, all_posts_filtered)) => {
+					store_live_listing_cache(&posts, &after);
+					let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(posts, all_posts_filtered);
+					(
+						user.clone(),
+						posts,
+						cached_post_ids,
+						(param(&path, "after").unwrap_or_default(), after),
+						String::new(),
+						String::new(),
+						all_posts_filtered,
+					)
+				}
+				Err(msg) if user_upstream_unavailable_notice(&username, &msg).is_some() => {
+					let notice = user_upstream_unavailable_notice(&username, &msg).unwrap_or_default();
+					fallback_notice = join_notices(&fallback_notice, &notice);
+					let merged = merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing), &filters);
+					(
+						user.clone(),
+						merged.posts,
+						merged.cached_post_ids,
+						(String::new(), String::new()),
+						String::new(),
+						String::new(),
+						merged.all_cached_posts_filtered,
+					)
+				}
 				Err(msg) if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) => {
 					info!("user: retrying {} via scrape fallback after listing error: {}", current_url, msg);
 					let scraped = instance_scrape::scrape_user_page(&current_url).await.map_err(|_| msg.clone())?;
@@ -3098,16 +3271,20 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 					utils::store_post_flairs(&scraped.posts);
 					utils::store_user_subreddits(&username, &scraped.posts);
 					crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
-					if cacheable_submitted_first_page {
-						crate::post_cache::store_source_posts_for_cache(
-							&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
-							scraped.posts.clone(),
-							scraped.after.clone(),
-							Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
-						);
-					}
+					store_live_listing_cache(&scraped.posts, &scraped.after);
+					let mut scraped_posts = scraped.posts.clone();
+					let (_, all_scraped_posts_filtered) = filter_posts(&mut scraped_posts, &filters);
+					let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(scraped_posts, all_scraped_posts_filtered);
 					fallback_notice = join_notices(&status_notice, instance_scrape::scrape_notice());
-					(scraped.user, scraped.posts, (String::new(), scraped.after), String::new(), String::new(), false)
+					(
+						scraped.user,
+						posts,
+						cached_post_ids,
+						(String::new(), scraped.after),
+						String::new(),
+						String::new(),
+						all_posts_filtered,
+					)
 				}
 				Err(msg) => {
 					warn!("user: direct listing request failed for {} without usable scrape fallback: {}", current_url, msg);
@@ -3122,6 +3299,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		UserFragmentTemplate {
 			user: fragment_user,
 			posts,
+			cached_post_ids,
 			user_subreddits: user_sidebar_subreddits(&username),
 			coomer_recent_posts,
 			fallback_notice,
@@ -3209,31 +3387,28 @@ pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		.map_err(|error| error.to_string())
 }
 
-// USER
-async fn user(name: &str) -> Result<User, String> {
-	if let Some(cached) = cached_user_metadata(name) {
-		return Ok(cached);
-	}
-
-	// Build the Reddit JSON API path
-	let path: String = format!("/user/{name}/about.json?raw_json=1");
-
-	// Send a request to the url
-	let res = json(path, false).await?;
-
+async fn parse_user_metadata(name: &str, res: &serde_json::Value, enrich_external_links: bool) -> User {
 	// Grab creation date as unix timestamp
 	let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
 	let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-	let profile = utils::user_profile_details_with_social_links(name, &res["data"]["subreddit"]).await;
-	let external_links = tokio::time::timeout(StdDuration::from_secs(6), utils::external_links_with_coomer_lookups(profile.external_links.clone()))
-		.await
-		.unwrap_or_else(|_| profile.external_links.clone());
+	let profile = if enrich_external_links {
+		utils::user_profile_details_with_social_links(name, &res["data"]["subreddit"]).await
+	} else {
+		utils::user_profile_details(&res["data"]["subreddit"])
+	};
+	let external_links = if enrich_external_links {
+		tokio::time::timeout(StdDuration::from_secs(6), utils::external_links_with_coomer_lookups(profile.external_links.clone()))
+			.await
+			.unwrap_or_else(|_| profile.external_links.clone())
+	} else {
+		profile.external_links
+	};
 
 	// Closure used to parse JSON from Reddit APIs
 	let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
 
 	// Parse the JSON output into a User struct
-	let user = User {
+	User {
 		name: res["data"]["name"].as_str().unwrap_or(name).to_owned(),
 		title: about("title"),
 		icon: format_url(&about("icon_img")),
@@ -3245,9 +3420,35 @@ async fn user(name: &str) -> Result<User, String> {
 		bio_html: profile.bio_html,
 		external_links,
 		nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
-	};
+	}
+}
+
+async fn fetch_user_metadata_with_mode(name: &str, enrich_external_links: bool) -> Result<User, String> {
+	// Build the Reddit JSON API path
+	let path: String = format!("/user/{name}/about.json?raw_json=1");
+
+	// Send a request to the url
+	let res = json(path, false).await?;
+	let user = parse_user_metadata(name, &res, enrich_external_links).await;
 	store_user_metadata(name, &user);
 	Ok(user)
+}
+
+async fn fetch_user_metadata_fresh(name: &str) -> Result<User, String> {
+	fetch_user_metadata_with_mode(name, true).await
+}
+
+async fn fetch_user_metadata_status(name: &str) -> Result<User, String> {
+	fetch_user_metadata_with_mode(name, false).await
+}
+
+// USER
+async fn user(name: &str) -> Result<User, String> {
+	if let Some(cached) = cached_user_metadata(name) {
+		return Ok(cached);
+	}
+
+	fetch_user_metadata_fresh(name).await
 }
 
 pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
