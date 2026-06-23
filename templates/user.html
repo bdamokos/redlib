@@ -24,12 +24,16 @@
         data-loading-message="{{ loading_message }}"
         data-error-message="Loading the user page is taking longer than expected."
         data-timeout-ms="20000">
+        {% if posts.len() > 0 || all_posts_filtered || all_posts_hidden_nsfw %}
+        {% include "user_fragment.html" %}
+        {% else %}
         <main>
             <div id="column_one">
                 <center>Loading posts...</center>
             </div>
             {% include "user_sidebar.html" %}
         </main>
+        {% endif %}
     </div>
     {% else %}
     {% include "user_fragment.html" %}

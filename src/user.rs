@@ -29,6 +29,7 @@ const USER_METADATA_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
 const USER_VIDEO_STATS_CACHE_SIZE: usize = 1000;
 const USER_VIDEO_STATS_CACHE_TTL: StdDuration = StdDuration::from_secs(10_800);
 const USER_CACHE_MATERIALIZED_POST_LIMIT: usize = 160;
+const USER_CACHE_SUBREDDIT_SOURCE_LIMIT: usize = 64;
 const FOLLOWING_PARENT_COMMENT_BATCH_SIZE: usize = 100;
 const FOLLOWING_PARENT_COMMENT_EXPAND_THRESHOLD: usize = 320;
 
@@ -1221,6 +1222,41 @@ fn cached_post_matches_user_listing(post: &Post, listing: &str) -> bool {
 	}
 }
 
+fn cached_subreddit_source_posts_for_user(username: &str, listing: &str, filters: &HashSet<String>) -> Vec<Post> {
+	if listing == "comments" {
+		return Vec::new();
+	}
+
+	let username_lc = username.trim().to_lowercase();
+	if username_lc.is_empty() {
+		return Vec::new();
+	}
+
+	let mut seen_sources = HashSet::new();
+	let mut posts = Vec::new();
+	for entry in user_sidebar_subreddits(username).into_iter().take(USER_CACHE_SUBREDDIT_SOURCE_LIMIT) {
+		let subreddit = entry.name.trim();
+		if subreddit.is_empty() || filters.contains(subreddit) || filters.contains(&subreddit.to_lowercase()) {
+			continue;
+		}
+		if !seen_sources.insert(subreddit.to_lowercase()) {
+			continue;
+		}
+
+		let source = crate::post_cache::FeedSource::subreddit(subreddit.to_string(), crate::post_cache::FeedSort::New);
+		let Some(cached_posts) = crate::post_cache::servable_cached_source_posts(&source) else {
+			continue;
+		};
+		posts.extend(
+			cached_posts
+				.into_iter()
+				.filter(|post| post.author.name.trim().eq_ignore_ascii_case(&username_lc))
+				.filter(|post| cached_post_matches_user_listing(post, listing)),
+		);
+	}
+	posts
+}
+
 fn cached_user_posts_for_listing(username: &str, listing: &str, filters: &HashSet<String>) -> Vec<Post> {
 	let mut posts = cached_user_sources_for_listing(username, listing)
 		.into_iter()
@@ -1228,6 +1264,7 @@ fn cached_user_posts_for_listing(username: &str, listing: &str, filters: &HashSe
 		.flatten()
 		.collect::<Vec<_>>();
 
+	posts.extend(cached_subreddit_source_posts_for_user(username, listing, filters));
 	posts.extend(crate::materialized_catalog::query_author_posts_limited(
 		username,
 		filters,
@@ -1254,6 +1291,7 @@ fn merge_user_posts_with_cached_posts(live_posts: Vec<Post>, mut cached_posts: V
 	let cached_raw_count = cached_posts.len();
 	let (_, all_cached_posts_filtered) = filter_posts(&mut cached_posts, filters);
 
+	let mut cached_identities = HashSet::new();
 	let mut seen = HashSet::new();
 	for post in &live_posts {
 		let identity = cached_post_identity(post);
@@ -1269,8 +1307,15 @@ fn merge_user_posts_with_cached_posts(live_posts: Vec<Post>, mut cached_posts: V
 		if identity.is_empty() || !seen.insert(identity.clone()) {
 			continue;
 		}
-		cached_post_ids.push(identity);
+		cached_identities.insert(identity);
 		posts.push(post);
+	}
+	posts = collapse_duplicate_submissions(posts);
+	for post in &posts {
+		let identity = cached_post_identity(post);
+		if cached_identities.contains(&identity) {
+			cached_post_ids.push(identity);
+		}
 	}
 
 	UserPostMerge {
@@ -1718,6 +1763,50 @@ mod tests {
 	}
 
 	#[test]
+	fn merge_user_posts_with_cached_posts_collapses_cached_duplicate_under_live_post() {
+		let live = test_post("live", "Live title", "sub_one", "", "image", "https://i.redd.it/shared.jpg?width=2048", &[]);
+		let cached_duplicate = test_post(
+			"cached-duplicate",
+			"Cached duplicate",
+			"sub_two",
+			"",
+			"image",
+			"https://i.redd.it/shared.jpg?width=1024",
+			&[],
+		);
+		let filters = HashSet::new();
+
+		let merged = super::merge_user_posts_with_cached_posts(vec![live], vec![cached_duplicate], &filters);
+
+		assert_eq!(merged.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["live"]);
+		assert_eq!(merged.posts[0].collapsed_duplicates.len(), 1);
+		assert_eq!(merged.posts[0].collapsed_duplicates[0].title, "Cached duplicate");
+		assert!(merged.cached_post_ids.is_empty());
+	}
+
+	#[test]
+	fn merge_user_posts_with_cached_posts_collapses_cache_only_duplicates() {
+		let cached_primary = test_post("cached-primary", "Cached primary", "sub_one", "", "image", "https://i.redd.it/shared.jpg?width=2048", &[]);
+		let cached_duplicate = test_post(
+			"cached-duplicate",
+			"Cached duplicate",
+			"sub_two",
+			"",
+			"image",
+			"https://i.redd.it/shared.jpg?width=1024",
+			&[],
+		);
+		let filters = HashSet::new();
+
+		let merged = super::merge_user_posts_with_cached_posts(Vec::new(), vec![cached_primary.clone(), cached_duplicate], &filters);
+
+		assert_eq!(merged.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["cached-primary"]);
+		assert_eq!(merged.posts[0].collapsed_duplicates.len(), 1);
+		assert_eq!(merged.posts[0].collapsed_duplicates[0].title, "Cached duplicate");
+		assert_eq!(merged.cached_post_ids, vec![super::cached_post_identity(&cached_primary)]);
+	}
+
+	#[test]
 	fn cached_user_posts_for_listing_uses_materialized_posts_from_subreddit_cache() {
 		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 		crate::materialized_catalog::reset_catalog();
@@ -1741,6 +1830,39 @@ mod tests {
 
 		assert_eq!(posts.into_iter().map(|post| post.id).collect::<Vec<_>>(), vec!["cached-sub-post".to_string()]);
 		crate::materialized_catalog::reset_catalog();
+	}
+
+	#[test]
+	fn cached_user_posts_for_listing_loads_sidebar_subreddit_source_cache_without_catalog() {
+		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		crate::materialized_catalog::reset_catalog();
+		crate::utils::clear_test_caches();
+		let mut cached = test_post(
+			"cached-sidebar-source-post",
+			"Cached sidebar source post",
+			"sidebar_loaded_sub",
+			"",
+			"image",
+			"https://i.redd.it/sidebar-cached.jpg",
+			&[],
+		);
+		cached.author.name = "OpenedUser".to_string();
+		cached.created_ts = 300;
+
+		crate::post_cache::store_source_posts_for_cache(
+			&crate::post_cache::FeedSource::subreddit("sidebar_loaded_sub", crate::post_cache::FeedSort::New),
+			vec![cached.clone()],
+			String::new(),
+			Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+		);
+		crate::materialized_catalog::reset_catalog();
+		crate::utils::store_user_subreddits("openeduser", &[cached.clone()]);
+
+		let posts = super::cached_user_posts_for_listing("openeduser", "submitted", &HashSet::new());
+
+		assert_eq!(posts.into_iter().map(|post| post.id).collect::<Vec<_>>(), vec!["cached-sidebar-source-post".to_string()]);
+		crate::materialized_catalog::reset_catalog();
+		crate::utils::clear_test_caches();
 	}
 
 	#[test]
@@ -2003,6 +2125,50 @@ mod tests {
 		assert!(html.contains("id=\"page_fragment\""));
 		assert!(html.contains("<main>"));
 		assert!(html.contains("<aside>"));
+	}
+
+	#[test]
+	fn renders_shell_mode_cached_posts_before_fragment_loads() {
+		let cached = test_post("cached", "Cached shell title", "demo_sub", "", "image", "https://i.redd.it/cached-shell.jpg", &[]);
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts: vec![cached.clone()],
+			cached_post_ids: vec![super::cached_post_identity(&cached)],
+			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: true,
+			fragment_url: "/user-fragment/demo_user".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: "Loading user page...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-fragment-url=\"/user-fragment/demo_user\""));
+		assert!(html.contains("Cached shell title"));
+		assert!(html.contains("user_cached_post_marker"));
+		assert!(html.contains("from cache"));
+		assert!(!html.contains("<center>Loading posts...</center>"));
 	}
 
 	#[test]
@@ -2996,6 +3162,12 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let user_subreddits = user_sidebar_subreddits(&username);
 	let avg_video_length = cached_avg_video_length(&username);
 	let shell_user = cached_or_placeholder_user(&username);
+	let cached_shell_merge = if !video_listing && request_is_first_user_page(query) {
+		merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing, &filters), &filters)
+	} else {
+		UserPostMerge::default()
+	};
+	let shell_all_posts_hidden_nsfw = !cached_shell_merge.posts.is_empty() && cached_shell_merge.posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on";
 	let video_mode_sidebar = if video_listing {
 		cached_video_mode_sidebar(&req, &username, &url, query, &filters)
 	} else {
@@ -3005,8 +3177,8 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(template(&UserTemplate {
 		user: shell_user,
 		username: username.clone(),
-		posts: Vec::new(),
-		cached_post_ids: Vec::new(),
+		posts: cached_shell_merge.posts,
+		cached_post_ids: cached_shell_merge.cached_post_ids,
 		user_subreddits,
 		coomer_recent_posts: None,
 		fallback_notice: String::new(),
@@ -3017,8 +3189,8 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 		url: url.clone(),
 		redirect_url,
 		is_filtered,
-		all_posts_filtered: false,
-		all_posts_hidden_nsfw: false,
+		all_posts_filtered: cached_shell_merge.all_cached_posts_filtered,
+		all_posts_hidden_nsfw: shell_all_posts_hidden_nsfw,
 		avg_video_length,
 		no_posts: false,
 		shell_mode: true,
