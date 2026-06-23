@@ -141,15 +141,50 @@ fn content_security_policy() -> String {
 	)
 }
 
+fn register_subreddit_fragment_routes(app: &mut server::Server) {
+	app.at("/subreddit-fragment").get(|r| subreddit::community_fragment(r).boxed());
+	app.at("/subreddit-fragment/r/:sub").get(|r| subreddit::community_fragment(r).boxed());
+	app.at("/subreddit-fragment/r/:sub/:sort").get(|r| subreddit::community_fragment(r).boxed());
+	app.at("/subreddit-fragment/following").get(|r| subreddit::community_fragment(r).boxed());
+	app.at("/subreddit-fragment/following/:sort").get(|r| subreddit::community_fragment(r).boxed());
+	app.at("/subreddit-fragment/:sort").get(|r| subreddit::community_fragment(r).boxed());
+}
+
 #[cfg(test)]
 mod tests {
 	use super::configured_origin;
+	use hyper::Method;
+	use redlib::server::Server;
 
 	#[test]
 	fn configured_origin_keeps_scheme_host_and_port() {
 		assert_eq!(configured_origin("https://redlib1.bdamokos.org/path?q=1"), Some("https://redlib1.bdamokos.org".to_string()));
 		assert_eq!(configured_origin("http://127.0.0.1:18081/settings"), Some("http://127.0.0.1:18081".to_string()));
 		assert_eq!(configured_origin("not a url"), None);
+	}
+
+	#[test]
+	fn subreddit_fragment_route_keeps_subreddit_param() {
+		let mut app = Server::new();
+		super::register_subreddit_fragment_routes(&mut app);
+
+		let params = app.recognize_params_for_test(&Method::GET, "/subreddit-fragment/r/rust").expect("subreddit fragment route");
+
+		assert_eq!(params.find("sub"), Some("rust"));
+		assert_eq!(params.find("sort"), None);
+	}
+
+	#[test]
+	fn subreddit_fragment_route_keeps_subreddit_sort_param() {
+		let mut app = Server::new();
+		super::register_subreddit_fragment_routes(&mut app);
+
+		let params = app
+			.recognize_params_for_test(&Method::GET, "/subreddit-fragment/r/rust/top")
+			.expect("subreddit sorted fragment route");
+
+		assert_eq!(params.find("sub"), Some("rust"));
+		assert_eq!(params.find("sort"), Some("top"));
 	}
 }
 
@@ -512,12 +547,7 @@ async fn main() {
 	app.at("/bookmarks/add").post(|r| bookmarks::add(r).boxed());
 	app.at("/bookmarks/remove").post(|r| bookmarks::remove(r).boxed());
 	app.at("/suggested-profiles").get(|r| suggested_profiles::page(r).boxed());
-	app.at("/subreddit-fragment").get(|r| subreddit::community_fragment(r).boxed());
-	app.at("/subreddit-fragment/:sort").get(|r| subreddit::community_fragment(r).boxed());
-	app.at("/subreddit-fragment/following").get(|r| subreddit::community_fragment(r).boxed());
-	app.at("/subreddit-fragment/following/:sort").get(|r| subreddit::community_fragment(r).boxed());
-	app.at("/subreddit-fragment/r/:sub").get(|r| subreddit::community_fragment(r).boxed());
-	app.at("/subreddit-fragment/r/:sub/:sort").get(|r| subreddit::community_fragment(r).boxed());
+	register_subreddit_fragment_routes(&mut app);
 
 	app.at("/r/:sub/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/r/:sub/comments/:id/:title").get(|r| post::item(r).boxed());

@@ -304,6 +304,11 @@ impl Server {
 		}
 	}
 
+	#[doc(hidden)]
+	pub fn recognize_params_for_test(&self, method: &Method, path: &str) -> Option<Params> {
+		self.router.recognize(&format!("/{}{}", method.as_str(), path)).ok().map(|found| found.params().clone())
+	}
+
 	pub fn listen(self, addr: &str) -> Boxed<Result<(), hyper::Error>> {
 		let make_svc = make_service_fn(move |_conn| {
 			// For correct borrowing, these values need to be borrowed
