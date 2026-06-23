@@ -296,8 +296,9 @@
 {% endif %}
 {%- endmacro %}
 
-{% macro post_in_list(post, show_subscription_button, redirect_url) -%}
+{% macro post_in_list(post, show_subscription_button, redirect_url, auto_expand_followed_users) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
+{% set auto_expand_preview = auto_expand_followed_users && prefs.has_followed_user(post.author.name.as_str()) -%}
 <div
 	id="{{ post.id }}"
 	class="post{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post.following_comments.len() > 0 %} post_following_bundle{% endif %}"
@@ -382,7 +383,7 @@
 		{% else if (post.post_type == "gif" || post.post_type == "video") %}
 			{% call render_video_html(post, "list") %}
 		{% else if post.post_type == "gallery" %}
-		<div class="gallery post_preview">
+		<div class="gallery post_preview{% if auto_expand_preview %} expanded{% endif %}">
 		{% for image in post.gallery -%}
 			<figure>
 				<a href="{{ image.url }}">
@@ -439,7 +440,7 @@
     {% endif %}
     <span class="label"> Upvotes</span></div>
 	{% if !post.preview_body.is_empty() || !post.body.is_empty() %}
-	<div class="post_body post_preview">
+	<div class="post_body post_preview{% if auto_expand_preview %} expanded{% endif %}">
 		{% if !post.preview_body.is_empty() %}
 		{{ post.preview_body|safe }}
 		{% else %}

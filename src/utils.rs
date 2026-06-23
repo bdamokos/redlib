@@ -2295,6 +2295,10 @@ impl Preferences {
 		self.subscriptions_lc.contains(&value.to_ascii_lowercase())
 	}
 
+	pub fn has_followed_user(&self, username: &str) -> bool {
+		!username.is_empty() && self.has_subscription(&format!("u_{username}"))
+	}
+
 	pub fn has_followed_users(&self) -> bool {
 		self.subscriptions.iter().any(|subscription| subscription.starts_with("u_"))
 	}
@@ -6263,6 +6267,20 @@ mod tests {
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
 		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+	}
+
+	#[test]
+	fn followed_user_detection_uses_user_subscription_prefix_case_insensitively() {
+		let mut prefs = Preferences {
+			subscriptions: vec!["u_Demo_User".to_string(), "rust".to_string()],
+			..Preferences::default()
+		};
+		prefs.prepare_for_runtime();
+
+		assert!(prefs.has_followed_user("demo_user"));
+		assert!(prefs.has_followed_user("DEMO_USER"));
+		assert!(!prefs.has_followed_user("rust"));
+		assert!(!prefs.has_followed_user(""));
 	}
 
 	#[test]

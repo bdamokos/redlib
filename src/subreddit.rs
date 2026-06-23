@@ -3516,6 +3516,33 @@ mod tests {
 	}
 
 	#[test]
+	fn feed_preview_from_followed_author_renders_expanded() {
+		let mut post = test_post();
+		post.preview_body = "<div class=\"md\"><p>Long followed-author preview.</p></div>".to_string();
+
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["u_demo_user".to_string()];
+		prefs.prepare_for_runtime();
+
+		let html = super::FeedFragmentTemplate {
+			posts: vec![post],
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs,
+			url: "/following/new".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("class=\"post_body post_preview expanded\""));
+	}
+
+	#[test]
 	fn does_not_render_sidebar_panel_when_subreddit_sidebar_is_empty() {
 		let html = SubredditTemplate {
 			sub: Subreddit {

@@ -15,7 +15,7 @@
 {% for post in posts %}
 {% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
 <hr class="sep" />
-{% call utils::post_in_list(post, false, "") %}
+{% call utils::post_in_list(post, false, "", true) %}
 {% endif %}
 {% endfor %}
 {% if prefs.use_hls == "on" %}

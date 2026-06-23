@@ -45,7 +45,7 @@
         {% if self.post_from_cache(post) %}
         <div class="user_cached_post_marker">from cache</div>
         {% endif %}
-        {% call utils::post_in_list(post, true, redirect_url.as_str()) %}
+        {% call utils::post_in_list(post, true, redirect_url.as_str(), false) %}
         {% endif %}
         {% endfor %}
         {% if prefs.use_hls == "on" %}
