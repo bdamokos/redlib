@@ -1332,6 +1332,21 @@ fn feed_page_url(current_url: &str, session_id: &str, page: usize) -> String {
 	)
 }
 
+async fn ensure_contextual_feed_session(requested_session_id: String, request: FeedSessionRequest, cache_page: usize) -> String {
+	if crate::post_cache::continue_feed_session_with_budget(
+		&requested_session_id,
+		cache_page,
+		crate::post_cache::POSTS_PER_PAGE,
+		CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET,
+	)
+	.await
+	{
+		return requested_session_id;
+	}
+
+	crate::post_cache::ensure_feed_session_with_budget(request, cache_page, crate::post_cache::POSTS_PER_PAGE, CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET).await
+}
+
 fn now_unix() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_secs()).unwrap_or_default()
 }
@@ -1850,20 +1865,21 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		let timeframe = param(&format!("?{}", query), "t").unwrap_or_default();
 		let query_fingerprint = listing_query_fingerprint(&query);
 		let front_page_session_sources = build_front_page_session_sources(&prefs, &front_page, front_page_is_default, aggregate_front_page, &sub_name, &sort);
+		let requested_feed_session_id = param(&format!("?{}", query), FEED_SESSION_PARAM).unwrap_or_default();
 
-		let feed_session_id = crate::post_cache::ensure_feed_session_with_budget(
+		let feed_session_id = ensure_contextual_feed_session(
+			requested_feed_session_id,
 			FeedSessionRequest {
 				sources: front_page_session_sources,
 				filters: get_filters(&req),
 				quarantine: true,
 				query_fingerprint,
+				cache_revision: crate::post_cache::source_cache_revision(),
 				bundle_followed_user_comments: is_following_front_page(&front_page),
 				merge_sort: following_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
 			cache_page,
-			crate::post_cache::POSTS_PER_PAGE,
-			CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET,
 		)
 		.await;
 
@@ -2354,19 +2370,20 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			.and_then(|p| p.parse::<usize>().ok())
 			.unwrap_or(0);
 		let query_fingerprint = listing_query_fingerprint(&query);
-		let feed_session_id = crate::post_cache::ensure_feed_session_with_budget(
+		let requested_feed_session_id = param(&format!("?{}", req.uri().query().unwrap_or_default()), FEED_SESSION_PARAM).unwrap_or_default();
+		let feed_session_id = ensure_contextual_feed_session(
+			requested_feed_session_id,
 			FeedSessionRequest {
 				sources: front_page_session_sources,
 				filters: filters.clone(),
 				quarantine: quarantined,
 				query_fingerprint,
+				cache_revision: crate::post_cache::source_cache_revision(),
 				bundle_followed_user_comments: is_following_front_page(&front_page),
 				merge_sort: following_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
 			cache_page,
-			crate::post_cache::POSTS_PER_PAGE,
-			CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET,
 		)
 		.await;
 

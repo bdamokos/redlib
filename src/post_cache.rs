@@ -14,6 +14,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use tokio::time::{Duration, MissedTickBehavior};
@@ -355,6 +356,7 @@ pub struct FeedSessionRequest {
 	pub filters: HashSet<String>,
 	pub quarantine: bool,
 	pub query_fingerprint: String,
+	pub cache_revision: u64,
 	pub bundle_followed_user_comments: bool,
 	/// When set, merge / finalize use this sort while [`FeedSource::sort`] may differ (e.g. `/following/hot`
 	/// loads `New` listings to match daemon-cached `u_` keys).
@@ -368,6 +370,7 @@ impl Default for FeedSessionRequest {
 			filters: HashSet::new(),
 			quarantine: false,
 			query_fingerprint: String::new(),
+			cache_revision: 0,
 			bundle_followed_user_comments: false,
 			merge_sort: None,
 		}
@@ -430,6 +433,7 @@ static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::
 pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+static SOURCE_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
 
 fn source_cache_is_expired(entry: &CachedSourcePosts) -> bool {
 	entry.fetched_at.elapsed().as_secs() > CACHE_TTL_SECS
@@ -944,6 +948,30 @@ fn prune_source_cache_locked(cache: &mut HashMap<String, CachedSourcePosts>) -> 
 	pruned_sources
 }
 
+pub fn source_cache_revision() -> u64 {
+	SOURCE_CACHE_REVISION.load(AtomicOrdering::Relaxed)
+}
+
+fn bump_source_cache_revision() {
+	SOURCE_CACHE_REVISION.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+fn source_window_signature(posts: &[Post], after: &str) -> u64 {
+	let mut hasher = DefaultHasher::new();
+	after.hash(&mut hasher);
+	posts.len().hash(&mut hasher);
+	for post in posts {
+		post.id.hash(&mut hasher);
+		post.kind.hash(&mut hasher);
+		post.community.hash(&mut hasher);
+		post.author.name.hash(&mut hasher);
+		post.created_ts.hash(&mut hasher);
+		post.score.1.hash(&mut hasher);
+		post.post_type.hash(&mut hasher);
+	}
+	hasher.finish()
+}
+
 pub(crate) fn prune_source_cache() {
 	let pruned_sources = {
 		let Ok(mut cache) = SOURCE_CACHE.lock() else {
@@ -964,6 +992,7 @@ pub(crate) fn prune_source_cache() {
 			crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
 		}
 	}
+	bump_source_cache_revision();
 	crate::cache_persistence::mark_dirty();
 }
 
@@ -985,7 +1014,12 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	if materialized_catalog::source_is_supported(source) {
 		materialized_catalog::apply_source_refresh(source, &posts);
 	}
+	let new_signature = source_window_signature(&posts, &after);
+	let mut source_window_changed = true;
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
+		source_window_changed = cache
+			.get(&source.cache_key())
+			.is_none_or(|entry| source_window_signature(&entry.posts, &entry.after) != new_signature);
 		cache.insert(
 			source.cache_key(),
 			CachedSourcePosts {
@@ -1000,6 +1034,9 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 		if let Some(entry) = cache.get(&source.cache_key()) {
 			write_source_entry_to_disk(&source.cache_key(), entry);
 		}
+	}
+	if source_window_changed || !pruned_sources.is_empty() {
+		bump_source_cache_revision();
 	}
 	if is_persisted_subreddit_feed_source(source) || materialized_catalog::source_is_supported(source) {
 		crate::cache_persistence::mark_dirty();
@@ -1643,6 +1680,7 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	let mut hasher = DefaultHasher::new();
 	request.quarantine.hash(&mut hasher);
 	request.query_fingerprint.hash(&mut hasher);
+	request.cache_revision.hash(&mut hasher);
 	request.bundle_followed_user_comments.hash(&mut hasher);
 	request.merge_sort.hash(&mut hasher);
 
@@ -2201,6 +2239,7 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 	}
 
 	if !updated_sources.is_empty() {
+		bump_source_cache_revision();
 		crate::cache_persistence::mark_dirty();
 	}
 
@@ -2615,6 +2654,46 @@ pub async fn ensure_feed_session(request: FeedSessionRequest, page: usize, per_p
 
 pub async fn ensure_feed_session_with_budget(request: FeedSessionRequest, page: usize, per_page: usize, max_sync_sources: usize) -> String {
 	ensure_feed_session_inner(request, page, per_page, Some(max_sync_sources)).await
+}
+
+pub async fn continue_feed_session_with_budget(session_id: &str, page: usize, per_page: usize, _max_sync_sources: usize) -> bool {
+	if session_id.trim().is_empty() {
+		return false;
+	}
+
+	reconcile_stuck_fetching_sources(session_id).await;
+	{
+		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+		sessions.retain(|_, session| !session_is_expired(session));
+		let Some(session) = sessions.get_mut(session_id) else {
+			return false;
+		};
+		session.requested_page = session.requested_page.max(page);
+		reconcile_session_with_source_cache(session);
+		touch_session(session);
+	}
+
+	let warm_mode = {
+		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(session) = sessions.get_mut(session_id) else {
+			return false;
+		};
+		plan_session_warm_mode(session, page, per_page, false)
+	};
+
+	if let Some(warm_mode) = warm_mode {
+		let background_id = session_id.to_string();
+		tokio::spawn(async move {
+			match warm_mode {
+				SessionWarmMode::InitialLoad => warm_session_background(background_id).await,
+				SessionWarmMode::FollowupCachePreferred { max_sources } => {
+					warm_session_followup_cached(background_id, page, per_page, max_sources).await;
+				}
+			}
+		});
+	}
+
+	true
 }
 
 pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_page: usize) -> String {
@@ -3096,20 +3175,22 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 mod tests {
 	use super::{
 		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, build_session_id,
-		cache_status_for_preferences, catalog_source_candidates, count_sources_in_state, effective_freshness_target_secs, feed_page, feed_status, followup_source_budget,
-		get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget,
-		merged_posts_for_session, merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
-		prune_source_cache, publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal,
-		remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts,
-		session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable,
+		cache_status_for_preferences, catalog_source_candidates, continue_feed_session_with_budget, count_sources_in_state, effective_freshness_target_secs,
+		ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
+		mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
+		pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache, publish_plain_subreddit_refresh,
+		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits,
+		remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts,
+		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision,
 		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource,
 		RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
-		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE,
+		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE, SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 	use std::cmp::Ordering;
 	use std::collections::{HashMap, HashSet};
+	use std::sync::atomic::Ordering as AtomicOrdering;
 	use std::sync::{LazyLock, Mutex, MutexGuard};
 	use std::time::{Duration, Instant};
 
@@ -3124,6 +3205,7 @@ mod tests {
 		FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		SOURCE_CACHE_REVISION.store(0, AtomicOrdering::Relaxed);
 		crate::materialized_catalog::reset_catalog();
 		crate::utils::clear_test_caches();
 		crate::user::clear_test_caches();
@@ -3609,6 +3691,120 @@ mod tests {
 			..new_merge.clone()
 		};
 		assert_ne!(build_session_id(&new_merge), build_session_id(&hot_merge));
+	}
+
+	#[test]
+	fn session_identity_differs_when_cache_revision_changes() {
+		let base = FeedSessionRequest {
+			sources: vec![new_source("rust")],
+			filters: HashSet::new(),
+			quarantine: false,
+			query_fingerprint: "sort=new".to_string(),
+			cache_revision: 1,
+			..Default::default()
+		};
+		let changed = FeedSessionRequest {
+			cache_revision: 2,
+			..base.clone()
+		};
+
+		assert_ne!(build_session_id(&base), build_session_id(&changed));
+	}
+
+	#[test]
+	fn source_cache_revision_advances_only_when_source_window_changes() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		let posts = vec![test_post("one", "rust", 100), test_post("two", "rust", 90)];
+		assert_eq!(source_cache_revision(), 0);
+
+		seed_source(&source, posts.clone());
+		let first_revision = source_cache_revision();
+		assert!(first_revision > 0);
+
+		seed_source(&source, posts);
+		assert_eq!(source_cache_revision(), first_revision);
+
+		seed_source(&source, vec![test_post("new", "rust", 110), test_post("one", "rust", 100)]);
+		assert!(source_cache_revision() > first_revision);
+	}
+
+	#[test]
+	fn fresh_session_after_cache_revision_change_does_not_reuse_frozen_page() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		let old_posts = (0..POSTS_PER_PAGE)
+			.map(|index| test_post(&format!("old-{index}"), "rust", 1_000 - index as u64))
+			.collect::<Vec<_>>();
+		seed_source(&source, old_posts);
+
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+		let old_session_id = runtime.block_on(ensure_feed_session_with_budget(
+			FeedSessionRequest {
+				sources: vec![source.clone()],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "front-page".to_string(),
+				cache_revision: source_cache_revision(),
+				..Default::default()
+			},
+			0,
+			POSTS_PER_PAGE,
+			1,
+		));
+		let old_page = feed_page(&old_session_id, 0, POSTS_PER_PAGE).expect("old page");
+		assert_eq!(old_page.posts.first().map(|post| post.id.as_str()), Some("old-0"));
+
+		let fresh_posts = std::iter::once(test_post("fresh-0", "rust", 2_000))
+			.chain((0..POSTS_PER_PAGE - 1).map(|index| test_post(&format!("new-{index}"), "rust", 1_900 - index as u64)))
+			.collect::<Vec<_>>();
+		seed_source(&source, fresh_posts);
+
+		assert!(runtime.block_on(continue_feed_session_with_budget(&old_session_id, 0, POSTS_PER_PAGE, 1)));
+		assert_eq!(
+			feed_page(&old_session_id, 0, POSTS_PER_PAGE)
+				.expect("continued old frozen page")
+				.posts
+				.first()
+				.map(|post| post.id.as_str()),
+			Some("old-0")
+		);
+
+		let fresh_session_id = runtime.block_on(ensure_feed_session_with_budget(
+			FeedSessionRequest {
+				sources: vec![source],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "front-page".to_string(),
+				cache_revision: source_cache_revision(),
+				..Default::default()
+			},
+			0,
+			POSTS_PER_PAGE,
+			1,
+		));
+
+		assert_ne!(fresh_session_id, old_session_id);
+		assert_eq!(
+			feed_page(&old_session_id, 0, POSTS_PER_PAGE)
+				.expect("old frozen page")
+				.posts
+				.first()
+				.map(|post| post.id.as_str()),
+			Some("old-0")
+		);
+		assert_eq!(
+			feed_page(&fresh_session_id, 0, POSTS_PER_PAGE)
+				.expect("fresh page")
+				.posts
+				.first()
+				.map(|post| post.id.as_str()),
+			Some("fresh-0")
+		);
 	}
 
 	#[test]
@@ -4963,6 +5159,7 @@ mod tests {
 					filters: HashSet::new(),
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
+					cache_revision: 0,
 					bundle_followed_user_comments: true,
 					merge_sort: None,
 				},
