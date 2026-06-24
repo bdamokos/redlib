@@ -67,6 +67,10 @@
         return layer ? layer.querySelector(".video_preview_fallback_video") : null;
     }
 
+    function hostUsesDirectPreviewFallback(host) {
+        return Boolean(host && host.dataset.previewFallbackVideoUrl && !host.dataset.mediaUrl);
+    }
+
     function readPreviewSoundEnabled() {
         try {
             return window.localStorage.getItem(PREVIEW_SOUND_STORAGE_KEY) === "on";
@@ -610,15 +614,16 @@
 
     function hostSupportsPreviewFallback(host, state) {
         var video = previewVideo(host);
+        var directFallback = hostUsesDirectPreviewFallback(host);
         return Boolean(
             state &&
             host.dataset.previewFallbackVideoUrl &&
-            !state.ready &&
+            (directFallback || !state.ready) &&
             !state.failed &&
             !state.rendered &&
             !state.previewFallbackActive &&
             !state.previewFallbackLoading &&
-            !state.suppressPreviewLease &&
+            (directFallback || !state.suppressPreviewLease) &&
             video &&
             !video.autoplay
         );
@@ -634,18 +639,21 @@
         return waiting;
     }
 
-    function eligiblePreviewFallbackHosts() {
+    function eligiblePreviewFallbackHosts(directOnly) {
         var now = performance.now();
         var candidates = [];
 
         activeHosts.forEach(function (state, host) {
+            if (directOnly && !hostUsesDirectPreviewFallback(host)) {
+                return;
+            }
             if (!hostSupportsPreviewFallback(host, state)) {
                 return;
             }
             if (!shouldRenderHost(host)) {
                 return;
             }
-            if (!state.previewGenerationStartedAt || now - state.previewGenerationStartedAt < PREVIEW_FALLBACK_DELAY_MS) {
+            if (!hostUsesDirectPreviewFallback(host) && (!state.previewGenerationStartedAt || now - state.previewGenerationStartedAt < PREVIEW_FALLBACK_DELAY_MS)) {
                 return;
             }
 
@@ -684,8 +692,18 @@
         }
     }
 
+    function activateVisibleDirectPreviewFallbacks() {
+        activeHosts.forEach(function (state, host) {
+            if (!hostUsesDirectPreviewFallback(host) || !hostSupportsPreviewFallback(host, state) || !shouldRenderHost(host)) {
+                return;
+            }
+
+            activatePreviewFallback(host, state);
+        });
+    }
+
     function processPreviewFallbackQueue() {
-        if (!pageSettled || document.visibilityState === "hidden" || !desktopPreviewFallbackAllowed()) {
+        if (!pageSettled || document.visibilityState === "hidden") {
             if (hasWaitingPreviewFallbackHosts()) {
                 schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
             }
@@ -696,7 +714,8 @@
             return;
         }
 
-        var candidates = eligiblePreviewFallbackHosts();
+        var directOnly = !desktopPreviewFallbackAllowed();
+        var candidates = eligiblePreviewFallbackHosts(directOnly);
         if (!candidates.length) {
             if (hasWaitingPreviewFallbackHosts()) {
                 schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
@@ -810,12 +829,15 @@
             activeHosts.set(host, state);
         }
 
-        if (host.dataset.previewFallbackVideoUrl && !host.dataset.mediaUrl) {
+        if (hostUsesDirectPreviewFallback(host)) {
             state.suppressPreviewLease = true;
             state.ready = true;
+            markPreviewGenerationStart(state);
             setLoadingState(host, "ready");
-            if (!state.previewFallbackActive && !state.previewFallbackLoading) {
+            if (shouldRenderHost(host) && !state.previewFallbackActive && !state.previewFallbackLoading) {
                 activatePreviewFallback(host, state);
+            } else if (!state.previewFallbackActive && !state.previewFallbackLoading) {
+                schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
             }
             return;
         }
@@ -965,6 +987,7 @@
         observeHosts(document);
         ensureHeartbeat();
         schedulePendingRenderCheck();
+        activateVisibleDirectPreviewFallbacks();
         schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
         syncPreviewSoundMode();
     });
@@ -975,11 +998,13 @@
 
     window.addEventListener("scroll", function () {
         schedulePendingRenderCheck();
+        activateVisibleDirectPreviewFallbacks();
         schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
         syncPreviewSoundMode();
     }, { passive: true });
     window.addEventListener("resize", function () {
         schedulePendingRenderCheck();
+        activateVisibleDirectPreviewFallbacks();
         schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
         syncPreviewSoundMode();
     });
