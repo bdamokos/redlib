@@ -443,7 +443,7 @@ main.post_page_main #page_fragment {
 .user_cached_post_marker {
     display: inline-flex;
     align-items: center;
-    margin: 8px 0 -6px 12px;
+    margin: 12px 0 4px 12px;
     padding: 2px 8px;
     border: 1px solid currentColor;
     border-radius: 3px;
