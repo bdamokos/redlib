@@ -2944,7 +2944,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 mod tests {
 	use super::{
 		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, split_subscriptions_for_listing, update_url_query,
-		AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, SubredditTemplate, FRONT_CURSOR_PARAM,
+		AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, FeedFragmentTemplate, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use hyper::{Body, Request};
@@ -3023,6 +3023,30 @@ mod tests {
 			bookmarked: false,
 			bookmark_new_comments: None,
 		}
+	}
+
+	#[test]
+	fn feed_fragment_marks_followed_authors_case_insensitively() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["u_Demo_User".to_string()];
+		prefs.subscriptions_lc = prefs.subscriptions.iter().map(|value| value.to_ascii_lowercase()).collect();
+
+		let html = FeedFragmentTemplate {
+			posts: vec![test_post()],
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs,
+			url: "/".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("class=\"followed_author_marker\">followed</span>"));
 	}
 
 	fn metric_post(id: &str, community: &str, created_ts: u64, score: i64, stickied: bool) -> Post {

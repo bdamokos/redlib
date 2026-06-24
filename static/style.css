@@ -1620,6 +1620,21 @@ a.search_subreddit_link:hover {
     opacity: 1;
 }
 
+.followed_author_marker {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 4px;
+    padding: 1px 6px;
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    color: var(--accent);
+    background: transparent;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1.6;
+    vertical-align: middle;
+}
+
 .inline_bookmark_form {
     margin-left: auto;
 }

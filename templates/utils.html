@@ -299,6 +299,7 @@
 {% macro post_in_list(post, show_subscription_button, redirect_url, auto_expand_followed_users) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
 {% set auto_expand_preview = auto_expand_followed_users && prefs.has_followed_user(post.author.name.as_str()) -%}
+{% set show_followed_author_marker = auto_expand_followed_users && prefs.has_followed_user(post.author.name.as_str()) -%}
 <div
 	id="{{ post.id }}"
 	class="post{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post.following_comments.len() > 0 %} post_following_bundle{% endif %}"
@@ -337,6 +338,9 @@
 		{% endif %}
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
+		{% if show_followed_author_marker %}
+		<span class="followed_author_marker">followed</span>
+		{% endif %}
 		{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
 		<span class="dot">&bull;</span>
 		<span class="created" title="{{ post.display_created_tooltip() }}" data-created-ts="{{ post.created_ts }}">{{ post.display_rel_time() }}</span>
