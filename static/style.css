@@ -479,7 +479,10 @@ main.post_page_main #page_fragment {
 .user_cached_post_marker {
     display: inline-flex;
     align-items: center;
-    margin: 12px 0 4px 12px;
+    position: relative;
+    z-index: 1;
+    top: 6px;
+    margin: 8px 0 -4px 12px;
     padding: 2px 8px;
     border: 1px solid currentColor;
     border-radius: 3px;
