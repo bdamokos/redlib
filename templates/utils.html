@@ -102,7 +102,9 @@
 {% macro post(post) -%}
 {% set post_should_be_blurred = post.flags.spoiler && prefs.blur_spoiler=="on" -%}
 <!-- POST CONTENT -->
-<div class="post highlighted{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post_should_be_blurred %} post_blurred{% endif %}">
+<div
+	class="post highlighted{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post_should_be_blurred %} post_blurred{% endif %}"
+	data-reddit-url="https://www.reddit.com{{ post.permalink }}">
 	<p class="post_header">
 		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
 		<span class="dot">&bull;</span>
@@ -305,6 +307,7 @@
 	class="post{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post.following_comments.len() > 0 %} post_following_bundle{% endif %}"
 	data-post-type="{{ post.post_type }}"
 	data-created-ts="{{ post.created_ts }}"
+	data-reddit-url="https://www.reddit.com{{ post.permalink }}"
 	data-post-merge-keys="{{ crate::user::post_merge_keys_attr(post) }}">
 	<div class="post_header">
 		{% let community -%}

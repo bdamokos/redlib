@@ -519,6 +519,10 @@ function isOpenPostContextShortcutKey(event) {
     return !event.repeat && getKeyName(event) === "u";
 }
 
+function isOpenPostOnRedditShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "r";
+}
+
 function isFilterPostAuthorShortcutKey(event) {
     return !event.repeat && getKeyName(event) === "x";
 }
@@ -602,6 +606,34 @@ function openCurrentPostContext() {
     return true;
 }
 
+function getPostRedditUrl(post) {
+    if (!(post instanceof Element)) {
+        return "";
+    }
+
+    const redditUrl = post.getAttribute("data-reddit-url") || "";
+    if (redditUrl !== "") {
+        return redditUrl;
+    }
+
+    const permalink = post.querySelector(".post_comments[href^='/r/'], .post_title a[href^='/r/'], #post_links a[href^='/r/']");
+    if (!(permalink instanceof HTMLAnchorElement)) {
+        return "";
+    }
+
+    return `https://www.reddit.com${permalink.pathname}${permalink.search}${permalink.hash}`;
+}
+
+function openCurrentPostOnReddit() {
+    const redditUrl = getPostRedditUrl(findCurrentViewedPost());
+    if (redditUrl === "") {
+        return false;
+    }
+
+    window.location.assign(redditUrl);
+    return true;
+}
+
 function getPaginationAccessKeyForDirection(direction) {
     if (direction > 0) {
         return "N";
@@ -631,6 +663,7 @@ document.addEventListener("keydown", (event) => {
     const isFollowShortcut = isFollowShortcutKey(event);
     const isExpandPreviewShortcut = isExpandPreviewShortcutKey(event);
     const isOpenPostContextShortcut = isOpenPostContextShortcutKey(event);
+    const isOpenPostOnRedditShortcut = isOpenPostOnRedditShortcutKey(event);
     const isFilterPostAuthorShortcut = isFilterPostAuthorShortcutKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
@@ -639,7 +672,7 @@ document.addEventListener("keydown", (event) => {
 
     if (
         event.defaultPrevented
-        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut && !isFilterPostAuthorShortcut)
+        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut && !isOpenPostOnRedditShortcut && !isFilterPostAuthorShortcut)
         || event.altKey
         || event.ctrlKey
         || event.metaKey
@@ -674,6 +707,13 @@ document.addEventListener("keydown", (event) => {
 
     if (isOpenPostContextShortcut) {
         if (openCurrentPostContext()) {
+            event.preventDefault();
+        }
+        return;
+    }
+
+    if (isOpenPostOnRedditShortcut) {
+        if (openCurrentPostOnReddit()) {
             event.preventDefault();
         }
         return;
