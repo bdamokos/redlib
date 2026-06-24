@@ -684,15 +684,17 @@
             activeHosts.set(host, state);
         }
 
-        if (state.ready || state.leasing || state.suppressPreviewLease) {
-            return;
-        }
-
         if (host.dataset.previewFallbackVideoUrl && !host.dataset.mediaUrl) {
             state.suppressPreviewLease = true;
             state.ready = true;
             setLoadingState(host, "ready");
-            activatePreviewFallback(host, state);
+            if (!state.previewFallbackActive && !state.previewFallbackLoading) {
+                activatePreviewFallback(host, state);
+            }
+            return;
+        }
+
+        if (state.ready || state.leasing || state.suppressPreviewLease) {
             return;
         }
 
