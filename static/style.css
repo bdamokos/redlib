@@ -291,10 +291,38 @@ nav #links {
     flex-grow: 1;
     flex-basis: 0;
     justify-content: flex-end;
+    align-items: center;
 }
 
 nav #links svg {
     display: none;
+}
+
+.nav_icon_button {
+    align-items: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    font: inherit;
+    justify-content: center;
+    line-height: 1;
+    margin: 0 0 0 10px;
+    min-height: 30px;
+    min-width: 30px;
+    padding: 3px 5px;
+}
+
+.nav_icon_button:hover,
+.nav_icon_button:focus-visible,
+.nav_icon_button[aria-pressed="true"] {
+    background: var(--highlighted);
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.nav_icon_button span {
+    display: inline;
 }
 
 nav #redlib {
@@ -3685,6 +3713,9 @@ th {
     }
     nav #links span {
         display: none;
+    }
+    nav #links .nav_icon_button span {
+        display: inline;
     }
     nav #links svg {
         display: block;

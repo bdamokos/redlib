@@ -60,6 +60,9 @@
 			</div>
 			{% block search %}{% endblock %}
 			<div id="links">
+				<button id="video_preview_sound_toggle" class="nav_icon_button" type="button" aria-pressed="false" title="Preview sound off">
+					<span aria-hidden="true">🔇</span>
+				</button>
 				<a id="reddit_link" {% if !str_eq(prefs.disable_visit_reddit_confirmation, "on") %}href="#popup"{% else %}href="https://www.reddit.com{{ crate::utils::canonical_reddit_path(url) }}" rel="nofollow"{% endif %}>
 					<span>reddit</span>
 					<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
