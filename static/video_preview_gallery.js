@@ -1,6 +1,6 @@
 // @license http://www.gnu.org/licenses/agpl-3.0.html AGPL-3.0
 (function () {
-    if (!window.fetch || !window.crypto || typeof window.crypto.randomUUID !== "function") {
+    if (!window.fetch) {
         return;
     }
 
@@ -9,7 +9,15 @@
     var PREVIEW_FALLBACK_POLL_MS = 500;
     var DESKTOP_PREVIEW_FALLBACK_QUERY = "(min-width: 1000px) and (hover: hover) and (pointer: fine)";
 
-    var pageSessionId = window.crypto.randomUUID();
+    function createPageSessionId() {
+        if (window.crypto && typeof window.crypto.randomUUID === "function") {
+            return window.crypto.randomUUID();
+        }
+
+        return "page-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+    }
+
+    var pageSessionId = createPageSessionId();
     var activeHosts = new Map();
     var heartbeatTimer = null;
     var pendingRenderTimer = null;
