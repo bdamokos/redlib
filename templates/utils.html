@@ -667,11 +667,15 @@
 	{% else %}
 	{% set use_dash = str_eq(prefs.use_dash, "on") && !post.media.dash_url.is_empty() %}
 	{% set use_hls = !use_dash && str_eq(prefs.use_hls, "on") && !post.media.hls_url.is_empty() %}
+	{% set video_previews_requested = post.media.video_preview_enabled && prefs.video_previews == "on" %}
+	{% set generated_video_previews_active = crate::video_preview::feature_enabled() && video_previews_requested && !post.media.video_preview_job_hint.is_empty() %}
+	{% set direct_video_preview_active = video_previews_requested && !post.media.video_preview_fallback_url.is_empty() %}
+	{% set video_previews_active = generated_video_previews_active || direct_video_preview_active %}
 	<div class="post_media_column">
 	<div class="post_media_content">
 		<div
 			class="video_preview_host"
-			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
+			{% if video_previews_active %}
 			data-preview-render-mode="animation"
 			data-post-id="{{ post.id }}"
 			data-poster-url="{{ post.media.display_poster_url(prefs) }}"
@@ -679,7 +683,7 @@
 			data-width="{{ post.media.width }}"
 			data-height="{{ post.media.height }}"
 			data-page-path="{{ post.permalink }}"
-			{% if !post.media.video_preview_job_hint.is_empty() %}
+			{% if generated_video_previews_active %}
 			data-media-url="{{ post.media.video_preview_job_hint }}"
 			{% endif %}
 			{% if !post.media.video_preview_fallback_url.is_empty() %}
@@ -722,14 +726,14 @@
 				<source src="{{ post.media.display_video_url(prefs) }}" type="video/mp4" />
 				<a href="{{ post.media.display_video_url(prefs) }}">Video</a>
 			</video>
-			{% if post.media.video_preview_enabled && prefs.video_previews == "on" %}
+			{% if video_previews_active %}
 			<div class="video_preview_layer" aria-hidden="true">
 				<img class="video_preview_image" alt="" />
 				<video class="video_preview_fallback_video" muted loop playsinline preload="none" disablepictureinpicture hidden aria-hidden="true"></video>
 			</div>
 			{% endif %}
 			</div>
-			{% if post.media.video_preview_enabled && prefs.video_previews == "on" && !post.media.video_preview_job_hint.is_empty() %}
+			{% if generated_video_previews_active %}
 			<div class="video_preview_loading" hidden aria-live="polite">
 				<span class="video_preview_spinner" aria-hidden="true"></span>
 				<span class="video_preview_status_text">Generating animated preview…</span>

@@ -517,8 +517,7 @@ impl Media {
 				.unwrap_or_default()
 		};
 		let duration = format_video_duration(duration_seconds);
-		let video_preview_enabled =
-			crate::video_preview::feature_enabled() && (post_type == "video" || post_type == "gif") && embed_code.is_empty() && !url_val.as_str().unwrap_or_default().is_empty();
+		let video_preview_enabled = (post_type == "video" || post_type == "gif") && embed_code.is_empty() && !url_val.as_str().unwrap_or_default().is_empty();
 		let video_preview_job_hint = if redgifs_url.is_some() || post_type == "gif" {
 			// RedGifs clips and Reddit-hosted GIF posts can use a direct looping
 			// MP4 fallback in the preview layer instead of generating server-side
