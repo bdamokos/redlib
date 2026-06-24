@@ -26,7 +26,6 @@ const EXPANDABLE_POST_PREVIEW_SELECTOR = ".post_preview.truncated:not(.expanded)
 const PAGE_EDGE_TOLERANCE = 1;
 const POST_MEDIA_FIT_READY_ATTR = "data-post-media-fit-ready";
 let postMediaFitFrame = null;
-let postMediaFitViewportHeight = null;
 
 function parsePostMediaLength(value, fallback) {
     const trimmedValue = value.trim().toLowerCase();
@@ -336,12 +335,7 @@ function resizeSinglePostMediaToViewport(root = document, options = {}) {
     getPostsFromRoot(root).forEach((post) => fitPostMediaToViewport(post, options));
 }
 
-function getPostMediaFitViewportHeight() {
-    return Math.round(window.innerHeight);
-}
-
 function resizePostMediaToViewportOnLoad() {
-    postMediaFitViewportHeight = getPostMediaFitViewportHeight();
     resizeSinglePostMediaToViewport(document);
 }
 
@@ -356,13 +350,20 @@ function scheduleSinglePostMediaResize(root = document, options = {}) {
     });
 }
 
-function schedulePostMediaResizeAfterViewportHeightChange() {
-    const viewportHeight = getPostMediaFitViewportHeight();
-    if (viewportHeight === postMediaFitViewportHeight) {
+function isIpadViewportDevice() {
+    const navigatorInfo = window.navigator || {};
+    const userAgent = navigatorInfo.userAgent || "";
+    const platform = navigatorInfo.platform || "";
+    const maxTouchPoints = Number(navigatorInfo.maxTouchPoints) || 0;
+
+    return /\biPad\b/.test(userAgent) || (platform === "MacIntel" && maxTouchPoints > 1);
+}
+
+function schedulePostMediaResizeAfterIpadOrientationChange() {
+    if (!isIpadViewportDevice()) {
         return;
     }
 
-    postMediaFitViewportHeight = viewportHeight;
     scheduleSinglePostMediaResize(document, { force: true });
 }
 
@@ -797,7 +798,6 @@ document.addEventListener("keydown", (event) => {
 
 window.resizeSinglePostMediaToViewport = resizeSinglePostMediaToViewport;
 document.addEventListener("DOMContentLoaded", resizePostMediaToViewportOnLoad);
-window.addEventListener("resize", schedulePostMediaResizeAfterViewportHeightChange);
-window.addEventListener("orientationchange", schedulePostMediaResizeAfterViewportHeightChange);
+window.addEventListener("orientationchange", schedulePostMediaResizeAfterIpadOrientationChange);
 document.addEventListener("load", handlePostMediaLoaded, true);
 document.addEventListener("loadedmetadata", handlePostMediaLoaded, true);
