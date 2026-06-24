@@ -19,3 +19,4 @@ output/playwright/
 tmp/
 .clawpatch/
 cookies.txt
+.codex/
