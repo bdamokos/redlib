@@ -231,6 +231,34 @@
         }
     };
 
+    let toastTimeout = null;
+    const showPreferenceToast = (message) => {
+        if (!message) {
+            return;
+        }
+
+        let toast = document.getElementById("redlib_toast");
+        if (!toast) {
+            toast = document.createElement("div");
+            toast.id = "redlib_toast";
+            toast.className = "redlib_toast";
+            toast.setAttribute("role", "status");
+            toast.setAttribute("aria-live", "polite");
+            document.body.append(toast);
+        }
+
+        toast.textContent = message;
+        toast.classList.add("visible");
+
+        if (toastTimeout !== null) {
+            window.clearTimeout(toastTimeout);
+        }
+        toastTimeout = window.setTimeout(() => {
+            toast.classList.remove("visible");
+            toastTimeout = null;
+        }, 2200);
+    };
+
     const cookieValuesForForm = (form) =>
         (form.dataset.cookieValues || "")
             .split(/[|+]/)
@@ -244,6 +272,34 @@
         const normalizedLeft = left.map((value) => value.toLowerCase()).sort();
         const normalizedRight = right.map((value) => value.toLowerCase()).sort();
         return normalizedLeft.every((value, index) => value === normalizedRight[index]);
+    };
+
+    const displayPreferenceValue = (value, cookieName) => {
+        if (value.startsWith("u_")) {
+            return `u/${value.slice(2)}`;
+        }
+        if (cookieName === "subscriptions" || cookieName === "filters") {
+            return `r/${value}`;
+        }
+        return value;
+    };
+
+    const preferenceSuccessToast = (form, intent, isEnabling) => {
+        if (form.dataset.successToast) {
+            return form.dataset.successToast;
+        }
+        if (intent.mode !== "list" || intent.values.length !== 1) {
+            return "";
+        }
+
+        const value = displayPreferenceValue(intent.values[0], intent.cookieName);
+        if (intent.cookieName === "subscriptions") {
+            return `${isEnabling ? "Followed" : "Unfollowed"} ${value}`;
+        }
+        if (intent.cookieName === "filters") {
+            return `${isEnabling ? "Filtered" : "Unfiltered"} ${value}`;
+        }
+        return "";
     };
 
     const preferenceIntent = (form) => ({
@@ -356,11 +412,13 @@
 
             setPending(target, true);
             const requestAction = form.action;
+            let successToast = "";
 
             try {
                 const stateOn = form.dataset.stateOn || "subscribed";
                 const isEnabling = form.dataset.subscriptionState !== stateOn;
                 const intent = preferenceIntent(form);
+                successToast = preferenceSuccessToast(form, intent, isEnabling);
 
                 const response = await fetch(requestAction, {
                     method: form.method || "POST",
@@ -397,6 +455,7 @@
 
             setPending(target, false);
             removeSettingsFeedItem(form);
+            showPreferenceToast(successToast);
         });
     };
 
@@ -460,6 +519,7 @@
         form.dataset.cookieMode = "list";
         form.dataset.cookieName = cookieName;
         form.dataset.cookieValues = value;
+        form.dataset.successToast = labels.successToast || "";
 
         const button = document.createElement("button");
         button.type = "submit";
@@ -483,6 +543,7 @@
             unsubscribeLabel: "Unfilter",
             subscribeClass: "filter",
             unsubscribeClass: "unfilter",
+            successToast: `Filtered ${value.startsWith("u_") ? `u/${value.slice(2)}` : value}`,
         });
         bindForm(form);
 

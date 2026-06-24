@@ -1624,6 +1624,14 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		return Ok(entry);
 	}
 
+	if matches!(refresh_origin, RefreshOrigin::FrontPageSession) && crate::instance_scrape::reddit_rate_limited_now() {
+		if let Some(entry) = cached_source_posts_with_mode(&source, CacheServeMode::AllowStaleOnOauthOutage) {
+			warn!("post_cache: serving stale cached source {} because Reddit is rate limited", source.display_name());
+			return Ok(entry);
+		}
+		return Err("Reddit rate limited; skipping front-page warm".to_string());
+	}
+
 	if let Some(key) = remembered_feed_key_for_source(&source) {
 		if !matches!(refresh_origin, RefreshOrigin::DirectLiveFetch) {
 			let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());

@@ -200,11 +200,47 @@ body.fixed_navbar {
     pointer-events: auto;
 }
 
+.redlib_toast {
+    position: fixed;
+    top: 96px;
+    right: 20px;
+    z-index: 4;
+    box-sizing: border-box;
+    max-width: min(360px, calc(100% - 40px));
+    padding: 8px 12px;
+    border: var(--panel-border);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--outside) 92%, black 8%);
+    color: var(--text);
+    box-shadow: var(--shadow);
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.35;
+    opacity: 0;
+    transform: translateY(-4px);
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+}
+
+.redlib_toast.visible {
+    opacity: 1;
+    transform: translateY(0);
+    visibility: visible;
+}
+
 @media screen and (max-width: 800px) {
     .image_quality_status {
         font-size: 11px;
         max-width: calc(100% - 20px);
         right: 10px;
+    }
+
+    .redlib_toast {
+        top: 88px;
+        right: 10px;
+        max-width: calc(100% - 20px);
+        font-size: 12px;
     }
 }
 

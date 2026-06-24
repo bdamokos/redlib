@@ -1,0 +1,4 @@
+interface:
+  display_name: "Redlib Follow Merge"
+  short_description: "Merge followed-user prefs on the deployed Redlib Pi."
+  default_prompt: "Merge the followed-user lists between Redlib desktop and mobile profiles on the deployed Pi."
