@@ -24,7 +24,7 @@ crate::impl_template_str_eq!(SettingsTemplate);
 
 // CONSTANTS
 
-const PREFS: [&str; 23] = [
+const PREFS: [&str; 24] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -40,6 +40,7 @@ const PREFS: [&str; 23] = [
 	"autoplay_videos",
 	"video_previews",
 	"direct_redgifs_media",
+	"redgifs_poster_quality",
 	"hide_sidebar_and_summary",
 	"fixed_navbar",
 	"hide_awards",
@@ -207,6 +208,7 @@ fn apply_standard_preference(prefs: &mut Preferences, name: &str, value: &str) {
 		"autoplay_videos" => prefs.autoplay_videos = value.to_string(),
 		"video_previews" => prefs.video_previews = value.to_string(),
 		"direct_redgifs_media" => prefs.direct_redgifs_media = value.to_string(),
+		"redgifs_poster_quality" => prefs.redgifs_poster_quality = value.to_string(),
 		"hide_sidebar_and_summary" => prefs.hide_sidebar_and_summary = value.to_string(),
 		"fixed_navbar" => prefs.fixed_navbar = value.to_string(),
 		"hide_awards" => prefs.hide_awards = value.to_string(),

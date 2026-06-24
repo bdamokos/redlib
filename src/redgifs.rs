@@ -18,6 +18,7 @@ pub struct RedgifsMediaPaths {
 	video_path: String,
 	mobile_video_path: String,
 	poster_path: String,
+	hd_poster_path: String,
 	duration_seconds: i64,
 	has_audio: bool,
 	username: String,
@@ -30,6 +31,14 @@ impl RedgifsMediaPaths {
 
 	pub(crate) fn poster_path(&self) -> &str {
 		&self.poster_path
+	}
+
+	pub(crate) fn hd_poster_path(&self) -> &str {
+		if self.hd_poster_path.is_empty() {
+			&self.poster_path
+		} else {
+			&self.hd_poster_path
+		}
 	}
 
 	pub(crate) fn mobile_video_path(&self) -> &str {
@@ -105,6 +114,19 @@ fn derive_mobile_video_path_from_media_path(path: &str) -> Option<String> {
 	let stem = stem.strip_suffix("-silent").unwrap_or(stem);
 	let stem = stem.strip_suffix("-mobile").unwrap_or(stem);
 	let candidate = format!("{stem}-mobile.mp4");
+	if is_valid_media_path(&candidate) {
+		Some(format!("/redgifs/{candidate}"))
+	} else {
+		None
+	}
+}
+
+fn derive_hd_poster_path_from_media_path(path: &str) -> Option<String> {
+	let filename = path.strip_prefix("/redgifs/")?;
+	let stem = filename.strip_suffix(".mp4")?;
+	let stem = stem.strip_suffix("-silent").unwrap_or(stem);
+	let stem = stem.strip_suffix("-mobile").unwrap_or(stem);
+	let candidate = format!("{stem}-poster.jpg");
 	if is_valid_media_path(&candidate) {
 		Some(format!("/redgifs/{candidate}"))
 	} else {
@@ -234,6 +256,7 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 		.or_else(|| json["gif"]["urls"]["thumbnail"].as_str())
 		.and_then(media_path_from_url)
 		.unwrap_or_default();
+	let hd_poster_path = derive_hd_poster_path_from_media_path(&video_path).unwrap_or_else(|| poster_path.clone());
 	let duration_seconds = json["gif"]["duration"].as_f64().map(|value| value.round() as i64).unwrap_or_default();
 	let username = json["gif"]["userName"]
 		.as_str()
@@ -247,6 +270,7 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 		video_path,
 		mobile_video_path,
 		poster_path,
+		hd_poster_path,
 		duration_seconds,
 		has_audio,
 		username,
@@ -344,6 +368,7 @@ async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<Redg
 	let video_path = media_path_from_url(&selected_video_url).ok_or_else(|| "No video URL in RedGifs watch page".to_string())?;
 	let mobile_video_path = derive_mobile_video_path_from_media_path(&video_path).unwrap_or_default();
 	let poster_path = twitter_image.as_deref().and_then(media_path_from_url).unwrap_or_default();
+	let hd_poster_path = derive_hd_poster_path_from_media_path(&video_path).unwrap_or_else(|| poster_path.clone());
 	let duration_seconds = og_duration.map(|value| value.round() as i64).unwrap_or_default();
 	let username = REDGIFS_USER_HTML_REGEX
 		.captures(html)
@@ -356,6 +381,7 @@ async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<Redg
 		video_path,
 		mobile_video_path,
 		poster_path,
+		hd_poster_path,
 		duration_seconds,
 		has_audio,
 		username,
@@ -427,7 +453,9 @@ fn validate_video_id(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{is_valid_media_path, media_path_from_url, parse_watch_page_media_paths, watch_path_from_embed_code, watch_path_from_url};
+	use super::{
+		derive_hd_poster_path_from_media_path, is_valid_media_path, media_path_from_url, parse_watch_page_media_paths, watch_path_from_embed_code, watch_path_from_url,
+	};
 	use futures_lite::future::block_on;
 
 	#[test]
@@ -488,6 +516,22 @@ mod tests {
 	}
 
 	#[test]
+	fn derives_hd_poster_path_from_full_silent_or_mobile_video_path() {
+		assert_eq!(
+			derive_hd_poster_path_from_media_path("/redgifs/FamiliarFrizzyChevrotain.mp4"),
+			Some("/redgifs/FamiliarFrizzyChevrotain-poster.jpg".to_string())
+		);
+		assert_eq!(
+			derive_hd_poster_path_from_media_path("/redgifs/FamiliarFrizzyChevrotain-silent.mp4"),
+			Some("/redgifs/FamiliarFrizzyChevrotain-poster.jpg".to_string())
+		);
+		assert_eq!(
+			derive_hd_poster_path_from_media_path("/redgifs/FamiliarFrizzyChevrotain-mobile.mp4"),
+			Some("/redgifs/FamiliarFrizzyChevrotain-poster.jpg".to_string())
+		);
+	}
+
+	#[test]
 	fn parses_redgifs_watch_page_metadata_as_fallback() {
 		let html = r#"
 			<html>
@@ -506,6 +550,7 @@ mod tests {
 				video_path: "/redgifs/ImperturbableLumpyShihtzu-silent.mp4".to_string(),
 				mobile_video_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.mp4".to_string(),
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
+				hd_poster_path: "/redgifs/ImperturbableLumpyShihtzu-poster.jpg".to_string(),
 				duration_seconds: 31,
 				has_audio: false,
 				username: "imperturbablecreator".to_string(),
@@ -530,6 +575,7 @@ mod tests {
 				video_path: "/redgifs/ImperturbableLumpyShihtzu.mp4".to_string(),
 				mobile_video_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.mp4".to_string(),
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
+				hd_poster_path: "/redgifs/ImperturbableLumpyShihtzu-poster.jpg".to_string(),
 				duration_seconds: 0,
 				has_audio: false,
 				username: String::new(),

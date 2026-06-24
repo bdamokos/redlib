@@ -36,6 +36,7 @@ const LEGACY_SIMPLE_COOKIES: &[&str] = &[
 	"autoplay_videos",
 	"video_previews",
 	"direct_redgifs_media",
+	"redgifs_poster_quality",
 	"hide_sidebar_and_summary",
 	"fixed_navbar",
 	"hide_awards",

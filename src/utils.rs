@@ -325,6 +325,7 @@ pub struct Media {
 	pub width: i64,
 	pub height: i64,
 	pub poster: String,
+	pub hd_poster: String,
 	pub duration_seconds: i64,
 	pub duration: String,
 	pub download_name: String,
@@ -348,6 +349,7 @@ impl Media {
 			width: 0,
 			height: 0,
 			poster: String::new(),
+			hd_poster: String::new(),
 			duration_seconds: 0,
 			duration: String::new(),
 			download_name: String::new(),
@@ -372,7 +374,12 @@ impl Media {
 	}
 
 	pub fn display_poster_url(&self, prefs: &Preferences) -> String {
-		Self::redgifs_render_url(&self.poster, prefs)
+		let poster = if prefs.redgifs_poster_quality == "sd" || self.hd_poster.is_empty() {
+			&self.poster
+		} else {
+			&self.hd_poster
+		};
+		Self::redgifs_render_url(poster, prefs)
 	}
 
 	pub fn display_video_preview_fallback_url(&self, prefs: &Preferences) -> String {
@@ -401,6 +408,7 @@ impl Media {
 			None
 		};
 		let redgifs_poster = redgifs_bundle.as_ref().map(|paths| paths.poster_path().to_string()).unwrap_or_default();
+		let redgifs_hd_poster = redgifs_bundle.as_ref().map(|paths| paths.hd_poster_path().to_string()).unwrap_or_default();
 		let redgifs_duration_seconds = redgifs_bundle.as_ref().map(|paths| paths.duration_seconds()).unwrap_or_default();
 		let redgifs_username = redgifs_bundle.as_ref().map(|paths| paths.username().to_string()).unwrap_or_default();
 		let redgifs_preview_fallback_url = redgifs_bundle.as_ref().map(|paths| paths.mobile_video_path().to_string()).unwrap_or_default();
@@ -506,6 +514,7 @@ impl Media {
 		} else {
 			format_url(source["url"].as_str().unwrap_or_default())
 		};
+		let hd_poster = if redgifs_url.is_some() { redgifs_hd_poster } else { String::new() };
 		let duration_seconds = if redgifs_url.is_some() {
 			redgifs_duration_seconds
 		} else {
@@ -557,6 +566,7 @@ impl Media {
 				width,
 				height,
 				poster,
+				hd_poster,
 				duration_seconds,
 				duration,
 				download_name,
@@ -1044,6 +1054,7 @@ impl Post {
 					width: data["thumbnail_width"].as_i64().unwrap_or_default(),
 					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
 					poster: String::new(),
+					hd_poster: String::new(),
 					duration_seconds: 0,
 					duration: String::new(),
 					download_name: String::new(),
@@ -1767,7 +1778,7 @@ pub struct Params {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 5)]
+#[revisioned(revision = 6)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -1804,6 +1815,9 @@ pub struct Preferences {
 	#[revision(start = 5)]
 	#[serde(default = "default_on_string")]
 	pub direct_redgifs_media: String,
+	#[revision(start = 6)]
+	#[serde(default = "default_hd_string")]
+	pub redgifs_poster_quality: String,
 	#[revision(start = 1)]
 	pub fixed_navbar: String,
 	#[revision(start = 1)]
@@ -1883,6 +1897,7 @@ impl From<LegacyPreferencesV1> for Preferences {
 			autoplay_videos: value.autoplay_videos,
 			video_previews: "on".to_string(),
 			direct_redgifs_media: "on".to_string(),
+			redgifs_poster_quality: "hd".to_string(),
 			fixed_navbar: value.fixed_navbar,
 			disable_visit_reddit_confirmation: value.disable_visit_reddit_confirmation,
 			comment_sort: value.comment_sort,
@@ -1948,6 +1963,7 @@ impl From<LegacyPreferencesV0> for Preferences {
 			autoplay_videos: value.autoplay_videos,
 			video_previews: "on".to_string(),
 			direct_redgifs_media: "on".to_string(),
+			redgifs_poster_quality: "hd".to_string(),
 			fixed_navbar: value.fixed_navbar,
 			disable_visit_reddit_confirmation: String::new(),
 			comment_sort: value.comment_sort,
@@ -2133,6 +2149,10 @@ fn default_on_string() -> String {
 	"on".to_string()
 }
 
+fn default_hd_string() -> String {
+	"hd".to_string()
+}
+
 struct DeployGitFooter {
 	short: String,
 	title: String,
@@ -2227,6 +2247,7 @@ impl Preferences {
 			"autoplay_videos" => Some(self.autoplay_videos.clone()),
 			"video_previews" => Some(self.video_previews.clone()),
 			"direct_redgifs_media" => Some(self.direct_redgifs_media.clone()),
+			"redgifs_poster_quality" => Some(self.redgifs_poster_quality.clone()),
 			"fixed_navbar" => Some(self.fixed_navbar.clone()),
 			"disable_visit_reddit_confirmation" => Some(self.disable_visit_reddit_confirmation.clone()),
 			"comment_sort" => Some(self.comment_sort.clone()),
@@ -2269,6 +2290,7 @@ impl Preferences {
 			autoplay_videos: setting(req, "autoplay_videos"),
 			video_previews: setting_or_default(req, "video_previews", "on".to_string()),
 			direct_redgifs_media: setting_or_default(req, "direct_redgifs_media", "on".to_string()),
+			redgifs_poster_quality: setting_or_default(req, "redgifs_poster_quality", "hd".to_string()),
 			fixed_navbar: setting_or_default(req, "fixed_navbar", "on".to_string()),
 			disable_visit_reddit_confirmation: setting(req, "disable_visit_reddit_confirmation"),
 			comment_sort: setting(req, "comment_sort"),
@@ -2584,6 +2606,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
 			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
 			poster: String::new(),
+			hd_poster: String::new(),
 			duration_seconds: 0,
 			duration: String::new(),
 			download_name: String::new(),
@@ -6144,17 +6167,21 @@ mod tests {
 		let media = Media {
 			url: "/redgifs/FamiliarFrizzyChevrotain.mp4".to_string(),
 			poster: "/redgifs/FamiliarFrizzyChevrotain-poster.jpg".to_string(),
+			hd_poster: "/redgifs/FamiliarFrizzyChevrotain-hd-poster.jpg".to_string(),
 			video_preview_fallback_url: "/redgifs/FamiliarFrizzyChevrotain-mobile.mp4".to_string(),
 			..Media::empty()
 		};
 
 		let mut prefs = Preferences::default();
 		assert_eq!(media.display_video_url(&prefs), "https://media.redgifs.com/FamiliarFrizzyChevrotain.mp4");
-		assert_eq!(media.display_poster_url(&prefs), "https://media.redgifs.com/FamiliarFrizzyChevrotain-poster.jpg");
+		assert_eq!(media.display_poster_url(&prefs), "https://media.redgifs.com/FamiliarFrizzyChevrotain-hd-poster.jpg");
 		assert_eq!(
 			media.display_video_preview_fallback_url(&prefs),
 			"https://media.redgifs.com/FamiliarFrizzyChevrotain-mobile.mp4"
 		);
+
+		prefs.redgifs_poster_quality = "sd".to_string();
+		assert_eq!(media.display_poster_url(&prefs), "https://media.redgifs.com/FamiliarFrizzyChevrotain-poster.jpg");
 
 		prefs.direct_redgifs_media = "off".to_string();
 		assert_eq!(media.display_video_url(&prefs), "/redgifs/FamiliarFrizzyChevrotain.mp4");
@@ -6250,6 +6277,7 @@ mod tests {
 			autoplay_videos: "on".to_owned(),
 			video_previews: "on".to_owned(),
 			direct_redgifs_media: "on".to_owned(),
+			redgifs_poster_quality: "hd".to_owned(),
 			fixed_navbar: "on".to_owned(),
 			disable_visit_reddit_confirmation: "on".to_owned(),
 			comment_sort: "confidence".to_owned(),
@@ -6265,7 +6293,7 @@ mod tests {
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&redgifs_poster_quality=hd&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
 	}
 
 	#[test]
@@ -6506,6 +6534,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		width: 130,
 		height: 60,
 		poster: String::new(),
+		hd_poster: String::new(),
 		duration_seconds: 0,
 		duration: String::new(),
 		download_name: String::new(),
@@ -6525,6 +6554,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		width: 0,
 		height: 0,
 		poster: String::new(),
+		hd_poster: String::new(),
 		duration_seconds: 0,
 		duration: String::new(),
 		download_name: String::new(),
@@ -6544,6 +6574,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		width: 1080,
 		height: 1920,
 		poster: String::new(),
+		hd_poster: String::new(),
 		duration_seconds: 0,
 		duration: String::new(),
 		download_name: String::new(),
@@ -6576,6 +6607,7 @@ fn test_reddit_image_asset_key_matches_local_preview_variants() {
 		width: 0,
 		height: 0,
 		poster: String::new(),
+		hd_poster: String::new(),
 		duration_seconds: 0,
 		duration: String::new(),
 		download_name: String::new(),

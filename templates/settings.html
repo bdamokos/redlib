@@ -145,6 +145,12 @@
 							%}checked{% endif %}>
 					</div>
 					<div class="prefs-group">
+						<label for="redgifs_poster_quality">Use HD RedGifs poster previews</label>
+						<input type="hidden" value="sd" name="redgifs_poster_quality">
+						<input type="checkbox" value="hd" name="redgifs_poster_quality" id="redgifs_poster_quality" {% if prefs.redgifs_poster_quality!="sd"
+							%}checked{% endif %}>
+					</div>
+					<div class="prefs-group">
 						<label for="fixed_navbar">Keep navbar fixed</label>
 						<input type="hidden" value="off" name="fixed_navbar">
 						<input type="checkbox" name="fixed_navbar" {% if prefs.fixed_navbar=="on" %}checked{% endif %}>
