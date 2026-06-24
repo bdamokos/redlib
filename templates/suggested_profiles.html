@@ -100,26 +100,29 @@
 							{% endif %}
 						</p>
 					</div>
-				<form
-					class="suggested_profile_follow"
-					action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
-					method="POST"
-					data-subscription-form
-					data-subscription-target="suggested-user:u_{{ suggestion.name }}"
-					data-subscription-state="unsubscribed"
-					data-state-on="subscribed"
-					data-state-off="unsubscribed"
-					data-subscribe-action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
-					data-unsubscribe-action="{{ self.unsubscribe_path(suggestion.name.as_str()) }}"
-					data-subscribe-label="Follow"
-					data-unsubscribe-label="Unfollow"
-					data-subscribe-class="subscribe"
-					data-unsubscribe-class="unsubscribe"
-					data-cookie-mode="list"
-					data-cookie-name="subscriptions"
-					data-cookie-values="u_{{ suggestion.name }}">
-					<button class="subscribe" type="submit">Follow</button>
-				</form>
+				<div class="suggested_profile_actions">
+					<form
+						class="suggested_profile_follow"
+						action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+						method="POST"
+						data-subscription-form
+						data-subscription-target="suggested-user:u_{{ suggestion.name }}"
+						data-subscription-state="unsubscribed"
+						data-state-on="subscribed"
+						data-state-off="unsubscribed"
+						data-subscribe-action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+						data-unsubscribe-action="{{ self.unsubscribe_path(suggestion.name.as_str()) }}"
+						data-subscribe-label="Follow"
+						data-unsubscribe-label="Unfollow"
+						data-subscribe-class="subscribe"
+						data-unsubscribe-class="unsubscribe"
+						data-cookie-mode="list"
+						data-cookie-name="subscriptions"
+						data-cookie-values="u_{{ suggestion.name }}">
+						<button class="subscribe" type="submit">Follow</button>
+					</form>
+					<button class="suggested_profile_ignore" type="button" data-suggested-profile-ignore="{{ suggestion.name }}">Ignore</button>
+				</div>
 			</div>
 
 			{% if suggestion.media_posts.len() > 0 %}

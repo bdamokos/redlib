@@ -3291,14 +3291,36 @@ input[type="submit"] {
     overflow-wrap: anywhere;
 }
 
+.suggested_profile_actions {
+    align-items: center;
+    display: flex;
+    flex-shrink: 0;
+    gap: 8px;
+}
+
 .suggested_profile_follow {
     flex-shrink: 0;
 }
 
 .suggested_profile_follow .subscribe,
-.suggested_profile_follow .unsubscribe {
+.suggested_profile_follow .unsubscribe,
+.suggested_profile_ignore {
     padding: 6px 12px;
     white-space: nowrap;
+}
+
+.suggested_profile_ignore {
+    background: var(--outside);
+    border: var(--panel-border);
+    border-radius: 5px;
+    color: var(--visited);
+    cursor: pointer;
+    font: inherit;
+}
+
+.suggested_profile_ignore:hover {
+    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+    color: var(--text);
 }
 
 .suggested_profile_meta {
@@ -3520,12 +3542,18 @@ input[type="submit"] {
         grid-template-columns: 1fr;
     }
 
-    .suggested_profile_follow {
+    .suggested_profile_actions {
         width: 100%;
     }
 
+    .suggested_profile_actions form {
+        flex: 1;
+    }
+
     .suggested_profile_follow .subscribe,
-    .suggested_profile_follow .unsubscribe {
+    .suggested_profile_follow .unsubscribe,
+    .suggested_profile_ignore {
+        flex: 1;
         width: 100%;
     }
 

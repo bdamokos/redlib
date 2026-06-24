@@ -1,5 +1,5 @@
 use crate::materialized_catalog::{SuggestedProfileScoringMode, SuggestedProfilesReport};
-use crate::utils::{get_filters, param, template, Preferences};
+use crate::utils::{get_filters, param, read_sharded_cookie, template, Preferences};
 use askama::Template;
 use hyper::{Body, Request, Response};
 use std::collections::{HashMap, HashSet};
@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 const SUGGESTED_PROFILE_DEFAULT_LIMIT: usize = 40;
 const SUGGESTED_PROFILE_INCREMENT: usize = 40;
 const SUGGESTED_PROFILE_MAX_LIMIT: usize = 200;
+const SUGGESTED_PROFILE_IGNORE_COOKIE: &str = "suggested_profile_ignores";
+const SUGGESTED_PROFILE_IGNORE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Template)]
 #[template(path = "suggested_profiles.html")]
@@ -73,6 +75,18 @@ fn filtered_profiles(filters: &HashSet<String>) -> HashSet<String> {
 	filters.iter().filter_map(|filter| filter.strip_prefix("u_").map(str::to_string)).collect()
 }
 
+fn ignored_profiles(req: &Request<Body>, now_unix: u64) -> HashSet<String> {
+	read_sharded_cookie(req, SUGGESTED_PROFILE_IGNORE_COOKIE)
+		.split('+')
+		.filter_map(|entry| {
+			let (name, ignored_at) = entry.split_once(':')?;
+			let ignored_at = ignored_at.parse::<u64>().ok()?;
+			let name = name.trim().to_lowercase();
+			(!name.is_empty() && now_unix.saturating_sub(ignored_at) <= SUGGESTED_PROFILE_IGNORE_TTL_SECS).then_some(name)
+		})
+		.collect()
+}
+
 fn followed_profile_subreddit_cache(followed: &[String]) -> HashMap<String, Vec<(String, u32)>> {
 	followed
 		.iter()
@@ -125,7 +139,8 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 	let filters = get_filters(&req);
 	let followed = followed_profiles(&prefs);
 	let followed_subreddits = followed_profile_subreddit_cache(&followed);
-	let excluded = filtered_profiles(&filters);
+	let mut excluded = filtered_profiles(&filters);
+	excluded.extend(ignored_profiles(&req, crate::cache_persistence::unix_now()));
 	let suggestion_limit = requested_suggestion_limit(&req);
 	let scoring_mode = requested_scoring_mode(&req);
 	let fetch_limit = if suggestion_limit < SUGGESTED_PROFILE_MAX_LIMIT {
@@ -189,6 +204,24 @@ mod tests {
 	#[test]
 	fn requested_scoring_mode_accepts_vector() {
 		assert_eq!(requested_scoring_mode(&request_for("/suggested-profiles?mode=vector")), SuggestedProfileScoringMode::Vector);
+	}
+
+	#[test]
+	fn ignored_profiles_keeps_entries_for_thirty_days() {
+		let now = 1_700_000_000;
+		let recent = now - SUGGESTED_PROFILE_IGNORE_TTL_SECS;
+		let expired = recent - 1;
+		let req = Request::builder()
+			.uri("/suggested-profiles")
+			.header("cookie", format!("suggested_profile_ignores=Demo:{recent}+Old:{expired}+bad+Nope:not-a-time"))
+			.body(Body::empty())
+			.expect("valid test request");
+
+		let ignored = ignored_profiles(&req, now);
+
+		assert!(ignored.contains("demo"));
+		assert!(!ignored.contains("old"));
+		assert!(!ignored.contains("nope"));
 	}
 
 	#[test]
