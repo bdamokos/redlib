@@ -26,6 +26,7 @@ const EXPANDABLE_POST_PREVIEW_SELECTOR = ".post_preview.truncated:not(.expanded)
 const PAGE_EDGE_TOLERANCE = 1;
 const POST_MEDIA_FIT_READY_ATTR = "data-post-media-fit-ready";
 let postMediaFitFrame = null;
+let postMediaScrollFitTimer = null;
 
 function parsePostMediaLength(value, fallback) {
     const trimmedValue = value.trim().toLowerCase();
@@ -55,8 +56,18 @@ function getPostMediaBaseMaxHeight(post) {
     return parsePostMediaLength(defaultMaxHeight, fallback);
 }
 
-function getAvailablePostHeight() {
-    return Math.max(0, window.innerHeight - getScrollPaddingTop() - POST_MEDIA_FIT_BOTTOM_GAP);
+function getAvailablePostHeight(post = null) {
+    const viewportTop = getScrollPaddingTop();
+    let frameTop = viewportTop;
+
+    if (post instanceof Element) {
+        const postRect = post.getBoundingClientRect();
+        if (postRect.top > viewportTop && postRect.top < window.innerHeight) {
+            frameTop = postRect.top;
+        }
+    }
+
+    return Math.max(0, window.innerHeight - frameTop - POST_MEDIA_FIT_BOTTOM_GAP);
 }
 
 function isMeasurableElement(element) {
@@ -261,7 +272,7 @@ function fitPostMediaToViewport(post, options = {}) {
         return;
     }
 
-    const availablePostHeight = getAvailablePostHeight();
+    const availablePostHeight = getAvailablePostHeight(post);
     const baseMaxHeight = getPostMediaBaseMaxHeight(post);
     if (availablePostHeight <= 0 || baseMaxHeight <= 0) {
         return;
@@ -334,6 +345,20 @@ function scheduleSinglePostMediaResize(root = document, options = {}) {
         postMediaFitFrame = null;
         resizeSinglePostMediaToViewport(root, options);
     });
+}
+
+function scheduleViewedPostMediaResize() {
+    if (postMediaScrollFitTimer !== null) {
+        window.clearTimeout(postMediaScrollFitTimer);
+    }
+
+    postMediaScrollFitTimer = window.setTimeout(() => {
+        postMediaScrollFitTimer = null;
+        const post = findCurrentViewedPost();
+        if (post !== null) {
+            scheduleSinglePostMediaResize(post, { force: true });
+        }
+    }, 80);
 }
 
 function handlePostMediaLoaded(event) {
@@ -769,5 +794,6 @@ window.resizeSinglePostMediaToViewport = resizeSinglePostMediaToViewport;
 document.addEventListener("DOMContentLoaded", () => resizeSinglePostMediaToViewport(document));
 window.addEventListener("resize", () => scheduleSinglePostMediaResize(document, { force: true }));
 window.addEventListener("orientationchange", () => scheduleSinglePostMediaResize(document, { force: true }));
+window.addEventListener("scroll", scheduleViewedPostMediaResize, { passive: true });
 document.addEventListener("load", handlePostMediaLoaded, true);
 document.addEventListener("loadedmetadata", handlePostMediaLoaded, true);
