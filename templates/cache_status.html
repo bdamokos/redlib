@@ -23,12 +23,13 @@
 	<p>Generated at Unix time {{ generated_at_unix }}.</p>
 
 	<div class="panel">
-		<p><strong>Visible sources:</strong> {{ summary.sources_total }}</p>
-		<p><strong>Cached now:</strong> {{ summary.cached_sources }}</p>
-		<p><strong>Daemon-managed:</strong> {{ summary.daemon_managed_sources }}</p>
-		<p><strong>Scheduled:</strong> {{ summary.scheduled_sources }}</p>
-		<p><strong>In flight:</strong> {{ summary.in_flight_sources }}</p>
-		<p><strong>Blocked:</strong> {{ summary.blocked_sources }}</p>
+		<p><strong>Visible feeds:</strong> {{ summary.sources_total }}</p>
+		<p><strong>Cached feeds:</strong> {{ summary.cached_sources }}</p>
+		<p><strong>Cached posts:</strong> {{ summary.cached_posts }} (about {{ summary.estimated_cached_post_pages }} full pages before feed filters and duplicate merging)</p>
+		<p><strong>Daemon-managed feeds:</strong> {{ summary.daemon_managed_sources }}</p>
+		<p><strong>Scheduled feeds:</strong> {{ summary.scheduled_sources }}</p>
+		<p><strong>In flight refreshes:</strong> {{ summary.in_flight_sources }}</p>
+		<p><strong>Blocked feeds:</strong> {{ summary.blocked_sources }}</p>
 	</div>
 
 	<div class="panel">

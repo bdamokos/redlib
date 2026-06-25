@@ -143,6 +143,13 @@ impl Default for PersistedCatalogSnapshot {
 	}
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CatalogPageMetricCandidate {
+	pub created_ts: u64,
+	pub score: Option<i64>,
+	pub stickied: bool,
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedCatalogRecord {
@@ -860,6 +867,19 @@ fn allowed_source_keys_for_session(session: &FeedSession) -> HashSet<CatalogSour
 		.collect()
 }
 
+fn catalog_record_is_visible(record: &CatalogRecord, allowed_keys: &HashSet<CatalogSourceKey>, filters: &HashSet<String>) -> bool {
+	if record.source_keys.is_disjoint(allowed_keys) {
+		return false;
+	}
+	if filters.contains(&record.post.community) || filters.contains(&format!("u_{}", record.post.author.name)) {
+		return false;
+	}
+	if crate::utils::is_deleted_reddit_placeholder_post(&record.post) {
+		return false;
+	}
+	true
+}
+
 fn query_posts_for_keys_limited(catalog: &MaterializedCatalog, allowed_keys: &HashSet<CatalogSourceKey>, filters: &HashSet<String>, limit: usize) -> Vec<Post> {
 	if allowed_keys.is_empty() {
 		return Vec::new();
@@ -873,13 +893,7 @@ fn query_posts_for_keys_limited(catalog: &MaterializedCatalog, allowed_keys: &Ha
 		let Some(record) = catalog.posts_by_id.get(&entry.post_id) else {
 			continue;
 		};
-		if record.source_keys.is_disjoint(allowed_keys) {
-			continue;
-		}
-		if filters.contains(&record.post.community) || filters.contains(&format!("u_{}", record.post.author.name)) {
-			continue;
-		}
-		if crate::utils::is_deleted_reddit_placeholder_post(&record.post) {
+		if !catalog_record_is_visible(record, allowed_keys, filters) {
 			continue;
 		}
 		posts.push(record.post.clone());
@@ -888,6 +902,36 @@ fn query_posts_for_keys_limited(catalog: &MaterializedCatalog, allowed_keys: &Ha
 		}
 	}
 	posts
+}
+
+fn query_page_metric_candidates_for_keys_limited(
+	catalog: &MaterializedCatalog,
+	allowed_keys: &HashSet<CatalogSourceKey>,
+	filters: &HashSet<String>,
+	limit: usize,
+) -> Vec<CatalogPageMetricCandidate> {
+	if allowed_keys.is_empty() || limit == 0 {
+		return Vec::new();
+	}
+
+	let mut candidates = Vec::new();
+	for entry in &catalog.timeline_new {
+		let Some(record) = catalog.posts_by_id.get(&entry.post_id) else {
+			continue;
+		};
+		if !catalog_record_is_visible(record, allowed_keys, filters) {
+			continue;
+		}
+		candidates.push(CatalogPageMetricCandidate {
+			created_ts: record.created_ts,
+			score: record.post.score.1.parse::<i64>().ok(),
+			stickied: record.post.flags.stickied,
+		});
+		if candidates.len() >= limit {
+			break;
+		}
+	}
+	candidates
 }
 
 pub(crate) fn query_author_posts_limited(username: &str, filters: &HashSet<String>, limit: usize) -> Vec<Post> {
@@ -1024,6 +1068,12 @@ pub(crate) fn query_session_stream_limited(session: &FeedSession, limit: usize) 
 	let allowed_keys = allowed_source_keys_for_session(session);
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	query_posts_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, limit)
+}
+
+pub(crate) fn query_session_page_metric_candidates_limited(session: &FeedSession, limit: usize) -> Vec<CatalogPageMetricCandidate> {
+	let allowed_keys = allowed_source_keys_for_session(session);
+	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	query_page_metric_candidates_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, limit)
 }
 
 pub(crate) fn query_source_candidates_limited(sources: &[FeedSource], filters: &HashSet<String>, limit: usize) -> Vec<Post> {

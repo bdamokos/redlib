@@ -271,6 +271,8 @@ pub enum CacheServeMode {
 pub struct CacheStatusSummary {
 	pub sources_total: usize,
 	pub cached_sources: usize,
+	pub cached_posts: usize,
+	pub estimated_cached_post_pages: usize,
 	pub daemon_managed_sources: usize,
 	pub scheduled_sources: usize,
 	pub in_flight_sources: usize,
@@ -1803,7 +1805,11 @@ fn parse_numeric_score(post: &Post) -> Option<i64> {
 }
 
 fn representative_created_ts(posts: &[Post]) -> Option<u64> {
-	let mut created = posts.iter().map(|post| post.created_ts).filter(|ts| *ts > 0).collect::<Vec<_>>();
+	representative_created_ts_from_values(posts.iter().map(|post| post.created_ts))
+}
+
+fn representative_created_ts_from_values(created_ts: impl IntoIterator<Item = u64>) -> Option<u64> {
+	let mut created = created_ts.into_iter().filter(|ts| *ts > 0).collect::<Vec<_>>();
 	if created.is_empty() {
 		return None;
 	}
@@ -1812,7 +1818,11 @@ fn representative_created_ts(posts: &[Post]) -> Option<u64> {
 }
 
 fn representative_score(posts: &[Post]) -> Option<i64> {
-	let mut scores = posts.iter().filter(|post| !post.flags.stickied).filter_map(parse_numeric_score).collect::<Vec<_>>();
+	representative_score_from_values(posts.iter().filter(|post| !post.flags.stickied).filter_map(parse_numeric_score))
+}
+
+fn representative_score_from_values(scores: impl IntoIterator<Item = i64>) -> Option<i64> {
+	let mut scores = scores.into_iter().collect::<Vec<_>>();
 	if scores.len() < 3 {
 		return None;
 	}
@@ -2900,7 +2910,19 @@ pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Ve
 		const METRICS_MAX_CANDIDATES: usize = 25_000;
 		let target_posts = METRICS_TARGET_PAGES.saturating_mul(per_page).max(background_target_posts(session));
 		let limit = target_posts.saturating_mul(METRICS_OVERFETCH_FACTOR).min(METRICS_MAX_CANDIDATES);
-		finalize_session_posts(session, materialized_catalog::query_session_stream_limited(session, limit))
+		let candidates = materialized_catalog::query_session_page_metric_candidates_limited(session, limit);
+		let mut metrics = Vec::new();
+		for (page, chunk) in candidates.chunks(per_page).enumerate() {
+			let full_page = chunk.len() == per_page;
+			metrics.push(FeedSessionPageMetric {
+				page,
+				full_page,
+				ready: full_page || session.background_complete,
+				representative_created_ts: representative_created_ts_from_values(chunk.iter().map(|candidate| candidate.created_ts)),
+				representative_score: representative_score_from_values(chunk.iter().filter(|candidate| !candidate.stickied).filter_map(|candidate| candidate.score)),
+			});
+		}
+		return Some(metrics);
 	} else {
 		merged_posts_for_session(session)
 	};
@@ -3192,9 +3214,12 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 		});
 	}
 
+	let cached_posts_total = sources.iter().map(|source| source.cached_posts).sum::<usize>();
 	let summary = CacheStatusSummary {
 		sources_total: sources.len(),
 		cached_sources: sources.iter().filter(|source| source.cached).count(),
+		cached_posts: cached_posts_total,
+		estimated_cached_post_pages: cached_posts_total.saturating_add(POSTS_PER_PAGE - 1) / POSTS_PER_PAGE,
 		daemon_managed_sources: sources.iter().filter(|source| source.daemon_managed).count(),
 		scheduled_sources: sources.iter().filter(|source| source.schedule_state == "scheduled").count(),
 		in_flight_sources: sources.iter().filter(|source| source.schedule_state == "in_flight").count(),
