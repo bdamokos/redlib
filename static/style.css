@@ -2065,7 +2065,7 @@ a.redgifs_uploader_mismatch {
 }
 
 .video_playback_progress {
-    background: color-mix(in srgb, var(--bg) 70%, transparent);
+    background: rgb(0 0 0 / 0.72);
     bottom: 0;
     height: 4px;
     inset-inline: 0;
@@ -2076,7 +2076,8 @@ a.redgifs_uploader_mismatch {
 }
 
 .video_playback_progress_fill {
-    background: color-mix(in srgb, var(--accent) 82%, var(--text) 18%);
+    background: oklch(88% 0.2 95);
+    box-shadow: 0 0 6px rgb(0 0 0 / 0.55);
     height: 100%;
     transform: scaleX(var(--video-playback-progress, 0));
     transform-origin: left center;
