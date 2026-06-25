@@ -271,19 +271,9 @@ pub fn attach_rl_feed_cookies(response: &mut Response<Body>, session_id: &str, s
 	}
 }
 
-/// Paths for `/`, `/hot`, `/following`, etc. (no `/r/...`).
+/// Hide-seen is disabled while the feed-session behavior is unreliable.
 pub fn public_page_is_feed_seen_scope(path_and_query: &str) -> bool {
-	let path = path_and_query.split('?').next().unwrap_or(path_and_query);
-	if path == "/" {
-		return true;
-	}
-	if path == "/following" || path.starts_with("/following/") {
-		return true;
-	}
-	if path.starts_with('/') && path.matches('/').count() == 1 {
-		let seg = path.trim_start_matches('/');
-		return matches!(seg, "best" | "hot" | "new" | "top" | "rising" | "controversial" | "video-length");
-	}
+	let _ = path_and_query;
 	false
 }
 
@@ -364,11 +354,11 @@ mod tests {
 	}
 
 	#[test]
-	fn public_paths_match_front_and_following() {
-		assert!(public_page_is_feed_seen_scope("/"));
-		assert!(public_page_is_feed_seen_scope("/hot"));
-		assert!(public_page_is_feed_seen_scope("/following"));
-		assert!(public_page_is_feed_seen_scope("/following/new"));
+	fn public_paths_do_not_enable_seen_filtering() {
+		assert!(!public_page_is_feed_seen_scope("/"));
+		assert!(!public_page_is_feed_seen_scope("/hot"));
+		assert!(!public_page_is_feed_seen_scope("/following"));
+		assert!(!public_page_is_feed_seen_scope("/following/new"));
 		assert!(!public_page_is_feed_seen_scope("/r/rust"));
 	}
 

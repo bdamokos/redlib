@@ -91,41 +91,25 @@
         return Number.isFinite(parsed) ? parsed : 0;
     }
 
-    function postForHost(host) {
-        return host ? host.closest(".post") || host : null;
-    }
-
-    function visibleFallbackHosts() {
+    function fullyVisibleFallbackHosts() {
         var viewportTop = scrollPaddingTop();
         var viewportBottom = window.innerHeight;
+        var viewportRight = window.innerWidth;
         return Array.from(activeHosts.keys()).filter(function (host) {
             var fallback = previewFallbackVideo(host);
             if (!fallback || fallback.hidden) {
                 return false;
             }
 
-            var target = postForHost(host);
-            var rect = target.getBoundingClientRect();
-            return rect.bottom > viewportTop && rect.top < viewportBottom;
+            var rect = fallback.getBoundingClientRect();
+            return rect.top >= viewportTop && rect.bottom <= viewportBottom && rect.left >= 0 && rect.right <= viewportRight;
         });
     }
 
     function currentPreviewSoundHost() {
-        var viewportTop = scrollPaddingTop();
-        var hosts = visibleFallbackHosts();
-        var containingViewportTop = hosts.filter(function (host) {
-            var rect = postForHost(host).getBoundingClientRect();
-            return rect.top <= viewportTop + 1 && rect.bottom > viewportTop + 1;
-        }).sort(function (left, right) {
-            return postForHost(right).getBoundingClientRect().top - postForHost(left).getBoundingClientRect().top;
-        });
-
-        if (containingViewportTop.length) {
-            return containingViewportTop[0];
-        }
-
+        var hosts = fullyVisibleFallbackHosts();
         hosts.sort(function (left, right) {
-            return postForHost(left).getBoundingClientRect().top - postForHost(right).getBoundingClientRect().top;
+            return previewFallbackVideo(left).getBoundingClientRect().top - previewFallbackVideo(right).getBoundingClientRect().top;
         });
 
         return hosts[0] || null;

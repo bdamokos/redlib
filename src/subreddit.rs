@@ -3804,7 +3804,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn feed_fragment_replaces_seen_posts_with_next_unseen_posts() {
+	async fn feed_fragment_keeps_seen_posts_visible() {
 		let source = FeedSource::subreddit("feed-fragment-seen-fill-test", FeedSort::New);
 		let posts = (0..30)
 			.map(|index| {
@@ -3834,14 +3834,14 @@ mod tests {
 		let body = hyper::body::to_bytes(response.into_body()).await.expect("feed fragment body");
 		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
 
-		assert!(html.contains("Post seen-fill-25"), "{html}");
-		assert!(html.contains("Post seen-fill-29"), "{html}");
-		assert!(!html.contains("Post seen-fill-24"), "{html}");
+		assert!(html.contains("Post seen-fill-0"), "{html}");
+		assert!(html.contains("Post seen-fill-24"), "{html}");
+		assert!(!html.contains("Post seen-fill-25"), "{html}");
 		assert!(!html.contains("No posts were found."), "{html}");
 	}
 
 	#[tokio::test]
-	async fn feed_fragment_replaces_seen_posts_with_next_unseen_posts_for_following_routes() {
+	async fn feed_fragment_keeps_seen_posts_visible_for_following_routes() {
 		let source = FeedSource::subreddit("following-seen-fill-test", FeedSort::New);
 		let posts = (0..30)
 			.map(|index| {
@@ -3871,9 +3871,9 @@ mod tests {
 		let body = hyper::body::to_bytes(response.into_body()).await.expect("feed fragment body");
 		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
 
-		assert!(html.contains("Post following-seen-fill-25"), "{html}");
-		assert!(html.contains("Post following-seen-fill-29"), "{html}");
-		assert!(!html.contains("Post following-seen-fill-24"), "{html}");
+		assert!(html.contains("Post following-seen-fill-0"), "{html}");
+		assert!(html.contains("Post following-seen-fill-24"), "{html}");
+		assert!(!html.contains("Post following-seen-fill-25"), "{html}");
 		assert!(!html.contains("No posts were found."), "{html}");
 	}
 
