@@ -729,6 +729,9 @@
 				<source src="{{ post.media.display_video_url(prefs) }}" type="video/mp4" />
 				<a href="{{ post.media.display_video_url(prefs) }}">Video</a>
 			</video>
+			<div class="video_playback_progress" hidden aria-hidden="true">
+				<div class="video_playback_progress_fill"></div>
+			</div>
 			{% if video_previews_active %}
 			<div class="video_preview_layer" aria-hidden="true">
 				<img class="video_preview_image" alt="" />

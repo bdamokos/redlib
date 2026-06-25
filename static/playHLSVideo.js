@@ -36,6 +36,9 @@
                 newVideo.preload = "metadata";
 
                 oldVideo.parentNode.replaceChild(newVideo, oldVideo);
+                if (typeof window.bindVideoProgress === "function") {
+                    window.bindVideoProgress(newVideo);
+                }
 
                 function getIndexOfDefault(length) {
                     switch (qualitySetting) {

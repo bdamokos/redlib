@@ -2064,6 +2064,26 @@ a.redgifs_uploader_mismatch {
     cursor: pointer;
 }
 
+.video_playback_progress {
+    background: color-mix(in srgb, var(--bg) 70%, transparent);
+    bottom: 0;
+    height: 4px;
+    inset-inline: 0;
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+    z-index: 3;
+}
+
+.video_playback_progress_fill {
+    background: color-mix(in srgb, var(--accent) 82%, var(--text) 18%);
+    height: 100%;
+    transform: scaleX(var(--video-playback-progress, 0));
+    transform-origin: left center;
+    transition: transform 120ms linear;
+    width: 100%;
+}
+
 .video_preview_layer {
     inset: 0;
     min-height: 0;
