@@ -7,9 +7,25 @@
         return stage ? stage.querySelector(".video_playback_progress") : null;
     }
 
+    function activeProgressVideo(stage) {
+        if (!stage) {
+            return null;
+        }
+
+        var fallback = stage.querySelector(".video_preview_fallback_video:not([hidden])");
+        return fallback || stage.querySelector("video.post_media_video");
+    }
+
     function syncVideoProgress(videoEl) {
-        var progress = progressBarForVideo(videoEl);
+        var stage = videoEl ? videoEl.closest(".video_preview_stage") : null;
+        var progress = stage ? stage.querySelector(".video_playback_progress") : null;
         if (!progress) {
+            return;
+        }
+
+        var activeVideo = activeProgressVideo(stage);
+        if (activeVideo && activeVideo !== videoEl) {
+            syncVideoProgress(activeVideo);
             return;
         }
 
@@ -46,7 +62,7 @@
         }
 
         videoEl._redlib_progress_bound = true;
-        ["durationchange", "loadedmetadata", "timeupdate", "seeked", "emptied", "ended"].forEach(function (eventName) {
+        ["durationchange", "loadedmetadata", "timeupdate", "seeked", "pause", "emptied", "ended"].forEach(function (eventName) {
             videoEl.addEventListener(eventName, function () {
                 syncVideoProgress(videoEl);
             });
@@ -100,8 +116,8 @@
 
     function observeVideoVisibility(root) {
         var container = root || document;
-        var videos = container.querySelectorAll("video.post_media_video");
-        videos.forEach(function (videoEl) {
+        var progressVideos = container.querySelectorAll("video.post_media_video, video.video_preview_fallback_video");
+        progressVideos.forEach(function (videoEl) {
             bindVideoProgress(videoEl);
         });
 
@@ -110,6 +126,7 @@
             return;
         }
 
+        var videos = container.querySelectorAll("video.post_media_video");
         videos.forEach(function (videoEl) {
             observer.observe(videoEl);
         });
