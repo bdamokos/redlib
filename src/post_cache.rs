@@ -47,7 +47,7 @@ const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
 pub const POSTS_PER_PAGE: usize = 25;
 const DEFAULT_SOURCE_RESIDENT_TTL_SECS: u64 = 15 * 60;
 
-/// Max time the server waits for a full first contextual page (or background complete) before
+/// Max time the server waits for a full contextual page (or background complete) before
 /// sealing whatever merged posts exist so the HTML/fragment response does not keep changing.
 const CONTEXTUAL_FEED_PAINT_WAIT: Duration = Duration::from_secs(12);
 
@@ -769,6 +769,7 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 			Ok(None) => return None,
 			Err(error) => {
 				warn!("post_cache: failed to read source cache entry {}: {}", source.display_name(), error);
+				crate::cache_persistence::remove_source_cache_entry(&cache_key);
 				return None;
 			}
 		};
@@ -1574,12 +1575,13 @@ fn store_source_posts(source: &FeedSource, posts: Vec<Post>, after: String) {
 	store_source_posts_with_origin(source, posts, after, None);
 }
 
-fn cached_source_origin_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<RefreshOrigin> {
-	cached_source_posts_with_mode(source, mode).and_then(|entry| entry.refresh_origin)
-}
-
-fn cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
-	cached_source_origin_with_mode(source, CacheServeMode::Normal)
+fn resident_cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
+	let Ok(cache) = SOURCE_CACHE.lock() else {
+		return None;
+	};
+	cache
+		.get(&source.cache_key())
+		.and_then(|entry| if source_cache_is_servable(source, entry) { entry.refresh_origin } else { None })
 }
 
 fn cached_source_posts_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<CachedSourcePosts> {
@@ -2023,7 +2025,7 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 	let daemon_cached_sources = session
 		.sources
 		.iter()
-		.filter(|entry| entry.state == SessionSourceState::Ready && cached_source_origin(&entry.source) == Some(RefreshOrigin::Daemon))
+		.filter(|entry| entry.state == SessionSourceState::Ready && resident_cached_source_origin(&entry.source) == Some(RefreshOrigin::Daemon))
 		.count();
 	let failed_sources = session.sources.iter().filter(|entry| entry.state == SessionSourceState::Failed).count();
 	let total_user_sources = session
@@ -2664,7 +2666,7 @@ pub async fn ensure_feed_session_with_budget(request: FeedSessionRequest, page: 
 	ensure_feed_session_inner(request, page, per_page, Some(max_sync_sources)).await
 }
 
-pub async fn continue_feed_session_with_budget(session_id: &str, page: usize, per_page: usize, _max_sync_sources: usize) -> bool {
+pub async fn continue_feed_session_with_budget(session_id: &str, page: usize, per_page: usize, max_sync_sources: usize) -> bool {
 	if session_id.trim().is_empty() {
 		return false;
 	}
@@ -2679,6 +2681,17 @@ pub async fn continue_feed_session_with_budget(session_id: &str, page: usize, pe
 		session.requested_page = session.requested_page.max(page);
 		reconcile_session_with_source_cache(session);
 		touch_session(session);
+	}
+
+	let needs_sync_fill = {
+		let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(session) = sessions.get(session_id) else {
+			return false;
+		};
+		!session_requested_page_ready(session, page, per_page)
+	};
+	if needs_sync_fill {
+		warm_session_to_fill(session_id, page, per_page, max_sync_sources).await;
 	}
 
 	let warm_mode = {

@@ -170,6 +170,10 @@ crate::impl_template_str_eq!(SubredditFragmentTemplate);
 
 const CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET: usize = 24;
 
+fn contextual_front_page_sync_source_budget(cache_page: usize) -> usize {
+	CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET.max((cache_page + 1).saturating_mul(crate::post_cache::POSTS_PER_PAGE))
+}
+
 #[derive(Template)]
 #[template(path = "feed_fragment.html")]
 struct FeedFragmentTemplate {
@@ -1343,14 +1347,14 @@ async fn ensure_contextual_feed_session(requested_session_id: String, request: F
 		&requested_session_id,
 		cache_page,
 		crate::post_cache::POSTS_PER_PAGE,
-		CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET,
+		contextual_front_page_sync_source_budget(cache_page),
 	)
 	.await
 	{
 		return requested_session_id;
 	}
 
-	crate::post_cache::ensure_feed_session_with_budget(request, cache_page, crate::post_cache::POSTS_PER_PAGE, CONTEXTUAL_FRONT_PAGE_SYNC_SOURCE_BUDGET).await
+	crate::post_cache::ensure_feed_session_with_budget(request, cache_page, crate::post_cache::POSTS_PER_PAGE, contextual_front_page_sync_source_budget(cache_page)).await
 }
 
 fn now_unix() -> u64 {
@@ -1880,7 +1884,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				filters: get_filters(&req),
 				quarantine: true,
 				query_fingerprint,
-				cache_revision: crate::post_cache::source_cache_revision(),
+				// Keep plain homepage reloads on the same contextual session while
+				// background source refreshes advance the global cache revision.
+				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
 				merge_sort: following_feed_merge_sort(&front_page, &sort),
 				..Default::default()
@@ -1889,9 +1895,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		)
 		.await;
 
-		if cache_page == 0 {
-			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
-		}
+		crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
 
 		let page = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
 		if let Some(mut page) = page {
@@ -1904,7 +1908,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			let mut page_posts = page_posts;
 			page.has_next = page.has_next || has_next_unseen;
 
-			let no_posts = page_posts.is_empty();
+			let no_posts = page.ready && page_posts.is_empty();
 			let all_posts_hidden_nsfw = !no_posts && (page_posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 			if is_following_route(&url) {
 				page_posts = crate::user::hydrate_following_submission_posts(page_posts).await;
@@ -1931,7 +1935,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			} else {
 				String::new()
 			};
-			let contextual_pagination = build_contextual_pagination(&url, &feed_session_id, cache_page, &sort);
+			let contextual_pagination = if cache_page == 0 {
+				Vec::new()
+			} else {
+				build_contextual_pagination(&url, &feed_session_id, cache_page, &sort)
+			};
 
 			let mut page_template = SubredditTemplate {
 				sub: cached_sub,
@@ -2385,7 +2393,9 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				filters: filters.clone(),
 				quarantine: quarantined,
 				query_fingerprint,
-				cache_revision: crate::post_cache::source_cache_revision(),
+				// Keep plain homepage reloads on the same contextual session while
+				// background source refreshes advance the global cache revision.
+				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
 				merge_sort: following_feed_merge_sort(&front_page, &sort),
 				..Default::default()
@@ -2394,9 +2404,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		)
 		.await;
 
-		if cache_page == 0 {
-			crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
-		}
+		crate::post_cache::wait_and_seal_contextual_feed_paint(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE).await;
 
 		if let Some(mut page) = crate::post_cache::feed_page(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE) {
 			let feed_status = crate::post_cache::feed_status(&feed_session_id, cache_page, crate::post_cache::POSTS_PER_PAGE);
@@ -2445,7 +2453,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			} else {
 				String::new()
 			};
-			let contextual_pagination = build_contextual_pagination(&url, &feed_session_id, cache_page, &sort);
+			let contextual_pagination = if cache_page == 0 {
+				Vec::new()
+			} else {
+				build_contextual_pagination(&url, &feed_session_id, cache_page, &sort)
+			};
 
 			return render_subreddit_fragment(
 				&req,
@@ -4541,9 +4553,7 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let page = param(&format!("?{}", req.uri().query().unwrap_or_default()), "cache_page")
 		.and_then(|value| value.parse::<usize>().ok())
 		.unwrap_or(0);
-	if page == 0 {
-		crate::post_cache::wait_and_seal_contextual_feed_paint(&session_id, page, crate::post_cache::POSTS_PER_PAGE).await;
-	}
+	crate::post_cache::wait_and_seal_contextual_feed_paint(&session_id, page, crate::post_cache::POSTS_PER_PAGE).await;
 	let Some(mut feed_page) = crate::post_cache::feed_page(&session_id, page, crate::post_cache::POSTS_PER_PAGE) else {
 		return error(req, "Feed session not found or expired").await;
 	};
@@ -4620,7 +4630,11 @@ pub async fn feed_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	let no_posts = page_ready && posts.is_empty();
 	let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|post| post.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 	let session_sort = crate::post_cache::feed_session_sort(&session_id).map(|sort| sort.as_str().to_string()).unwrap_or_default();
-	let contextual_pagination = build_contextual_pagination(&current_url, &session_id, page, &session_sort);
+	let contextual_pagination = if page == 0 {
+		Vec::new()
+	} else {
+		build_contextual_pagination(&current_url, &session_id, page, &session_sort)
+	};
 	let user_agent = req.headers().get("user-agent").and_then(|value| value.to_str().ok()).unwrap_or_default();
 	info!(
 		"post_cache: feed-fragment current_url={} page={} session={} rendered_posts={} page_ready={} no_posts={} has_next={} ua={}",
