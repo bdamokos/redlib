@@ -2753,6 +2753,16 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		return None;
 	}
 	reconcile_session_with_source_cache(session);
+	let has_more_available = session.background_active || page < session.requested_page || session_has_remaining_sources(session);
+	if let Some(posts) = session.frozen_pages.get(&page).cloned() {
+		let has_next = has_more_available || posts.len() >= per_page;
+		return Some(FeedPage {
+			posts,
+			has_prev: page > 0,
+			has_next,
+			ready: true,
+		});
+	}
 
 	let merged_posts = merged_posts_for_session(session);
 	let page_ready = current_page_is_ready(session, &merged_posts, page, per_page);
@@ -2771,7 +2781,6 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	};
 	let shown_ids: HashSet<String> = posts.iter().map(|post| post.id.clone()).collect();
 	let has_next_from_feed = tail_for_page.iter().any(|post| !shown_ids.contains(&post.id));
-	let has_more_available = session.background_active || page < session.requested_page || session_has_remaining_sources(session);
 	Some(FeedPage {
 		posts,
 		has_prev: page > 0,
@@ -2818,9 +2827,13 @@ pub async fn wait_and_seal_contextual_feed_paint(session_id: &str, page: usize, 
 			if session_is_expired(session) {
 				return;
 			}
-			reconcile_session_with_source_cache(session);
-			let merged_posts = merged_posts_for_session(session);
-			current_page_is_ready(session, &merged_posts, page, per_page)
+			if session.frozen_pages.contains_key(&page) {
+				true
+			} else {
+				reconcile_session_with_source_cache(session);
+				let merged_posts = merged_posts_for_session(session);
+				current_page_is_ready(session, &merged_posts, page, per_page)
+			}
 		};
 		if ready || tokio::time::Instant::now() >= deadline {
 			break;
@@ -2837,6 +2850,9 @@ pub fn feed_status(session_id: &str, page: usize, per_page: usize) -> Option<Fee
 		return None;
 	}
 	reconcile_session_with_source_cache(session);
+	if let Some(posts) = session.frozen_pages.get(&page).cloned() {
+		return Some(session_status_from_posts(session, &posts, page, per_page));
+	}
 
 	let posts = merged_posts_for_session(session);
 	Some(session_status_from_posts(session, &posts, page, per_page))
