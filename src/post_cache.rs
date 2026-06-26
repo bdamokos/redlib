@@ -22,6 +22,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 pub(crate) const CACHE_TTL_SECS: u64 = 10_800;
 pub(crate) const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 pub(crate) const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
+const REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK: usize = 20;
 /// Visit-interest boost decays with this half-life so manual browsing lifts refresh priority temporarily.
 const VISIT_PRIORITY_HALFLIFE_SECS: u64 = 72 * 60 * 60;
 /// Minimum time between visit signals for the same feed (pagination / rapid reload spam guard).
@@ -251,6 +252,12 @@ enum RememberedFailureDisposition {
 	Transient,
 	Permanent,
 	Banned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RememberedRefreshOutcome {
+	Succeeded,
+	Failed(RememberedFailureDisposition),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1121,21 +1128,22 @@ pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refr
 	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
 		return;
 	};
-	record_remembered_source_refresh_failure(&source, error, refresh_origin);
+	let _ = record_remembered_source_refresh_failure(&source, error, refresh_origin);
 }
 
-fn record_remembered_source_refresh_failure(source: &FeedSource, error: &str, refresh_origin: RefreshOrigin) {
+fn record_remembered_source_refresh_failure(source: &FeedSource, error: &str, refresh_origin: RefreshOrigin) -> Option<RememberedFailureDisposition> {
 	let Some(key) = remembered_feed_key_for_source(source) else {
-		return;
+		return None;
 	};
+	let disposition = refresh_failure_disposition(error);
 	let now = Instant::now();
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let Some(entry) = remembered.get_mut(&key) else {
-		return;
+		return None;
 	};
 
 	entry.last_refresh_failed_at = Some(now);
-	match refresh_failure_disposition(error) {
+	match disposition {
 		RememberedFailureDisposition::Banned => {
 			entry.banned_until = Some(now + Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
 		}
@@ -1153,6 +1161,7 @@ fn record_remembered_source_refresh_failure(source: &FeedSource, error: &str, re
 		error
 	);
 	crate::cache_persistence::mark_dirty();
+	Some(disposition)
 }
 
 pub fn cleanup_decayed_remembered_subreddits() {
@@ -1422,7 +1431,7 @@ fn source_should_hydrate_media_fingerprints(source: &FeedSource) -> bool {
 	matches!(source, FeedSource::Subreddit { name, .. } if name.to_lowercase().starts_with("u_"))
 }
 
-async fn refresh_remembered_feed(source: &FeedSource) {
+async fn refresh_remembered_feed(source: &FeedSource) -> RememberedRefreshOutcome {
 	mark_remembered_source_refresh_started(source);
 	let listing_result = match Post::fetch(&source.build_path(), false).await {
 		Ok((posts, after)) => {
@@ -1435,14 +1444,16 @@ async fn refresh_remembered_feed(source: &FeedSource) {
 		Err(error) => Err(error),
 	};
 
-	match listing_result {
+	let outcome = match listing_result {
 		Ok((posts, after)) => {
 			publish_remembered_source_refresh(source, posts, after, RefreshOrigin::Daemon);
+			RememberedRefreshOutcome::Succeeded
 		}
 		Err(error) => {
-			record_remembered_source_refresh_failure(source, &error, RefreshOrigin::Daemon);
+			let disposition = record_remembered_source_refresh_failure(source, &error, RefreshOrigin::Daemon).unwrap_or(RememberedFailureDisposition::Transient);
+			RememberedRefreshOutcome::Failed(disposition)
 		}
-	}
+	};
 
 	let metadata_subreddit = match source {
 		FeedSource::Subreddit { name, .. } if !name.to_lowercase().starts_with("u_") => Some(name.as_str()),
@@ -1450,7 +1461,7 @@ async fn refresh_remembered_feed(source: &FeedSource) {
 		FeedSource::Subreddit { .. } | FeedSource::UserComments { .. } => None,
 	};
 	let Some(subreddit) = metadata_subreddit else {
-		return;
+		return outcome;
 	};
 
 	match crate::subreddit::refresh_subreddit_metadata(subreddit, false).await {
@@ -1467,6 +1478,15 @@ async fn refresh_remembered_feed(source: &FeedSource) {
 			warn!("post_cache: failed to refresh metadata for {} via {:?}: {}", subreddit, RefreshOrigin::Daemon, error);
 		}
 	}
+
+	outcome
+}
+
+fn daemon_should_continue_after_refresh(outcome: RememberedRefreshOutcome, attempts: usize) -> bool {
+	matches!(
+		outcome,
+		RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Permanent | RememberedFailureDisposition::Banned)
+	) && attempts < REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK
 }
 
 pub fn spawn_remembered_feed_daemon() {
@@ -1492,27 +1512,60 @@ pub fn spawn_remembered_feed_daemon() {
 				total, active, eligible, blocked_or_in_flight
 			);
 
-			let Some(source) = pick_next_remembered_feed_to_refresh() else {
-				info!("post_cache: remembered feed daemon idle: no eligible source to refresh");
-				continue;
-			};
+			let mut attempts = 0;
+			loop {
+				let Some(source) = pick_next_remembered_feed_to_refresh() else {
+					if attempts == 0 {
+						info!("post_cache: remembered feed daemon idle: no eligible source to refresh");
+					}
+					break;
+				};
 
-			let should_skip = {
-				let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-				remembered_feed_key_for_source(&source).map_or(true, |key| {
-					remembered.get(&key).is_none_or(|entry| !remembered_entry_is_active(entry) || entry.refresh_in_flight)
-				})
-			};
-			if should_skip {
-				info!(
-					"post_cache: remembered feed daemon skipped refresh for {} because it is no longer eligible",
-					source.display_name()
-				);
-				continue;
+				let should_skip = {
+					let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+					remembered_feed_key_for_source(&source).map_or(true, |key| {
+						remembered.get(&key).is_none_or(|entry| !remembered_entry_is_active(entry) || entry.refresh_in_flight)
+					})
+				};
+				if should_skip {
+					info!(
+						"post_cache: remembered feed daemon skipped refresh for {} because it is no longer eligible",
+						source.display_name()
+					);
+					break;
+				}
+
+				attempts += 1;
+				info!("post_cache: remembered feed daemon refreshing {}", source.display_name());
+				let outcome = refresh_remembered_feed(&source).await;
+				match outcome {
+					RememberedRefreshOutcome::Succeeded => {
+						if attempts > 1 {
+							info!("post_cache: remembered feed daemon refreshed a feed after {} attempts", attempts);
+						}
+						break;
+					}
+					RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Transient) => {
+						break;
+					}
+					RememberedRefreshOutcome::Failed(disposition) => {
+						if !daemon_should_continue_after_refresh(outcome, attempts) {
+							warn!(
+								"post_cache: remembered feed daemon reached attempt limit after {} attempts; last failure was {:?} for {}",
+								attempts,
+								disposition,
+								source.display_name()
+							);
+							break;
+						}
+						info!(
+							"post_cache: remembered feed daemon continuing after {:?} failure for {}",
+							disposition,
+							source.display_name()
+						);
+					}
+				}
 			}
-
-			info!("post_cache: remembered feed daemon refreshing {}", source.display_name());
-			refresh_remembered_feed(&source).await;
 		}
 	});
 }
@@ -1656,7 +1709,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 				}
 			}
 			if remembered_feed_key_for_source(&source).is_some() {
-				record_remembered_source_refresh_failure(&source, &error, refresh_origin);
+				let _ = record_remembered_source_refresh_failure(&source, &error, refresh_origin);
 			}
 			return Err(error);
 		}
@@ -3237,16 +3290,17 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 mod tests {
 	use super::{
 		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, build_session_id,
-		cache_status_for_preferences, catalog_source_candidates, continue_feed_session_with_budget, count_sources_in_state, effective_freshness_target_secs,
-		ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
-		mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
-		pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache, publish_plain_subreddit_refresh,
-		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits,
-		remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts,
+		cache_status_for_preferences, catalog_source_candidates, continue_feed_session_with_budget, count_sources_in_state, daemon_should_continue_after_refresh,
+		effective_freshness_target_secs, ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions,
+		initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
+		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache,
+		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, remember_flair_request,
+		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts,
 		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision,
 		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource,
-		RefreshOrigin, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
-		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		RefreshOrigin, RememberedFailureDisposition, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
+		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE,
+		REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4371,6 +4425,27 @@ mod tests {
 		let remaining = banned_until.saturating_duration_since(Instant::now());
 		assert!(remaining <= Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
 		assert!(remaining > Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS.saturating_sub(5)));
+	}
+
+	#[test]
+	fn daemon_continues_after_permanent_failures_until_attempt_limit() {
+		assert!(daemon_should_continue_after_refresh(
+			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Permanent),
+			1
+		));
+		assert!(daemon_should_continue_after_refresh(
+			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Banned),
+			REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK - 1
+		));
+		assert!(!daemon_should_continue_after_refresh(
+			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Permanent),
+			REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK
+		));
+		assert!(!daemon_should_continue_after_refresh(
+			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Transient),
+			1
+		));
+		assert!(!daemon_should_continue_after_refresh(RememberedRefreshOutcome::Succeeded, 1));
 	}
 
 	#[test]
