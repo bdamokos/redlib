@@ -593,7 +593,7 @@ function getPostContextLink(post) {
     return post.querySelector(selector);
 }
 
-function getPostAuthorFilterValue(post) {
+function getPostAuthorPreferenceValue(post) {
     if (!(post instanceof Element)) {
         return "";
     }
@@ -617,12 +617,32 @@ function getPostAuthorFilterValue(post) {
 }
 
 function filterCurrentPostAuthor() {
-    const filterValue = getPostAuthorFilterValue(findCurrentViewedPost());
+    const filterValue = getPostAuthorPreferenceValue(findCurrentViewedPost());
     if (filterValue === "" || typeof window.filterPreferenceValue !== "function") {
         return false;
     }
 
     return window.filterPreferenceValue(filterValue) === true;
+}
+
+function isCurrentPostAuthorMarkedFollowed(post) {
+    if (!(post instanceof Element)) {
+        return false;
+    }
+
+    return post.querySelector(".post_header .followed_author_marker") !== null;
+}
+
+function followCurrentPostAuthor() {
+    const post = findCurrentViewedPost();
+    const followValue = getPostAuthorPreferenceValue(post);
+    if (followValue === "" || typeof window.followPreferenceValue !== "function") {
+        return false;
+    }
+
+    return window.followPreferenceValue(followValue, {
+        alreadyFollowed: isCurrentPostAuthorMarkedFollowed(post),
+    }) === true;
 }
 
 function openCurrentPostContext() {
@@ -716,7 +736,7 @@ document.addEventListener("keydown", (event) => {
     }
 
     if (isFollowShortcut) {
-        if (window.togglePrimarySubscription?.() === true) {
+        if (followCurrentPostAuthor() || window.togglePrimarySubscription?.() === true) {
             event.preventDefault();
         }
         return;
