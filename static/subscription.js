@@ -353,89 +353,6 @@
         }
     };
 
-    const authorNameFromPreferenceValue = (value) => {
-        if (!value.startsWith("u_")) {
-            return "";
-        }
-        return value.slice(2).trim().toLowerCase();
-    };
-
-    const postAuthorName = (post) => {
-        const authorLink = post.querySelector(".post_author[href]");
-        if (!(authorLink instanceof HTMLAnchorElement)) {
-            return "";
-        }
-
-        const match = authorLink.pathname.match(/^\/(?:u|user)\/([^/?#]+)/);
-        if (match === null) {
-            return "";
-        }
-
-        return decodeURIComponent(match[1]).trim().toLowerCase();
-    };
-
-    const postMatchesAuthorPreference = (post, value) => {
-        const target = authorNameFromPreferenceValue(value);
-        return target !== "" && postAuthorName(post) === target;
-    };
-
-    const ensureFollowedAuthorMarker = (post) => {
-        const header = post.querySelector(".post_header");
-        const authorLink = header?.querySelector(".post_author[href]");
-        if (!(header instanceof Element) || !(authorLink instanceof HTMLAnchorElement)) {
-            return;
-        }
-        if (header.querySelector(".followed_author_marker") !== null) {
-            return;
-        }
-
-        const marker = document.createElement("span");
-        marker.className = "followed_author_marker";
-        marker.textContent = "followed";
-        authorLink.after(marker);
-    };
-
-    const removeFollowedAuthorMarker = (post) => {
-        post.querySelector(".post_header .followed_author_marker")?.remove();
-    };
-
-    const syncFollowedAuthorMarkers = (intent, isEnabling) => {
-        if (intent.mode !== "list" || intent.values.length !== 1) {
-            return;
-        }
-
-        const value = intent.values[0];
-        if (authorNameFromPreferenceValue(value) === "") {
-            return;
-        }
-
-        for (const post of document.querySelectorAll(".post")) {
-            if (!postMatchesAuthorPreference(post, value)) {
-                continue;
-            }
-            if (isEnabling) {
-                ensureFollowedAuthorMarker(post);
-            } else {
-                removeFollowedAuthorMarker(post);
-            }
-        }
-    };
-
-    const applyListPreferenceSideEffects = (intent, isEnabling) => {
-        if (intent.mode !== "list") {
-            return;
-        }
-
-        if (intent.cookieName === "subscriptions") {
-            syncFollowedAuthorMarkers(intent, isEnabling);
-            return;
-        }
-
-        if (intent.cookieName === "filters" && isEnabling) {
-            syncFollowedAuthorMarkers({ ...intent, cookieName: "subscriptions" }, false);
-        }
-    };
-
     const applyPreferenceIntent = (intent, isEnabling) => {
         for (const form of getForms()) {
             if (formMatchesIntent(form, intent)) {
@@ -443,7 +360,6 @@
             }
         }
         applyCounterpartListIntent(intent, isEnabling);
-        applyListPreferenceSideEffects(intent, isEnabling);
     };
 
     const broadcastPreferenceIntent = (intent, isEnabling) => {
@@ -574,18 +490,6 @@
         return true;
     };
 
-    const submitPreferenceForm = (form) => {
-        if (typeof form.requestSubmit === "function") {
-            form.requestSubmit();
-        } else {
-            form.querySelector("button")?.click();
-        }
-
-        if (form.hidden && form.contains(document.activeElement) && document.activeElement instanceof HTMLElement) {
-            document.activeElement.blur();
-        }
-    };
-
     const hiddenListPreferenceForm = (value, cookieName, actionName, labels) => {
         const existing = getForms().find((form) => {
             const intent = preferenceIntent(form);
@@ -627,35 +531,6 @@
         return form;
     };
 
-    const followPreferenceValue = (value, options = {}) => {
-        if (!/^[A-Za-z0-9_-]+$/.test(value)) {
-            return false;
-        }
-
-        const form = hiddenListPreferenceForm(value, "subscriptions", "subscribe", {
-            stateOn: "subscribed",
-            stateOff: "unsubscribed",
-            subscribeLabel: "Follow",
-            unsubscribeLabel: "Unfollow",
-            subscribeClass: "subscribe",
-            unsubscribeClass: "unsubscribe",
-            successToast: `Followed ${value.startsWith("u_") ? `u/${value.slice(2)}` : value}`,
-        });
-        bindForm(form);
-
-        if (options.alreadyFollowed === true) {
-            updateFormState(form, form.dataset.stateOn || "subscribed");
-            return true;
-        }
-
-        if (currentCookieState(form) === (form.dataset.stateOn || "subscribed")) {
-            return true;
-        }
-
-        submitPreferenceForm(form);
-        return true;
-    };
-
     const filterPreferenceValue = (value) => {
         if (!/^[A-Za-z0-9_-]+$/.test(value)) {
             return false;
@@ -676,13 +551,16 @@
             return false;
         }
 
-        submitPreferenceForm(form);
+        if (typeof form.requestSubmit === "function") {
+            form.requestSubmit();
+        } else {
+            form.querySelector("button")?.click();
+        }
         return true;
     };
 
     window.initializeSubscriptionForms = initializeSubscriptionForms;
     window.togglePrimarySubscription = togglePrimarySubscription;
-    window.followPreferenceValue = followPreferenceValue;
     window.filterPreferenceValue = filterPreferenceValue;
 
     window.addEventListener("focus", syncAllForms);
