@@ -1416,7 +1416,7 @@ pub fn pick_next_remembered_feed_to_refresh() -> Option<FeedSource> {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let mut entries = remembered
 		.values()
-		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked(entry))
+		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked(entry) && !entry.refresh_in_flight)
 		.cloned()
 		.collect::<Vec<_>>();
 	entries.sort_by(remembered_refresh_priority);
@@ -4277,6 +4277,25 @@ mod tests {
 			pick_next_remembered_feed_to_refresh().map(|source| source.display_name()),
 			Some("programming#News".to_string())
 		);
+	}
+
+	#[test]
+	fn pick_next_remembered_feed_skips_in_flight_source() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let mut in_flight = remembered_entry("alpha");
+		in_flight.refresh_in_flight = true;
+		in_flight.last_requested_at = Instant::now();
+		let mut ready = remembered_entry("beta");
+		ready.last_requested_at = Instant::now() - Duration::from_secs(60);
+
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		remembered.insert("alpha".to_string(), in_flight);
+		remembered.insert("beta".to_string(), ready);
+		drop(remembered);
+
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("beta".to_string()));
 	}
 
 	#[test]
