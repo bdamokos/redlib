@@ -15,8 +15,8 @@ use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
-	bookmarks, cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, suggested_profiles, user,
-	video_mode_api, video_preview,
+	bookmarks, cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, suggested_profiles,
+	suggested_subreddits, user, video_mode_api, video_preview,
 };
 use url::Url;
 
@@ -233,6 +233,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"author_links.js" => resource(include_str!("../static/author_links.js"), "text/javascript", false).await,
 		"subscription.js" => resource(include_str!("../static/subscription.js"), "text/javascript", false).await,
 		"suggested_profiles.js" => resource(include_str!("../static/suggested_profiles.js"), "text/javascript", false).await,
+		"suggested_subreddits.js" => resource(include_str!("../static/suggested_subreddits.js"), "text/javascript", false).await,
 		"feed_status.js" => resource(include_str!("../static/feed_status.js"), "text/javascript", false).await,
 		"page_fragment.js" => resource(include_str!("../static/page_fragment.js"), "text/javascript", false).await,
 		"dynamic_content.js" => resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).await,
@@ -435,6 +436,9 @@ async fn main() {
 		.at("/suggested_profiles.js")
 		.get(|_| resource(include_str!("../static/suggested_profiles.js"), "text/javascript", false).boxed());
 	app
+		.at("/suggested_subreddits.js")
+		.get(|_| resource(include_str!("../static/suggested_subreddits.js"), "text/javascript", false).boxed());
+	app
 		.at("/feed_status.js")
 		.get(|_| resource(include_str!("../static/feed_status.js"), "text/javascript", false).boxed());
 	app
@@ -547,6 +551,7 @@ async fn main() {
 	app.at("/bookmarks/add").post(|r| bookmarks::add(r).boxed());
 	app.at("/bookmarks/remove").post(|r| bookmarks::remove(r).boxed());
 	app.at("/suggested-profiles").get(|r| suggested_profiles::page(r).boxed());
+	app.at("/suggested-subreddits").get(|r| suggested_subreddits::page(r).boxed());
 	register_subreddit_fragment_routes(&mut app);
 
 	app.at("/r/:sub/comments/:id").get(|r| post::item(r).boxed());

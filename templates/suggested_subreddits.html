@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% import "utils.html" as utils %}
+
+{% block title %}Suggested Subreddits{% endblock %}
+
+{% block subscriptions %}
+{% call utils::sub_list("__suggested_subreddits__", "") %}
+{% endblock %}
+
+{% block search %}
+{% call utils::search("".to_owned(), "") %}
+{% endblock %}
+
+{% block head %}
+	{% call super() %}
+	<script src="{{ crate::utils::static_asset_href("suggested_subreddits.js") }}" defer></script>
+{% endblock %}
+
+{% block body %}
+<main class="suggested_profiles_page suggested_subreddits_page">
+	<header class="suggested_profiles_header panel">
+		<div>
+			<p class="suggested_profiles_kicker">Based on followed profiles</p>
+			<h1>Subreddits your network keeps posting to</h1>
+		</div>
+		<nav class="suggested_profiles_mode" aria-label="Suggested profile scoring mode">
+			<span>Suggested profile source</span>
+			<a href="{{ self.overlap_mode_path() }}" class="{% if self.is_overlap_mode() %}active{% endif %}"{% if self.is_overlap_mode() %} aria-current="page"{% endif %}>Overlap</a>
+			<a href="{{ self.vector_mode_path() }}" class="{% if self.is_vector_mode() %}active{% endif %}"{% if self.is_vector_mode() %} aria-current="page"{% endif %}>Vector</a>
+		</nav>
+		<div class="suggested_profiles_stats" aria-label="Suggestion source summary">
+			<div>
+				<strong>{{ report.followed_profile_count }}</strong>
+				<span>followed profiles</span>
+			</div>
+			<div>
+				<strong>{{ report.followed_profiles_with_cache }}</strong>
+				<span>with subreddit history</span>
+			</div>
+			<div>
+				<strong>{{ report.suggested_profile_count }}</strong>
+				<span>suggested profiles sampled</span>
+			</div>
+			<div>
+				<strong>{{ report.candidate_subreddit_count }}</strong>
+				<span>unfollowed candidates</span>
+			</div>
+		</div>
+	</header>
+
+	{% if report.followed_profile_count == 0 %}
+	<section class="suggested_profiles_empty panel">
+		<h2>No followed profiles yet</h2>
+		<p>Follow one or more user profiles first.</p>
+	</section>
+	{% else if report.followed_profiles_with_cache == 0 && report.suggested_profiles_with_cache == 0 %}
+	<section class="suggested_profiles_empty panel">
+		<h2>No subreddit history for followed profiles yet</h2>
+		<p>Open the profiles you follow or wait for the cache to refresh them.</p>
+	</section>
+	{% else if report.suggestions.is_empty() %}
+	<section class="suggested_profiles_empty panel">
+		<h2>No unfollowed subreddit suggestions yet</h2>
+		<p>The cached subreddit signals are already followed, filtered, or ignored.</p>
+	</section>
+	{% else %}
+	<section class="suggested_profile_grid suggested_subreddit_grid" data-suggested-subreddit-group>
+		{% for suggestion in report.suggestions %}
+		<article class="suggested_profile_card suggested_subreddit_card" data-suggested-subreddit="{{ suggestion.name }}">
+			<div class="suggested_profile_top suggested_subreddit_top">
+				<div class="suggested_profile_identity">
+					<div class="suggested_profile_title_row">
+						<h2><a href="{{ self.subreddit_path(suggestion.name.as_str()) }}">r/{{ suggestion.name }}</a></h2>
+						<div class="suggested_profile_rank suggested_subreddit_rank">
+							<span>{{ suggestion.score }}</span>
+							<small>signal</small>
+						</div>
+					</div>
+					<p class="suggested_profile_meta">
+						{{ suggestion.total_post_count }} cached posts across {{ suggestion.source_profile_count }} profiles.
+						{% if suggestion.followed_profile_count > 0 %}
+						{{ suggestion.followed_profile_count }} followed profiles posted {{ suggestion.followed_post_count }} times.
+						{% endif %}
+						{% if suggestion.suggested_profile_count > 0 %}
+						{{ suggestion.suggested_profile_count }} suggested profiles posted {{ suggestion.suggested_post_count }} times.
+						{% endif %}
+					</p>
+				</div>
+				<div class="suggested_profile_actions suggested_subreddit_actions">
+					<form
+						class="suggested_profile_follow suggested_subreddit_follow"
+						action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+						method="POST"
+						data-subscription-form
+						data-subscription-target="suggested-subreddit:{{ suggestion.name }}"
+						data-subscription-state="unsubscribed"
+						data-state-on="subscribed"
+						data-state-off="unsubscribed"
+						data-subscribe-action="{{ self.subscribe_path(suggestion.name.as_str()) }}"
+						data-unsubscribe-action="{{ self.unsubscribe_path(suggestion.name.as_str()) }}"
+						data-subscribe-label="Subscribe"
+						data-unsubscribe-label="Unsubscribe"
+						data-subscribe-class="subscribe"
+						data-unsubscribe-class="unsubscribe"
+						data-cookie-mode="list"
+						data-cookie-name="subscriptions"
+						data-cookie-values="{{ suggestion.name }}">
+						<button class="subscribe" type="submit">Subscribe</button>
+					</form>
+					<button class="suggested_profile_ignore suggested_subreddit_ignore" type="button" data-suggested-subreddit-ignore="{{ suggestion.name }}">Ignore</button>
+				</div>
+			</div>
+
+			<div class="suggested_profile_signals suggested_subreddit_signals">
+				{% if suggestion.followed_profile_count > 0 %}
+				<span><strong>{{ suggestion.followed_profile_count }}</strong> followed {% if suggestion.followed_profile_count == 1 %}profile{% else %}profiles{% endif %}</span>
+				<span><strong>{{ suggestion.followed_post_count }}</strong> followed-profile posts</span>
+				{% endif %}
+				{% if suggestion.suggested_profile_count > 0 %}
+				<span><strong>{{ suggestion.suggested_profile_count }}</strong> suggested {% if suggestion.suggested_profile_count == 1 %}profile{% else %}profiles{% endif %}</span>
+				<span><strong>{{ suggestion.suggested_post_count }}</strong> suggested-profile posts</span>
+				{% endif %}
+			</div>
+
+			<div class="suggested_profile_body suggested_subreddit_body">
+				<div class="suggested_profile_overlap_header">
+					<span class="suggested_profile_overlap_label">Posting profiles</span>
+				</div>
+				<ul class="suggested_profile_overlap suggested_subreddit_sources">
+					{% for profile in suggestion.source_profiles %}
+						<li class="{% if profile.from_suggested_profile %}suggested_subreddit_source_suggested{% else %}suggested_subreddit_source_followed{% endif %}">
+							<a href="/user/{{ profile.name }}">u/{{ profile.name }}</a>
+							<span>{{ profile.post_count }} posts{% if profile.from_suggested_profile %} · suggested{% else %} · followed{% endif %}{% if let Some(match_score) = profile.match_score_percent %} · {{ match_score }}% match{% endif %}</span>
+						</li>
+					{% endfor %}
+				</ul>
+			</div>
+		</article>
+		{% endfor %}
+	</section>
+	{% if has_more_suggestions %}
+	<nav class="suggested_profiles_more suggested_subreddits_more" aria-label="More suggested subreddits" data-suggested-subreddits-more>
+		<a href="{{ self.load_more_path() }}">Load {{ self.next_batch_size() }} more subreddits</a>
+		<span data-suggested-subreddits-status>{{ report.suggestions.len() }} shown</span>
+	</nav>
+	{% endif %}
+	{% endif %}
+</main>
+{% endblock %}

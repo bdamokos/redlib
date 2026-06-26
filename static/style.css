@@ -3547,6 +3547,27 @@ input[type="submit"] {
     margin-bottom: 8px;
 }
 
+.suggested_subreddit_card .suggested_profile_meta {
+    max-width: 720px;
+}
+
+.suggested_subreddit_rank span {
+    font-variant-numeric: tabular-nums;
+}
+
+.suggested_subreddit_sources li {
+    border: var(--panel-border);
+}
+
+.suggested_subreddit_sources li.suggested_subreddit_source_suggested {
+    background: color-mix(in srgb, var(--accent) 7%, var(--outside));
+}
+
+.suggested_subreddit_sources span {
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
 @media screen and (max-width: 760px) {
     .suggested_profiles_stats {
         grid-template-columns: repeat(2, minmax(0, 1fr));
