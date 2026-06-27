@@ -60,11 +60,43 @@ function getPostMediaBaseMaxHeight(post) {
     return parsePostMediaLength(defaultMaxHeight, fallback);
 }
 
+function isMobileViewport() {
+    return window.matchMedia?.("(max-width: 800px)")?.matches ?? window.innerWidth <= 800;
+}
+
+function isFirstListingPost(post) {
+    const postsContainer = post instanceof Element ? post.closest("#posts") : null;
+    if (postsContainer === null) {
+        return false;
+    }
+
+    return Array.from(postsContainer.children)
+        .find((child) => child instanceof Element && child.classList.contains("post")) === post;
+}
+
+function isStackedUserProfileVisibleAbovePost(post) {
+    if (!isUserPage() || !isMobileViewport() || !isFirstListingPost(post)) {
+        return false;
+    }
+
+    const main = post.closest("main");
+    const userProfile = main?.querySelector(":scope > aside #user") || null;
+    if (!(userProfile instanceof Element)) {
+        return false;
+    }
+
+    const viewportTop = getScrollPaddingTop();
+    const profileRect = userProfile.getBoundingClientRect();
+    const postRect = post.getBoundingClientRect();
+
+    return profileRect.bottom > viewportTop + 1 && profileRect.top < postRect.top;
+}
+
 function getAvailablePostHeight(post = null, options = {}) {
     const viewportTop = getScrollPaddingTop();
     let frameTop = viewportTop;
 
-    if (options.useCurrentPostTop && post instanceof Element) {
+    if (options.useCurrentPostTop && post instanceof Element && !isStackedUserProfileVisibleAbovePost(post)) {
         const postRect = post.getBoundingClientRect();
         if (postRect.top > viewportTop && postRect.top < window.innerHeight) {
             frameTop = postRect.top;
