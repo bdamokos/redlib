@@ -1586,6 +1586,11 @@ a.search_subreddit_link:hover {
         / minmax(40px, auto) minmax(0, 1fr) fit-content(min(20%, 152px));
 }
 
+.post[data-temporary-author-filtered="true"],
+.sep[data-temporary-author-filtered="true"] {
+    display: none !important;
+}
+
 .post[data-post-type="image"],
 .post[data-post-type="video"],
 .post[data-post-type="gif"],

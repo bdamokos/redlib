@@ -406,6 +406,18 @@ function isHighlightedTarget(target) {
 }
 
 function isVisibleTarget(target) {
+    if (!(target instanceof Element)) {
+        return false;
+    }
+
+    if (target.closest("[data-temporary-author-filtered='true']") !== null) {
+        return false;
+    }
+
+    if (target instanceof HTMLElement && target.hidden) {
+        return false;
+    }
+
     return target.getClientRects().length > 0;
 }
 
