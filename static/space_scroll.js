@@ -25,6 +25,8 @@ const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notificatio
 const EXPANDABLE_POST_PREVIEW_SELECTOR = ".post_preview.truncated:not(.expanded)";
 const TEMPORARY_AUTHOR_FILTER_STORAGE_KEY = "redlib-temporary-author-filters-v1";
 const TEMPORARY_AUTHOR_FILTER_DURATION_MS = 24 * 60 * 60 * 1000;
+const PAGE_BOUNDARY_NAVIGATION_STORAGE_KEY = "redlib-page-boundary-navigation-v1";
+const PAGE_BOUNDARY_NAVIGATION_MAX_AGE_MS = 30 * 1000;
 const PAGE_EDGE_TOLERANCE = 1;
 const POST_MEDIA_FIT_READY_ATTR = "data-post-media-fit-ready";
 let postMediaFitFrame = null;
@@ -1056,6 +1058,112 @@ function getPaginationLinkForDirection(direction) {
     return getPaginationLink(getPaginationAccessKeyForDirection(direction));
 }
 
+function normalizedNavigationUrl(value) {
+    try {
+        const url = new URL(value, window.location.href);
+        url.hash = "";
+
+        return `${url.origin}${url.pathname}${url.search}`;
+    } catch (_error) {
+        return "";
+    }
+}
+
+function rememberBoundaryPaginationTarget(direction, paginationLink) {
+    if (direction >= 0 || !(paginationLink instanceof HTMLAnchorElement)) {
+        return;
+    }
+
+    const targetUrl = normalizedNavigationUrl(paginationLink.href);
+    if (targetUrl === "") {
+        return;
+    }
+
+    try {
+        window.sessionStorage?.setItem(PAGE_BOUNDARY_NAVIGATION_STORAGE_KEY, JSON.stringify({
+            targetUrl,
+            direction,
+            createdAt: Date.now(),
+        }));
+    } catch (_error) {
+        // Pagination should still work if session storage is unavailable.
+    }
+}
+
+function followPaginationLinkForDirection(direction, paginationLink) {
+    rememberBoundaryPaginationTarget(direction, paginationLink);
+    paginationLink.click();
+}
+
+function consumeBoundaryPaginationTarget() {
+    let rawValue = "";
+
+    try {
+        rawValue = window.sessionStorage?.getItem(PAGE_BOUNDARY_NAVIGATION_STORAGE_KEY) || "";
+        if (rawValue !== "") {
+            window.sessionStorage?.removeItem(PAGE_BOUNDARY_NAVIGATION_STORAGE_KEY);
+        }
+    } catch (_error) {
+        return null;
+    }
+
+    if (rawValue === "") {
+        return null;
+    }
+
+    try {
+        const value = JSON.parse(rawValue);
+        const createdAt = Number(value.createdAt);
+        const direction = Number(value.direction);
+
+        if (
+            typeof value.targetUrl !== "string"
+            || value.targetUrl === ""
+            || !Number.isFinite(createdAt)
+            || Date.now() - createdAt > PAGE_BOUNDARY_NAVIGATION_MAX_AGE_MS
+            || direction >= 0
+            || value.targetUrl !== normalizedNavigationUrl(window.location.href)
+        ) {
+            return null;
+        }
+
+        return { direction };
+    } catch (_error) {
+        return null;
+    }
+}
+
+function findLastVisiblePost() {
+    const posts = getPostsFromRoot(document).filter(isVisibleTarget);
+
+    return posts.length > 0 ? posts[posts.length - 1] : null;
+}
+
+function scrollToPostTop(post) {
+    if (!(post instanceof Element)) {
+        return false;
+    }
+
+    window.scrollTo({
+        top: Math.max(0, getPostTop(post) - getScrollPaddingTop()),
+        behavior: "auto",
+    });
+    return true;
+}
+
+function restoreBoundaryPaginationPosition() {
+    const target = consumeBoundaryPaginationTarget();
+    if (target === null || target.direction >= 0) {
+        return;
+    }
+
+    window.requestAnimationFrame(() => {
+        if (scrollToPostTop(findLastVisiblePost())) {
+            window.setTimeout(() => scrollToPostTop(findLastVisiblePost()), 0);
+        }
+    });
+}
+
 document.addEventListener("redlib:post-feedback", (event) => {
     const detail = event.detail || {};
     if (detail.source !== "keyboard") {
@@ -1179,7 +1287,7 @@ document.addEventListener("keydown", (event) => {
     const paginationLinkForDirection = getPaginationLinkForDirection(scrollDirection);
     if (paginationLinkForDirection !== null && isAtPageEdge(scrollDirection)) {
         event.preventDefault();
-        paginationLinkForDirection.click();
+        followPaginationLinkForDirection(scrollDirection, paginationLinkForDirection);
         return;
     }
 
@@ -1194,7 +1302,7 @@ document.addEventListener("keydown", (event) => {
     if (targetPost === null) {
         if (paginationLinkForDirection !== null) {
             event.preventDefault();
-            paginationLinkForDirection.click();
+            followPaginationLinkForDirection(scrollDirection, paginationLinkForDirection);
         }
 
         return;
@@ -1211,6 +1319,7 @@ window.resizeSinglePostMediaToViewport = resizeSinglePostMediaToViewport;
 window.applyTemporaryAuthorFilters = applyTemporaryAuthorFilters;
 document.addEventListener("DOMContentLoaded", () => applyTemporaryAuthorFilters(document));
 document.addEventListener("DOMContentLoaded", resizePostMediaToViewportOnLoad);
+document.addEventListener("DOMContentLoaded", restoreBoundaryPaginationPosition);
 window.addEventListener("orientationchange", schedulePostMediaResizeAfterIpadOrientationChange);
 window.addEventListener("storage", (event) => {
     if (event.key === TEMPORARY_AUTHOR_FILTER_STORAGE_KEY) {
