@@ -1,10 +1,11 @@
 # Repository Notes
 
 - The current local Docker deploy for this repo is running on port `18081`.
-- Use `docker compose -f compose.dev.yaml up -d --build` for local Docker here. Do not recreate a local `docker-compose.yml`; that stale file spins up an unnecessary `nginx` container alongside `redlib`.
+- Use `./scripts/local-docker-deploy.sh` for local Docker validation here. It wraps `docker compose -f compose.dev.yaml up -d --build`, labels `redlib:local` with the current commit only when the worktree is clean, and leaves dirty/in-progress builds as `dev` so the deploy coordinator will not reuse them accidentally. Do not recreate a local `docker-compose.yml`; that stale file spins up an unnecessary `nginx` container alongside `redlib`.
 - Local development deploy:
-  Run `docker compose -f compose.dev.yaml up -d --build`.
+  Run `./scripts/local-docker-deploy.sh`.
   This binds Redlib to `127.0.0.1:18081`.
+  If you use raw Compose after a deployable commit exists, run `GIT_HASH=$(git rev-parse HEAD) REDLIB_DEPLOY_GIT_HASH=$(git rev-parse HEAD) docker compose -f compose.dev.yaml up -d --build` so the resulting `redlib:local` image can be reused by `deploy.sh`.
 - Default change workflow:
   When the user asks to fix or change something in this repo, assume they expect the change to be committed and deployed after validation unless they explicitly say otherwise.
   If there are parallel active threads or workstreams that could also affect deployment, spawn or defer to an orchestrator thread that can coordinate those parallel changes and manage the final deploy ordering.
@@ -23,6 +24,7 @@
   The Pi deploy serves Redlib on port `8081`.
   `./deploy.sh --deploy-only` skips the local build and push.
   `./deploy.sh --follow-logs` tails the remote Redlib logs after deployment.
+  Before rebuilding, `deploy.sh` tries to reuse `redlib:local` when its `org.opencontainers.image.revision` label exactly matches `HEAD`, the worktree is clean, and the image platform matches `TARGET_PLATFORM`. Use `REUSE_LOCAL_IMAGE=never ./deploy.sh` to force a rebuild, or `REUSE_LOCAL_IMAGE=required ./deploy.sh` to fail instead of rebuilding when the local validation image is not reusable.
 - Pi runtime details:
   The active Pi deploy directory is `~/redlib`.
   The Pi compose file is `compose.pi.yaml`, not `compose.yaml`.

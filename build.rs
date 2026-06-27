@@ -7,6 +7,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::os::windows::process::ExitStatusExt;
 
 fn main() {
+	println!("cargo:rerun-if-env-changed=GIT_HASH");
+	println!("cargo:rerun-if-changed=.git/HEAD");
 	println!("cargo:rerun-if-changed=src/");
 	println!("cargo:rerun-if-changed=static/");
 	println!("cargo:rerun-if-changed=templates/");

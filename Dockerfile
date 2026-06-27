@@ -29,6 +29,7 @@ COPY static ./static
 COPY templates ./templates
 
 # Build the application
+ENV GIT_HASH=${GIT_HASH}
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     --mount=type=cache,target=/usr/src/redlib/target,sharing=locked \
@@ -37,6 +38,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 # Runtime stage
 FROM debian:bookworm-slim
+
+ARG GIT_HASH=dev
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -69,6 +72,9 @@ ENV REDLIB_DEFAULT_AUTOPLAY_VIDEOS=off
 ENV REDLIB_BANNER_TEXT=Redlib
 ENV REDLIB_CACHE_DIR=/var/lib/redlib/cache
 ENV REDLIB_PREFS_DB=/var/lib/redlib/state/preferences.sqlite3
+
+LABEL org.opencontainers.image.title="Redlib" \
+    org.opencontainers.image.revision="${GIT_HASH}"
 
 # Tell Docker to expose port 8080
 EXPOSE 8080

@@ -15,6 +15,8 @@ IMAGE_NAME=${IMAGE_NAME:-redlib}
 IMAGE_TAG=${IMAGE_TAG:-latest}
 TARGET_PLATFORM=${TARGET_PLATFORM:-linux/arm64}
 HOST_PORT=${HOST_PORT:-8081}
+LOCAL_REUSE_IMAGE=${LOCAL_REUSE_IMAGE:-redlib:local}
+REUSE_LOCAL_IMAGE=${REUSE_LOCAL_IMAGE:-auto}
 
 KEYCHAIN_SERVICE=${KEYCHAIN_SERVICE:-redlib-deploy}
 KEYCHAIN_ACCOUNT="$SERVER_USER@$SERVER_HOST"
@@ -68,6 +70,8 @@ Environment overrides:
   IMAGE_TAG            Default: $IMAGE_TAG
   TARGET_PLATFORM      Default: $TARGET_PLATFORM
   HOST_PORT            Default: $HOST_PORT
+  LOCAL_REUSE_IMAGE    Default: $LOCAL_REUSE_IMAGE
+  REUSE_LOCAL_IMAGE    Default: $REUSE_LOCAL_IMAGE (auto, never, required)
   KEYCHAIN_SERVICE     Default: $KEYCHAIN_SERVICE
   SSH_CONTROL_PERSIST  Default: $SSH_CONTROL_PERSIST
   SSH_CONTROL_DIR_BASE Default: $SSH_CONTROL_DIR_BASE
@@ -205,13 +209,137 @@ resolve_remote_dir() {
 	fi
 }
 
+current_git_hash() {
+	git rev-parse HEAD 2>/dev/null || echo dev
+}
+
+git_worktree_clean() {
+	git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+		git diff --quiet --ignore-submodules -- &&
+		git diff --cached --quiet --ignore-submodules --
+}
+
+docker_image_field() {
+	local image="$1"
+	local format="$2"
+	local value
+	value=$(docker image inspect "$image" --format "$format" 2>/dev/null || true)
+	if [[ "$value" == "<no value>" ]]; then
+		value=""
+	fi
+	printf '%s' "$value"
+}
+
+docker_image_label() {
+	local image="$1"
+	local label="$2"
+	docker_image_field "$image" "{{ index .Config.Labels \"$label\" }}"
+}
+
+reuse_local_image_mode() {
+	local mode
+	mode=$(printf '%s' "$REUSE_LOCAL_IMAGE" | tr '[:upper:]' '[:lower:]')
+	case "$mode" in
+		auto|yes|true|1|on)
+			printf '%s' auto
+			;;
+		required|require|must)
+			printf '%s' required
+			;;
+		never|no|false|0|off)
+			printf '%s' never
+			;;
+		*)
+			echo "Error: REUSE_LOCAL_IMAGE must be auto, never, or required; got '$REUSE_LOCAL_IMAGE'." >&2
+			exit 1
+			;;
+	esac
+}
+
+local_image_reuse_blocker() {
+	local expected_hash="$1"
+	local target_os="${TARGET_PLATFORM%%/*}"
+	local target_arch_part="${TARGET_PLATFORM#*/}"
+	local target_arch="${target_arch_part%%/*}"
+	local image_os
+	local image_arch
+	local revision
+
+	if ! docker image inspect "$LOCAL_REUSE_IMAGE" >/dev/null 2>&1; then
+		echo "$LOCAL_REUSE_IMAGE was not found"
+		return
+	fi
+
+	if ! git_worktree_clean; then
+		echo "git worktree has uncommitted changes"
+		return
+	fi
+
+	revision=$(docker_image_label "$LOCAL_REUSE_IMAGE" "org.opencontainers.image.revision")
+	if [[ -z "$revision" ]]; then
+		echo "$LOCAL_REUSE_IMAGE has no org.opencontainers.image.revision label"
+		return
+	fi
+	if [[ "$revision" != "$expected_hash" ]]; then
+		echo "$LOCAL_REUSE_IMAGE revision label is $revision, expected $expected_hash"
+		return
+	fi
+
+	image_os=$(docker_image_field "$LOCAL_REUSE_IMAGE" '{{ .Os }}')
+	image_arch=$(docker_image_field "$LOCAL_REUSE_IMAGE" '{{ .Architecture }}')
+	if [[ "$image_os" != "$target_os" || "$image_arch" != "$target_arch" ]]; then
+		echo "$LOCAL_REUSE_IMAGE platform is $image_os/$image_arch, expected $target_os/$target_arch"
+		return
+	fi
+}
+
+push_reusable_local_image() {
+	local expected_hash="$1"
+	local image_ref_push="$2"
+	local mode
+	local blocker
+
+	mode=$(reuse_local_image_mode) || exit 1
+	if [[ "$mode" == "never" ]]; then
+		echo "Local image reuse disabled by REUSE_LOCAL_IMAGE=never."
+		return 1
+	fi
+
+	blocker=$(local_image_reuse_blocker "$expected_hash")
+	if [[ -n "$blocker" ]]; then
+		if [[ "$mode" == "required" ]]; then
+			echo "Error: cannot reuse $LOCAL_REUSE_IMAGE: $blocker." >&2
+			exit 1
+		fi
+		echo "Not reusing $LOCAL_REUSE_IMAGE: $blocker."
+		return 1
+	fi
+
+	echo "Reusing local test image $LOCAL_REUSE_IMAGE ($expected_hash, $TARGET_PLATFORM)."
+	echo "Tagging $IMAGE_NAME:$IMAGE_TAG..."
+	docker tag "$LOCAL_REUSE_IMAGE" "$IMAGE_NAME:$IMAGE_TAG" || exit 1
+
+	echo "Tagging $image_ref_push..."
+	docker tag "$LOCAL_REUSE_IMAGE" "$image_ref_push" || exit 1
+
+	echo "Pushing $image_ref_push..."
+	docker push "$image_ref_push" || exit 1
+}
+
 build_and_push() {
 	local image_ref_push="$REGISTRY_HOST_PUSH/$IMAGE_NAME:$IMAGE_TAG"
+	local deploy_git_hash
+
+	deploy_git_hash=$(current_git_hash)
+
+	if push_reusable_local_image "$deploy_git_hash" "$image_ref_push"; then
+		return
+	fi
 
 	echo "Building $IMAGE_NAME for $TARGET_PLATFORM..."
 	docker buildx build \
 		--platform "$TARGET_PLATFORM" \
-		--build-arg "GIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo dev)" \
+		--build-arg "GIT_HASH=$deploy_git_hash" \
 		--load \
 		-t "$IMAGE_NAME:$IMAGE_TAG" \
 		.
@@ -336,6 +464,8 @@ echo "Remote path: $DEPLOY_PATH"
 echo "Registry push host: $REGISTRY_HOST_PUSH"
 echo "Registry pull host: $REGISTRY_HOST_PULL"
 echo "Image: $IMAGE_NAME:$IMAGE_TAG"
+echo "Local reuse image: $LOCAL_REUSE_IMAGE"
+echo "Local image reuse mode: $REUSE_LOCAL_IMAGE"
 echo "Host port: $HOST_PORT"
 echo
 
