@@ -29,7 +29,7 @@ const PAGE_EDGE_TOLERANCE = 1;
 const POST_MEDIA_FIT_READY_ATTR = "data-post-media-fit-ready";
 let postMediaFitFrame = null;
 let temporaryAuthorFilterMemory = [];
-let temporaryAuthorFilterToastTimeout = null;
+let redlibToastTimeout = null;
 let lastTemporaryAuthorFilterToastKey = "";
 
 function parsePostMediaLength(value, fallback) {
@@ -783,6 +783,33 @@ function temporaryAuthorFilterDisplayName(author) {
     return author.startsWith("u_") ? `u/${author.slice(2)}` : author;
 }
 
+function showRedlibToast(message) {
+    if (message === "") {
+        return;
+    }
+
+    let toast = document.getElementById("redlib_toast");
+    if (!toast) {
+        toast = document.createElement("div");
+        toast.id = "redlib_toast";
+        toast.className = "redlib_toast";
+        toast.setAttribute("role", "status");
+        toast.setAttribute("aria-live", "polite");
+        document.body.append(toast);
+    }
+
+    toast.textContent = message;
+    toast.classList.add("visible");
+
+    if (redlibToastTimeout !== null) {
+        window.clearTimeout(redlibToastTimeout);
+    }
+    redlibToastTimeout = window.setTimeout(() => {
+        toast.classList.remove("visible");
+        redlibToastTimeout = null;
+    }, 2600);
+}
+
 function showTemporaryAuthorFilterToast(authorCounts) {
     const visibleAuthorCounts = Array.from(authorCounts.entries()).filter(([, count]) => count > 0);
     if (visibleAuthorCounts.length === 0) {
@@ -807,26 +834,7 @@ function showTemporaryAuthorFilterToast(authorCounts) {
         : authors.join(" and ");
     const message = `Temporarily filtered out ${authorList} for 24h`;
 
-    let toast = document.getElementById("redlib_toast");
-    if (!toast) {
-        toast = document.createElement("div");
-        toast.id = "redlib_toast";
-        toast.className = "redlib_toast";
-        toast.setAttribute("role", "status");
-        toast.setAttribute("aria-live", "polite");
-        document.body.append(toast);
-    }
-
-    toast.textContent = message;
-    toast.classList.add("visible");
-
-    if (temporaryAuthorFilterToastTimeout !== null) {
-        window.clearTimeout(temporaryAuthorFilterToastTimeout);
-    }
-    temporaryAuthorFilterToastTimeout = window.setTimeout(() => {
-        toast.classList.remove("visible");
-        temporaryAuthorFilterToastTimeout = null;
-    }, 2600);
+    showRedlibToast(message);
 }
 
 function applyTemporaryAuthorFilters(root = document, options = {}) {
@@ -887,7 +895,21 @@ function submitCurrentPostFeedback(signal) {
         return false;
     }
 
-    return window.submitPostFeedback(findCurrentViewedPost(), signal) === true;
+    return window.submitPostFeedback(findCurrentViewedPost(), signal, { source: "keyboard" }) === true;
+}
+
+function postFeedbackToastMessage(signal, requestedSignal) {
+    if (signal === "like") {
+        return "Post liked";
+    }
+    if (signal === "dislike") {
+        return "Post disliked";
+    }
+    if (requestedSignal === "like" || requestedSignal === "dislike" || requestedSignal === "clear") {
+        return "Post rating cleared";
+    }
+
+    return "";
 }
 
 function isCurrentPostAuthorMarkedFollowed(post) {
@@ -989,6 +1011,15 @@ function getPaginationLink(accessKey) {
 function getPaginationLinkForDirection(direction) {
     return getPaginationLink(getPaginationAccessKeyForDirection(direction));
 }
+
+document.addEventListener("redlib:post-feedback", (event) => {
+    const detail = event.detail || {};
+    if (detail.source !== "keyboard") {
+        return;
+    }
+
+    showRedlibToast(postFeedbackToastMessage(detail.signal || "", detail.requestedSignal || ""));
+});
 
 document.addEventListener("keydown", (event) => {
     const isSpaceKey = isSpaceNavigationKey(event);

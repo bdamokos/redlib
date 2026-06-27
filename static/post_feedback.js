@@ -52,6 +52,19 @@
         }
     };
 
+    const emitFeedbackSaved = (group, signal, requestedSignal, source) => {
+        group.dispatchEvent(new CustomEvent("redlib:post-feedback", {
+            bubbles: true,
+            detail: {
+                postId: group.dataset.postId || "",
+                model: group.dataset.feedbackModel || "manual",
+                signal,
+                requestedSignal,
+                source,
+            },
+        }));
+    };
+
     const broadcastSignal = (group, signal) => {
         const message = {
             type: "post-feedback",
@@ -93,6 +106,10 @@
                 return;
             }
 
+            const requestedSignal = form.dataset.feedbackSignal || "";
+            const source = form.dataset.postFeedbackSource || "";
+            delete form.dataset.postFeedbackSource;
+
             setPending(group, true);
             try {
                 const response = await fetch(form.action, {
@@ -111,6 +128,7 @@
                 const nextSignal = payload?.signal || "";
                 syncSignal(group, nextSignal);
                 broadcastSignal(group, nextSignal);
+                emitFeedbackSaved(group, nextSignal, requestedSignal, source);
             } catch (_error) {
                 setPending(group, false);
                 nativeSubmit.call(form);
@@ -130,7 +148,7 @@
         }
     };
 
-    const submitPostFeedback = (post, signal) => {
+    const submitPostFeedback = (post, signal, options = {}) => {
         if (!(post instanceof Element)) {
             return false;
         }
@@ -141,6 +159,9 @@
         const form = group.querySelector(`[data-feedback-signal='${signal}']`);
         if (!(form instanceof HTMLFormElement)) {
             return false;
+        }
+        if (options.source) {
+            form.dataset.postFeedbackSource = options.source;
         }
         if (typeof form.requestSubmit === "function") {
             form.requestSubmit();
