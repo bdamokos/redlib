@@ -568,6 +568,24 @@ function isUserPage() {
     return /^\/(?:user|u)\//.test(window.location.pathname);
 }
 
+function isSubredditListingPagePath(pathname) {
+    const match = pathname.match(/^\/r\/[^/]+(?:\/([^/]+))?\/?$/);
+    const listing = match?.[1] || "";
+
+    return match !== null && (listing === "" || ["best", "hot", "new", "top", "rising", "controversial", "video-length"].includes(listing));
+}
+
+function isUserListingPagePath(pathname) {
+    const match = pathname.match(/^\/(?:user|u)\/[^/]+(?:\/([^/]+))?\/?$/);
+    const listing = match?.[1] || "";
+
+    return match !== null && (listing === "" || ["overview", "comments", "submitted", "videos", "hot", "new", "top", "controversial"].includes(listing));
+}
+
+function isListingPageWithOwnRedditTarget() {
+    return isSubredditListingPagePath(window.location.pathname) || isUserListingPagePath(window.location.pathname);
+}
+
 function findCurrentViewedPost() {
     const posts = getPostsFromRoot(document).filter(isVisibleTarget);
     const viewportTop = getScrollPaddingTop();
@@ -681,8 +699,24 @@ function getPostRedditUrl(post) {
     return `https://www.reddit.com${permalink.pathname}${permalink.search}${permalink.hash}`;
 }
 
+function redditUrlFromLink(link) {
+    if (!(link instanceof HTMLAnchorElement)) {
+        return "";
+    }
+
+    return /^https:\/\/(?:www\.)?reddit\.com\//.test(link.href) ? link.href : "";
+}
+
+function getCurrentPageRedditUrl() {
+    if (!isListingPageWithOwnRedditTarget()) {
+        return "";
+    }
+
+    return redditUrlFromLink(document.getElementById("reddit_link")) || redditUrlFromLink(document.getElementById("toreddit"));
+}
+
 function openCurrentPostOnReddit() {
-    const redditUrl = getPostRedditUrl(findCurrentViewedPost());
+    const redditUrl = getCurrentPageRedditUrl() || getPostRedditUrl(findCurrentViewedPost());
     if (redditUrl === "") {
         return false;
     }
