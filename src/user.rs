@@ -57,6 +57,7 @@ pub struct UserVideoSignal {
 	pub avg_video_length: Option<(String, String)>,
 	pub video_count: usize,
 	pub redgifs_profile_count: usize,
+	pub redgifs_usernames: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,6 +103,12 @@ impl UserVideoStatsAccumulator {
 
 	fn redgifs_profile_count(&self) -> usize {
 		self.seen_redgifs_users.len()
+	}
+
+	pub(crate) fn redgifs_usernames(&self) -> Vec<String> {
+		let mut usernames = self.seen_redgifs_users.iter().cloned().collect::<Vec<_>>();
+		usernames.sort();
+		usernames
 	}
 
 	fn total_duration_seconds(&self) -> i64 {
@@ -947,6 +954,7 @@ pub fn cached_video_signal(username: &str) -> UserVideoSignal {
 		avg_video_length: stats.avg_video_length(),
 		video_count: stats.video_count(),
 		redgifs_profile_count: stats.redgifs_profile_count(),
+		redgifs_usernames: stats.redgifs_usernames(),
 	}
 }
 
@@ -2708,6 +2716,7 @@ mod tests {
 
 		let meta = super::cached_avg_video_length(username).unwrap().1;
 		assert!(meta.contains("2 rg profiles"), "expected short rg hint in {meta:?}");
+		assert_eq!(super::cached_video_signal(username).redgifs_usernames, vec!["alice".to_string(), "bob".to_string()]);
 	}
 
 	#[test]
@@ -2931,7 +2940,7 @@ mod tests {
 		.render()
 		.unwrap();
 
-		assert!(html.contains("Recent archive videos"));
+		assert!(html.contains("Recent creator videos"));
 		assert!(html.contains("A much longer Coomer title"));
 		assert!(html.contains("2025-09-10"));
 		assert!(html.contains("user_coomer_post_badge"));
@@ -2986,7 +2995,7 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("All posts are hidden because they are NSFW"));
-		assert!(html.contains("Recent archive videos"));
+		assert!(html.contains("Recent creator videos"));
 		assert!(html.contains("Visible from coomer"));
 	}
 
@@ -3583,7 +3592,7 @@ pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		}
 	};
 	let _ = tokio::time::timeout(StdDuration::from_secs(3), utils::hydrate_user_external_links_from_author_cache(&mut sidebar_user)).await;
-	let coomer_recent_posts = tokio::time::timeout(StdDuration::from_secs(6), utils::coomer_recent_posts_panel(&sidebar_user.external_links))
+	let coomer_recent_posts = tokio::time::timeout(StdDuration::from_secs(6), utils::creator_recent_posts_panel(&username, &sidebar_user.external_links))
 		.await
 		.unwrap_or(None);
 	let video_mode_sidebar = if video_listing {

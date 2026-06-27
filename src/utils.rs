@@ -678,6 +678,10 @@ pub fn creator_identity_slug_from_profile_url(raw_url: &str) -> Option<String> {
 		"loyalfans.com" | "www.loyalfans.com" => segments.first().copied(),
 		h if h.ends_with(".loyalfans.com") => segments.first().copied(),
 		"justfor.fans" | "www.justfor.fans" => segments.first().copied(),
+		"redgifs.com" | "www.redgifs.com" => match segments.as_slice() {
+			["users", profile, ..] => Some(*profile),
+			_ => None,
+		},
 		_ => None,
 	}?;
 
@@ -3851,9 +3855,10 @@ pub async fn external_links_with_coomer_flags(links: Vec<ExternalLink>) -> Vec<E
 	flagged_links
 }
 
-pub async fn coomer_recent_posts_panel(links: &[ExternalLink]) -> Option<CoomerRecentPostsPanel> {
+pub async fn creator_recent_posts_panel(author_name: &str, links: &[ExternalLink]) -> Option<CoomerRecentPostsPanel> {
 	let profile_urls = coomer_profile_urls_from_links(links);
-	if profile_urls.is_empty() {
+	let redgifs_usernames = redgifs_recent_usernames_for_author(author_name, links);
+	if profile_urls.is_empty() && redgifs_usernames.is_empty() {
 		return None;
 	}
 
@@ -3861,6 +3866,9 @@ pub async fn coomer_recent_posts_panel(links: &[ExternalLink]) -> Option<CoomerR
 		let mut pending = JoinSet::new();
 		for profile_url in profile_urls {
 			pending.spawn(async move { fetch_coomer_profile_recent_posts(profile_url).await.unwrap_or_default() });
+		}
+		for username in redgifs_usernames {
+			pending.spawn(async move { fetch_redgifs_profile_recent_posts(username).await.unwrap_or_default() });
 		}
 
 		let mut merged = Vec::new();
@@ -3877,6 +3885,10 @@ pub async fn coomer_recent_posts_panel(links: &[ExternalLink]) -> Option<CoomerR
 		return None;
 	};
 	select_coomer_recent_posts(merged)
+}
+
+pub async fn coomer_recent_posts_panel(links: &[ExternalLink]) -> Option<CoomerRecentPostsPanel> {
+	creator_recent_posts_panel("", links).await
 }
 
 fn dedupe_external_links_by_host(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
@@ -4220,6 +4232,8 @@ fn is_creator_link_host(host: &str) -> bool {
 			| "www.afdian.com"
 			| "fanbox.cc"
 			| "www.fanbox.cc"
+			| "redgifs.com"
+			| "www.redgifs.com"
 			| "ci-en.dlsite.com"
 	) || host.ends_with(".fanbox.cc")
 		|| host.ends_with(".gumroad.com")
@@ -4243,6 +4257,45 @@ fn coomer_profile_urls_from_links(links: &[ExternalLink]) -> Vec<String> {
 	}
 
 	urls
+}
+
+fn redgifs_recent_usernames_for_author(author_name: &str, links: &[ExternalLink]) -> Vec<String> {
+	let mut seen = HashSet::new();
+	let mut usernames = Vec::new();
+
+	for link in links {
+		let Some(username) = redgifs_username_from_profile_url(&link.url) else {
+			continue;
+		};
+		if seen.insert(username.clone()) {
+			usernames.push(username);
+		}
+	}
+
+	if !author_name.trim().is_empty() {
+		for username in crate::user::cached_video_signal(author_name).redgifs_usernames {
+			if redgifs_uploader_matches_author(&username, author_name, links) && seen.insert(username.clone()) {
+				usernames.push(username);
+			}
+		}
+	}
+
+	usernames
+}
+
+fn redgifs_username_from_profile_url(url: &str) -> Option<String> {
+	let parsed = Url::parse(url).or_else(|_| Url::parse(&format!("https://{url}"))).ok()?;
+	let host = parsed.host_str()?.trim().trim_matches('.').to_lowercase();
+	if host != "redgifs.com" && host != "www.redgifs.com" {
+		return None;
+	}
+
+	let segments = parsed.path_segments()?.filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+	let username = match segments.as_slice() {
+		["users", username, ..] => *username,
+		_ => return None,
+	};
+	redgifs::normalize_username(username)
 }
 
 async fn direct_coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
@@ -4735,6 +4788,11 @@ async fn fetch_coomer_api_profile_recent_posts(profile_url: String) -> Result<Ve
 	Ok(posts.into_iter().map(coomer_listing_post_to_recent_post).collect())
 }
 
+async fn fetch_redgifs_profile_recent_posts(username: String) -> Result<Vec<CoomerMergedPost>, String> {
+	let gifs = redgifs::fetch_user_recent_gifs(username, 10).await?;
+	Ok(gifs.into_iter().map(redgifs_listing_gif_to_recent_post).collect())
+}
+
 async fn fetch_kemono_profile_recent_posts(profile_url: String) -> Result<Vec<CoomerMergedPost>, String> {
 	let Some((service, profile_id)) = kemono_profile_parts(&profile_url) else {
 		return Ok(Vec::new());
@@ -4795,6 +4853,26 @@ fn coomer_listing_post_to_recent_post(post: CoomerListingPost) -> CoomerMergedPo
 
 fn kemono_listing_post_to_recent_post(post: CoomerListingPost) -> CoomerMergedPost {
 	listing_post_to_recent_post(post, KEMONO_ORIGIN)
+}
+
+fn redgifs_listing_gif_to_recent_post(gif: redgifs::RedgifsUserGif) -> CoomerMergedPost {
+	let mut title = coomer_clean_text(gif.description.as_deref().unwrap_or_default());
+	if title.is_empty() && !gif.tags.is_empty() {
+		title = gif.tags.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+	}
+	if title.is_empty() {
+		title = "RedGifs clip".to_string();
+	}
+	let id = gif.id.trim().to_ascii_lowercase();
+	let url = if id.is_empty() { String::new() } else { format!("https://www.redgifs.com/watch/{id}") };
+
+	CoomerMergedPost {
+		title,
+		url,
+		published: redgifs_date_label(gif.create_date),
+		sort_key: redgifs_sort_key(gif.create_date),
+		has_video: true,
+	}
 }
 
 fn listing_post_to_recent_post(post: CoomerListingPost, origin: &str) -> CoomerMergedPost {
@@ -4894,6 +4972,17 @@ fn coomerfans_text_suggests_video(value: &str) -> bool {
 	[".mp4", ".webm", ".mov", ".m4v"].iter().any(|ext| lower.contains(ext))
 }
 
+fn redgifs_date_label(created_at: i64) -> String {
+	OffsetDateTime::from_unix_timestamp(created_at)
+		.ok()
+		.and_then(|created| created.format(format_description!("[year]-[month]-[day]")).ok())
+		.unwrap_or_default()
+}
+
+fn redgifs_sort_key(created_at: i64) -> String {
+	format!("{:020}", created_at.max(0))
+}
+
 fn coomerfans_date_label(published: &str) -> String {
 	let cleaned = coomerfans_clean_date_text(published);
 	cleaned.get(..10).filter(|value| value.chars().nth(4) == Some('-')).unwrap_or_default().to_string()
@@ -4917,7 +5006,7 @@ fn coomerfans_clean_date_text(value: &str) -> String {
 
 fn select_coomer_recent_posts(mut merged: Vec<CoomerMergedPost>) -> Option<CoomerRecentPostsPanel> {
 	let mut seen = HashSet::new();
-	merged.retain(|post| seen.insert(post.url.clone()));
+	merged.retain(|post| !post.url.is_empty() && seen.insert(post.url.clone()));
 	merged.sort_by(|a, b| b.sort_key.cmp(&a.sort_key).then_with(|| b.url.cmp(&a.url)));
 
 	let mut items = merged.iter().filter(|post| post.has_video).take(5).cloned().collect::<Vec<_>>();
@@ -5449,6 +5538,20 @@ mod tests {
 			has_coomer: false,
 		}];
 		assert!(redgifs_uploader_matches_author("my-real-name", "otherreddit", &links));
+	}
+
+	#[test]
+	fn redgifs_uploader_matches_direct_redgifs_profile_slug() {
+		let links = vec![ExternalLink {
+			label: "RedGifs".to_string(),
+			url: "https://www.redgifs.com/users/my-real-name".to_string(),
+			host: "www.redgifs.com".to_string(),
+			icon_path: "/icon/redgifs".to_string(),
+			has_coomer: false,
+		}];
+
+		assert!(redgifs_uploader_matches_author("my_real_name", "otherreddit", &links));
+		assert_eq!(super::redgifs_recent_usernames_for_author("otherreddit", &links), vec!["my-real-name".to_string()]);
 	}
 
 	#[test]

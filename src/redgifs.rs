@@ -3,11 +3,13 @@ use cached::proc_macro::cached;
 use hyper::{Body, Method, Request, Response};
 use log::{info, warn};
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
 
 static REDGIFS_TOKEN: LazyLock<Mutex<(String, i64)>> = LazyLock::new(|| Mutex::new((String::new(), 0)));
 static REDGIFS_ID_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+$").unwrap());
+static REDGIFS_USERNAME_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").unwrap());
 static REDGIFS_MEDIA_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\.(?:mp4|jpg|jpeg|png|webp)$").unwrap());
 static REDGIFS_META_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<meta\s+(?:property|name)="(?P<name>[^"]+)"\s+content="(?P<content>[^"]+)""#).unwrap());
 static REDGIFS_LINK_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<link\s+[^>]*rel="(?P<rel>[^"]+)"[^>]*href="(?P<href>[^"]+)""#).unwrap());
@@ -22,6 +24,28 @@ pub struct RedgifsMediaPaths {
 	duration_seconds: i64,
 	has_audio: bool,
 	username: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RedgifsUserGif {
+	#[serde(default)]
+	pub id: String,
+	#[serde(default)]
+	pub description: Option<String>,
+	#[serde(default, rename = "createDate")]
+	pub create_date: i64,
+	#[serde(default)]
+	pub duration: f64,
+	#[serde(default, rename = "userName")]
+	pub user_name: String,
+	#[serde(default)]
+	pub tags: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RedgifsUserSearchResponse {
+	#[serde(default)]
+	gifs: Vec<RedgifsUserGif>,
 }
 
 impl RedgifsMediaPaths {
@@ -56,6 +80,45 @@ impl RedgifsMediaPaths {
 
 pub fn is_redgifs_domain(domain: &str) -> bool {
 	matches!(domain, "redgifs.com" | "www.redgifs.com") || (domain.starts_with('v') && domain.ends_with(".redgifs.com"))
+}
+
+pub fn normalize_username(value: &str) -> Option<String> {
+	let username = value.trim().trim_start_matches('@');
+	if REDGIFS_USERNAME_REGEX.is_match(username) {
+		Some(username.to_ascii_lowercase())
+	} else {
+		None
+	}
+}
+
+pub async fn fetch_user_recent_gifs(username: String, count: usize) -> Result<Vec<RedgifsUserGif>, String> {
+	let username = normalize_username(&username).ok_or_else(|| "Invalid RedGifs username".to_string())?;
+	let count = count.clamp(1, 20);
+	fetch_user_recent_gifs_cached(username, count).await
+}
+
+#[cached(size = 2048, time = 86400, result = true)]
+async fn fetch_user_recent_gifs_cached(username: String, count: usize) -> Result<Vec<RedgifsUserGif>, String> {
+	let token = get_token().await?;
+	let api_url = format!("https://api.redgifs.com/v2/users/{username}/search?order=latest&count={count}");
+	let req = create_request(&api_url, Some(&token))?;
+	let res = CLIENT.request(req).await.map_err(|err| err.to_string())?;
+	let status = res.status();
+	let content_type = res.headers().get("content-type").and_then(|value| value.to_str().ok()).map(str::to_owned);
+	let content_length = res
+		.headers()
+		.get("content-length")
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<u64>().ok());
+	let body_bytes = hyper::body::to_bytes(res.into_body()).await.map_err(|err| err.to_string())?;
+	log_redgifs_download("redgifs_user_search", &api_url, status, content_type.as_deref(), content_length, body_bytes.len());
+	if !status.is_success() {
+		let preview = String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>();
+		return Err(format!("RedGifs user search returned HTTP {status}: {preview}"));
+	}
+
+	let response: RedgifsUserSearchResponse = serde_json::from_slice(&body_bytes).map_err(|err| err.to_string())?;
+	Ok(response.gifs)
 }
 
 pub fn watch_path_from_url(url: &str) -> Option<String> {
