@@ -291,6 +291,44 @@
         return !(connection && connection.saveData);
     }
 
+    function rememberPreviewFallbackResumePoint(host, fallback) {
+        var state = activeHosts.get(host);
+        var src = fallback ? fallback.getAttribute("src") : "";
+        if (!state || !src) {
+            return;
+        }
+
+        var currentTime = Number(fallback.currentTime);
+        if (!Number.isFinite(currentTime) || currentTime <= 0) {
+            return;
+        }
+
+        state.previewFallbackResumeSrc = src;
+        state.previewFallbackResumeTime = currentTime;
+    }
+
+    function restorePreviewFallbackResumePoint(host, fallback) {
+        var state = activeHosts.get(host);
+        var src = fallback ? fallback.getAttribute("src") : "";
+        var resumeTime = state ? Number(state.previewFallbackResumeTime) : 0;
+        if (!state || !src || state.previewFallbackResumeSrc !== src || !Number.isFinite(resumeTime) || resumeTime <= 0) {
+            return;
+        }
+
+        var duration = Number(fallback.duration);
+        if (Number.isFinite(duration) && duration > 0) {
+            resumeTime = Math.min(resumeTime, Math.max(0, duration - 0.05));
+        }
+
+        try {
+            if (Math.abs(Number(fallback.currentTime) - resumeTime) > 0.25) {
+                fallback.currentTime = resumeTime;
+            }
+            delete state.previewFallbackResumeSrc;
+            delete state.previewFallbackResumeTime;
+        } catch (error) {}
+    }
+
     function stopPreviewFallback(host, unloadSource) {
         var layer = previewLayer(host);
         var image = previewImage(host);
@@ -304,6 +342,7 @@
             image.hidden = false;
         }
         if (fallback) {
+            rememberPreviewFallbackResumePoint(host, fallback);
             fallback.muted = true;
             fallback.pause();
             fallback.hidden = true;
@@ -340,6 +379,7 @@
         }
         fallback.hidden = false;
         fallback.muted = true;
+        restorePreviewFallbackResumePoint(host, fallback);
         setLoadingState(host, "ready");
         syncAnimatedPreviewVisibility(host);
 
