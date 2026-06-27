@@ -115,6 +115,14 @@
         return hosts[0] || null;
     }
 
+    function browserAllowsPreviewSound() {
+        if (document.visibilityState !== "visible") {
+            return false;
+        }
+
+        return typeof document.hasFocus !== "function" || document.hasFocus();
+    }
+
     function syncPreviewSoundButton() {
         if (!previewSoundButton) {
             return;
@@ -131,7 +139,7 @@
     }
 
     function syncPreviewSoundMode() {
-        var soundHost = previewSoundEnabled ? currentPreviewSoundHost() : null;
+        var soundHost = previewSoundEnabled && browserAllowsPreviewSound() ? currentPreviewSoundHost() : null;
 
         Array.from(activeHosts.keys()).forEach(function (host) {
             var fallback = previewFallbackVideo(host);
@@ -1032,6 +1040,8 @@
         schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
         syncPreviewSoundMode();
     });
+    window.addEventListener("focus", syncPreviewSoundMode);
+    window.addEventListener("blur", syncPreviewSoundMode);
 
     if (document.readyState === "complete") {
         armPageSettledState();
