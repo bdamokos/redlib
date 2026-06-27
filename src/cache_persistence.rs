@@ -551,21 +551,21 @@ pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> 
 				continue;
 			}
 		};
-		let bytes = match fs::read(&path) {
-			Ok(bytes) => bytes,
+		let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+			Ok(modified) => modified,
 			Err(error) => {
-				warn!("cache_persistence: failed to read source cache file {:?}: {error}", path.file_name());
+				warn!("cache_persistence: failed to stat source cache file {:?}: {error}", path.file_name());
 				continue;
 			}
 		};
-		let persisted = match bincode::deserialize::<PersistedSourceCacheEntry>(&bytes) {
-			Ok(persisted) => persisted,
+		let fetched_at_unix = match modified.duration_since(UNIX_EPOCH) {
+			Ok(duration) => duration.as_secs(),
 			Err(error) => {
-				warn!("cache_persistence: failed to decode source cache file {:?}: {error}", path.file_name());
+				warn!("cache_persistence: source cache file {:?} has pre-epoch mtime: {error}", path.file_name());
 				continue;
 			}
 		};
-		seeds.push((key, persisted.fetched_at_unix));
+		seeds.push((key, fetched_at_unix));
 	}
 
 	Ok(seeds)
