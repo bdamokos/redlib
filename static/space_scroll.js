@@ -55,11 +55,11 @@ function getPostMediaBaseMaxHeight(post) {
     return parsePostMediaLength(defaultMaxHeight, fallback);
 }
 
-function getAvailablePostHeight(post = null) {
+function getAvailablePostHeight(post = null, options = {}) {
     const viewportTop = getScrollPaddingTop();
     let frameTop = viewportTop;
 
-    if (post instanceof Element) {
+    if (options.useCurrentPostTop && post instanceof Element) {
         const postRect = post.getBoundingClientRect();
         if (postRect.top > viewportTop && postRect.top < window.innerHeight) {
             frameTop = postRect.top;
@@ -271,7 +271,9 @@ function fitPostMediaToViewport(post, options = {}) {
         return;
     }
 
-    const availablePostHeight = getAvailablePostHeight(post);
+    const availablePostHeight = getAvailablePostHeight(post, {
+        useCurrentPostTop: options.viewportAnchorPost === post,
+    });
     const baseMaxHeight = getPostMediaBaseMaxHeight(post);
     if (availablePostHeight <= 0 || baseMaxHeight <= 0) {
         return;
@@ -332,7 +334,11 @@ function getPostsFromRoot(root) {
 }
 
 function resizeSinglePostMediaToViewport(root = document, options = {}) {
-    getPostsFromRoot(root).forEach((post) => fitPostMediaToViewport(post, options));
+    const viewportAnchorPost = options.viewportAnchorPost || findCurrentViewedPost();
+    getPostsFromRoot(root).forEach((post) => fitPostMediaToViewport(post, {
+        ...options,
+        viewportAnchorPost,
+    }));
 }
 
 function resizePostMediaToViewportOnLoad() {
