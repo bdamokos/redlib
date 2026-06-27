@@ -1706,6 +1706,74 @@ a.search_subreddit_link:hover {
     margin-left: auto;
 }
 
+.post_feedback {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+
+.post_footer > .post_feedback {
+    margin-left: 8px;
+}
+
+.post_feedback_form {
+    display: inline-flex;
+    margin: 0;
+}
+
+.post_feedback_button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--text) 35%, transparent);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+    opacity: 0.7;
+}
+
+.post_feedback_button:hover,
+.post_feedback_button:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
+    opacity: 1;
+}
+
+.post_feedback_button.active {
+    opacity: 1;
+}
+
+.post_feedback_like.active {
+    border-color: color-mix(in srgb, #2ea043 75%, var(--accent) 25%);
+    background: color-mix(in srgb, #2ea043 20%, transparent);
+    color: color-mix(in srgb, #2ea043 82%, var(--text) 18%);
+}
+
+.post_feedback_dislike.active {
+    border-color: color-mix(in srgb, #d73a49 75%, var(--accent) 25%);
+    background: color-mix(in srgb, #d73a49 18%, transparent);
+    color: color-mix(in srgb, #d73a49 82%, var(--text) 18%);
+}
+
+.post_feedback_clear {
+    font-size: 15px;
+    opacity: 0.55;
+}
+
+.post_feedback[data-feedback-pending="true"] .post_feedback_button {
+    cursor: progress;
+    opacity: 0.55;
+}
+
 form[data-subscription-form][data-subscription-pending="true"] button {
     opacity: 0.75;
     cursor: progress;

@@ -15,7 +15,7 @@ use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
-	bookmarks, cache_persistence, config, duplicates, headers, instance_info, post, post_cache, search, settings, site_icon, subreddit, suggested_profiles,
+	bookmarks, cache_persistence, config, duplicates, headers, instance_info, post, post_cache, post_feedback, search, settings, site_icon, subreddit, suggested_profiles,
 	suggested_subreddits, user, video_mode_api, video_preview,
 };
 use url::Url;
@@ -228,6 +228,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"space_scroll.js" => resource(include_str!("../static/space_scroll.js"), "text/javascript", false).await,
 		"network_image.js" => resource(include_str!("../static/network_image.js"), "text/javascript", false).await,
 		"post_preview.js" => resource(include_str!("../static/post_preview.js"), "text/javascript", false).await,
+		"post_feedback.js" => resource(include_str!("../static/post_feedback.js"), "text/javascript", false).await,
 		"relative_time.js" => resource(include_str!("../static/relative_time.js"), "text/javascript", false).await,
 		"browser_session.js" => resource(include_str!("../static/browser_session.js"), "text/javascript", false).await,
 		"author_links.js" => resource(include_str!("../static/author_links.js"), "text/javascript", false).await,
@@ -424,6 +425,9 @@ async fn main() {
 		.at("/post_preview.js")
 		.get(|_| resource(include_str!("../static/post_preview.js"), "text/javascript", false).boxed());
 	app
+		.at("/post_feedback.js")
+		.get(|_| resource(include_str!("../static/post_feedback.js"), "text/javascript", false).boxed());
+	app
 		.at("/browser_session.js")
 		.get(|_| resource(include_str!("../static/browser_session.js"), "text/javascript", false).boxed());
 	app
@@ -468,6 +472,7 @@ async fn main() {
 	app.at("/api/video-mode/clear-redirect").get(|r| video_mode_api::clear_redirect(r).boxed());
 	app.at("/api/browser-sessions/heartbeat").post(|r| post_cache::browser_session_heartbeat(r).boxed());
 	app.at("/api/browser-sessions/release").post(|r| post_cache::browser_session_release(r).boxed());
+	app.at("/post-feedback").post(|r| post_feedback::update(r).boxed());
 	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());
 	app.at("/api/video-previews/:job_id/animation").get(|r| video_preview::animation(r).boxed());
 	app.at("/api/video-previews/:job_id/frame/:index").get(|r| video_preview::frame(r).boxed());

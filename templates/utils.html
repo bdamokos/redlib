@@ -231,6 +231,7 @@
 				</a>
 			</li>
 			{% endif %}
+			<li>{% call post_feedback_controls(post, "manual", self.url) %}</li>
 			{% if post.kind == "t3" %}
 			<li>{% call bookmark_form(post, "") %}</li>
 			{% endif %}
@@ -296,6 +297,54 @@
 		{% if post.bookmarked %}Bookmarked{% else %}Bookmark{% endif %}
 	</button>
 </form>
+{% endif %}
+{%- endmacro %}
+
+{% macro post_feedback_controls(post, feedback_model, redirect_url) -%}
+{% if !post.id.is_empty() && !post.community.is_empty() %}
+{% set liked = prefs.has_post_feedback_signal(post.id.as_str(), feedback_model, "like") %}
+{% set disliked = prefs.has_post_feedback_signal(post.id.as_str(), feedback_model, "dislike") %}
+{% set has_feedback = liked || disliked %}
+<div
+	class="post_feedback"
+	data-post-feedback
+	data-post-id="{{ post.id }}"
+	data-feedback-model="{{ feedback_model }}"
+	data-feedback-current-signal="{% if liked %}like{% else if disliked %}dislike{% endif %}">
+	<form class="post_feedback_form" action="/post-feedback" method="POST" data-post-feedback-form data-feedback-signal="like">
+		<input type="hidden" name="id" value="{{ post.id }}">
+		<input type="hidden" name="community" value="{{ post.community }}">
+		<input type="hidden" name="author" value="{{ post.author.name }}">
+		<input type="hidden" name="model" value="{{ feedback_model }}">
+		<input type="hidden" name="signal" value="like">
+		<input type="hidden" name="redirect" value="{% if redirect_url.is_empty() %}{{ self.url }}{% else %}{{ redirect_url }}{% endif %}">
+		<button class="post_feedback_button post_feedback_like{% if liked %} active{% endif %}" type="submit" aria-label="Like this post" aria-pressed="{% if liked %}true{% else %}false{% endif %}" title="Like this post">
+			&#9650;
+		</button>
+	</form>
+	<form class="post_feedback_form" action="/post-feedback" method="POST" data-post-feedback-form data-feedback-signal="dislike">
+		<input type="hidden" name="id" value="{{ post.id }}">
+		<input type="hidden" name="community" value="{{ post.community }}">
+		<input type="hidden" name="author" value="{{ post.author.name }}">
+		<input type="hidden" name="model" value="{{ feedback_model }}">
+		<input type="hidden" name="signal" value="dislike">
+		<input type="hidden" name="redirect" value="{% if redirect_url.is_empty() %}{{ self.url }}{% else %}{{ redirect_url }}{% endif %}">
+		<button class="post_feedback_button post_feedback_dislike{% if disliked %} active{% endif %}" type="submit" aria-label="Dislike this post" aria-pressed="{% if disliked %}true{% else %}false{% endif %}" title="Dislike this post">
+			&#9660;
+		</button>
+	</form>
+	<form class="post_feedback_form post_feedback_clear_form" action="/post-feedback" method="POST" data-post-feedback-form data-feedback-signal="clear"{% if !has_feedback %} hidden{% endif %}>
+		<input type="hidden" name="id" value="{{ post.id }}">
+		<input type="hidden" name="community" value="{{ post.community }}">
+		<input type="hidden" name="author" value="{{ post.author.name }}">
+		<input type="hidden" name="model" value="{{ feedback_model }}">
+		<input type="hidden" name="signal" value="clear">
+		<input type="hidden" name="redirect" value="{% if redirect_url.is_empty() %}{{ self.url }}{% else %}{{ redirect_url }}{% endif %}">
+		<button class="post_feedback_button post_feedback_clear" type="submit" aria-label="Clear post feedback" aria-pressed="false" title="Clear post feedback">
+			&times;
+		</button>
+	</form>
+</div>
 {% endif %}
 {%- endmacro %}
 
@@ -476,6 +525,7 @@
 			{% endif %}
 		</span>
 		{% endif %}
+		{% call post_feedback_controls(post, "manual", redirect_url) %}
 		{% call bookmark_form(post, redirect_url) %}
 	</div>
 	{% if post.following_comments.len() > 0 %}

@@ -13,6 +13,7 @@ use crate::{
 };
 use askama::Template;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use bincode::Options;
 use brotli::Decompressor as BrotliDecompressor;
 use cached::proc_macro::cached;
 use cookie::Cookie;
@@ -115,6 +116,23 @@ pub struct FlairPart {
 pub struct FlairSubscription {
 	pub subreddit: String,
 	pub flair: String,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[revisioned(revision = 1)]
+pub struct PostFeedbackEntry {
+	pub post_id: String,
+	pub model: String,
+	pub subreddit: String,
+	pub author: String,
+	pub signal: String,
+	pub created_at_unix: u64,
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct PostFeedbackSummary {
+	pub likes: u32,
+	pub dislikes: u32,
 }
 
 impl FlairPart {
@@ -1778,7 +1796,7 @@ pub struct Params {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 6)]
+#[revisioned(revision = 7)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -1847,6 +1865,9 @@ pub struct Preferences {
 	pub hide_score: String,
 	#[revision(start = 1)]
 	pub remove_default_feeds: String,
+	#[revision(start = 7)]
+	#[serde(default, serialize_with = "serialize_post_feedback_entries", deserialize_with = "deserialize_post_feedback_entries")]
+	pub post_feedback: Vec<PostFeedbackEntry>,
 }
 
 #[derive(Deserialize)]
@@ -1910,6 +1931,7 @@ impl From<LegacyPreferencesV1> for Preferences {
 			hide_awards: value.hide_awards,
 			hide_score: value.hide_score,
 			remove_default_feeds: value.remove_default_feeds,
+			post_feedback: Vec::new(),
 		};
 		prefs.rebuild_indexes();
 		prefs
@@ -1976,6 +1998,7 @@ impl From<LegacyPreferencesV0> for Preferences {
 			hide_awards: value.hide_awards,
 			hide_score: value.hide_score,
 			remove_default_feeds: value.remove_default_feeds,
+			post_feedback: Vec::new(),
 		};
 		prefs.rebuild_indexes();
 		prefs
@@ -2031,6 +2054,39 @@ where
 {
 	let encoded = String::deserialize(deserializer)?;
 	decode_flair_subscriptions(&encoded).map_err(serde::de::Error::custom)
+}
+
+fn encode_post_feedback_entries(entries: &[PostFeedbackEntry]) -> Result<String, String> {
+	if entries.is_empty() {
+		return Ok(String::new());
+	}
+
+	let json = serde_json::to_vec(entries).map_err(|e| e.to_string())?;
+	Ok(URL_SAFE_NO_PAD.encode(json))
+}
+
+fn decode_post_feedback_entries(encoded: &str) -> Result<Vec<PostFeedbackEntry>, String> {
+	if encoded.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| e.to_string())?;
+	serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn serialize_post_feedback_entries<S>(entries: &[PostFeedbackEntry], serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: Serializer,
+{
+	serializer.serialize_str(&encode_post_feedback_entries(entries).map_err(serde::ser::Error::custom)?)
+}
+
+fn deserialize_post_feedback_entries<'de, D>(deserializer: D) -> Result<Vec<PostFeedbackEntry>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let encoded = String::deserialize(deserializer)?;
+	decode_post_feedback_entries(&encoded).map_err(serde::de::Error::custom)
 }
 
 fn chunk_cookie_value(value: &str, max_len: usize) -> Vec<String> {
@@ -2153,6 +2209,43 @@ fn default_hd_string() -> String {
 	"hd".to_string()
 }
 
+const MAX_POST_FEEDBACK_ENTRIES: usize = 1000;
+pub const POST_FEEDBACK_LIKE: &str = "like";
+pub const POST_FEEDBACK_DISLIKE: &str = "dislike";
+pub const POST_FEEDBACK_CLEAR: &str = "clear";
+
+pub fn normalize_post_feedback_signal(value: &str) -> Option<&'static str> {
+	match value.trim().to_ascii_lowercase().as_str() {
+		POST_FEEDBACK_LIKE => Some(POST_FEEDBACK_LIKE),
+		POST_FEEDBACK_DISLIKE => Some(POST_FEEDBACK_DISLIKE),
+		POST_FEEDBACK_CLEAR => Some(POST_FEEDBACK_CLEAR),
+		_ => None,
+	}
+}
+
+fn normalize_post_feedback_token(value: &str, max_len: usize) -> String {
+	value
+		.trim()
+		.chars()
+		.filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+		.take(max_len)
+		.collect()
+}
+
+fn normalize_post_feedback_key(value: &str, max_len: usize) -> String {
+	normalize_post_feedback_token(value, max_len).to_ascii_lowercase()
+}
+
+fn normalized_post_feedback_entry(mut entry: PostFeedbackEntry) -> Option<PostFeedbackEntry> {
+	entry.post_id = normalize_post_feedback_key(&entry.post_id, 32);
+	entry.model = normalize_post_feedback_key(&entry.model, 64);
+	entry.subreddit = normalize_post_feedback_token(&entry.subreddit, 64);
+	entry.author = normalize_post_feedback_token(&entry.author, 64);
+	entry.signal = normalize_post_feedback_signal(&entry.signal)?.to_string();
+
+	(!entry.post_id.is_empty() && !entry.model.is_empty() && !entry.subreddit.is_empty()).then_some(entry)
+}
+
 struct DeployGitFooter {
 	short: String,
 	title: String,
@@ -2219,6 +2312,7 @@ impl Preferences {
 	pub(crate) fn prepare_for_runtime(&mut self) {
 		self.available_themes = AVAILABLE_THEMES.clone();
 		self.rebuild_indexes();
+		self.normalize_post_feedback_entries();
 	}
 
 	pub(crate) fn prepare_for_storage(&self) -> Self {
@@ -2226,7 +2320,28 @@ impl Preferences {
 		prefs.available_themes = Vec::new();
 		prefs.subscriptions_lc = HashSet::new();
 		prefs.filters_lc = HashSet::new();
+		prefs.normalize_post_feedback_entries();
 		prefs
+	}
+
+	fn normalize_post_feedback_entries(&mut self) {
+		let mut deduped = Vec::new();
+		let mut seen = HashSet::new();
+		for entry in self.post_feedback.drain(..).rev() {
+			let Some(entry) = normalized_post_feedback_entry(entry) else {
+				continue;
+			};
+			if seen.insert((entry.post_id.clone(), entry.model.clone())) {
+				deduped.push(entry);
+			}
+		}
+		deduped.reverse();
+
+		if deduped.len() > MAX_POST_FEEDBACK_ENTRIES {
+			deduped.drain(0..deduped.len() - MAX_POST_FEEDBACK_ENTRIES);
+		}
+
+		self.post_feedback = deduped;
 	}
 
 	pub(crate) fn setting_value(&self, name: &str) -> Option<String> {
@@ -2303,13 +2418,16 @@ impl Preferences {
 			hide_awards: setting(req, "hide_awards"),
 			hide_score: setting(req, "hide_score"),
 			remove_default_feeds: setting(req, "remove_default_feeds"),
+			post_feedback: Vec::new(),
 		};
 		prefs.rebuild_indexes();
 		prefs
 	}
 
 	pub fn to_urlencoded(&self) -> Result<String, String> {
-		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
+		let mut prefs = self.clone();
+		prefs.post_feedback.clear();
+		serde_urlencoded::to_string(prefs).map_err(|e| e.to_string())
 	}
 
 	pub fn has_subscription(&self, value: &str) -> bool {
@@ -2332,6 +2450,77 @@ impl Preferences {
 		self.filters_lc.contains(&value.to_ascii_lowercase())
 	}
 
+	pub fn post_feedback_signal(&self, post_id: &str, model: &str) -> String {
+		let post_id = normalize_post_feedback_key(post_id, 32);
+		let model = normalize_post_feedback_key(model, 64);
+		if post_id.is_empty() || model.is_empty() {
+			return String::new();
+		}
+
+		self
+			.post_feedback
+			.iter()
+			.rev()
+			.find(|entry| entry.post_id == post_id && entry.model == model)
+			.map(|entry| entry.signal.clone())
+			.unwrap_or_default()
+	}
+
+	pub fn has_post_feedback_signal(&self, post_id: &str, model: &str, signal: &str) -> bool {
+		self.post_feedback_signal(post_id, model) == signal
+	}
+
+	pub fn update_post_feedback(&mut self, entry: PostFeedbackEntry) -> Result<String, String> {
+		let requested_signal = normalize_post_feedback_signal(&entry.signal).ok_or_else(|| "Invalid feedback signal".to_string())?;
+		let mut normalized = normalized_post_feedback_entry(entry).ok_or_else(|| "Invalid post feedback".to_string())?;
+		let current_signal = self.post_feedback_signal(&normalized.post_id, &normalized.model);
+
+		self
+			.post_feedback
+			.retain(|existing| !(existing.post_id == normalized.post_id && existing.model == normalized.model));
+		if requested_signal == POST_FEEDBACK_CLEAR || current_signal == requested_signal {
+			return Ok(String::new());
+		}
+
+		normalized.signal = requested_signal.to_string();
+		self.post_feedback.push(normalized);
+		self.normalize_post_feedback_entries();
+		Ok(requested_signal.to_string())
+	}
+
+	pub fn post_feedback_by_model_and_subreddit(&self) -> HashMap<(String, String), PostFeedbackSummary> {
+		let mut summary = HashMap::new();
+		for entry in &self.post_feedback {
+			let bucket = summary
+				.entry((entry.model.clone(), entry.subreddit.to_ascii_lowercase()))
+				.or_insert_with(PostFeedbackSummary::default);
+			match entry.signal.as_str() {
+				POST_FEEDBACK_LIKE => bucket.likes += 1,
+				POST_FEEDBACK_DISLIKE => bucket.dislikes += 1,
+				_ => {}
+			}
+		}
+		summary
+	}
+
+	pub fn post_feedback_by_model_and_author(&self) -> HashMap<(String, String), PostFeedbackSummary> {
+		let mut summary = HashMap::new();
+		for entry in &self.post_feedback {
+			if entry.author.is_empty() {
+				continue;
+			}
+			let bucket = summary
+				.entry((entry.model.clone(), entry.author.to_ascii_lowercase()))
+				.or_insert_with(PostFeedbackSummary::default);
+			match entry.signal.as_str() {
+				POST_FEEDBACK_LIKE => bucket.likes += 1,
+				POST_FEEDBACK_DISLIKE => bucket.dislikes += 1,
+				_ => {}
+			}
+		}
+		summary
+	}
+
 	pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
 		let mut bytes = Vec::new();
 		self.serialize_revisioned(&mut bytes).map_err(|e| e.to_string())?;
@@ -2346,20 +2535,37 @@ impl Preferences {
 }
 
 pub fn preferences_from_bincode(bytes: &[u8]) -> Result<Preferences, String> {
+	let legacy = bincode::DefaultOptions::new()
+		.with_fixint_encoding()
+		.reject_trailing_bytes()
+		.deserialize::<Preferences>(bytes)
+		.or_else(|_| {
+			bincode::DefaultOptions::new()
+				.with_fixint_encoding()
+				.reject_trailing_bytes()
+				.deserialize::<LegacyPreferencesV1>(bytes)
+				.map(Preferences::from)
+		})
+		.or_else(|_| {
+			bincode::DefaultOptions::new()
+				.with_fixint_encoding()
+				.reject_trailing_bytes()
+				.deserialize::<LegacyPreferencesV0>(bytes)
+				.map(Preferences::from)
+		});
+	if let Ok(mut preferences) = legacy {
+		preferences.rebuild_indexes();
+		return Ok(preferences);
+	}
+
 	let mut reader = bytes;
 	match Preferences::deserialize_revisioned(&mut reader) {
-		Ok(mut preferences) => {
+		Ok(mut preferences) if reader.is_empty() => {
 			preferences.rebuild_indexes();
 			Ok(preferences)
 		}
-		Err(_) => bincode::deserialize::<Preferences>(bytes)
-			.or_else(|_| bincode::deserialize::<LegacyPreferencesV1>(bytes).map(Preferences::from))
-			.or_else(|_| bincode::deserialize::<LegacyPreferencesV0>(bytes).map(Preferences::from))
-			.map(|mut preferences| {
-				preferences.rebuild_indexes();
-				preferences
-			})
-			.map_err(|e| e.to_string()),
+		Ok(_) => Err("revisioned preferences decoder left unread bytes".to_string()),
+		Err(error) => Err(error.to_string()),
 	}
 }
 
@@ -5211,7 +5417,7 @@ mod tests {
 		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration,
 		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links,
 		store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair,
-		FlairSubscription, GalleryMedia, Media, Post, Preferences,
+		FlairSubscription, GalleryMedia, Media, Post, PostFeedbackEntry, Preferences,
 	};
 	use crate::cache_persistence::PersistedSubredditUsersEntry;
 	use crate::utils::ParentComment;
@@ -6290,10 +6496,11 @@ mod tests {
 			hide_awards: "off".to_owned(),
 			hide_score: "off".to_owned(),
 			remove_default_feeds: "off".to_owned(),
+			post_feedback: Vec::new(),
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&redgifs_poster_quality=hd&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&redgifs_poster_quality=hd&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off&post_feedback=");
 	}
 
 	#[test]
@@ -6308,6 +6515,39 @@ mod tests {
 		assert!(prefs.has_followed_user("DEMO_USER"));
 		assert!(!prefs.has_followed_user("rust"));
 		assert!(!prefs.has_followed_user(""));
+	}
+
+	#[test]
+	fn post_feedback_toggles_and_summarizes_by_model() {
+		let mut prefs = Preferences::default();
+		let entry = PostFeedbackEntry {
+			post_id: "ABC123".to_string(),
+			model: "Manual".to_string(),
+			subreddit: "Rust".to_string(),
+			author: "DemoUser".to_string(),
+			signal: "like".to_string(),
+			created_at_unix: 100,
+		};
+
+		assert_eq!(prefs.update_post_feedback(entry.clone()).unwrap(), "like");
+		assert!(prefs.has_post_feedback_signal("abc123", "manual", "like"));
+		assert_eq!(prefs.update_post_feedback(entry.clone()).unwrap(), "");
+		assert_eq!(prefs.post_feedback_signal("abc123", "manual"), "");
+
+		let mut dislike = entry;
+		dislike.signal = "dislike".to_string();
+		dislike.created_at_unix = 101;
+		assert_eq!(prefs.update_post_feedback(dislike).unwrap(), "dislike");
+
+		let subreddit_summary = prefs.post_feedback_by_model_and_subreddit();
+		let subreddit_bucket = subreddit_summary.get(&("manual".to_string(), "rust".to_string())).unwrap();
+		assert_eq!(subreddit_bucket.likes, 0);
+		assert_eq!(subreddit_bucket.dislikes, 1);
+
+		let author_summary = prefs.post_feedback_by_model_and_author();
+		let author_bucket = author_summary.get(&("manual".to_string(), "demouser".to_string())).unwrap();
+		assert_eq!(author_bucket.likes, 0);
+		assert_eq!(author_bucket.dislikes, 1);
 	}
 
 	#[test]

@@ -2,6 +2,7 @@
     const initialize = (root = document) => {
         window.initializeFeedStatus?.(root);
         window.initializeSubscriptionForms?.(root);
+        window.initializePostFeedback?.(root);
         window.applyTemporaryAuthorFilters?.(root);
         window.loadAuthorLinks?.(root);
         window.markTruncatedPreviews?.();

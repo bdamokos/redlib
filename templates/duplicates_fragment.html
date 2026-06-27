@@ -74,6 +74,7 @@
 				<span class="label"> Upvotes</span></div>
 				<div class="post_footer">
 					<a href="{{ post.permalink }}" class="post_comments" title="{{ post.comments.1 }} comments">{{ post.comments.0 }} comments</a>
+					{% call utils::post_feedback_controls(post, "manual", self.url) %}
 				</div>
 		</div>
 		{% endif %}

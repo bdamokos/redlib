@@ -573,6 +573,14 @@ function isTemporaryFilterPostAuthorShortcutKey(event) {
     return !event.repeat && getKeyName(event) === "y";
 }
 
+function isLikePostFeedbackShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "w";
+}
+
+function isDislikePostFeedbackShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "s";
+}
+
 function isUserPage() {
     return /^\/(?:user|u)\//.test(window.location.pathname);
 }
@@ -874,6 +882,14 @@ function temporarilyFilterCurrentPostAuthor() {
     return true;
 }
 
+function submitCurrentPostFeedback(signal) {
+    if (typeof window.submitPostFeedback !== "function") {
+        return false;
+    }
+
+    return window.submitPostFeedback(findCurrentViewedPost(), signal) === true;
+}
+
 function isCurrentPostAuthorMarkedFollowed(post) {
     if (!(post instanceof Element)) {
         return false;
@@ -982,6 +998,8 @@ document.addEventListener("keydown", (event) => {
     const isOpenPostOnRedditShortcut = isOpenPostOnRedditShortcutKey(event);
     const isFilterPostAuthorShortcut = isFilterPostAuthorShortcutKey(event);
     const isTemporaryFilterPostAuthorShortcut = isTemporaryFilterPostAuthorShortcutKey(event);
+    const isLikePostFeedbackShortcut = isLikePostFeedbackShortcutKey(event);
+    const isDislikePostFeedbackShortcut = isDislikePostFeedbackShortcutKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
     const isScrollNavigationKey = scrollDirection !== 0;
@@ -989,7 +1007,18 @@ document.addEventListener("keydown", (event) => {
 
     if (
         event.defaultPrevented
-        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut && !isOpenPostOnRedditShortcut && !isFilterPostAuthorShortcut && !isTemporaryFilterPostAuthorShortcut)
+        || (
+            !isScrollNavigationKey
+            && !isPaginationKey
+            && !isFollowShortcut
+            && !isExpandPreviewShortcut
+            && !isOpenPostContextShortcut
+            && !isOpenPostOnRedditShortcut
+            && !isFilterPostAuthorShortcut
+            && !isTemporaryFilterPostAuthorShortcut
+            && !isLikePostFeedbackShortcut
+            && !isDislikePostFeedbackShortcut
+        )
         || event.altKey
         || event.ctrlKey
         || event.metaKey
@@ -1003,6 +1032,20 @@ document.addEventListener("keydown", (event) => {
 
     if (isTemporaryFilterPostAuthorShortcut) {
         if (temporarilyFilterCurrentPostAuthor()) {
+            event.preventDefault();
+        }
+        return;
+    }
+
+    if (isLikePostFeedbackShortcut) {
+        if (submitCurrentPostFeedback("like")) {
+            event.preventDefault();
+        }
+        return;
+    }
+
+    if (isDislikePostFeedbackShortcut) {
+        if (submitCurrentPostFeedback("dislike")) {
             event.preventDefault();
         }
         return;
