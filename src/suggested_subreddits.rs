@@ -1,5 +1,8 @@
 use crate::materialized_catalog::{SuggestedProfileEntry, SuggestedProfileScoringMode, SuggestedProfilesReport};
-use crate::utils::{get_filters, param, read_sharded_cookie, template, Preferences};
+use crate::utils::{
+	get_filters, param, post_feedback_score_adjustment, post_feedback_summary_affinity, read_sharded_cookie, template, PostFeedbackSummary, Preferences,
+	POST_FEEDBACK_MODEL_MANUAL,
+};
 use askama::Template;
 use hyper::{Body, Request, Response};
 use std::collections::{HashMap, HashSet};
@@ -10,6 +13,7 @@ const SUGGESTED_SUBREDDIT_MAX_LIMIT: usize = 200;
 const SUGGESTED_SUBREDDIT_PROFILE_SAMPLE_LIMIT: usize = 120;
 const SUGGESTED_SUBREDDIT_PROFILE_SUBREDDIT_LIMIT: usize = 32;
 const SUGGESTED_SUBREDDIT_SOURCE_LIMIT: usize = 8;
+const SUGGESTED_SUBREDDIT_FEEDBACK_MAX_SCORE_ADJUSTMENT: f64 = 18.0;
 const SUGGESTED_SUBREDDIT_IGNORE_COOKIE: &str = "suggested_subreddit_ignores";
 const SUGGESTED_PROFILE_IGNORE_COOKIE: &str = "suggested_profile_ignores";
 const SUGGESTED_IGNORE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
@@ -221,6 +225,14 @@ fn sorted_profile_subreddit_counts(mut counts: HashMap<String, u32>) -> Vec<(Str
 	subreddits
 }
 
+fn manual_post_feedback_summary<'a>(feedback: &'a HashMap<(String, String), PostFeedbackSummary>, name: &str) -> Option<&'a PostFeedbackSummary> {
+	feedback.get(&(POST_FEEDBACK_MODEL_MANUAL.to_string(), normalize_subreddit_name(name)))
+}
+
+fn has_positive_post_feedback(summary: &PostFeedbackSummary) -> bool {
+	post_feedback_summary_affinity(Some(summary)) > 0.0
+}
+
 fn profile_subreddit_counts(profile: &str) -> Vec<(String, u32)> {
 	let normalized = normalize_profile_name(profile);
 	if normalized.is_empty() {
@@ -314,15 +326,19 @@ fn add_profile_signal(
 	added_any
 }
 
-fn entry_score(accumulator: &SuggestedSubredditAccumulator) -> u32 {
+fn entry_score(accumulator: &SuggestedSubredditAccumulator, subreddit_feedback: Option<&PostFeedbackSummary>) -> u32 {
 	let followed_breadth = accumulator.followed_profiles.len() as f64;
 	let suggested_breadth = accumulator.suggested_profiles.len() as f64;
 	let followed_volume = (accumulator.followed_posts as f64).sqrt();
 	let suggested_volume = (accumulator.suggested_posts as f64).sqrt();
 
-	(followed_breadth * 28.0 + followed_volume * 9.0 + suggested_breadth * 10.0 + suggested_volume * 4.0)
-		.round()
-		.clamp(1.0, u32::MAX as f64) as u32
+	(followed_breadth * 28.0
+		+ followed_volume * 9.0
+		+ suggested_breadth * 10.0
+		+ suggested_volume * 4.0
+		+ post_feedback_score_adjustment(subreddit_feedback, SUGGESTED_SUBREDDIT_FEEDBACK_MAX_SCORE_ADJUSTMENT))
+	.round()
+	.clamp(1.0, u32::MAX as f64) as u32
 }
 
 fn report_from_profile_counts(
@@ -333,6 +349,7 @@ fn report_from_profile_counts(
 	followed_subreddits: &HashSet<String>,
 	filtered_subreddits: &HashSet<String>,
 	ignored_subreddits: &HashSet<String>,
+	subreddit_feedback: &HashMap<(String, String), PostFeedbackSummary>,
 	limit: usize,
 ) -> SuggestedSubredditsReport {
 	let mut excluded_subreddits = followed_subreddits.clone();
@@ -359,6 +376,19 @@ fn report_from_profile_counts(
 			suggested_profiles_with_cache += 1;
 		}
 	}
+	for ((model, subreddit), summary) in subreddit_feedback {
+		if model != POST_FEEDBACK_MODEL_MANUAL || !has_positive_post_feedback(summary) {
+			continue;
+		}
+		let subreddit = normalize_subreddit_name(subreddit);
+		if subreddit.is_empty() || subreddit.starts_with("u_") || excluded_subreddits.contains(&subreddit) {
+			continue;
+		}
+		accumulators.entry(subreddit.clone()).or_insert_with(|| SuggestedSubredditAccumulator {
+			name: subreddit,
+			..SuggestedSubredditAccumulator::default()
+		});
+	}
 
 	let candidate_subreddit_count = accumulators.len();
 	let mut suggestions = accumulators
@@ -366,7 +396,7 @@ fn report_from_profile_counts(
 		.map(|accumulator| {
 			let followed_profile_count = accumulator.followed_profiles.len();
 			let suggested_profile_count = accumulator.suggested_profiles.len();
-			let score = entry_score(&accumulator);
+			let score = entry_score(&accumulator, manual_post_feedback_summary(subreddit_feedback, &accumulator.name));
 			let total_post_count = accumulator.followed_posts + accumulator.suggested_posts;
 			let mut source_profiles = accumulator.source_profiles.into_values().collect::<Vec<_>>();
 			source_profiles.sort_by(|left, right| {
@@ -432,10 +462,13 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		suggestion_limit
 	};
-	let profile_report: SuggestedProfilesReport = crate::materialized_catalog::suggested_profiles_with_mode(
+	let author_feedback = prefs.post_feedback_by_model_and_author();
+	let subreddit_feedback = prefs.post_feedback_by_model_and_subreddit();
+	let profile_report: SuggestedProfilesReport = crate::materialized_catalog::suggested_profiles_with_mode_and_feedback(
 		&followed,
 		&followed_profile_subreddits,
 		&excluded_profiles,
+		&author_feedback,
 		SUGGESTED_SUBREDDIT_PROFILE_SAMPLE_LIMIT,
 		scoring_mode,
 	);
@@ -448,6 +481,7 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 		&followed_subreddits(&prefs),
 		&filtered_subreddits(&filters),
 		&ignored_subreddit_names,
+		&subreddit_feedback,
 		fetch_limit,
 	);
 	let has_more_suggestions = report.suggestions.len() > suggestion_limit && suggestion_limit < SUGGESTED_SUBREDDIT_MAX_LIMIT;
@@ -555,6 +589,7 @@ mod tests {
 			&HashSet::from(["already".to_string()]),
 			&HashSet::from(["filtered".to_string()]),
 			&HashSet::from(["ignored".to_string()]),
+			&HashMap::new(),
 			10,
 		);
 
@@ -577,6 +612,7 @@ mod tests {
 			&HashSet::new(),
 			&HashSet::new(),
 			&HashSet::new(),
+			&HashMap::new(),
 			10,
 		);
 
@@ -584,5 +620,70 @@ mod tests {
 		assert_eq!(report.suggestions[0].followed_profile_count, 2);
 		assert_eq!(report.suggestions[1].name, "noisy");
 		assert_eq!(report.suggestions[1].suggested_profile_count, 2);
+	}
+
+	#[test]
+	fn report_uses_post_feedback_to_nudge_subreddit_rank() {
+		let followed = vec!["alice".to_string()];
+		let followed_counts = HashMap::from([("alice".to_string(), vec![("alpha".to_string(), 3), ("beta".to_string(), 3)])]);
+
+		let without_feedback = report_from_profile_counts(
+			&followed,
+			&followed_counts,
+			&[],
+			&HashMap::new(),
+			&HashSet::new(),
+			&HashSet::new(),
+			&HashSet::new(),
+			&HashMap::new(),
+			10,
+		);
+		assert_eq!(without_feedback.suggestions[0].name, "alpha");
+
+		let feedback = HashMap::from([((POST_FEEDBACK_MODEL_MANUAL.to_string(), "beta".to_string()), PostFeedbackSummary { likes: 4, dislikes: 0 })]);
+		let with_feedback = report_from_profile_counts(
+			&followed,
+			&followed_counts,
+			&[],
+			&HashMap::new(),
+			&HashSet::new(),
+			&HashSet::new(),
+			&HashSet::new(),
+			&feedback,
+			10,
+		);
+
+		assert_eq!(with_feedback.suggestions[0].name, "beta");
+		assert!(with_feedback.suggestions[0].score > without_feedback.suggestions[0].score);
+	}
+
+	#[test]
+	fn report_includes_positive_feedback_subreddit_candidates() {
+		let followed = vec!["alice".to_string()];
+		let followed_counts = HashMap::from([("alice".to_string(), vec![("rust".to_string(), 3)])]);
+		let feedback = HashMap::from([(
+			(POST_FEEDBACK_MODEL_MANUAL.to_string(), "likedonly".to_string()),
+			PostFeedbackSummary { likes: 4, dislikes: 0 },
+		)]);
+
+		let report = report_from_profile_counts(
+			&followed,
+			&followed_counts,
+			&[],
+			&HashMap::new(),
+			&HashSet::new(),
+			&HashSet::new(),
+			&HashSet::new(),
+			&feedback,
+			10,
+		);
+
+		let liked = report
+			.suggestions
+			.iter()
+			.find(|suggestion| suggestion.name == "likedonly")
+			.expect("liked subreddit suggestion");
+		assert_eq!(liked.total_post_count, 0);
+		assert_eq!(liked.score, SUGGESTED_SUBREDDIT_FEEDBACK_MAX_SCORE_ADJUSTMENT as u32);
 	}
 }

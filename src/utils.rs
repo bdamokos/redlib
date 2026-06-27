@@ -135,6 +135,12 @@ pub struct PostFeedbackSummary {
 	pub dislikes: u32,
 }
 
+impl PostFeedbackSummary {
+	pub fn total(&self) -> u32 {
+		self.likes.saturating_add(self.dislikes)
+	}
+}
+
 impl FlairPart {
 	pub fn parse(flair_type: &str, rich_flair: Option<&Vec<Value>>, text_flair: Option<&str>) -> Vec<Self> {
 		// Parse type of flair
@@ -2214,6 +2220,7 @@ fn default_hd_string() -> String {
 }
 
 const MAX_POST_FEEDBACK_ENTRIES: usize = 1000;
+pub const POST_FEEDBACK_MODEL_MANUAL: &str = "manual";
 pub const POST_FEEDBACK_LIKE: &str = "like";
 pub const POST_FEEDBACK_DISLIKE: &str = "dislike";
 pub const POST_FEEDBACK_CLEAR: &str = "clear";
@@ -2225,6 +2232,24 @@ pub fn normalize_post_feedback_signal(value: &str) -> Option<&'static str> {
 		POST_FEEDBACK_CLEAR => Some(POST_FEEDBACK_CLEAR),
 		_ => None,
 	}
+}
+
+pub fn post_feedback_summary_affinity(summary: Option<&PostFeedbackSummary>) -> f64 {
+	let Some(summary) = summary else {
+		return 0.0;
+	};
+	let total = summary.total();
+	if total == 0 {
+		return 0.0;
+	}
+
+	let net = summary.likes as f64 - summary.dislikes as f64;
+	let confidence = (total as f64 / 4.0).min(1.0);
+	(net / total as f64) * confidence
+}
+
+pub fn post_feedback_score_adjustment(summary: Option<&PostFeedbackSummary>, max_abs_adjustment: f64) -> f64 {
+	post_feedback_summary_affinity(summary) * max_abs_adjustment.max(0.0)
 }
 
 fn normalize_post_feedback_token(value: &str, max_len: usize) -> String {
@@ -5504,9 +5529,9 @@ mod tests {
 		cache_author_watched_links_from_posts, cached_subreddit_users, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links,
 		coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links,
 		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration,
-		hydrate_post_author_links_from_cache, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links,
-		store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair,
-		FlairSubscription, GalleryMedia, Media, Post, PostFeedbackEntry, Preferences,
+		hydrate_post_author_links_from_cache, post_feedback_score_adjustment, post_feedback_summary_affinity, read_sharded_cookie, redgifs_uploader_matches_author,
+		refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links, store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards,
+		CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media, Post, PostFeedbackEntry, PostFeedbackSummary, Preferences,
 	};
 	use crate::cache_persistence::PersistedSubredditUsersEntry;
 	use crate::utils::ParentComment;
@@ -6651,6 +6676,45 @@ mod tests {
 		let author_bucket = author_summary.get(&("manual".to_string(), "demouser".to_string())).unwrap();
 		assert_eq!(author_bucket.likes, 0);
 		assert_eq!(author_bucket.dislikes, 1);
+	}
+
+	#[test]
+	fn post_feedback_survives_server_json_storage_round_trip() {
+		let mut prefs = Preferences::default();
+		prefs
+			.update_post_feedback(PostFeedbackEntry {
+				post_id: "ABC123".to_string(),
+				model: "Manual".to_string(),
+				subreddit: "Rust".to_string(),
+				author: "DemoUser".to_string(),
+				signal: "like".to_string(),
+				created_at_unix: 100,
+			})
+			.unwrap();
+
+		let stored_json = serde_json::to_string(&prefs.prepare_for_storage()).unwrap();
+		let mut restored: Preferences = serde_json::from_str(&stored_json).unwrap();
+		restored.prepare_for_runtime();
+
+		assert!(restored.has_post_feedback_signal("abc123", "manual", "like"));
+		assert_eq!(
+			restored.post_feedback_by_model_and_subreddit().get(&("manual".to_string(), "rust".to_string())),
+			Some(&PostFeedbackSummary { likes: 1, dislikes: 0 })
+		);
+	}
+
+	#[test]
+	fn post_feedback_affinity_is_confidence_weighted() {
+		let weak_like = PostFeedbackSummary { likes: 1, dislikes: 0 };
+		let strong_like = PostFeedbackSummary { likes: 4, dislikes: 0 };
+		let mixed = PostFeedbackSummary { likes: 3, dislikes: 1 };
+		let strong_dislike = PostFeedbackSummary { likes: 0, dislikes: 4 };
+
+		assert_eq!(post_feedback_summary_affinity(Some(&weak_like)), 0.25);
+		assert_eq!(post_feedback_summary_affinity(Some(&strong_like)), 1.0);
+		assert_eq!(post_feedback_summary_affinity(Some(&mixed)), 0.5);
+		assert_eq!(post_feedback_summary_affinity(Some(&strong_dislike)), -1.0);
+		assert_eq!(post_feedback_score_adjustment(Some(&mixed), 20.0), 10.0);
 	}
 
 	#[test]

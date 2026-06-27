@@ -148,7 +148,9 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		suggestion_limit
 	};
-	let mut report = crate::materialized_catalog::suggested_profiles_with_mode(&followed, &followed_subreddits, &excluded, fetch_limit, scoring_mode);
+	let author_feedback = prefs.post_feedback_by_model_and_author();
+	let mut report =
+		crate::materialized_catalog::suggested_profiles_with_mode_and_feedback(&followed, &followed_subreddits, &excluded, &author_feedback, fetch_limit, scoring_mode);
 	let has_more_suggestions = report.suggestions.len() > suggestion_limit && suggestion_limit < SUGGESTED_PROFILE_MAX_LIMIT;
 	report.suggestions.truncate(suggestion_limit);
 

@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::cache_persistence::PersistedPost;
 use crate::post_cache::{FeedSession, FeedSort, FeedSource, SessionSourceState};
-use crate::utils::Post;
+use crate::utils::{post_feedback_score_adjustment, post_feedback_summary_affinity, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -20,6 +20,7 @@ const SUGGESTED_PROFILE_TWO_OVERLAP_FACTOR: f64 = 0.85;
 const SUGGESTED_PROFILE_VECTOR_SINGLE_OVERLAP_FACTOR: f64 = 0.45;
 const SUGGESTED_PROFILE_VECTOR_TWO_OVERLAP_FACTOR: f64 = 0.80;
 const SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD: usize = 4;
+const SUGGESTED_PROFILE_FEEDBACK_MAX_SCORE_ADJUSTMENT: f64 = 0.25;
 const AUTHOR_HISTORY_MAX_POST_AGE_SECS: u64 = 180 * 24 * 60 * 60;
 const AUTHOR_HISTORY_MAX_POSTS_PER_AUTHOR: usize = 160;
 const AUTHOR_HISTORY_GLOBAL_MAX_POSTS: usize = 60_000;
@@ -269,6 +270,18 @@ fn suggested_profile_vector_idf(total_profiles: usize, subreddit_profile_count: 
 	let total = total_profiles.max(1) as f64;
 	let subreddit_profiles = subreddit_profile_count.max(1) as f64;
 	(((total + 1.0) / (subreddit_profiles + 1.0)).ln() + 0.35).clamp(0.20, 2.75)
+}
+
+fn manual_post_feedback_summary<'a>(feedback: &'a HashMap<(String, String), PostFeedbackSummary>, name: &str) -> Option<&'a PostFeedbackSummary> {
+	feedback.get(&(POST_FEEDBACK_MODEL_MANUAL.to_string(), name.trim().to_lowercase()))
+}
+
+fn suggested_profile_feedback_adjusted_score(score: f64, summary: Option<&PostFeedbackSummary>) -> f64 {
+	(score + post_feedback_score_adjustment(summary, SUGGESTED_PROFILE_FEEDBACK_MAX_SCORE_ADJUSTMENT)).clamp(0.01, 1.0)
+}
+
+fn suggested_profile_has_positive_feedback(summary: Option<&PostFeedbackSummary>) -> bool {
+	post_feedback_summary_affinity(summary) > 0.0
 }
 
 fn normalize_suggested_profile_vector(vector: &mut HashMap<String, f64>) -> f64 {
@@ -1128,9 +1141,21 @@ pub(crate) fn suggested_profiles_with_mode(
 	limit: usize,
 	mode: SuggestedProfileScoringMode,
 ) -> SuggestedProfilesReport {
+	let feedback = HashMap::new();
+	suggested_profiles_with_mode_and_feedback(followed_profiles, followed_profile_subreddits, excluded_profiles, &feedback, limit, mode)
+}
+
+pub(crate) fn suggested_profiles_with_mode_and_feedback(
+	followed_profiles: &[String],
+	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
+	excluded_profiles: &HashSet<String>,
+	author_feedback: &HashMap<(String, String), PostFeedbackSummary>,
+	limit: usize,
+	mode: SuggestedProfileScoringMode,
+) -> SuggestedProfilesReport {
 	match mode {
-		SuggestedProfileScoringMode::Overlap => suggested_profiles_overlap(followed_profiles, followed_profile_subreddits, excluded_profiles, limit),
-		SuggestedProfileScoringMode::Vector => suggested_profiles_vector_mode(followed_profiles, followed_profile_subreddits, excluded_profiles, limit),
+		SuggestedProfileScoringMode::Overlap => suggested_profiles_overlap(followed_profiles, followed_profile_subreddits, excluded_profiles, author_feedback, limit),
+		SuggestedProfileScoringMode::Vector => suggested_profiles_vector_mode(followed_profiles, followed_profile_subreddits, excluded_profiles, author_feedback, limit),
 	}
 }
 
@@ -1138,6 +1163,7 @@ fn suggested_profiles_overlap(
 	followed_profiles: &[String],
 	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
 	excluded_profiles: &HashSet<String>,
+	author_feedback: &HashMap<(String, String), PostFeedbackSummary>,
 	limit: usize,
 ) -> SuggestedProfilesReport {
 	let followed_profiles = followed_profiles
@@ -1225,6 +1251,23 @@ fn suggested_profiles_overlap(
 			*entry = (*entry).max(count);
 		}
 	}
+	for ((model, profile), summary) in author_feedback {
+		if model != POST_FEEDBACK_MODEL_MANUAL || !suggested_profile_has_positive_feedback(Some(summary)) {
+			continue;
+		}
+		let profile = normalize_profile_name(profile);
+		if profile.is_empty() || followed_profiles.contains(&profile) || excluded_profiles.contains(&profile) {
+			continue;
+		}
+		let Some(counts) = catalog.author_community_counts.get(&profile) else {
+			continue;
+		};
+		let candidate_counts = candidate_counts_by_profile.entry(profile).or_default();
+		for (subreddit, count) in sorted_subreddit_counts(counts, SUGGESTED_PROFILE_TOP_SUBREDDITS) {
+			let entry = candidate_counts.entry(subreddit).or_default();
+			*entry = (*entry).max(count);
+		}
+	}
 	drop(catalog);
 
 	for (subreddit, _) in &followed_top {
@@ -1257,6 +1300,8 @@ fn suggested_profiles_overlap(
 			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
 				continue;
 			}
+			let feedback_summary = manual_post_feedback_summary(author_feedback, &profile);
+			let has_positive_feedback = suggested_profile_has_positive_feedback(feedback_summary);
 
 			compared_profile_count += 1;
 
@@ -1281,7 +1326,7 @@ fn suggested_profiles_overlap(
 				});
 			}
 
-			if dot <= 0.0 || candidate_norm_sq <= 0.0 || matched_posts == 0 {
+			if candidate_norm_sq <= 0.0 || ((dot <= 0.0 || matched_posts == 0) && !has_positive_feedback) {
 				continue;
 			}
 
@@ -1295,7 +1340,7 @@ fn suggested_profiles_overlap(
 
 			let similarity = dot / (followed_norm * candidate_norm_sq.sqrt());
 			let confidence = (cached_posts as f64 / 8.0).min(1.0);
-			let score = similarity * confidence * suggested_profile_overlap_factor(overlap_count);
+			let score = suggested_profile_feedback_adjusted_score(similarity * confidence * suggested_profile_overlap_factor(overlap_count), feedback_summary);
 			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
 
 			suggestions.push(SuggestedProfileEntry {
@@ -1348,6 +1393,7 @@ fn suggested_profiles_vector_mode(
 	followed_profiles: &[String],
 	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
 	excluded_profiles: &HashSet<String>,
+	author_feedback: &HashMap<(String, String), PostFeedbackSummary>,
 	limit: usize,
 ) -> SuggestedProfilesReport {
 	let followed_profiles = followed_profiles
@@ -1495,6 +1541,8 @@ fn suggested_profiles_vector_mode(
 			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
 				continue;
 			}
+			let feedback_summary = manual_post_feedback_summary(author_feedback, &profile);
+			let has_positive_feedback = suggested_profile_has_positive_feedback(feedback_summary);
 
 			let mut candidate_vector = suggested_profile_vector(&counts, &subreddit_weights, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
 			if normalize_suggested_profile_vector(&mut candidate_vector) <= 0.0 {
@@ -1507,7 +1555,7 @@ fn suggested_profiles_vector_mode(
 				.map(|centroid| (suggested_profile_dot(centroid, &candidate_vector), centroid))
 				.max_by(|(left, _), (right, _)| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
 				.unwrap_or((0.0, &centroids[0]));
-			if similarity <= 0.0 {
+			if similarity <= 0.0 && !has_positive_feedback {
 				continue;
 			}
 
@@ -1526,7 +1574,7 @@ fn suggested_profiles_vector_mode(
 				});
 			}
 
-			if matched_posts == 0 {
+			if matched_posts == 0 && !has_positive_feedback {
 				continue;
 			}
 
@@ -1539,7 +1587,7 @@ fn suggested_profiles_vector_mode(
 			overlap_subreddits.truncate(SUGGESTED_PROFILE_REASON_LIMIT);
 
 			let confidence = (cached_posts as f64 / 12.0).sqrt().min(1.0);
-			let score = similarity * confidence * suggested_profile_vector_breadth_factor(overlap_count);
+			let score = suggested_profile_feedback_adjusted_score(similarity * confidence * suggested_profile_vector_breadth_factor(overlap_count), feedback_summary);
 			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
 
 			suggestions.push(SuggestedProfileEntry {
@@ -1772,10 +1820,10 @@ mod tests {
 		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_author_posts_limited, query_source_candidates, record_author_history_from_posts,
 		rejected_author_redgifs_profile_count, reset_catalog, restore_catalog, restore_persisted_author_history, restore_persisted_rejected_author_redgifs_profiles,
 		snapshot_catalog, snapshot_persisted_author_history, snapshot_persisted_rejected_author_redgifs_profiles, suggested_profiles, suggested_profiles_with_mode,
-		SuggestedProfileScoringMode,
+		suggested_profiles_with_mode_and_feedback, SuggestedProfileScoringMode,
 	};
 	use crate::post_cache::{FeedSort, FeedSource};
-	use crate::utils::{Author, Awards, Flags, Flair, Media, ParentComment, Post};
+	use crate::utils::{Author, Awards, Flags, Flair, Media, ParentComment, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
 	use std::collections::{HashMap, HashSet};
 	use std::sync::MutexGuard;
 
@@ -2048,6 +2096,77 @@ mod tests {
 		assert!(!report.suggestions.iter().any(|entry| entry.name == "alice"));
 		assert!(report.suggestions[0].overlap_subreddits.iter().any(|entry| entry.name == "rust"));
 		assert!(report.suggestions[0].overlap_subreddits.iter().any(|entry| entry.name == "programming"));
+	}
+
+	#[test]
+	fn suggested_profiles_use_post_feedback_to_nudge_rank() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_alice", FeedSort::New),
+			&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)],
+		);
+		apply_source_refresh(
+			&FeedSource::subreddit("rust", FeedSort::New),
+			&[test_post("bob-rust", "rust", "bob", 280), test_post("carol-rust", "rust", "carol", 270)],
+		);
+		apply_source_refresh(
+			&FeedSource::subreddit("programming", FeedSort::New),
+			&[
+				test_post("bob-programming", "programming", "bob", 260),
+				test_post("carol-programming", "programming", "carol", 250),
+			],
+		);
+
+		let without_feedback = suggested_profiles(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+		assert_eq!(without_feedback.suggestions[0].name, "bob");
+
+		let feedback = HashMap::from([((POST_FEEDBACK_MODEL_MANUAL.to_string(), "carol".to_string()), PostFeedbackSummary { likes: 4, dislikes: 0 })]);
+		let with_feedback = suggested_profiles_with_mode_and_feedback(
+			&["alice".to_string()],
+			&HashMap::new(),
+			&HashSet::new(),
+			&feedback,
+			10,
+			SuggestedProfileScoringMode::Overlap,
+		);
+
+		assert_eq!(with_feedback.suggestions[0].name, "carol");
+		assert!(with_feedback.suggestions[0].score_percent > without_feedback.suggestions[0].score_percent);
+	}
+
+	#[test]
+	fn suggested_profiles_include_positive_feedback_cached_authors() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_alice", FeedSort::New),
+			&[test_post("alice-rust", "rust", "alice", 300), test_post("alice-programming", "programming", "alice", 290)],
+		);
+		apply_source_refresh(
+			&FeedSource::subreddit("cooking", FeedSort::New),
+			&[test_post("carol-cooking", "cooking", "carol", 280), test_post("carol-baking", "baking", "carol", 270)],
+		);
+		assert!(catalog_user_sidebar_stats("carol").is_some());
+
+		let without_feedback = suggested_profiles(&["alice".to_string()], &HashMap::new(), &HashSet::new(), 10);
+		assert!(!without_feedback.suggestions.iter().any(|suggestion| suggestion.name == "carol"));
+
+		let feedback = HashMap::from([((POST_FEEDBACK_MODEL_MANUAL.to_string(), "carol".to_string()), PostFeedbackSummary { likes: 4, dislikes: 0 })]);
+		let with_feedback = suggested_profiles_with_mode_and_feedback(
+			&["alice".to_string()],
+			&HashMap::new(),
+			&HashSet::new(),
+			&feedback,
+			10,
+			SuggestedProfileScoringMode::Overlap,
+		);
+
+		let carol = with_feedback.suggestions.iter().find(|suggestion| suggestion.name == "carol").expect("liked cached author");
+		assert_eq!(carol.matched_posts, 0);
+		assert_eq!(carol.score_percent, 25);
 	}
 
 	#[test]

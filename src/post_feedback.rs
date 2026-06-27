@@ -1,5 +1,5 @@
 use crate::prefs_store;
-use crate::utils::{redirect, PostFeedbackEntry, Preferences};
+use crate::utils::{redirect, PostFeedbackEntry, Preferences, POST_FEEDBACK_DISLIKE, POST_FEEDBACK_LIKE};
 use hyper::body::to_bytes;
 use hyper::header::CONTENT_TYPE;
 use hyper::{Body, Request, Response, StatusCode};
@@ -36,6 +36,14 @@ fn ajax_ok_response(signal: &str) -> Response<Body> {
 		.unwrap_or_default()
 }
 
+fn feedback_cache_signal_value(signal: &str) -> i8 {
+	match signal {
+		POST_FEEDBACK_LIKE => 1,
+		POST_FEEDBACK_DISLIKE => -1,
+		_ => 0,
+	}
+}
+
 pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 	let mut prefs = Preferences::new(&req);
 	let (parts, body) = req.into_parts();
@@ -52,6 +60,7 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 		return Ok(error_response(StatusCode::BAD_REQUEST, "Missing feedback fields"));
 	}
 
+	let previous_signal = prefs.post_feedback_signal(id, model);
 	let entry = PostFeedbackEntry {
 		post_id: id.to_string(),
 		model: model.to_string(),
@@ -64,10 +73,30 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 		Ok(signal) => signal,
 		Err(message) => return Ok(error_response(StatusCode::BAD_REQUEST, &message)),
 	};
+	let cache_signal_delta = feedback_cache_signal_value(&next_signal) - feedback_cache_signal_value(&previous_signal);
+	if cache_signal_delta != 0 {
+		crate::post_cache::record_remembered_feed_feedback_signal_delta(
+			&crate::post_cache::FeedSource::subreddit(community.to_string(), crate::post_cache::FeedSort::New),
+			cache_signal_delta,
+		);
+	}
 
 	prefs.prepare_for_runtime();
 	let request = Request::from_parts(parts, Body::empty());
 	let mut response = if is_ajax { ajax_ok_response(&next_signal) } else { redirect(&redirect_to) };
 	prefs_store::save_preferences(&mut response, &request, &prefs)?;
 	Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn feedback_cache_signal_value_maps_transitions() {
+		assert_eq!(feedback_cache_signal_value("like"), 1);
+		assert_eq!(feedback_cache_signal_value("dislike"), -1);
+		assert_eq!(feedback_cache_signal_value(""), 0);
+		assert_eq!(feedback_cache_signal_value("clear"), 0);
+	}
 }

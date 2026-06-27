@@ -31,6 +31,12 @@ const VISIT_PRIORITY_BUMP: f64 = 1.0;
 const VISIT_PRIORITY_MAX_SCORE: f64 = 16.0;
 /// Maps decaying visit score into `effective_freshness_target` reduction: target *= 1/(1 + k*score).
 const VISIT_PRIORITY_SENSITIVITY: f64 = 0.35;
+/// Rating feedback has a smaller, separate cache-priority effect to reduce feedback-loop risk.
+const FEEDBACK_PRIORITY_HALFLIFE_SECS: u64 = 7 * 24 * 60 * 60;
+const FEEDBACK_PRIORITY_BUMP: f64 = 0.30;
+const FEEDBACK_PRIORITY_MAX_SCORE: f64 = 3.0;
+const FEEDBACK_PRIORITY_MIN_SCORE: f64 = -3.0;
+const FEEDBACK_PRIORITY_SENSITIVITY: f64 = 0.08;
 const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
 const PERMANENT_FAILURE_BACKOFF_SECS: u64 = 14 * 24 * 60 * 60;
 const ACTIVE_BROWSER_SESSION_TTL_SECS: u64 = 20;
@@ -238,6 +244,9 @@ pub struct RememberedSubredditEntry {
 	pub visit_priority_score: f64,
 	pub visit_priority_last_update_at: Option<Instant>,
 	pub visit_signal_last_applied_at: Option<Instant>,
+	/// Accumulated rating-feedback score. Positive values mildly promote, negative values mildly defer.
+	pub feedback_priority_score: f64,
+	pub feedback_priority_last_update_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -537,16 +546,26 @@ fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 		visit_priority_score: 0.0,
 		visit_priority_last_update_at: None,
 		visit_signal_last_applied_at: None,
+		feedback_priority_score: 0.0,
+		feedback_priority_last_update_at: None,
 	}
 }
 
-fn visit_priority_score_now(entry: &RememberedSubredditEntry) -> f64 {
-	let Some(anchor) = entry.visit_priority_last_update_at else {
+fn decayed_priority_score(score: f64, anchor: Option<Instant>, half_life_secs: u64) -> f64 {
+	let Some(anchor) = anchor else {
 		return 0.0;
 	};
 	let dt = anchor.elapsed().as_secs_f64();
-	let lambda = std::f64::consts::LN_2 / VISIT_PRIORITY_HALFLIFE_SECS as f64;
-	entry.visit_priority_score * (-lambda * dt).exp()
+	let lambda = std::f64::consts::LN_2 / half_life_secs as f64;
+	score * (-lambda * dt).exp()
+}
+
+fn visit_priority_score_now(entry: &RememberedSubredditEntry) -> f64 {
+	decayed_priority_score(entry.visit_priority_score, entry.visit_priority_last_update_at, VISIT_PRIORITY_HALFLIFE_SECS)
+}
+
+fn feedback_priority_score_now(entry: &RememberedSubredditEntry) -> f64 {
+	decayed_priority_score(entry.feedback_priority_score, entry.feedback_priority_last_update_at, FEEDBACK_PRIORITY_HALFLIFE_SECS)
 }
 
 /// Browsing the canonical first page of a remembered `new` feed (subreddit, flair, or `u_` listing)
@@ -578,6 +597,33 @@ pub fn record_remembered_feed_visit_signal(source: &FeedSource) {
 	entry.visit_priority_score = score;
 	entry.visit_priority_last_update_at = Some(Instant::now());
 	entry.visit_signal_last_applied_at = Some(Instant::now());
+	crate::cache_persistence::mark_dirty();
+}
+
+pub fn record_remembered_feed_feedback_signal_delta(source: &FeedSource, signal_delta: i8) {
+	if signal_delta == 0 {
+		return;
+	}
+	let Some(normalized) = normalize_remembered_source(source) else {
+		return;
+	};
+	let Some(key) = remembered_feed_key_for_source(&normalized) else {
+		return;
+	};
+
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let entry = match remembered.entry(key) {
+		Entry::Occupied(slot) => slot.into_mut(),
+		Entry::Vacant(slot) if signal_delta > 0 => {
+			let name = slot.key().clone();
+			slot.insert(new_remembered_subreddit_entry(name))
+		}
+		Entry::Vacant(_) => return,
+	};
+
+	let score = feedback_priority_score_now(entry) + signal_delta as f64 * FEEDBACK_PRIORITY_BUMP;
+	entry.feedback_priority_score = score.clamp(FEEDBACK_PRIORITY_MIN_SCORE, FEEDBACK_PRIORITY_MAX_SCORE);
+	entry.feedback_priority_last_update_at = Some(Instant::now());
 	crate::cache_persistence::mark_dirty();
 }
 
@@ -856,8 +902,14 @@ fn effective_freshness_target_secs(entry: &RememberedSubredditEntry) -> u64 {
 		base = base.saturating_mul(entry.consecutive_failures.max(1).min(8) as u64);
 	}
 	let score = visit_priority_score_now(entry);
-	let boosted = (base as f64 / (1.0 + VISIT_PRIORITY_SENSITIVITY * score)).max(MIN_FRESHNESS_TARGET_SECS as f64);
-	boosted as u64
+	let mut target = base as f64 / (1.0 + VISIT_PRIORITY_SENSITIVITY * score);
+	let feedback_score = feedback_priority_score_now(entry);
+	if feedback_score >= 0.0 {
+		target /= 1.0 + FEEDBACK_PRIORITY_SENSITIVITY * feedback_score;
+	} else {
+		target *= 1.0 + FEEDBACK_PRIORITY_SENSITIVITY * -feedback_score;
+	}
+	target.clamp(MIN_FRESHNESS_TARGET_SECS as f64, MAX_FRESHNESS_TARGET_SECS as f64) as u64
 }
 
 fn remembered_entry_refresh_blocked(entry: &RememberedSubredditEntry) -> bool {
@@ -1238,6 +1290,8 @@ pub(crate) fn snapshot_persisted_remembered_subreddits(now_unix: u64) -> Vec<Per
 			visit_priority_score: entry.visit_priority_score,
 			visit_priority_last_update_unix: option_instant_to_unix(entry.visit_priority_last_update_at, now_unix),
 			visit_signal_last_applied_unix: option_instant_to_unix(entry.visit_signal_last_applied_at, now_unix),
+			feedback_priority_score: entry.feedback_priority_score,
+			feedback_priority_last_update_unix: option_instant_to_unix(entry.feedback_priority_last_update_at, now_unix),
 		})
 		.collect()
 }
@@ -1269,6 +1323,8 @@ pub(crate) fn restore_persisted_state(
 					visit_priority_score: entry.visit_priority_score,
 					visit_priority_last_update_at: option_unix_to_instant(entry.visit_priority_last_update_unix, now_unix),
 					visit_signal_last_applied_at: option_unix_to_instant(entry.visit_signal_last_applied_unix, now_unix),
+					feedback_priority_score: entry.feedback_priority_score,
+					feedback_priority_last_update_at: option_unix_to_instant(entry.feedback_priority_last_update_unix, now_unix),
 				},
 			))
 		})
@@ -3294,13 +3350,14 @@ mod tests {
 		effective_freshness_target_secs, ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions,
 		initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
 		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache,
-		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_visit_signal, remember_flair_request,
-		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority, restore_persisted_state, servable_cached_source_posts, session_status_from_posts,
-		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision,
-		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource,
-		RefreshOrigin, RememberedFailureDisposition, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
-		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE,
-		REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
+		record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority,
+		restore_persisted_state, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries,
+		sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts, store_source_posts_with_origin, sync_sources_to_request,
+		warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedRefreshOutcome,
+		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
+		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE,
+		SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -3361,6 +3418,8 @@ mod tests {
 			visit_priority_score: 0.0,
 			visit_priority_last_update_at: None,
 			visit_signal_last_applied_at: None,
+			feedback_priority_score: 0.0,
+			feedback_priority_last_update_at: None,
 		}
 	}
 
@@ -4106,6 +4165,37 @@ mod tests {
 		record_remembered_feed_visit_signal(&new_source("rust"));
 		let twice = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].visit_priority_score;
 		assert_eq!(once, twice);
+	}
+
+	#[test]
+	fn feedback_signal_has_smaller_cache_priority_effect_than_visit_signal() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		remember_subreddit_request("programming");
+		let before = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].clone();
+		let target_before = effective_freshness_target_secs(&before);
+
+		record_remembered_feed_feedback_signal_delta(&new_source("rust"), 1);
+		record_remembered_feed_visit_signal(&new_source("programming"));
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let target_after_feedback = effective_freshness_target_secs(&remembered["rust"]);
+		let target_after_visit = effective_freshness_target_secs(&remembered["programming"]);
+
+		assert!(target_after_feedback < target_before, "positive feedback should mildly increase refresh priority");
+		assert!(target_after_feedback > target_after_visit, "feedback priority should be weaker than a direct visit signal");
+	}
+
+	#[test]
+	fn negative_feedback_does_not_create_remembered_feed() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		record_remembered_feed_feedback_signal_delta(&new_source("rust"), -1);
+
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().is_empty());
 	}
 
 	#[test]

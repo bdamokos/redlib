@@ -261,6 +261,10 @@ pub(crate) struct PersistedRememberedSubredditEntry {
 	pub visit_priority_last_update_unix: Option<u64>,
 	#[serde(default)]
 	pub visit_signal_last_applied_unix: Option<u64>,
+	#[serde(default)]
+	pub feedback_priority_score: f64,
+	#[serde(default)]
+	pub feedback_priority_last_update_unix: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
