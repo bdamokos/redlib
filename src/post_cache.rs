@@ -219,6 +219,24 @@ impl FeedSource {
 	}
 }
 
+fn source_from_cache_key(key: &str) -> Option<FeedSource> {
+	if let Some(name) = key.strip_prefix("subreddit:") {
+		let (name, sort) = name.rsplit_once(':').map_or((name, FeedSort::New), |(name, sort)| (name, FeedSort::from_listing(sort)));
+		Some(FeedSource::subreddit(name.to_string(), sort))
+	} else if let Some(name) = key.strip_prefix("user_comments:") {
+		let (name, sort) = name.rsplit_once(':').map_or((name, FeedSort::New), |(name, sort)| (name, FeedSort::from_listing(sort)));
+		Some(FeedSource::user_comments(name.to_string(), sort))
+	} else if let Some(rest) = key.strip_prefix("flair:") {
+		let (subreddit, flair_and_sort) = rest.split_once(':')?;
+		let (flair, sort) = flair_and_sort
+			.rsplit_once(':')
+			.map_or((flair_and_sort, FeedSort::New), |(flair, sort)| (flair, FeedSort::from_listing(sort)));
+		Some(FeedSource::flair(subreddit.to_string(), flair.to_string(), sort))
+	} else {
+		None
+	}
+}
+
 #[derive(Clone)]
 struct CachedSourcePosts {
 	source: FeedSource,
@@ -729,6 +747,36 @@ fn ensure_remembered_feeds_seeded_for_preferences(preferences: &Preferences) {
 	if inserted {
 		crate::cache_persistence::mark_dirty();
 	}
+}
+
+pub(crate) fn seed_remembered_feeds_from_source_cache_keys<I, S>(keys: I) -> usize
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<str>,
+{
+	let mut inserted = 0;
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+
+	for source in keys
+		.into_iter()
+		.filter_map(|key| source_from_cache_key(key.as_ref()))
+		.filter_map(|source| normalize_remembered_source(&source))
+	{
+		let Some(key) = remembered_feed_key_for_source(&source) else {
+			continue;
+		};
+		if let Entry::Vacant(slot) = remembered.entry(key.clone()) {
+			slot.insert(new_remembered_subreddit_entry(key));
+			inserted += 1;
+		}
+	}
+	drop(remembered);
+
+	if inserted > 0 {
+		crate::cache_persistence::mark_dirty();
+	}
+
+	inserted
 }
 
 pub fn is_subreddit_remembered(subreddit: &str) -> bool {
@@ -3070,24 +3118,6 @@ pub fn feed_session_sort(session_id: &str) -> Option<FeedSort> {
 }
 
 pub fn cache_stats() -> (usize, usize) {
-	fn source_from_cache_key(key: &str) -> Option<FeedSource> {
-		if let Some(name) = key.strip_prefix("subreddit:") {
-			let (name, sort) = name.rsplit_once(':').map_or((name, FeedSort::New), |(name, sort)| (name, FeedSort::from_listing(sort)));
-			Some(FeedSource::subreddit(name.to_string(), sort))
-		} else if let Some(name) = key.strip_prefix("user_comments:") {
-			let (name, sort) = name.rsplit_once(':').map_or((name, FeedSort::New), |(name, sort)| (name, FeedSort::from_listing(sort)));
-			Some(FeedSource::user_comments(name.to_string(), sort))
-		} else if let Some(rest) = key.strip_prefix("flair:") {
-			let mut parts = rest.splitn(3, ':');
-			let subreddit = parts.next().unwrap_or_default().to_string();
-			let flair = parts.next().unwrap_or_default().to_string();
-			let sort = FeedSort::from_listing(parts.next().unwrap_or("new"));
-			Some(FeedSource::flair(subreddit, flair, sort))
-		} else {
-			None
-		}
-	}
-
 	let cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
 	let sources = cache
 		.iter()
@@ -3352,12 +3382,12 @@ mod tests {
 		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache,
 		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
 		record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority,
-		restore_persisted_state, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries,
-		sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts, store_source_posts_with_origin, sync_sources_to_request,
-		warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedRefreshOutcome,
-		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
-		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE,
-		SOURCE_CACHE_REVISION,
+		restore_persisted_state, seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
+		snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts,
+		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
+		RememberedFailureDisposition, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS,
+		ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
+		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -5579,6 +5609,29 @@ mod tests {
 		assert_eq!(flair_row.source_type, "flair");
 		assert!(flair_row.daemon_managed);
 		assert_eq!(flair_row.schedule_state, "scheduled");
+	}
+
+	#[test]
+	fn seed_remembered_feeds_from_source_cache_keys_recovers_daemon_queue() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let inserted = seed_remembered_feeds_from_source_cache_keys([
+			"subreddit:rust:new",
+			"user_comments:u_demo:new",
+			"flair:programming:news:new",
+			"subreddit:all:new",
+			"subreddit:rust:hot",
+			"not-a-source-key",
+		]);
+
+		assert_eq!(inserted, 3);
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		assert!(remembered.contains_key("rust"));
+		assert!(remembered.contains_key("user_comments:u_demo"));
+		assert!(remembered.contains_key(&format!("flair:programming:{}", URL_SAFE_NO_PAD.encode("news".as_bytes()))));
+		assert!(!remembered.contains_key("all"));
+		assert_eq!(remembered.len(), 3);
 	}
 
 	#[test]
