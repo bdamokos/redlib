@@ -442,15 +442,15 @@ pub fn init() {
 		warn!("cache_persistence: failed to load persisted cache snapshot: {error}");
 	}
 
-	match source_cache_keys() {
-		Ok(keys) => {
-			let inserted = post_cache::seed_remembered_feeds_from_source_cache_keys(keys);
+	match source_cache_seed_entries() {
+		Ok(entries) => {
+			let inserted = post_cache::seed_remembered_feeds_from_source_cache_entries(entries, unix_now());
 			if inserted > 0 {
-				info!("cache_persistence: seeded {inserted} remembered feed rows from persisted source cache keys");
+				info!("cache_persistence: seeded {inserted} remembered feed rows from persisted source cache entries");
 				persist_startup_recovery = true;
 			}
 		}
-		Err(error) => warn!("cache_persistence: failed to inspect persisted source cache keys: {error}"),
+		Err(error) => warn!("cache_persistence: failed to inspect persisted source cache entries: {error}"),
 	}
 	load_catalog_snapshot_or_rebuild();
 
@@ -514,14 +514,14 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 }
 
 #[cfg(not(test))]
-pub(crate) fn source_cache_keys() -> Result<Vec<String>, String> {
+pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
 	let entries = match fs::read_dir(source_cache_dir()) {
 		Ok(entries) => entries,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
 		Err(error) => return Err(error.to_string()),
 	};
 
-	let mut keys = Vec::new();
+	let mut seeds = Vec::new();
 	for entry in entries {
 		let entry = match entry {
 			Ok(entry) => entry,
@@ -551,14 +551,28 @@ pub(crate) fn source_cache_keys() -> Result<Vec<String>, String> {
 				continue;
 			}
 		};
-		keys.push(key);
+		let bytes = match fs::read(&path) {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				warn!("cache_persistence: failed to read source cache file {:?}: {error}", path.file_name());
+				continue;
+			}
+		};
+		let persisted = match bincode::deserialize::<PersistedSourceCacheEntry>(&bytes) {
+			Ok(persisted) => persisted,
+			Err(error) => {
+				warn!("cache_persistence: failed to decode source cache file {:?}: {error}", path.file_name());
+				continue;
+			}
+		};
+		seeds.push((key, persisted.fetched_at_unix));
 	}
 
-	Ok(keys)
+	Ok(seeds)
 }
 
 #[cfg(test)]
-pub(crate) fn source_cache_keys() -> Result<Vec<String>, String> {
+pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
 	Ok(Vec::new())
 }
 
