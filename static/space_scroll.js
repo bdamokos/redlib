@@ -23,9 +23,14 @@ const POST_MEDIA_STRETCHED_HEADER_TOLERANCE = 64;
 const POST_CONTINUATION_SELECTOR = ".post_body, .post_poll, .post_following_comments, .post_duplicates";
 const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notification";
 const EXPANDABLE_POST_PREVIEW_SELECTOR = ".post_preview.truncated:not(.expanded)";
+const TEMPORARY_AUTHOR_FILTER_STORAGE_KEY = "redlib-temporary-author-filters-v1";
+const TEMPORARY_AUTHOR_FILTER_DURATION_MS = 24 * 60 * 60 * 1000;
 const PAGE_EDGE_TOLERANCE = 1;
 const POST_MEDIA_FIT_READY_ATTR = "data-post-media-fit-ready";
 let postMediaFitFrame = null;
+let temporaryAuthorFilterMemory = [];
+let temporaryAuthorFilterToastTimeout = null;
+let lastTemporaryAuthorFilterToastKey = "";
 
 function parsePostMediaLength(value, fallback) {
     const trimmedValue = value.trim().toLowerCase();
@@ -564,6 +569,10 @@ function isFilterPostAuthorShortcutKey(event) {
     return !event.repeat && getKeyName(event) === "x";
 }
 
+function isTemporaryFilterPostAuthorShortcutKey(event) {
+    return !event.repeat && getKeyName(event) === "y";
+}
+
 function isUserPage() {
     return /^\/(?:user|u)\//.test(window.location.pathname);
 }
@@ -573,6 +582,24 @@ function isSubredditListingPagePath(pathname) {
     const listing = match?.[1] || "";
 
     return match !== null && (listing === "" || ["best", "hot", "new", "top", "rising", "controversial", "video-length"].includes(listing));
+}
+
+function subredditTemporaryAuthorFilterScope(pathname) {
+    const match = pathname.match(/^\/r\/([^/]+)(?:\/([^/]+))?\/?$/);
+    if (match === null || !isSubredditListingPagePath(pathname)) {
+        return "";
+    }
+
+    return `subreddit:${decodeURIComponent(match[1]).toLowerCase()}`;
+}
+
+function isFrontPageListingPagePath(pathname) {
+    return /^\/(?:best|hot|new|top|rising|controversial|video-length)?\/?$/.test(pathname);
+}
+
+function temporaryAuthorFilterScope() {
+    return subredditTemporaryAuthorFilterScope(window.location.pathname)
+        || (isFrontPageListingPagePath(window.location.pathname) ? "front" : "");
 }
 
 function isUserListingPagePath(pathname) {
@@ -640,6 +667,180 @@ function getPostAuthorPreferenceValue(post) {
     return `u_${username}`;
 }
 
+function normalizeTemporaryAuthorFilterAuthor(value) {
+    const author = value.trim();
+    const normalized = author.startsWith("u_") ? author : `u_${author}`;
+
+    return /^u_[A-Za-z0-9_-]+$/.test(normalized) ? normalized.toLowerCase() : "";
+}
+
+function normalizeTemporaryAuthorFilterEntry(entry, now = Date.now()) {
+    if (typeof entry !== "object" || entry === null) {
+        return null;
+    }
+
+    const scope = typeof entry.scope === "string" ? entry.scope.trim().toLowerCase() : "";
+    const author = typeof entry.author === "string" ? normalizeTemporaryAuthorFilterAuthor(entry.author) : "";
+    const expiresAt = Number(entry.expiresAt);
+
+    if (scope === "" || author === "" || !Number.isFinite(expiresAt) || expiresAt <= now) {
+        return null;
+    }
+
+    return { scope, author, expiresAt };
+}
+
+function compactTemporaryAuthorFilters(entries, now = Date.now()) {
+    const compacted = new Map();
+
+    for (const entry of entries) {
+        const normalized = normalizeTemporaryAuthorFilterEntry(entry, now);
+        if (normalized === null) {
+            continue;
+        }
+
+        const key = `${normalized.scope}\t${normalized.author}`;
+        const existing = compacted.get(key);
+        if (!existing || normalized.expiresAt > existing.expiresAt) {
+            compacted.set(key, normalized);
+        }
+    }
+
+    return Array.from(compacted.values());
+}
+
+function readTemporaryAuthorFilters() {
+    try {
+        const rawValue = window.localStorage?.getItem(TEMPORARY_AUTHOR_FILTER_STORAGE_KEY);
+        if (rawValue) {
+            return compactTemporaryAuthorFilters(JSON.parse(rawValue));
+        }
+    } catch (_error) {
+        // Fall back to memory-only filtering if storage is unavailable or corrupt.
+    }
+
+    return compactTemporaryAuthorFilters(temporaryAuthorFilterMemory);
+}
+
+function writeTemporaryAuthorFilters(entries) {
+    const compacted = compactTemporaryAuthorFilters(entries);
+    temporaryAuthorFilterMemory = compacted;
+
+    try {
+        if (compacted.length === 0) {
+            window.localStorage?.removeItem(TEMPORARY_AUTHOR_FILTER_STORAGE_KEY);
+        } else {
+            window.localStorage?.setItem(TEMPORARY_AUTHOR_FILTER_STORAGE_KEY, JSON.stringify(compacted));
+        }
+    } catch (_error) {
+        // The in-memory copy still handles the current page.
+    }
+
+    return compacted;
+}
+
+function separatorForPost(post) {
+    const separator = post.previousElementSibling;
+
+    return separator instanceof Element && separator.matches("hr.sep") ? separator : null;
+}
+
+function setPostTemporarilyAuthorFiltered(post, filtered) {
+    if (!(post instanceof HTMLElement)) {
+        return;
+    }
+
+    const separator = separatorForPost(post);
+    if (filtered) {
+        post.dataset.temporaryAuthorFiltered = "true";
+        post.hidden = true;
+        if (separator !== null) {
+            separator.dataset.temporaryAuthorFiltered = "true";
+            separator.hidden = true;
+        }
+        return;
+    }
+
+    if (post.dataset.temporaryAuthorFiltered === "true") {
+        delete post.dataset.temporaryAuthorFiltered;
+        post.hidden = false;
+    }
+    if (separator !== null && separator.dataset.temporaryAuthorFiltered === "true") {
+        delete separator.dataset.temporaryAuthorFiltered;
+        separator.hidden = false;
+    }
+}
+
+function temporaryAuthorFilterDisplayName(author) {
+    return author.startsWith("u_") ? `u/${author.slice(2)}` : author;
+}
+
+function showTemporaryAuthorFilterToast(authorCounts) {
+    const visibleAuthorCounts = Array.from(authorCounts.entries()).filter(([, count]) => count > 0);
+    if (visibleAuthorCounts.length === 0) {
+        return;
+    }
+
+    const toastKey = visibleAuthorCounts
+        .map(([author, count]) => `${author}:${count}`)
+        .sort()
+        .join("|");
+    if (toastKey === lastTemporaryAuthorFilterToastKey) {
+        return;
+    }
+    lastTemporaryAuthorFilterToastKey = toastKey;
+
+    const authors = visibleAuthorCounts.map(([author, count]) => {
+        const label = temporaryAuthorFilterDisplayName(author);
+        return count === 1 ? label : `${label} (${count})`;
+    });
+    const authorList = authors.length > 2
+        ? `${authors.slice(0, 2).join(", ")} and ${authors.length - 2} more`
+        : authors.join(" and ");
+    const message = `Temporarily filtered out ${authorList} for 24h`;
+
+    let toast = document.getElementById("redlib_toast");
+    if (!toast) {
+        toast = document.createElement("div");
+        toast.id = "redlib_toast";
+        toast.className = "redlib_toast";
+        toast.setAttribute("role", "status");
+        toast.setAttribute("aria-live", "polite");
+        document.body.append(toast);
+    }
+
+    toast.textContent = message;
+    toast.classList.add("visible");
+
+    if (temporaryAuthorFilterToastTimeout !== null) {
+        window.clearTimeout(temporaryAuthorFilterToastTimeout);
+    }
+    temporaryAuthorFilterToastTimeout = window.setTimeout(() => {
+        toast.classList.remove("visible");
+        temporaryAuthorFilterToastTimeout = null;
+    }, 2600);
+}
+
+function applyTemporaryAuthorFilters(root = document, options = {}) {
+    const scope = temporaryAuthorFilterScope();
+    const entries = writeTemporaryAuthorFilters(readTemporaryAuthorFilters());
+    const activeAuthors = new Set(entries.filter((entry) => entry.scope === scope).map((entry) => entry.author));
+    const filteredCounts = new Map();
+
+    for (const post of getPostsFromRoot(root)) {
+        const author = normalizeTemporaryAuthorFilterAuthor(getPostAuthorPreferenceValue(post));
+        const filtered = scope !== "" && activeAuthors.has(author);
+        setPostTemporarilyAuthorFiltered(post, filtered);
+        if (filtered) {
+            filteredCounts.set(author, (filteredCounts.get(author) || 0) + 1);
+        }
+    }
+
+    if (options.toast !== false) {
+        showTemporaryAuthorFilterToast(filteredCounts);
+    }
+}
+
 function filterCurrentPostAuthor() {
     const filterValue = getPostAuthorPreferenceValue(findCurrentViewedPost());
     if (filterValue === "" || typeof window.filterPreferenceValue !== "function") {
@@ -647,6 +848,30 @@ function filterCurrentPostAuthor() {
     }
 
     return window.filterPreferenceValue(filterValue) === true;
+}
+
+function temporarilyFilterCurrentPostAuthor() {
+    const scope = temporaryAuthorFilterScope();
+    if (scope === "") {
+        return false;
+    }
+
+    const post = findCurrentViewedPost();
+    const author = normalizeTemporaryAuthorFilterAuthor(getPostAuthorPreferenceValue(post));
+    if (author === "") {
+        return false;
+    }
+
+    const entries = readTemporaryAuthorFilters()
+        .filter((entry) => entry.scope !== scope || entry.author !== author);
+    entries.push({
+        scope,
+        author,
+        expiresAt: Date.now() + TEMPORARY_AUTHOR_FILTER_DURATION_MS,
+    });
+    writeTemporaryAuthorFilters(entries);
+    applyTemporaryAuthorFilters(document);
+    return true;
 }
 
 function isCurrentPostAuthorMarkedFollowed(post) {
@@ -756,6 +981,7 @@ document.addEventListener("keydown", (event) => {
     const isOpenPostContextShortcut = isOpenPostContextShortcutKey(event);
     const isOpenPostOnRedditShortcut = isOpenPostOnRedditShortcutKey(event);
     const isFilterPostAuthorShortcut = isFilterPostAuthorShortcutKey(event);
+    const isTemporaryFilterPostAuthorShortcut = isTemporaryFilterPostAuthorShortcutKey(event);
     const scrollDirection = getScrollNavigationDirection(event);
     const paginationLink = getPaginationLink(getPaginationAccessKey(event));
     const isScrollNavigationKey = scrollDirection !== 0;
@@ -763,7 +989,7 @@ document.addEventListener("keydown", (event) => {
 
     if (
         event.defaultPrevented
-        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut && !isOpenPostOnRedditShortcut && !isFilterPostAuthorShortcut)
+        || (!isScrollNavigationKey && !isPaginationKey && !isFollowShortcut && !isExpandPreviewShortcut && !isOpenPostContextShortcut && !isOpenPostOnRedditShortcut && !isFilterPostAuthorShortcut && !isTemporaryFilterPostAuthorShortcut)
         || event.altKey
         || event.ctrlKey
         || event.metaKey
@@ -772,6 +998,13 @@ document.addEventListener("keydown", (event) => {
     }
 
     if (isInteractiveElement(event.target) || isInteractiveElement(document.activeElement)) {
+        return;
+    }
+
+    if (isTemporaryFilterPostAuthorShortcut) {
+        if (temporarilyFilterCurrentPostAuthor()) {
+            event.preventDefault();
+        }
         return;
     }
 
@@ -857,7 +1090,14 @@ document.addEventListener("keydown", (event) => {
 });
 
 window.resizeSinglePostMediaToViewport = resizeSinglePostMediaToViewport;
+window.applyTemporaryAuthorFilters = applyTemporaryAuthorFilters;
+document.addEventListener("DOMContentLoaded", () => applyTemporaryAuthorFilters(document));
 document.addEventListener("DOMContentLoaded", resizePostMediaToViewportOnLoad);
 window.addEventListener("orientationchange", schedulePostMediaResizeAfterIpadOrientationChange);
+window.addEventListener("storage", (event) => {
+    if (event.key === TEMPORARY_AUTHOR_FILTER_STORAGE_KEY) {
+        applyTemporaryAuthorFilters(document);
+    }
+});
 document.addEventListener("load", handlePostMediaLoaded, true);
 document.addEventListener("loadedmetadata", handlePostMediaLoaded, true);
