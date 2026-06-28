@@ -22,7 +22,6 @@ KEYCHAIN_SERVICE=${KEYCHAIN_SERVICE:-redlib-deploy}
 KEYCHAIN_ACCOUNT="$SERVER_USER@$SERVER_HOST"
 SSH_CONTROL_PERSIST=${SSH_CONTROL_PERSIST:-600}
 SSH_CONTROL_DIR_BASE=${SSH_CONTROL_DIR_BASE:-/tmp/redlib-ssh}
-DEPLOY_EXIT_HOOK=${DEPLOY_EXIT_HOOK:-}
 
 FOLLOW_LOGS=false
 DEPLOY_ONLY=false
@@ -33,8 +32,6 @@ SSH_COMMON_OPTS=(
 )
 SSH_CONTROL_DIR=""
 SSH_CONTROL_PATH=""
-REMOTE_DEPLOY_DIR=""
-DEPLOY_STARTED_AT_UNIX="$(date +%s)"
 
 require_command() {
 	if ! command -v "$1" >/dev/null 2>&1; then
@@ -78,7 +75,6 @@ Environment overrides:
   KEYCHAIN_SERVICE     Default: $KEYCHAIN_SERVICE
   SSH_CONTROL_PERSIST  Default: $SSH_CONTROL_PERSIST
   SSH_CONTROL_DIR_BASE Default: $SSH_CONTROL_DIR_BASE
-  DEPLOY_EXIT_HOOK     Optional shell command run on script exit. Receives REDLIB_DEPLOY_* env vars.
 EOF
 				exit 0
 				;;
@@ -164,49 +160,12 @@ cleanup_ssh_multiplexing() {
 	fi
 }
 
-run_deploy_exit_hook() {
-	local exit_code="$1"
-	local finished_at_unix
-	local deploy_git_hash
-	local status
-
-	if [[ -z "$DEPLOY_EXIT_HOOK" ]]; then
-		return
-	fi
-
-	finished_at_unix="$(date +%s)"
-	deploy_git_hash="$(current_git_hash)"
-	if [[ "$exit_code" -eq 0 ]]; then
-		status=success
-	else
-		status=failure
-	fi
-
-	REDLIB_DEPLOY_EXIT_CODE="$exit_code" \
-	REDLIB_DEPLOY_STATUS="$status" \
-	REDLIB_DEPLOY_GIT_HASH="$deploy_git_hash" \
-	REDLIB_DEPLOY_SERVER="$SERVER_USER@$SERVER_HOST" \
-	REDLIB_DEPLOY_REMOTE_PATH="${REMOTE_DEPLOY_DIR:-$DEPLOY_PATH}" \
-	REDLIB_DEPLOY_IMAGE="$IMAGE_NAME:$IMAGE_TAG" \
-	REDLIB_DEPLOY_HOST_PORT="$HOST_PORT" \
-	REDLIB_DEPLOY_STARTED_AT_UNIX="$DEPLOY_STARTED_AT_UNIX" \
-	REDLIB_DEPLOY_FINISHED_AT_UNIX="$finished_at_unix" \
-		bash -c "$DEPLOY_EXIT_HOOK" || true
-}
-
-run_exit_handlers() {
-	local exit_code="$?"
-	set +e
-	run_deploy_exit_hook "$exit_code"
-	cleanup_ssh_multiplexing
-	exit "$exit_code"
-}
-
 start_ssh_multiplexing() {
 	SSH_CONTROL_DIR="$SSH_CONTROL_DIR_BASE"
 	mkdir -p "$SSH_CONTROL_DIR"
 	chmod 700 "$SSH_CONTROL_DIR"
 	SSH_CONTROL_PATH="$SSH_CONTROL_DIR/control-%C"
+	trap cleanup_ssh_multiplexing EXIT
 
 	echo "Opening SSH control connection..."
 	sshpass -p "$PASSWORD" ssh \
@@ -496,7 +455,6 @@ follow_logs() {
 }
 
 parse_args "$@"
-trap run_exit_handlers EXIT
 
 require_command docker
 require_command sshpass
