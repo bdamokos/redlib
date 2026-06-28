@@ -1169,6 +1169,21 @@ fn front_page_override(path: &str) -> Option<&'static str> {
 	}
 }
 
+fn is_top_level_random_route(path: &str) -> bool {
+	let path = path.strip_prefix("/subreddit-fragment").unwrap_or(path);
+	path == "/random"
+}
+
+fn front_page_for_path(path: &str, configured_front_page: &str) -> String {
+	if let Some(front_page) = front_page_override(path) {
+		front_page.to_string()
+	} else if is_top_level_random_route(path) {
+		"default".to_string()
+	} else {
+		configured_front_page.to_string()
+	}
+}
+
 fn is_following_front_page(front_page: &str) -> bool {
 	front_page == FOLLOWING_FRONT_PAGE
 }
@@ -1745,7 +1760,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subscribed = prefs.subscriptions.join("+");
 	let path = req.uri().path().to_string();
 	let has_default_saved_feeds = !saved_feeds(&prefs).is_empty();
-	let front_page = front_page_override(&path).map(str::to_string).unwrap_or_else(|| setting(&req, "front_page"));
+	let front_page = front_page_for_path(&path, &setting(&req, "front_page"));
 	if path == "/" && front_page == "bookmarks" {
 		return Ok(redirect("/bookmarks"));
 	}
@@ -1965,13 +1980,18 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			} else {
 				build_contextual_pagination(&url, &feed_session_id, cache_page, &sort)
 			};
+			let sort_base_path = if is_following_front_page(&front_page) {
+				FOLLOWING_ROUTE.to_string()
+			} else {
+				String::new()
+			};
 
 			let mut page_template = SubredditTemplate {
 				sub: cached_sub,
 				posts: page_posts,
 				top_users,
 				sort: (sort.clone(), timeframe),
-				sort_options: build_sort_options(&FOLLOWING_ROUTE.to_string(), &url, &sort, &active_flair_filter),
+				sort_options: build_sort_options(&sort_base_path, &url, &sort, &active_flair_filter),
 				flair_filters,
 				active_flair_filter: active_flair_filter.clone(),
 				active_flair_filter_encoded: encode_query_value(&active_flair_filter),
@@ -2057,7 +2077,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let subscribed = prefs.subscriptions.join("+");
 	let request_path = req.uri().path().to_string();
 	let has_default_saved_feeds = !saved_feeds(&prefs).is_empty();
-	let front_page = front_page_override(&request_path).map(str::to_string).unwrap_or_else(|| setting(&req, "front_page"));
+	let front_page = front_page_for_path(&request_path, &setting(&req, "front_page"));
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
 	let is_subreddit_route = req.uri().path().starts_with("/subreddit-fragment/r/");
 	let front_page_is_default = front_page == "default" || front_page.is_empty();
@@ -4034,6 +4054,14 @@ mod tests {
 	}
 
 	#[test]
+	fn top_level_random_ignores_following_front_page_preference() {
+		assert_eq!(super::front_page_for_path("/random", "following"), "default");
+		assert_eq!(super::front_page_for_path("/subreddit-fragment/random", "following"), "default");
+		assert_eq!(super::front_page_for_path("/following/random", "default"), "following");
+		assert_eq!(super::front_page_for_path("/", "following"), "following");
+	}
+
+	#[test]
 	fn random_front_page_uses_new_sources_with_random_merge_sort() {
 		let mut prefs = test_prefs();
 		prefs.subscriptions = vec!["rust".to_string(), "programming".to_string()];
@@ -4046,6 +4074,21 @@ mod tests {
 		assert!(sources
 			.iter()
 			.all(|source| matches!(source, FeedSource::Subreddit { sort: FeedSort::New, .. } | FeedSource::Flair { sort: FeedSort::New, .. })));
+	}
+
+	#[test]
+	fn top_level_random_uses_main_sources_not_following_comment_sources() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["rust".to_string(), "u_demo".to_string()];
+		let front_page = super::front_page_for_path("/random", "following");
+		let front_page_is_default = front_page == "default" || front_page.is_empty();
+
+		let sources = super::build_front_page_session_sources(&prefs, &front_page, front_page_is_default, true, "rust+u_demo", "random");
+
+		assert!(sources
+			.iter()
+			.any(|source| matches!(source, FeedSource::Subreddit { name, sort: FeedSort::New } if name == "rust")));
+		assert!(sources.iter().all(|source| !matches!(source, FeedSource::UserComments { .. })));
 	}
 
 	#[test]
