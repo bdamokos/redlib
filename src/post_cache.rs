@@ -398,6 +398,7 @@ pub struct FeedSessionRequest {
 	pub query_fingerprint: String,
 	pub cache_revision: u64,
 	pub bundle_followed_user_comments: bool,
+	pub random_rotation_seed: u64,
 	/// When set, merge / finalize use this sort while [`FeedSource::sort`] may differ (e.g. `/following/hot`
 	/// loads `New` listings to match daemon-cached `u_` keys).
 	pub merge_sort: Option<FeedSort>,
@@ -412,6 +413,7 @@ impl Default for FeedSessionRequest {
 			query_fingerprint: String::new(),
 			cache_revision: 0,
 			bundle_followed_user_comments: false,
+			random_rotation_seed: 0,
 			merge_sort: None,
 		}
 	}
@@ -1689,6 +1691,12 @@ pub const fn initial_source_window() -> usize {
 	INITIAL_SOURCE_WINDOW
 }
 
+pub(crate) const RANDOM_ROTATION_BUCKET_SECS: u64 = 15 * 60;
+
+pub(crate) fn random_rotation_seed_for_time(unix_secs: u64) -> u64 {
+	unix_secs / RANDOM_ROTATION_BUCKET_SECS
+}
+
 pub fn get_cached_source_page_with_mode(source: &FeedSource, page: usize, per_page: usize, mode: CacheServeMode) -> Option<(Vec<Post>, String, bool, bool)> {
 	let entry = cached_source_posts_with_mode(source, mode)?;
 	let start = page * per_page;
@@ -1839,6 +1847,7 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	request.query_fingerprint.hash(&mut hasher);
 	request.cache_revision.hash(&mut hasher);
 	request.bundle_followed_user_comments.hash(&mut hasher);
+	request.random_rotation_seed.hash(&mut hasher);
 	request.merge_sort.hash(&mut hasher);
 
 	let mut filter_values = request.filters.iter().cloned().collect::<Vec<_>>();
@@ -1858,6 +1867,10 @@ fn session_merge_sort(session: &FeedSession) -> FeedSort {
 		.merge_sort
 		.or_else(|| session.sources.first().map(|entry| entry.source.sort()))
 		.unwrap_or(FeedSort::New)
+}
+
+pub(crate) fn session_random_rotation_seed(session: &FeedSession) -> u64 {
+	session.request.random_rotation_seed
 }
 
 fn make_session(request: FeedSessionRequest) -> FeedSession {
@@ -1970,13 +1983,34 @@ pub(crate) fn deterministic_random_post_sort_key(post: &Post) -> u64 {
 	fnv1a64_update(hash, &post.community)
 }
 
-pub(crate) fn sort_posts_by_deterministic_random(posts: &mut [Post]) {
+fn mix_random_rotation_seed(mut value: u64) -> u64 {
+	value ^= 0x6d2b_79f5_aa65_4727;
+	value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+	value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+	value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+	value ^ (value >> 31)
+}
+
+pub(crate) fn deterministic_random_post_sort_key_with_seed(post: &Post, rotation_seed: u64) -> u64 {
+	let key = deterministic_random_post_sort_key(post);
+	if rotation_seed == 0 {
+		key
+	} else {
+		key.wrapping_sub(mix_random_rotation_seed(rotation_seed))
+	}
+}
+
+pub(crate) fn sort_posts_by_deterministic_random_with_seed(posts: &mut [Post], rotation_seed: u64) {
 	posts.sort_by(|left, right| {
-		deterministic_random_post_sort_key(right)
-			.cmp(&deterministic_random_post_sort_key(left))
+		deterministic_random_post_sort_key_with_seed(right, rotation_seed)
+			.cmp(&deterministic_random_post_sort_key_with_seed(left, rotation_seed))
 			.then_with(|| left.id.cmp(&right.id))
 			.then_with(|| left.permalink.cmp(&right.permalink))
 	});
+}
+
+pub(crate) fn sort_posts_by_deterministic_random(posts: &mut [Post]) {
+	sort_posts_by_deterministic_random_with_seed(posts, 0);
 }
 
 fn representative_created_ts(posts: &[Post]) -> Option<u64> {
@@ -2063,7 +2097,7 @@ fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Po
 	};
 	merged = collapse_duplicate_submissions(merged);
 	if merge_sort == FeedSort::Random {
-		sort_posts_by_deterministic_random(&mut merged);
+		sort_posts_by_deterministic_random_with_seed(&mut merged, session.request.random_rotation_seed);
 		return merged;
 	}
 	if session.request.bundle_followed_user_comments && merge_sort == FeedSort::New {
@@ -3404,15 +3438,15 @@ mod tests {
 		effective_freshness_target_secs, ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget, get_cached_source_page, has_active_browser_sessions,
 		initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
 		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache,
-		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
-		record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority,
-		restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts,
-		session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random, sort_sources,
-		source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets,
-		ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedRefreshOutcome,
-		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
-		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE,
-		SOURCE_CACHE_REVISION,
+		publish_plain_subreddit_refresh, random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
+		record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request,
+		remembered_refresh_priority, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys,
+		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random,
+		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts,
+		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
+		RememberedFailureDisposition, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS,
+		ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
+		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -3942,6 +3976,25 @@ mod tests {
 	}
 
 	#[test]
+	fn session_identity_differs_when_random_rotation_seed_changes() {
+		let base = FeedSessionRequest {
+			sources: vec![new_source("rust")],
+			filters: HashSet::new(),
+			quarantine: false,
+			query_fingerprint: "sort=random".to_string(),
+			random_rotation_seed: 1,
+			merge_sort: Some(FeedSort::Random),
+			..Default::default()
+		};
+		let changed = FeedSessionRequest {
+			random_rotation_seed: 2,
+			..base.clone()
+		};
+
+		assert_ne!(build_session_id(&base), build_session_id(&changed));
+	}
+
+	#[test]
 	fn source_cache_revision_advances_only_when_source_window_changes() {
 		let _guard = test_lock();
 		reset_test_caches();
@@ -4106,6 +4159,64 @@ mod tests {
 				filters: HashSet::new(),
 				quarantine: false,
 				query_fingerprint: "sort=random".to_string(),
+				merge_sort: Some(FeedSort::Random),
+				..Default::default()
+			},
+			sources: vec![session_entry(source, SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let ids = merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
+		assert_eq!(ids, expected_ids);
+	}
+
+	#[test]
+	fn random_rotation_seed_uses_fifteen_minute_buckets() {
+		assert_eq!(random_rotation_seed_for_time(0), 0);
+		assert_eq!(random_rotation_seed_for_time(899), 0);
+		assert_eq!(random_rotation_seed_for_time(900), 1);
+		assert_eq!(random_rotation_seed_for_time(1_799), 1);
+		assert_eq!(random_rotation_seed_for_time(1_800), 2);
+	}
+
+	#[test]
+	fn catalog_backed_random_session_rotates_sample_with_seed() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust-rotation");
+		let posts = (0..300)
+			.map(|index| test_post(&format!("catalog-rotation-{index:03}"), "rust-rotation", 10_000 - index as u64))
+			.collect::<Vec<_>>();
+
+		let mut expected = posts.clone();
+		sort_posts_by_deterministic_random_with_seed(&mut expected, 42);
+		expected.truncate(POSTS_PER_PAGE * 9);
+
+		let mut unrotated = posts.clone();
+		sort_posts_by_deterministic_random(&mut unrotated);
+		unrotated.truncate(POSTS_PER_PAGE * 9);
+		assert_ne!(
+			expected.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(),
+			unrotated.iter().map(|post| post.id.as_str()).collect::<Vec<_>>()
+		);
+
+		let expected_ids = expected.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+		seed_source(&source, posts);
+
+		let session = FeedSession {
+			id: "random-catalog-rotated".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![source.clone()],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "sort=random".to_string(),
+				random_rotation_seed: 42,
 				merge_sort: Some(FeedSort::Random),
 				..Default::default()
 			},
@@ -5550,6 +5661,7 @@ mod tests {
 					query_fingerprint: "demo".to_string(),
 					cache_revision: 0,
 					bundle_followed_user_comments: true,
+					random_rotation_seed: 0,
 					merge_sort: None,
 				},
 				sources: vec![

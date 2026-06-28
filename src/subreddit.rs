@@ -1397,6 +1397,14 @@ fn now_unix() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_secs()).unwrap_or_default()
 }
 
+fn random_rotation_seed_for_sort(sort: &str) -> u64 {
+	if is_random_sort(sort) {
+		crate::post_cache::random_rotation_seed_for_time(now_unix())
+	} else {
+		0
+	}
+}
+
 fn approximate_age_label(age_secs: u64) -> String {
 	const BUCKETS: &[(u64, &str)] = &[
 		(60 * 60, "~1h"),
@@ -1928,6 +1936,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
+				random_rotation_seed: random_rotation_seed_for_sort(&sort),
 				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
@@ -2446,6 +2455,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
+				random_rotation_seed: random_rotation_seed_for_sort(&sort),
 				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
