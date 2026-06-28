@@ -20,3 +20,5 @@ tmp/
 .clawpatch/
 cookies.txt
 .codex/
+__pycache__/
+*.pyc
