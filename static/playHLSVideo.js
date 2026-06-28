@@ -55,6 +55,7 @@
 
                 function initializeHls() {
                     var hls = new Hls({ autoStartLoad: false });
+                    newVideo._hlsjs_player = hls;
                     hls.loadSource(playlist);
                     hls.attachMedia(newVideo);
                     hls.on(Hls.Events.MANIFEST_PARSED, function () {

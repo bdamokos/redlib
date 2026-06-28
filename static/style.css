@@ -1587,7 +1587,9 @@ a.search_subreddit_link:hover {
 }
 
 .post[data-temporary-author-filtered="true"],
-.sep[data-temporary-author-filtered="true"] {
+.sep[data-temporary-author-filtered="true"],
+.post[data-permanent-author-filtered="true"],
+.sep[data-permanent-author-filtered="true"] {
     display: none !important;
 }
 

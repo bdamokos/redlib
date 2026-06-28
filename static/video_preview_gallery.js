@@ -28,6 +28,7 @@
     var pageSettledTimer = null;
     var previewSoundEnabled = false;
     var previewSoundButton = null;
+    var FILTERED_AUTHOR_SELECTOR = "[data-temporary-author-filtered='true'], [data-permanent-author-filtered='true']";
 
     function jsonHeaders() {
         return {
@@ -531,11 +532,63 @@
         }
     }
 
+    function hostIsUnavailable(host) {
+        var post = host.closest(".post");
+        var target = post || host;
+        return Boolean(target.closest(FILTERED_AUTHOR_SELECTOR) || target.hidden || target.getClientRects().length === 0);
+    }
+
     function shouldRenderHost(host) {
+        if (hostIsUnavailable(host)) {
+            return false;
+        }
+
         var post = host.closest(".post");
         var target = post || host;
         var rect = target.getBoundingClientRect();
         return rect.top <= window.innerHeight;
+    }
+
+    function releaseHost(host, jobIds) {
+        var state = activeHosts.get(host);
+        if (!state) {
+            stopPreviewFallback(host, true);
+            return;
+        }
+
+        if (state.pollTimer) {
+            window.clearTimeout(state.pollTimer);
+            state.pollTimer = null;
+        }
+        if (state.jobId) {
+            jobIds.push(state.jobId);
+        }
+        stopPreviewFallback(host, true);
+        activeHosts.delete(host);
+    }
+
+    function releasePostPreviewHosts(post) {
+        var jobIds = [];
+        post.querySelectorAll(".video_preview_host[data-media-url], .video_preview_host[data-preview-fallback-video-url]").forEach(function (host) {
+            releaseHost(host, jobIds);
+        });
+
+        if (previewFallbackSweepTimer && !hasWaitingPreviewFallbackHosts()) {
+            window.clearTimeout(previewFallbackSweepTimer);
+            previewFallbackSweepTimer = null;
+        }
+
+        if (jobIds.length > 0) {
+            postJson("/api/video-previews/release", {
+                page_session_id: pageSessionId,
+                job_ids: jobIds
+            });
+        }
+
+        if (activeHosts.size === 0) {
+            clearHeartbeat();
+        }
+        syncPreviewSoundMode();
     }
 
     function hostDocumentTop(host) {
@@ -987,6 +1040,10 @@
 
     function observeHosts(root) {
         (root || document).querySelectorAll(".video_preview_host[data-media-url], .video_preview_host[data-preview-fallback-video-url]").forEach(function (host) {
+            if (hostIsUnavailable(host)) {
+                return;
+            }
+
             bindPreviewLifecycle(host);
 
             if (!activeHosts.has(host)) {
@@ -1042,6 +1099,12 @@
     });
     window.addEventListener("focus", syncPreviewSoundMode);
     window.addEventListener("blur", syncPreviewSoundMode);
+    document.addEventListener("redlib:post-media-unloaded", function (event) {
+        var post = event.detail && event.detail.post instanceof Element ? event.detail.post : event.target.closest(".post");
+        if (post) {
+            releasePostPreviewHosts(post);
+        }
+    });
 
     if (document.readyState === "complete") {
         armPageSettledState();

@@ -25,6 +25,7 @@ const POST_MEDIA_HEADER_SELECTOR = ".post_header, .post_title, .post_notificatio
 const EXPANDABLE_POST_PREVIEW_SELECTOR = ".post_preview.truncated:not(.expanded)";
 const TEMPORARY_AUTHOR_FILTER_STORAGE_KEY = "redlib-temporary-author-filters-v1";
 const TEMPORARY_AUTHOR_FILTER_DURATION_MS = 24 * 60 * 60 * 1000;
+const FILTERED_AUTHOR_SELECTOR = "[data-temporary-author-filtered='true'], [data-permanent-author-filtered='true']";
 const PAGE_BOUNDARY_NAVIGATION_STORAGE_KEY = "redlib-page-boundary-navigation-v1";
 const PAGE_BOUNDARY_NAVIGATION_MAX_AGE_MS = 30 * 1000;
 const PAGE_EDGE_TOLERANCE = 1;
@@ -444,7 +445,7 @@ function isVisibleTarget(target) {
         return false;
     }
 
-    if (target.closest("[data-temporary-author-filtered='true']") !== null) {
+    if (target.closest(FILTERED_AUTHOR_SELECTOR) !== null) {
         return false;
     }
 
@@ -799,30 +800,105 @@ function separatorForPost(post) {
     return separator instanceof Element && separator.matches("hr.sep") ? separator : null;
 }
 
-function setPostTemporarilyAuthorFiltered(post, filtered) {
+function stopStreamingPlayer(video) {
+    const players = [
+        video._dashjs_player,
+        video._hlsjs_player,
+    ].filter(Boolean);
+
+    for (const player of players) {
+        try {
+            player.pause?.();
+            player.stopLoad?.();
+            player.reset?.();
+            player.destroy?.();
+        } catch (_error) {}
+    }
+
+    delete video._dashjs_player;
+    delete video._hlsjs_player;
+}
+
+function unloadVideoElement(video) {
+    stopStreamingPlayer(video);
+    video.muted = true;
+    video.pause();
+    video.preload = "none";
+    video.removeAttribute("autoplay");
+    video.removeAttribute("poster");
+    video.querySelectorAll("source").forEach((source) => {
+        source.removeAttribute("src");
+        source.removeAttribute("srcset");
+    });
+    video.removeAttribute("src");
+    try {
+        video.srcObject = null;
+    } catch (_error) {}
+    if (video.classList.contains("video_preview_fallback_video")) {
+        video.hidden = true;
+    }
+    video.load();
+}
+
+function unloadImageElement(image) {
+    image.removeAttribute("src");
+    image.removeAttribute("srcset");
+    image.removeAttribute("sizes");
+    image.removeAttribute("data-full-src");
+    image.removeAttribute("data-lazy-src");
+    image.removeAttribute("href");
+    image.removeAttribute("xlink:href");
+}
+
+function unloadIframeElement(iframe) {
+    iframe.setAttribute("src", "about:blank");
+    iframe.removeAttribute("srcdoc");
+}
+
+function unloadPostMedia(post) {
+    post.querySelectorAll("video").forEach(unloadVideoElement);
+    post.querySelectorAll("audio").forEach(unloadVideoElement);
+    post.querySelectorAll("img, image").forEach(unloadImageElement);
+    post.querySelectorAll("iframe").forEach(unloadIframeElement);
+    post.dispatchEvent(new CustomEvent("redlib:post-media-unloaded", {
+        bubbles: true,
+        detail: { post },
+    }));
+}
+
+function setPostAuthorFiltered(post, filtered, attributeName) {
     if (!(post instanceof HTMLElement)) {
         return;
     }
 
     const separator = separatorForPost(post);
     if (filtered) {
-        post.dataset.temporaryAuthorFiltered = "true";
+        post.setAttribute(attributeName, "true");
+        unloadPostMedia(post);
         post.hidden = true;
         if (separator !== null) {
-            separator.dataset.temporaryAuthorFiltered = "true";
+            separator.setAttribute(attributeName, "true");
             separator.hidden = true;
         }
         return;
     }
 
-    if (post.dataset.temporaryAuthorFiltered === "true") {
-        delete post.dataset.temporaryAuthorFiltered;
-        post.hidden = false;
+    if (post.getAttribute(attributeName) === "true") {
+        post.removeAttribute(attributeName);
+        post.hidden = post.matches(FILTERED_AUTHOR_SELECTOR);
     }
-    if (separator !== null && separator.dataset.temporaryAuthorFiltered === "true") {
-        delete separator.dataset.temporaryAuthorFiltered;
-        separator.hidden = false;
+    if (separator !== null && separator.getAttribute(attributeName) === "true") {
+        separator.removeAttribute(attributeName);
+        separator.hidden = separator.matches(FILTERED_AUTHOR_SELECTOR);
     }
+}
+
+function setPostTemporarilyAuthorFiltered(post, filtered) {
+    setPostAuthorFiltered(post, filtered, "data-temporary-author-filtered");
+}
+
+function setPostPermanentlyAuthorFiltered(post, filtered) {
+    setPostAuthorFiltered(post, filtered, "data-permanent-author-filtered");
 }
 
 function temporaryAuthorFilterDisplayName(author) {
@@ -904,12 +980,24 @@ function applyTemporaryAuthorFilters(root = document, options = {}) {
 }
 
 function filterCurrentPostAuthor() {
-    const filterValue = getPostAuthorPreferenceValue(findCurrentViewedPost());
+    const currentPost = findCurrentViewedPost();
+    const filterValue = getPostAuthorPreferenceValue(currentPost);
     if (filterValue === "" || typeof window.filterPreferenceValue !== "function") {
         return false;
     }
 
-    return window.filterPreferenceValue(filterValue) === true;
+    window.filterPreferenceValue(filterValue);
+    const author = normalizeTemporaryAuthorFilterAuthor(filterValue);
+    let filteredAnyPost = false;
+    for (const post of getPostsFromRoot(document)) {
+        const postAuthor = normalizeTemporaryAuthorFilterAuthor(getPostAuthorPreferenceValue(post));
+        if (author !== "" && postAuthor === author) {
+            setPostPermanentlyAuthorFiltered(post, true);
+            filteredAnyPost = true;
+        }
+    }
+
+    return filteredAnyPost;
 }
 
 function temporarilyFilterCurrentPostAuthor() {
