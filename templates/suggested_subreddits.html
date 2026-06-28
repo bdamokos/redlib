@@ -48,6 +48,46 @@
 		</div>
 	</header>
 
+	{% if self.is_vector_mode() && (profile_report.vector_cluster_centers.len() > 0 || profile_report.vector_subreddit_centers.len() > 0) %}
+	<section class="suggested_profiles_center panel" aria-label="Vector center">
+		<div class="suggested_profiles_center_summary">
+			<span>Vector center</span>
+			{% if let Some(active_center) = profile_report.active_vector_center_label %}
+			<strong>{{ active_center }}</strong>
+			<a href="{{ self.clear_vector_center_path() }}">Nearest centroid</a>
+			{% else %}
+			<strong>Nearest centroid</strong>
+			{% endif %}
+		</div>
+		{% if profile_report.vector_cluster_centers.len() > 0 %}
+		<div class="suggested_profiles_center_group">
+			<span>Clusters</span>
+			<div class="suggested_profiles_center_options">
+				{% for center in profile_report.vector_cluster_centers %}
+				<a href="{{ self.vector_center_path(center.id.as_str()) }}" class="{% if center.selected %}active{% endif %}"{% if center.selected %} aria-current="page"{% endif %}>
+					{{ center.label }}
+					{% if !center.detail.is_empty() %}<small>{{ center.detail }}</small>{% endif %}
+				</a>
+				{% endfor %}
+			</div>
+		</div>
+		{% endif %}
+		{% if profile_report.vector_subreddit_centers.len() > 0 %}
+		<div class="suggested_profiles_center_group">
+			<span>Subreddits</span>
+			<div class="suggested_profiles_center_options">
+				{% for center in profile_report.vector_subreddit_centers %}
+				<a href="{{ self.vector_center_path(center.id.as_str()) }}" class="{% if center.selected %}active{% endif %}"{% if center.selected %} aria-current="page"{% endif %}>
+					{{ center.label }}
+					{% if !center.detail.is_empty() %}<small>{{ center.detail }}</small>{% endif %}
+				</a>
+				{% endfor %}
+			</div>
+		</div>
+		{% endif %}
+	</section>
+	{% endif %}
+
 	{% if report.followed_profile_count == 0 %}
 	<section class="suggested_profiles_empty panel">
 		<h2>No followed profiles yet</h2>

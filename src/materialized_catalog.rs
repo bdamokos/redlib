@@ -9,6 +9,7 @@ use std::sync::{LazyLock, Mutex};
 const SUGGESTED_PROFILE_TOP_SUBREDDITS: usize = 16;
 const SUGGESTED_PROFILE_VECTOR_SUBREDDITS: usize = 32;
 const SUGGESTED_PROFILE_REASON_LIMIT: usize = 5;
+const SUGGESTED_PROFILE_VECTOR_CENTER_SUBREDDIT_LIMIT: usize = 12;
 const SUGGESTED_PROFILE_MIN_POSTS: usize = 2;
 const SUGGESTED_PROFILE_SUBREDDIT_USER_LIMIT: usize = 120;
 const SUGGESTED_PROFILE_MEDIA_LIMIT: usize = 3;
@@ -30,6 +31,36 @@ pub enum SuggestedProfileScoringMode {
 	#[default]
 	Overlap,
 	Vector,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SuggestedProfileVectorCenterRequest {
+	Cluster(usize),
+	Subreddit(String),
+}
+
+impl SuggestedProfileVectorCenterRequest {
+	pub fn parse(value: &str) -> Option<Self> {
+		let value = value.trim();
+		if value.is_empty() {
+			return None;
+		}
+
+		if let Some(index) = value.strip_prefix("cluster:").and_then(|index| index.trim().parse::<usize>().ok()) {
+			return if index > 0 { Some(Self::Cluster(index - 1)) } else { None };
+		}
+
+		let subreddit = value.strip_prefix("subreddit:").or_else(|| value.strip_prefix("r:")).unwrap_or(value);
+		let subreddit = normalize_vector_center_subreddit_name(subreddit);
+		(!subreddit.is_empty()).then_some(Self::Subreddit(subreddit))
+	}
+
+	pub fn id(&self) -> String {
+		match self {
+			Self::Cluster(index) => format!("cluster:{}", index + 1),
+			Self::Subreddit(subreddit) => format!("subreddit:{subreddit}"),
+		}
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -81,6 +112,14 @@ pub struct SuggestedProfileEntry {
 	pub overlap_subreddits: Vec<SuggestedProfileSubreddit>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuggestedProfileVectorCenter {
+	pub id: String,
+	pub label: String,
+	pub detail: String,
+	pub selected: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuggestedProfileMediaPost {
 	pub title: String,
@@ -127,6 +166,9 @@ pub struct SuggestedProfilesReport {
 	pub cached_profile_count: usize,
 	pub compared_profile_count: usize,
 	pub taste_centroid_count: usize,
+	pub active_vector_center_label: Option<String>,
+	pub vector_cluster_centers: Vec<SuggestedProfileVectorCenter>,
+	pub vector_subreddit_centers: Vec<SuggestedProfileVectorCenter>,
 	pub followed_subreddits: Vec<SuggestedProfileSubreddit>,
 	pub suggestions: Vec<SuggestedProfileEntry>,
 }
@@ -438,6 +480,78 @@ fn suggested_profile_taste_centroids(vectors: &[HashMap<String, f64>]) -> Vec<Ha
 		}
 	}
 	best_centroids
+}
+
+fn normalize_vector_center_subreddit_name(name: &str) -> String {
+	let trimmed = name.trim();
+	let without_path_prefix = trimmed.strip_prefix("/r/").unwrap_or(trimmed);
+	let without_prefix = without_path_prefix.strip_prefix("r/").unwrap_or(without_path_prefix);
+	without_prefix.trim().to_lowercase()
+}
+
+fn suggested_profile_vector_center_top_subreddits(vector: &HashMap<String, f64>, limit: usize) -> Vec<String> {
+	let mut entries = vector
+		.iter()
+		.filter(|(subreddit, weight)| !subreddit.is_empty() && !subreddit.starts_with("u_") && **weight > 0.0)
+		.map(|(subreddit, weight)| (subreddit.clone(), *weight))
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| left.0.cmp(&right.0)));
+	entries.truncate(limit);
+	entries.into_iter().map(|(subreddit, _)| subreddit).collect()
+}
+
+fn suggested_profile_vector_center_detail(vector: &HashMap<String, f64>) -> String {
+	suggested_profile_vector_center_top_subreddits(vector, 3)
+		.into_iter()
+		.map(|subreddit| format!("r/{subreddit}"))
+		.collect::<Vec<_>>()
+		.join(", ")
+}
+
+fn suggested_profile_cluster_center_label(index: usize, total: usize) -> String {
+	if total <= 1 {
+		"Overall taste".to_string()
+	} else {
+		format!("Cluster {}", index + 1)
+	}
+}
+
+fn suggested_profile_vector_center_options(
+	centroids: &[HashMap<String, f64>],
+	followed_top: &[(String, usize)],
+	selected_id: Option<&str>,
+) -> (Vec<SuggestedProfileVectorCenter>, Vec<SuggestedProfileVectorCenter>) {
+	let cluster_centers = centroids
+		.iter()
+		.enumerate()
+		.map(|(index, centroid)| {
+			let request = SuggestedProfileVectorCenterRequest::Cluster(index);
+			let id = request.id();
+			SuggestedProfileVectorCenter {
+				id: id.clone(),
+				label: suggested_profile_cluster_center_label(index, centroids.len()),
+				detail: suggested_profile_vector_center_detail(centroid),
+				selected: selected_id == Some(id.as_str()),
+			}
+		})
+		.collect();
+
+	let subreddit_centers = followed_top
+		.iter()
+		.take(SUGGESTED_PROFILE_VECTOR_CENTER_SUBREDDIT_LIMIT)
+		.map(|(subreddit, count)| {
+			let request = SuggestedProfileVectorCenterRequest::Subreddit(subreddit.clone());
+			let id = request.id();
+			SuggestedProfileVectorCenter {
+				id: id.clone(),
+				label: format!("r/{subreddit}"),
+				detail: format!("{count} posts"),
+				selected: selected_id == Some(id.as_str()),
+			}
+		})
+		.collect();
+
+	(cluster_centers, subreddit_centers)
 }
 
 fn normalize_profile_name(name: &str) -> String {
@@ -1202,6 +1316,7 @@ pub(crate) fn suggested_profiles(
 	)
 }
 
+#[cfg(test)]
 pub(crate) fn suggested_profiles_with_mode(
 	followed_profiles: &[String],
 	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
@@ -1213,6 +1328,7 @@ pub(crate) fn suggested_profiles_with_mode(
 	suggested_profiles_with_mode_and_feedback(followed_profiles, followed_profile_subreddits, excluded_profiles, &feedback, limit, mode)
 }
 
+#[cfg(test)]
 pub(crate) fn suggested_profiles_with_mode_and_feedback(
 	followed_profiles: &[String],
 	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
@@ -1221,9 +1337,23 @@ pub(crate) fn suggested_profiles_with_mode_and_feedback(
 	limit: usize,
 	mode: SuggestedProfileScoringMode,
 ) -> SuggestedProfilesReport {
+	suggested_profiles_with_mode_center_and_feedback(followed_profiles, followed_profile_subreddits, excluded_profiles, author_feedback, limit, mode, None)
+}
+
+pub(crate) fn suggested_profiles_with_mode_center_and_feedback(
+	followed_profiles: &[String],
+	followed_profile_subreddits: &HashMap<String, Vec<(String, u32)>>,
+	excluded_profiles: &HashSet<String>,
+	author_feedback: &HashMap<(String, String), PostFeedbackSummary>,
+	limit: usize,
+	mode: SuggestedProfileScoringMode,
+	vector_center: Option<&SuggestedProfileVectorCenterRequest>,
+) -> SuggestedProfilesReport {
 	match mode {
 		SuggestedProfileScoringMode::Overlap => suggested_profiles_overlap(followed_profiles, followed_profile_subreddits, excluded_profiles, author_feedback, limit),
-		SuggestedProfileScoringMode::Vector => suggested_profiles_vector_mode(followed_profiles, followed_profile_subreddits, excluded_profiles, author_feedback, limit),
+		SuggestedProfileScoringMode::Vector => {
+			suggested_profiles_vector_mode(followed_profiles, followed_profile_subreddits, excluded_profiles, author_feedback, limit, vector_center)
+		}
 	}
 }
 
@@ -1443,6 +1573,9 @@ fn suggested_profiles_overlap(
 		cached_profile_count: cached_profile_names.len(),
 		compared_profile_count,
 		taste_centroid_count: usize::from(followed_profiles_with_cache > 0),
+		active_vector_center_label: None,
+		vector_cluster_centers: Vec::new(),
+		vector_subreddit_centers: Vec::new(),
 		followed_subreddits: followed_top
 			.into_iter()
 			.take(SUGGESTED_PROFILE_REASON_LIMIT)
@@ -1463,6 +1596,7 @@ fn suggested_profiles_vector_mode(
 	excluded_profiles: &HashSet<String>,
 	author_feedback: &HashMap<(String, String), PostFeedbackSummary>,
 	limit: usize,
+	vector_center: Option<&SuggestedProfileVectorCenterRequest>,
 ) -> SuggestedProfilesReport {
 	let followed_profiles = followed_profiles
 		.iter()
@@ -1589,6 +1723,29 @@ fn suggested_profiles_vector_mode(
 		followed_vectors.push(vector);
 	}
 	let centroids = suggested_profile_taste_centroids(&followed_vectors);
+	let mut active_vector_center_label = None;
+	let mut active_vector_center_id = None;
+	let active_vector_center = match vector_center {
+		Some(SuggestedProfileVectorCenterRequest::Cluster(index)) => centroids.get(*index).map(|centroid| {
+			let request = SuggestedProfileVectorCenterRequest::Cluster(*index);
+			active_vector_center_id = Some(request.id());
+			active_vector_center_label = Some(suggested_profile_cluster_center_label(*index, centroids.len()));
+			centroid.clone()
+		}),
+		Some(SuggestedProfileVectorCenterRequest::Subreddit(subreddit)) => {
+			let subreddit = normalize_vector_center_subreddit_name(subreddit);
+			if subreddit.is_empty() {
+				None
+			} else {
+				let request = SuggestedProfileVectorCenterRequest::Subreddit(subreddit.clone());
+				active_vector_center_id = Some(request.id());
+				active_vector_center_label = Some(format!("r/{subreddit}"));
+				Some(HashMap::from([(subreddit, 1.0)]))
+			}
+		}
+		None => None,
+	};
+	let (vector_cluster_centers, vector_subreddit_centers) = suggested_profile_vector_center_options(&centroids, &followed_top, active_vector_center_id.as_deref());
 
 	let followed_subreddit_counts = followed_counts.clone();
 	let followed_subreddit_profile_counts = followed_profile_counts.clone();
@@ -1618,11 +1775,15 @@ fn suggested_profiles_vector_mode(
 			}
 			compared_profile_count += 1;
 
-			let (similarity, best_centroid) = centroids
-				.iter()
-				.map(|centroid| (suggested_profile_dot(centroid, &candidate_vector), centroid))
-				.max_by(|(left, _), (right, _)| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
-				.unwrap_or((0.0, &centroids[0]));
+			let (similarity, best_centroid) = if let Some(center) = active_vector_center.as_ref() {
+				(suggested_profile_dot(center, &candidate_vector), center)
+			} else {
+				centroids
+					.iter()
+					.map(|centroid| (suggested_profile_dot(centroid, &candidate_vector), centroid))
+					.max_by(|(left, _), (right, _)| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+					.unwrap_or((0.0, &centroids[0]))
+			};
 			if similarity <= 0.0 && !has_positive_feedback {
 				continue;
 			}
@@ -1689,6 +1850,9 @@ fn suggested_profiles_vector_mode(
 		cached_profile_count: cached_profile_names.len(),
 		compared_profile_count,
 		taste_centroid_count: centroids.len(),
+		active_vector_center_label,
+		vector_cluster_centers,
+		vector_subreddit_centers,
 		followed_subreddits: followed_top
 			.into_iter()
 			.take(SUGGESTED_PROFILE_REASON_LIMIT)
@@ -1888,7 +2052,7 @@ mod tests {
 		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_author_posts_limited, query_source_candidates, record_author_history_from_posts,
 		rejected_author_redgifs_profile_count, reset_catalog, restore_catalog, restore_persisted_author_history, restore_persisted_rejected_author_redgifs_profiles,
 		snapshot_catalog, snapshot_persisted_author_history, snapshot_persisted_rejected_author_redgifs_profiles, suggested_profiles, suggested_profiles_with_mode,
-		suggested_profiles_with_mode_and_feedback, SuggestedProfileScoringMode,
+		suggested_profiles_with_mode_and_feedback, suggested_profiles_with_mode_center_and_feedback, SuggestedProfileScoringMode, SuggestedProfileVectorCenterRequest,
 	};
 	use crate::post_cache::{FeedSort, FeedSource};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, ParentComment, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
@@ -2338,6 +2502,56 @@ mod tests {
 
 		assert_eq!(report.followed_profiles_with_cache, 6);
 		assert!(report.taste_centroid_count > 1, "{report:?}");
+	}
+
+	#[test]
+	fn suggested_profiles_vector_can_center_on_a_subreddit() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		let mut followed = Vec::new();
+		let mut side_cache = HashMap::new();
+		for index in 0..3 {
+			let profile = format!("codefollowed{index}");
+			side_cache.insert(profile.clone(), vec![("rust".to_string(), 5), ("programming".to_string(), 5)]);
+			followed.push(profile);
+		}
+		for index in 0..3 {
+			let profile = format!("foodfollowed{index}");
+			side_cache.insert(profile.clone(), vec![("baking".to_string(), 5), ("cooking".to_string(), 5)]);
+			followed.push(profile);
+		}
+
+		let mut rust_candidate = test_posts("rust-match-rust", "rust", "rust_match", 4, 800);
+		rust_candidate.extend(test_posts("rust-match-programming", "programming", "rust_match", 4, 790));
+		apply_source_refresh(&FeedSource::subreddit("rust", FeedSort::New), &rust_candidate);
+
+		let mut baking_candidate = test_posts("baking-match-baking", "baking", "baking_match", 4, 780);
+		baking_candidate.extend(test_posts("baking-match-cooking", "cooking", "baking_match", 4, 770));
+		apply_source_refresh(&FeedSource::subreddit("baking", FeedSort::New), &baking_candidate);
+
+		let report = suggested_profiles_with_mode_center_and_feedback(
+			&followed,
+			&side_cache,
+			&HashSet::new(),
+			&HashMap::new(),
+			10,
+			SuggestedProfileScoringMode::Vector,
+			Some(&SuggestedProfileVectorCenterRequest::Subreddit("baking".to_string())),
+		);
+
+		assert_eq!(report.active_vector_center_label.as_deref(), Some("r/baking"));
+		assert!(report.vector_subreddit_centers.iter().any(|center| center.id == "subreddit:baking" && center.selected));
+		assert_eq!(report.suggestions[0].name, "baking_match");
+		assert_eq!(
+			report.suggestions[0].overlap_subreddits,
+			vec![super::SuggestedProfileSubreddit {
+				name: "baking".to_string(),
+				followed_count: 15,
+				followed_profile_count: 3,
+				profile_count: 4,
+			}]
+		);
 	}
 
 	#[test]

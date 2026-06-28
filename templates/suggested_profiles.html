@@ -48,6 +48,46 @@
 		</div>
 	</header>
 
+	{% if self.is_vector_mode() && (report.vector_cluster_centers.len() > 0 || report.vector_subreddit_centers.len() > 0) %}
+	<section class="suggested_profiles_center panel" aria-label="Vector center">
+		<div class="suggested_profiles_center_summary">
+			<span>Vector center</span>
+			{% if let Some(active_center) = report.active_vector_center_label %}
+			<strong>{{ active_center }}</strong>
+			<a href="{{ self.clear_vector_center_path() }}">Nearest centroid</a>
+			{% else %}
+			<strong>Nearest centroid</strong>
+			{% endif %}
+		</div>
+		{% if report.vector_cluster_centers.len() > 0 %}
+		<div class="suggested_profiles_center_group">
+			<span>Clusters</span>
+			<div class="suggested_profiles_center_options">
+				{% for center in report.vector_cluster_centers %}
+				<a href="{{ self.vector_center_path(center.id.as_str()) }}" class="{% if center.selected %}active{% endif %}"{% if center.selected %} aria-current="page"{% endif %}>
+					{{ center.label }}
+					{% if !center.detail.is_empty() %}<small>{{ center.detail }}</small>{% endif %}
+				</a>
+				{% endfor %}
+			</div>
+		</div>
+		{% endif %}
+		{% if report.vector_subreddit_centers.len() > 0 %}
+		<div class="suggested_profiles_center_group">
+			<span>Subreddits</span>
+			<div class="suggested_profiles_center_options">
+				{% for center in report.vector_subreddit_centers %}
+				<a href="{{ self.vector_center_path(center.id.as_str()) }}" class="{% if center.selected %}active{% endif %}"{% if center.selected %} aria-current="page"{% endif %}>
+					{{ center.label }}
+					{% if !center.detail.is_empty() %}<small>{{ center.detail }}</small>{% endif %}
+				</a>
+				{% endfor %}
+			</div>
+		</div>
+		{% endif %}
+	</section>
+	{% endif %}
+
 	{% if report.followed_subreddits.len() > 0 %}
 	<section class="suggested_profiles_signal">
 		<span>Your followed profiles post most in</span>
@@ -90,7 +130,11 @@
 						</div>
 						<p class="suggested_profile_meta">
 							{% if self.is_vector_mode() %}
+							{% if let Some(active_center) = report.active_vector_center_label %}
+							Near {{ active_center }}: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} centered-vector subreddits.
+							{% else %}
 							Vector similarity: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} taste-vector subreddits.
+							{% endif %}
 							{% else %}
 							{% if suggestion.overlap_subreddits.len() == 1 %}
 							One-subreddit overlap: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts match.
