@@ -348,6 +348,56 @@
 {% endif %}
 {%- endmacro %}
 
+{% macro mobile_post_author_actions(post, redirect_url) -%}
+{% if !post.author.name.is_empty() && !str_eq(post.author.name, "[deleted]") %}
+{% set is_followed_author = prefs.has_followed_user(post.author.name.as_str()) %}
+<div class="mobile_post_author_actions" data-post-author-actions>
+	<button
+		class="post_author_action_button post_author_temporary_filter_button"
+		type="button"
+		data-post-author-action="temporary-filter"
+		aria-label="Temporarily filter u/{{ post.author.name }}"
+		title="Temporarily filter u/{{ post.author.name }} for 24h">
+		Y
+	</button>
+	<button
+		class="post_author_action_button post_author_permanent_filter_button"
+		type="button"
+		data-post-author-action="permanent-filter"
+		aria-label="Permanently filter u/{{ post.author.name }}"
+		title="Permanently filter u/{{ post.author.name }}">
+		X
+	</button>
+	<form
+		class="inline_subscription_form post_author_follow_form"
+		action="/r/u_{{ post.author.name }}/{% if is_followed_author %}unsubscribe{% else %}subscribe{% endif %}?redirect={{ redirect_url }}&canonical=u_{{ post.author.name }}"
+		method="POST"
+		data-subscription-form
+		data-subscription-target="user:u_{{ post.author.name }}"
+		data-subscription-state="{% if is_followed_author %}subscribed{% else %}unsubscribed{% endif %}"
+		data-state-on="subscribed"
+		data-state-off="unsubscribed"
+		data-subscribe-action="/r/u_{{ post.author.name }}/subscribe?redirect={{ redirect_url }}&canonical=u_{{ post.author.name }}"
+		data-unsubscribe-action="/r/u_{{ post.author.name }}/unsubscribe?redirect={{ redirect_url }}&canonical=u_{{ post.author.name }}"
+		data-subscribe-label="F"
+		data-unsubscribe-label="&#10003;"
+		data-subscribe-class="post_author_action_button post_author_follow_button"
+		data-unsubscribe-class="post_author_action_button post_author_follow_button"
+		data-cookie-mode="list"
+		data-cookie-name="subscriptions"
+		data-cookie-values="u_{{ post.author.name }}">
+		<button
+			class="post_author_action_button post_author_follow_button"
+			type="submit"
+			aria-label="Follow or unfollow u/{{ post.author.name }}"
+			title="Follow or unfollow u/{{ post.author.name }}">
+			{% if is_followed_author %}&#10003;{% else %}F{% endif %}
+		</button>
+	</form>
+</div>
+{% endif %}
+{%- endmacro %}
+
 {% macro post_in_list(post, show_subscription_button, redirect_url, auto_expand_followed_users) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
 {% set auto_expand_preview = auto_expand_followed_users && prefs.has_followed_user(post.author.name.as_str()) -%}
@@ -526,6 +576,7 @@
 		</span>
 		{% endif %}
 		{% call post_feedback_controls(post, "manual", redirect_url) %}
+		{% call mobile_post_author_actions(post, redirect_url) %}
 		{% call bookmark_form(post, redirect_url) %}
 	</div>
 	{% if post.following_comments.len() > 0 %}

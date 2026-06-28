@@ -1781,6 +1781,60 @@ a.search_subreddit_link:hover {
     opacity: 0.55;
 }
 
+.mobile_post_author_actions {
+    display: none;
+}
+
+.post_author_follow_form {
+    margin: 0;
+}
+
+.post_author_action_button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--text) 35%, transparent);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 750;
+    line-height: 1;
+    opacity: 0.72;
+}
+
+.post_author_action_button[hidden] {
+    display: none;
+}
+
+.post_author_action_button:hover,
+.post_author_action_button:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
+    opacity: 1;
+}
+
+.post_author_temporary_filter_button {
+    border-color: color-mix(in srgb, #d29922 55%, transparent);
+    color: color-mix(in srgb, #d29922 78%, var(--text) 22%);
+}
+
+.post_author_permanent_filter_button {
+    border-color: color-mix(in srgb, #d73a49 55%, transparent);
+    color: color-mix(in srgb, #d73a49 78%, var(--text) 22%);
+}
+
+.post_author_follow_form[data-subscription-state="subscribed"] .post_author_follow_button {
+    border-color: color-mix(in srgb, #2ea043 72%, var(--accent) 28%);
+    background: color-mix(in srgb, #2ea043 18%, transparent);
+    color: color-mix(in srgb, #2ea043 82%, var(--text) 18%);
+    opacity: 1;
+}
+
 form[data-subscription-form][data-subscription-pending="true"] button {
     opacity: 0.75;
     cursor: progress;
@@ -4045,7 +4099,21 @@ th {
         font-size: 14px;
     }
     .post_footer {
+        justify-content: flex-start;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px 9px;
         margin-left: 15px;
+    }
+
+    .post_footer > .post_feedback {
+        margin-left: 0;
+    }
+
+    .mobile_post_author_actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
     }
 
     .replies > .comment {

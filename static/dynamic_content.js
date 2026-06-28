@@ -3,6 +3,7 @@
         window.initializeFeedStatus?.(root);
         window.initializeSubscriptionForms?.(root);
         window.initializePostFeedback?.(root);
+        window.initializePostAuthorActions?.(root);
         window.applyTemporaryAuthorFilters?.(root);
         window.loadAuthorLinks?.(root);
         window.markTruncatedPreviews?.();

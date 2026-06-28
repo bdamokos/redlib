@@ -979,9 +979,8 @@ function applyTemporaryAuthorFilters(root = document, options = {}) {
     }
 }
 
-function filterCurrentPostAuthor() {
-    const currentPost = findCurrentViewedPost();
-    const filterValue = getPostAuthorPreferenceValue(currentPost);
+function filterPostAuthor(post) {
+    const filterValue = getPostAuthorPreferenceValue(post);
     if (filterValue === "" || typeof window.filterPreferenceValue !== "function") {
         return false;
     }
@@ -1000,13 +999,16 @@ function filterCurrentPostAuthor() {
     return filteredAnyPost;
 }
 
-function temporarilyFilterCurrentPostAuthor() {
+function filterCurrentPostAuthor() {
+    return filterPostAuthor(findCurrentViewedPost());
+}
+
+function temporarilyFilterPostAuthor(post) {
     const scope = temporaryAuthorFilterScope();
     if (scope === "") {
         return false;
     }
 
-    const post = findCurrentViewedPost();
     const author = normalizeTemporaryAuthorFilterAuthor(getPostAuthorPreferenceValue(post));
     if (author === "") {
         return false;
@@ -1022,6 +1024,10 @@ function temporarilyFilterCurrentPostAuthor() {
     writeTemporaryAuthorFilters(entries);
     applyTemporaryAuthorFilters(document);
     return true;
+}
+
+function temporarilyFilterCurrentPostAuthor() {
+    return temporarilyFilterPostAuthor(findCurrentViewedPost());
 }
 
 function submitCurrentPostFeedback(signal) {
@@ -1064,6 +1070,35 @@ function followCurrentPostAuthor() {
     return window.followPreferenceValue(followValue, {
         alreadyFollowed: isCurrentPostAuthorMarkedFollowed(post),
     }) === true;
+}
+
+function initializePostAuthorActions(root = document) {
+    const temporaryFilterAvailable = temporaryAuthorFilterScope() !== "";
+    const container = root || document;
+    const temporaryFilterButtons = container.querySelectorAll?.("[data-post-author-action='temporary-filter']") || [];
+
+    for (const button of temporaryFilterButtons) {
+        button.hidden = !temporaryFilterAvailable;
+    }
+}
+
+function handlePostAuthorActionClick(event) {
+    const actionButton = event.target?.closest?.("[data-post-author-action]");
+    if (!(actionButton instanceof HTMLButtonElement)) {
+        return;
+    }
+
+    const post = actionButton.closest(".post");
+    const action = actionButton.dataset.postAuthorAction || "";
+    const handled = action === "temporary-filter"
+        ? temporarilyFilterPostAuthor(post)
+        : action === "permanent-filter"
+            ? filterPostAuthor(post)
+            : false;
+
+    if (handled) {
+        event.preventDefault();
+    }
 }
 
 function openCurrentPostContext() {
@@ -1405,7 +1440,10 @@ document.addEventListener("keydown", (event) => {
 
 window.resizeSinglePostMediaToViewport = resizeSinglePostMediaToViewport;
 window.applyTemporaryAuthorFilters = applyTemporaryAuthorFilters;
+window.initializePostAuthorActions = initializePostAuthorActions;
+document.addEventListener("click", handlePostAuthorActionClick);
 document.addEventListener("DOMContentLoaded", () => applyTemporaryAuthorFilters(document));
+document.addEventListener("DOMContentLoaded", () => initializePostAuthorActions(document));
 document.addEventListener("DOMContentLoaded", resizePostMediaToViewportOnLoad);
 document.addEventListener("DOMContentLoaded", restoreBoundaryPaginationPosition);
 window.addEventListener("orientationchange", schedulePostMediaResizeAfterIpadOrientationChange);
