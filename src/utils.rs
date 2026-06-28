@@ -19,7 +19,7 @@ use cached::proc_macro::cached;
 use cookie::Cookie;
 use htmlescape::decode_html;
 use hyper::body::{to_bytes, HttpBody as _};
-use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE};
 use hyper::{Body, Request, Response, Uri};
 use libflate::deflate::{Decoder, Encoder};
 use libflate::gzip::Decoder as GzipDecoder;
@@ -3122,14 +3122,43 @@ async fn reddit_image_content_fingerprint(url: String) -> Option<String> {
 
 #[cached(size = 4096, time = 10800)]
 async fn reddit_video_content_fingerprint(url: String) -> Option<String> {
-	reddit_media_content_fingerprint(url, REDDIT_VIDEO_FINGERPRINT_MAX_BYTES, |content_type| {
+	reddit_media_prefix_or_full_content_fingerprint(url, REDDIT_VIDEO_FINGERPRINT_MAX_BYTES, |content_type| {
 		content_type.starts_with("video/") || content_type == "image/gif"
 	})
 	.await
 }
 
-async fn reddit_media_content_fingerprint(url: String, max_bytes: usize, content_type_allowed: fn(&str) -> bool) -> Option<String> {
-	let upstream = reddit_media_url_to_upstream(&url)?;
+fn response_content_type_allowed(response: &Response<Body>, content_type_allowed: fn(&str) -> bool) -> bool {
+	response
+		.headers()
+		.get(CONTENT_TYPE)
+		.and_then(|value| value.to_str().ok())
+		.is_some_and(|value| content_type_allowed(&value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase()))
+}
+
+fn response_content_length(response: &Response<Body>) -> Option<usize> {
+	response
+		.headers()
+		.get(CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<usize>().ok())
+}
+
+fn response_content_range_total_length(response: &Response<Body>) -> Option<usize> {
+	let value = response.headers().get(CONTENT_RANGE).and_then(|value| value.to_str().ok())?;
+	let (_, total) = value.rsplit_once('/')?;
+	total.parse::<usize>().ok()
+}
+
+fn media_prefix_fingerprint(body: &[u8], total_length: usize) -> Option<String> {
+	if body.is_empty() || total_length < body.len() {
+		return None;
+	}
+
+	Some(format!("prefix:{}:{}:{}", body.len(), total_length, sha256_hex(body)))
+}
+
+fn reddit_media_request(upstream: &str, range: Option<String>) -> Option<Request<Body>> {
 	let Ok(parsed_uri) = upstream.parse::<Uri>() else {
 		return None;
 	};
@@ -3139,32 +3168,56 @@ async fn reddit_media_content_fingerprint(url: String, max_bytes: usize, content
 		let client = OAUTH_CLIENT.load_full();
 		builder = builder.header("User-Agent", client.user_agent());
 	}
-	let Ok(request) = builder.body(Body::empty()) else {
-		return None;
-	};
+	if let Some(range) = range {
+		builder = builder.header(RANGE, range);
+	}
 
-	let response = match tokio::time::timeout(media_fingerprint_timeout(), CLIENT.request(request)).await {
+	builder.body(Body::empty()).ok()
+}
+
+async fn reddit_media_response(upstream: &str, range: Option<String>) -> Option<Response<Body>> {
+	let request = reddit_media_request(upstream, range)?;
+
+	Some(match tokio::time::timeout(media_fingerprint_timeout(), CLIENT.request(request)).await {
 		Ok(Ok(response)) if response.status().is_success() => response,
+		_ => return None,
+	})
+}
+
+async fn reddit_media_prefix_or_full_content_fingerprint(url: String, max_bytes: usize, content_type_allowed: fn(&str) -> bool) -> Option<String> {
+	let upstream = reddit_media_url_to_upstream(&url)?;
+	let range_end = max_bytes.checked_sub(1)?;
+	let response = reddit_media_response(&upstream, Some(format!("bytes=0-{range_end}"))).await?;
+	let partial_response = response.status() == hyper::StatusCode::PARTIAL_CONTENT;
+	if !response_content_type_allowed(&response, content_type_allowed) {
+		return None;
+	}
+	let total_length = response_content_range_total_length(&response).or_else(|| if partial_response { None } else { response_content_length(&response) })?;
+
+	let body = match tokio::time::timeout(media_fingerprint_timeout(), read_response_bytes_limited(response, max_bytes)).await {
+		Ok(Ok(body)) if !body.is_empty() => body,
 		_ => return None,
 	};
 
-	if !response
-		.headers()
-		.get(CONTENT_TYPE)
-		.and_then(|value| value.to_str().ok())
-		.is_some_and(|value| content_type_allowed(&value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase()))
-	{
+	if body.len() == total_length {
+		Some(sha256_hex(&body))
+	} else {
+		media_prefix_fingerprint(&body, total_length)
+	}
+}
+
+async fn reddit_media_content_fingerprint(url: String, max_bytes: usize, content_type_allowed: fn(&str) -> bool) -> Option<String> {
+	let upstream = reddit_media_url_to_upstream(&url)?;
+	let response = reddit_media_response(&upstream, None).await?;
+
+	if !response_content_type_allowed(&response, content_type_allowed) {
 		return None;
 	}
 
-	if response
-		.headers()
-		.get(CONTENT_LENGTH)
-		.and_then(|value| value.to_str().ok())
-		.and_then(|value| value.parse::<usize>().ok())
-		.is_some_and(|length| length > max_bytes)
-	{
-		return None;
+	if let Some(length) = response_content_length(&response) {
+		if length > max_bytes {
+			return None;
+		}
 	}
 
 	let body = match tokio::time::timeout(media_fingerprint_timeout(), read_response_bytes_limited(response, max_bytes)).await {
@@ -5603,6 +5656,32 @@ mod tests {
 		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
 		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
 		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
+	}
+
+	#[test]
+	fn media_prefix_fingerprint_combines_start_bytes_with_total_length() {
+		let first = super::media_prefix_fingerprint(b"matching prefix", 4_730_062).unwrap();
+		let second = super::media_prefix_fingerprint(b"matching prefix", 4_730_062).unwrap();
+		let different_length = super::media_prefix_fingerprint(b"matching prefix", 4_730_063).unwrap();
+		let different_prefix = super::media_prefix_fingerprint(b"different prefix", 4_730_062).unwrap();
+
+		assert_eq!(first, second);
+		assert_ne!(first, different_length);
+		assert_ne!(first, different_prefix);
+		assert_eq!(super::media_prefix_fingerprint(b"", 4_730_062), None);
+		assert_eq!(super::media_prefix_fingerprint(b"longer than total", 5), None);
+	}
+
+	#[test]
+	fn response_content_range_total_length_parses_total_size() {
+		let response = Response::builder()
+			.header(hyper::header::CONTENT_RANGE, "bytes 0-2097151/4730062")
+			.body(Body::empty())
+			.unwrap();
+		let unknown_total = Response::builder().header(hyper::header::CONTENT_RANGE, "bytes 0-2097151/*").body(Body::empty()).unwrap();
+
+		assert_eq!(super::response_content_range_total_length(&response), Some(4_730_062));
+		assert_eq!(super::response_content_range_total_length(&unknown_total), None);
 	}
 
 	#[test]
