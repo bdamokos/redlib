@@ -91,9 +91,24 @@
         }
     }
 
+    function pauseVideos(root) {
+        var container = root || document;
+        container.querySelectorAll("video.post_media_video, video.video_preview_fallback_video").forEach(function (videoEl) {
+            pauseVideo(videoEl);
+        });
+    }
+
+    function browserAllowsVideoPlayback() {
+        if (document.visibilityState !== "visible") {
+            return false;
+        }
+
+        return typeof document.hasFocus !== "function" || document.hasFocus();
+    }
+
     function handleVideoVisibility(entries) {
         entries.forEach(function (entry) {
-            if (!entry.isIntersecting) {
+            if (!browserAllowsVideoPlayback() || !entry.isIntersecting) {
                 pauseVideo(entry.target);
             }
         });
@@ -134,6 +149,14 @@
 
     window.observeVideoVisibility = observeVideoVisibility;
     window.bindVideoProgress = bindVideoProgress;
+    document.addEventListener("visibilitychange", function () {
+        if (!browserAllowsVideoPlayback()) {
+            pauseVideos(document);
+        }
+    });
+    window.addEventListener("blur", function () {
+        pauseVideos(document);
+    });
     observeVideoVisibility(document);
 })();
 // @license-end

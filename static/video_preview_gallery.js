@@ -117,6 +117,10 @@
     }
 
     function browserAllowsPreviewSound() {
+        return browserAllowsPreviewPlayback();
+    }
+
+    function browserAllowsPreviewPlayback() {
         if (document.visibilityState !== "visible") {
             return false;
         }
@@ -392,7 +396,7 @@
         setLoadingState(host, "ready");
         syncAnimatedPreviewVisibility(host);
 
-        if (!shouldRenderHost(host)) {
+        if (!browserAllowsPreviewPlayback() || !shouldRenderHost(host)) {
             stopPreviewFallback(host, false);
             return;
         }
@@ -720,6 +724,10 @@
     }
 
     function hasWaitingPreviewFallbackHosts() {
+        if (!browserAllowsPreviewPlayback()) {
+            return false;
+        }
+
         var waiting = false;
         activeHosts.forEach(function (state, host) {
             if (hostSupportsPreviewFallback(host, state) && shouldRenderHost(host)) {
@@ -765,7 +773,7 @@
         var layer = previewLayer(host);
         var fallback = previewFallbackVideo(host);
         var nextPath = host.dataset.previewFallbackVideoUrl || "";
-        if (!layer || !fallback || !nextPath || state.previewFallbackLoading || state.previewFallbackActive || !shouldRenderHost(host)) {
+        if (!layer || !fallback || !nextPath || state.previewFallbackLoading || state.previewFallbackActive || !browserAllowsPreviewPlayback() || !shouldRenderHost(host)) {
             return;
         }
 
@@ -784,6 +792,10 @@
 
     function activateVisibleDirectPreviewFallbacks() {
         syncPreviewFallbackPlayback();
+        if (!browserAllowsPreviewPlayback()) {
+            return;
+        }
+
         activeHosts.forEach(function (state, host) {
             if (!hostUsesDirectPreviewFallback(host) || !hostSupportsPreviewFallback(host, state) || !shouldRenderHost(host)) {
                 return;
@@ -798,7 +810,7 @@
             if (!state || (!state.previewFallbackActive && !state.previewFallbackLoading)) {
                 return;
             }
-            if (shouldRenderHost(host)) {
+            if (browserAllowsPreviewPlayback() && shouldRenderHost(host)) {
                 return;
             }
 
@@ -807,7 +819,7 @@
     }
 
     function processPreviewFallbackQueue() {
-        if (!pageSettled || document.visibilityState === "hidden") {
+        if (!pageSettled || !browserAllowsPreviewPlayback()) {
             if (hasWaitingPreviewFallbackHosts()) {
                 schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
             }
@@ -938,9 +950,9 @@
             state.ready = true;
             markPreviewGenerationStart(state);
             setLoadingState(host, "ready");
-            if (shouldRenderHost(host) && !state.previewFallbackActive && !state.previewFallbackLoading) {
+            if (browserAllowsPreviewPlayback() && shouldRenderHost(host) && !state.previewFallbackActive && !state.previewFallbackLoading) {
                 activatePreviewFallback(host, state);
-            } else if (!state.previewFallbackActive && !state.previewFallbackLoading) {
+            } else if (browserAllowsPreviewPlayback() && !state.previewFallbackActive && !state.previewFallbackLoading) {
                 schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
             }
             return;
@@ -1086,18 +1098,27 @@
         }, PAGE_SETTLED_DELAY_MS);
     }
 
-    document.addEventListener("visibilitychange", function () {
-        if (document.visibilityState === "hidden") {
-            releaseAll(true);
-            return;
-        }
-
+    function resumeForegroundPreviewWork() {
         observeHosts(document);
         ensureHeartbeat();
         schedulePendingRenderCheck();
         activateVisibleDirectPreviewFallbacks();
         schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
         syncPreviewSoundMode();
+    }
+
+    function pauseBackgroundPreviewWork() {
+        syncPreviewFallbackPlayback();
+        syncPreviewSoundMode();
+    }
+
+    document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "hidden") {
+            releaseAll(true);
+            return;
+        }
+
+        resumeForegroundPreviewWork();
     });
 
     window.addEventListener("pagehide", function () {
@@ -1116,8 +1137,8 @@
         schedulePreviewFallbackSweep(PREVIEW_FALLBACK_POLL_MS);
         syncPreviewSoundMode();
     });
-    window.addEventListener("focus", syncPreviewSoundMode);
-    window.addEventListener("blur", syncPreviewSoundMode);
+    window.addEventListener("focus", resumeForegroundPreviewWork);
+    window.addEventListener("blur", pauseBackgroundPreviewWork);
     document.addEventListener("redlib:post-media-unloaded", function (event) {
         var post = event.detail && event.detail.post instanceof Element ? event.detail.post : event.target.closest(".post");
         if (post) {
