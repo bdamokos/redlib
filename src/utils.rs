@@ -3753,6 +3753,11 @@ fn is_watched_creator_profile_link(link: &ExternalLink) -> bool {
 	let Ok(parsed) = Url::parse(&link.url) else {
 		return false;
 	};
+	let host = parsed.host_str().unwrap_or_default().trim().trim_matches('.').to_lowercase();
+	if matches!(host.as_str(), "redgifs.com" | "www.redgifs.com") {
+		return redgifs_username_from_profile_url(&link.url).is_some();
+	}
+
 	let segments = parsed
 		.path_segments()
 		.map(|segments| segments.filter(|segment| !segment.is_empty()).collect::<Vec<_>>())
@@ -5928,6 +5933,18 @@ mod tests {
 	}
 
 	#[test]
+	fn extracts_watched_creator_links_only_accepts_redgifs_user_profiles() {
+		let links = extract_watched_creator_links(&[
+			"https://www.redgifs.com/watch/zanyjudiciousrook",
+			"https://www.redgifs.com/ifr/zanyjudiciousrook",
+			"https://www.redgifs.com/users/real_creator",
+		]);
+
+		assert_eq!(links.len(), 1);
+		assert_eq!(links[0].url, "https://www.redgifs.com/users/real_creator");
+	}
+
+	#[test]
 	fn subreddit_user_cache_lookup_is_case_insensitive() {
 		clear_test_caches();
 
@@ -5986,6 +6003,19 @@ mod tests {
 	}
 
 	#[test]
+	fn opportunistic_author_link_cache_ignores_redgifs_watch_links() {
+		let mut post = Post::default();
+		post.author.name = "demo_redgifs_author".to_string();
+		post.out_url = Some("https://www.redgifs.com/watch/zanyjudiciousrook".to_string());
+		let mut posts = vec![post];
+
+		cache_author_watched_links_from_posts(&mut posts);
+		hydrate_post_author_links_from_cache(&mut posts);
+
+		assert!(posts[0].author.external_links.is_empty());
+	}
+
+	#[test]
 	fn opportunistic_author_link_cache_does_not_replace_existing_profile_links() {
 		clear_test_caches();
 		store_author_links(
@@ -6018,15 +6048,17 @@ mod tests {
 			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;ONLYFANS&quot;,&quot;url&quot;:&quot;https://onlyfans.com/lady-katarina&quot;,&quot;name&quot;:&quot;lady-katarina&quot;,&quot;position&quot;:1}}">
 			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;CUSTOM&quot;,&quot;url&quot;:&quot;https://fansly.com/LadyKatarina&quot;,&quot;name&quot;:&quot;Fansly - DM ME&quot;,&quot;position&quot;:2}}">
 			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;TWITTER&quot;,&quot;url&quot;:&quot;https://twitter.com/Lady_Kaatarina&quot;,&quot;name&quot;:&quot;Lady_Kaatarina&quot;,&quot;position&quot;:3}}">
+			<faceplate-tracker source="profile" action="click" noun="social_link" data-faceplate-tracking-context="{&quot;social_link&quot;:{&quot;type&quot;:&quot;CUSTOM&quot;,&quot;url&quot;:&quot;https://www.redgifs.com/users/lady-katarina&quot;,&quot;name&quot;:&quot;RedGifs&quot;,&quot;position&quot;:4}}">
 		"#;
 
 		let links = extract_profile_social_links(profile_html);
 
-		assert_eq!(links.len(), 4);
+		assert_eq!(links.len(), 5);
 		assert_eq!(links[0].label, "DM ME HERE");
 		assert_eq!(links[1].label, "lady-katarina");
 		assert_eq!(links[2].host, "fansly.com");
 		assert_eq!(links[3].host, "twitter.com");
+		assert_eq!(links[4].url, "https://www.redgifs.com/users/lady-katarina");
 	}
 
 	#[test]
