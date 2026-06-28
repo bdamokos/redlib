@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::cache_persistence::PersistedPost;
-use crate::post_cache::{FeedSession, FeedSort, FeedSource, SessionSourceState};
+use crate::post_cache::{deterministic_random_post_sort_key, FeedSession, FeedSort, FeedSource, SessionSourceState};
 use crate::utils::{post_feedback_score_adjustment, post_feedback_summary_affinity, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -893,12 +893,41 @@ fn catalog_record_is_visible(record: &CatalogRecord, allowed_keys: &HashSet<Cata
 	true
 }
 
-fn query_posts_for_keys_limited(catalog: &MaterializedCatalog, allowed_keys: &HashSet<CatalogSourceKey>, filters: &HashSet<String>, limit: usize) -> Vec<Post> {
+fn session_merge_sort(session: &FeedSession) -> FeedSort {
+	session
+		.request
+		.merge_sort
+		.or_else(|| session.sources.first().map(|entry| entry.source.sort()))
+		.unwrap_or(FeedSort::New)
+}
+
+fn query_posts_for_keys_limited(
+	catalog: &MaterializedCatalog,
+	allowed_keys: &HashSet<CatalogSourceKey>,
+	filters: &HashSet<String>,
+	limit: usize,
+	sort: FeedSort,
+) -> Vec<Post> {
 	if allowed_keys.is_empty() {
 		return Vec::new();
 	}
 	if limit == 0 {
 		return Vec::new();
+	}
+
+	if sort == FeedSort::Random {
+		let mut ranked = catalog
+			.posts_by_id
+			.values()
+			.filter(|record| catalog_record_is_visible(record, allowed_keys, filters))
+			.map(|record| (deterministic_random_post_sort_key(&record.post), record.post.id.clone()))
+			.collect::<Vec<_>>();
+		ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+		ranked.truncate(limit);
+		return ranked
+			.into_iter()
+			.filter_map(|(_, post_id)| catalog.posts_by_id.get(&post_id).map(|record| record.post.clone()))
+			.collect();
 	}
 
 	let mut posts = Vec::new();
@@ -922,9 +951,32 @@ fn query_page_metric_candidates_for_keys_limited(
 	allowed_keys: &HashSet<CatalogSourceKey>,
 	filters: &HashSet<String>,
 	limit: usize,
+	sort: FeedSort,
 ) -> Vec<CatalogPageMetricCandidate> {
 	if allowed_keys.is_empty() || limit == 0 {
 		return Vec::new();
+	}
+
+	if sort == FeedSort::Random {
+		let mut ranked = catalog
+			.posts_by_id
+			.values()
+			.filter(|record| catalog_record_is_visible(record, allowed_keys, filters))
+			.map(|record| (deterministic_random_post_sort_key(&record.post), record.post.id.clone()))
+			.collect::<Vec<_>>();
+		ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+		ranked.truncate(limit);
+		return ranked
+			.into_iter()
+			.filter_map(|(_, post_id)| {
+				let record = catalog.posts_by_id.get(&post_id)?;
+				Some(CatalogPageMetricCandidate {
+					created_ts: record.created_ts,
+					score: record.post.score.1.parse::<i64>().ok(),
+					stickied: record.post.flags.stickied,
+				})
+			})
+			.collect();
 	}
 
 	let mut candidates = Vec::new();
@@ -1074,25 +1126,25 @@ pub(crate) fn snapshot_catalog() -> PersistedCatalogSnapshot {
 pub(crate) fn query_source_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
 	let allowed_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	query_posts_for_keys_limited(&catalog, &allowed_keys, filters, usize::MAX)
+	query_posts_for_keys_limited(&catalog, &allowed_keys, filters, usize::MAX, FeedSort::New)
 }
 
 pub(crate) fn query_session_stream_limited(session: &FeedSession, limit: usize) -> Vec<Post> {
 	let allowed_keys = allowed_source_keys_for_session(session);
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	query_posts_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, limit)
+	query_posts_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, limit, session_merge_sort(session))
 }
 
 pub(crate) fn query_session_page_metric_candidates_limited(session: &FeedSession, limit: usize) -> Vec<CatalogPageMetricCandidate> {
 	let allowed_keys = allowed_source_keys_for_session(session);
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	query_page_metric_candidates_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, limit)
+	query_page_metric_candidates_for_keys_limited(&catalog, &allowed_keys, &session.request.filters, limit, session_merge_sort(session))
 }
 
 pub(crate) fn query_source_candidates_limited(sources: &[FeedSource], filters: &HashSet<String>, limit: usize) -> Vec<Post> {
 	let allowed_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
 	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	query_posts_for_keys_limited(&catalog, &allowed_keys, filters, limit)
+	query_posts_for_keys_limited(&catalog, &allowed_keys, filters, limit, FeedSort::New)
 }
 
 pub(crate) fn catalog_user_sidebar_stats(username: &str) -> Option<CatalogUserSidebarStats> {

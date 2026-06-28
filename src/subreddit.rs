@@ -597,6 +597,18 @@ fn is_video_length_sort(sort: &str) -> bool {
 	sort == "video-length"
 }
 
+fn is_random_sort(sort: &str) -> bool {
+	sort == "random"
+}
+
+fn canonical_new_sort_url(path: &str, query: Option<&str>) -> String {
+	let path = path.strip_suffix("/random").map(|base| format!("{base}/new")).unwrap_or_else(|| path.to_string());
+	match query {
+		Some(query) if !query.is_empty() => format!("{path}?{query}"),
+		_ => path,
+	}
+}
+
 fn default_post_sort_setting(prefs: &Preferences) -> String {
 	if prefs.post_sort.is_empty() {
 		"hot".to_string()
@@ -608,6 +620,7 @@ fn default_post_sort_setting(prefs: &Preferences) -> String {
 fn sort_option_label(method: &str) -> String {
 	match method {
 		"video-length" => "Video Length".to_string(),
+		"random" => "Random".to_string(),
 		_ => format!("{}{}", method.get(0..1).unwrap_or_default().to_uppercase(), method.get(1..).unwrap_or_default()),
 	}
 }
@@ -807,6 +820,8 @@ fn render_scraped_subreddit_fragment(
 	if sort == "new" {
 		posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
 		posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+	} else if is_random_sort(sort) {
+		crate::post_cache::sort_posts_by_deterministic_random(&mut posts);
 	}
 	let no_posts = posts.is_empty();
 	let prefs = Preferences::new(req);
@@ -867,7 +882,12 @@ fn render_scraped_subreddit_fragment(
 
 fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
 	let (_, query) = current_url_parts(current_query_url);
-	["hot", "new", "top", "rising", "controversial", "video-length"]
+	let methods = if base_path.is_empty() || base_path == FOLLOWING_ROUTE {
+		vec!["hot", "new", "random", "top", "rising", "controversial", "video-length"]
+	} else {
+		vec!["hot", "new", "top", "rising", "controversial", "video-length"]
+	};
+	methods
 		.into_iter()
 		.map(|method| SortOption {
 			label: sort_option_label(method),
@@ -1153,9 +1173,9 @@ fn is_following_front_page(front_page: &str) -> bool {
 	front_page == FOLLOWING_FRONT_PAGE
 }
 
-/// Listing sort for merge/finalize on `/following` (sources may use [`FeedSort::New`] to match daemon cache).
-fn following_feed_merge_sort(front_page: &str, sort: &str) -> Option<FeedSort> {
-	is_following_front_page(front_page).then(|| FeedSort::from_listing(sort))
+/// Listing sort for merge/finalize when source fetch sort intentionally differs from display sort.
+fn contextual_feed_merge_sort(front_page: &str, sort: &str) -> Option<FeedSort> {
+	(is_following_front_page(front_page) || is_random_sort(sort)).then(|| FeedSort::from_listing(sort))
 }
 
 fn build_subscription_sources(subscriptions: &[String], sort: FeedSort) -> Vec<FeedSource> {
@@ -1189,7 +1209,7 @@ fn build_video_mode_front_page_sources(preferences: &Preferences, front_page: &s
 }
 
 fn front_page_uses_contextual_session(is_subreddit_route: bool, sort: &str) -> bool {
-	!is_subreddit_route && matches!(sort, "new" | "hot")
+	!is_subreddit_route && matches!(sort, "new" | "hot" | "random")
 }
 
 fn build_front_page_session_sources(
@@ -1200,7 +1220,7 @@ fn build_front_page_session_sources(
 	sub_name: &str,
 	sort: &str,
 ) -> Vec<FeedSource> {
-	let listing_sort = FeedSort::from_listing(sort);
+	let listing_sort = if is_random_sort(sort) { FeedSort::New } else { FeedSort::from_listing(sort) };
 	let mut sources = if front_page_is_default && has_saved_feeds {
 		build_feed_sources(preferences, listing_sort)
 	} else if is_following_front_page(front_page) && has_saved_feeds {
@@ -1288,7 +1308,8 @@ fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str, be
 		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
 		.finish();
 
-	format!("/r/{}/{sort}.json?{query}", chunk.replace('+', "%2B"))
+	let reddit_sort = if is_random_sort(sort) { "new" } else { sort };
+	format!("/r/{}/{reddit_sort}.json?{query}", chunk.replace('+', "%2B"))
 }
 
 async fn fetch_listing_skipping_filtered_pages(path: &str, quarantined: bool, filters: &HashSet<String>) -> Result<FilteredListingFetch, String> {
@@ -1734,7 +1755,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
 	let post_sort = default_post_sort_setting(&prefs);
-	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
+	let requested_sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
+	if req.param("sub").is_some() && is_random_sort(&requested_sort) {
+		return Ok(redirect(&canonical_new_sort_url(&path, req.uri().query())));
+	}
+	let sort = requested_sort;
 	let aggregate_front_page = req.param("sub").is_none() && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
 	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
 	if aggregate_front_page {
@@ -1888,7 +1913,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
-				merge_sort: following_feed_merge_sort(&front_page, &sort),
+				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
 			cache_page,
@@ -2040,7 +2065,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
 	let post_sort = default_post_sort_setting(&prefs);
-	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
+	let requested_sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
+	if is_subreddit_route && is_random_sort(&requested_sort) {
+		return Ok(redirect(&canonical_new_sort_url(&request_path, req.uri().query())));
+	}
+	let sort = requested_sort;
 	let aggregate_front_page = !is_subreddit_route && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
 	let video_mode_front_page = !is_subreddit_route && is_video_length_sort(&sort);
 
@@ -2397,7 +2426,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
-				merge_sort: following_feed_merge_sort(&front_page, &sort),
+				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
 			},
 			cache_page,
@@ -2582,6 +2611,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		if sort == "new" {
 			posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
 			posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+		} else if is_random_sort(&sort) {
+			crate::post_cache::sort_posts_by_deterministic_random(&mut posts);
 		}
 
 		let no_posts = posts.is_empty();
@@ -2677,7 +2708,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			};
 			let next_page_url = if has_next && !after.is_empty() {
 				// Last cached page: link to Reddit's after-based pagination.
-				update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
+				update_url_query(&url, &[("sort", Some(sort.as_str())), ("after", Some(&after)), ("cache_page", None)])
 			} else if has_next {
 				update_url_query(&url, &[("cache_page", Some(&(rendered_cache_page + 1).to_string())), ("before", None), ("after", None)])
 			} else {
@@ -2879,7 +2910,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								String::new()
 							};
 							let next_page_url = if has_next && !after.is_empty() {
-								update_url_query(&url, &[("sort", Some("new")), ("after", Some(&after)), ("cache_page", None)])
+								update_url_query(&url, &[("sort", Some(sort.as_str())), ("after", Some(&after)), ("cache_page", None)])
 							} else if has_next {
 								update_url_query(&url, &[("cache_page", Some(&(rendered_cache_page + 1).to_string())), ("before", None), ("after", None)])
 							} else {
@@ -2963,8 +2994,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 #[cfg(test)]
 mod tests {
 	use super::{
-		decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, split_subscriptions_for_listing, update_url_query,
-		AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, FeedFragmentTemplate, SubredditTemplate, FRONT_CURSOR_PARAM,
+		canonical_new_sort_url, decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, split_subscriptions_for_listing,
+		update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, FeedFragmentTemplate, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use hyper::{Body, Request};
@@ -3965,10 +3996,12 @@ mod tests {
 	#[test]
 	fn aggregate_frontpage_sort_links_use_frontpage_routes() {
 		let options = super::build_sort_options("", "/hot?front_cursor=abc&after=t3_demo&t=day", "hot", "");
+		let random = options.iter().find(|option| option.label == "Random").unwrap();
 		let top = options.iter().find(|option| option.label == "Top").unwrap();
 		let rising = options.iter().find(|option| option.label == "Rising").unwrap();
 		let controversial = options.iter().find(|option| option.label == "Controversial").unwrap();
 
+		assert_eq!(random.url, "/random?t=day");
 		assert_eq!(top.url, "/top?t=day");
 		assert_eq!(rising.url, "/rising?t=day");
 		assert_eq!(controversial.url, "/controversial?t=day");
@@ -3977,11 +4010,42 @@ mod tests {
 	#[test]
 	fn following_sort_links_use_following_routes() {
 		let options = super::build_sort_options("/following", "/following/hot?front_cursor=abc&after=t3_demo&t=day", "hot", "");
+		let random = options.iter().find(|option| option.label == "Random").unwrap();
 		let top = options.iter().find(|option| option.label == "Top").unwrap();
 		let video_length = options.iter().find(|option| option.label == "Video Length").unwrap();
 
+		assert_eq!(random.url, "/following/random?t=day");
 		assert_eq!(top.url, "/following/top?t=day");
 		assert_eq!(video_length.url, "/following/video-length?t=day");
+	}
+
+	#[test]
+	fn subreddit_sort_links_omit_random() {
+		let options = super::build_sort_options("/r/rust", "/r/rust/hot?front_cursor=abc&after=t3_demo&t=day", "hot", "");
+
+		assert!(options.iter().all(|option| option.label != "Random"));
+		assert!(options.iter().all(|option| !option.url.contains("/random")));
+	}
+
+	#[test]
+	fn subreddit_random_sort_canonicalizes_to_new() {
+		assert_eq!(canonical_new_sort_url("/r/rust/random", Some("flair=Questions")), "/r/rust/new?flair=Questions");
+		assert_eq!(canonical_new_sort_url("/subreddit-fragment/r/rust/random", None), "/subreddit-fragment/r/rust/new");
+	}
+
+	#[test]
+	fn random_front_page_uses_new_sources_with_random_merge_sort() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["rust".to_string(), "programming".to_string()];
+
+		let sources = super::build_front_page_session_sources(&prefs, "default", true, true, "rust+programming", "random");
+
+		assert!(super::front_page_uses_contextual_session(false, "random"));
+		assert_eq!(super::contextual_feed_merge_sort("default", "random"), Some(FeedSort::Random));
+		assert_eq!(super::build_listing_path("rust", "random", "raw_json=1", "", ""), "/r/rust/new.json?raw_json=1");
+		assert!(sources
+			.iter()
+			.all(|source| matches!(source, FeedSource::Subreddit { sort: FeedSort::New, .. } | FeedSource::Flair { sort: FeedSort::New, .. })));
 	}
 
 	#[test]

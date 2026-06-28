@@ -86,6 +86,7 @@ struct ActiveBrowserSession {
 pub enum FeedSort {
 	New,
 	Hot,
+	Random,
 }
 
 impl FeedSort {
@@ -93,12 +94,14 @@ impl FeedSort {
 		match self {
 			Self::New => "new",
 			Self::Hot => "hot",
+			Self::Random => "random",
 		}
 	}
 
 	pub fn from_listing(sort: &str) -> Self {
 		match sort {
 			"hot" => Self::Hot,
+			"random" => Self::Random,
 			_ => Self::New,
 		}
 	}
@@ -363,7 +366,7 @@ struct ReadySourceQueue {
 #[derive(Clone, Eq, PartialEq)]
 struct ReadyQueueHead {
 	queue_index: usize,
-	primary_metric: i64,
+	primary_metric: i128,
 	secondary_metric: u64,
 	fetched_at: Instant,
 	source_priority: (u8, String, String),
@@ -1688,7 +1691,6 @@ pub const fn initial_source_window() -> usize {
 
 pub fn get_cached_source_page_with_mode(source: &FeedSource, page: usize, per_page: usize, mode: CacheServeMode) -> Option<(Vec<Post>, String, bool, bool)> {
 	let entry = cached_source_posts_with_mode(source, mode)?;
-
 	let start = page * per_page;
 	if start >= entry.posts.len() {
 		return None;
@@ -1938,13 +1940,43 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 }
 
 fn session_uses_materialized_catalog(session: &FeedSession) -> bool {
-	session_merge_sort(session) == FeedSort::New
+	matches!(session_merge_sort(session), FeedSort::New | FeedSort::Random)
 		&& !session.request.bundle_followed_user_comments
 		&& session.sources.iter().all(|entry| materialized_catalog::source_is_supported(&entry.source))
 }
 
 fn parse_numeric_score(post: &Post) -> Option<i64> {
 	post.score.1.parse::<i64>().ok()
+}
+
+fn fnv1a64_update(mut hash: u64, value: &str) -> u64 {
+	for byte in value.as_bytes() {
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(1_099_511_628_211);
+	}
+	hash
+}
+
+pub(crate) fn deterministic_random_post_sort_key(post: &Post) -> u64 {
+	let mut hash = 14_695_981_039_346_656_037u64;
+	hash = fnv1a64_update(hash, "redlib-random-feed-v1");
+	hash = fnv1a64_update(hash, "\0");
+	hash = fnv1a64_update(hash, &post.kind);
+	hash = fnv1a64_update(hash, "\0");
+	hash = fnv1a64_update(hash, &post.id);
+	hash = fnv1a64_update(hash, "\0");
+	hash = fnv1a64_update(hash, &post.permalink);
+	hash = fnv1a64_update(hash, "\0");
+	fnv1a64_update(hash, &post.community)
+}
+
+pub(crate) fn sort_posts_by_deterministic_random(posts: &mut [Post]) {
+	posts.sort_by(|left, right| {
+		deterministic_random_post_sort_key(right)
+			.cmp(&deterministic_random_post_sort_key(left))
+			.then_with(|| left.id.cmp(&right.id))
+			.then_with(|| left.permalink.cmp(&right.permalink))
+	});
 }
 
 fn representative_created_ts(posts: &[Post]) -> Option<u64> {
@@ -1976,8 +2008,9 @@ fn representative_score_from_values(scores: impl IntoIterator<Item = i64>) -> Op
 fn ready_queue_head(queue_index: usize, queue: &ReadySourceQueue, merge_sort: FeedSort) -> Option<ReadyQueueHead> {
 	let post = queue.posts.front()?;
 	let (primary_metric, secondary_metric) = match merge_sort {
-		FeedSort::New => (post.created_ts as i64, post.created_ts),
-		FeedSort::Hot => (parse_numeric_score(post).unwrap_or(i64::MIN), post.created_ts),
+		FeedSort::New => (post.created_ts as i128, post.created_ts),
+		FeedSort::Hot => (parse_numeric_score(post).unwrap_or(i64::MIN) as i128, post.created_ts),
+		FeedSort::Random => (deterministic_random_post_sort_key(post) as i128, post.created_ts),
 	};
 
 	Some(ReadyQueueHead {
@@ -2029,6 +2062,10 @@ fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Po
 		all_posts
 	};
 	merged = collapse_duplicate_submissions(merged);
+	if merge_sort == FeedSort::Random {
+		sort_posts_by_deterministic_random(&mut merged);
+		return merged;
+	}
 	if session.request.bundle_followed_user_comments && merge_sort == FeedSort::New {
 		return interleave_followed_posts_by_actor(merged);
 	}
@@ -2086,6 +2123,7 @@ fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, mut posts: Ve
 			posts
 		}
 		FeedSort::Hot => posts,
+		FeedSort::Random => posts,
 	}
 }
 
@@ -3369,11 +3407,12 @@ mod tests {
 		publish_plain_subreddit_refresh, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
 		record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority,
 		restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts,
-		session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_sources, source_budget_target, source_cache_is_servable,
-		source_cache_revision, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest,
-		FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState,
-		SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS,
-		POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random, sort_sources,
+		source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets,
+		ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedRefreshOutcome,
+		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS,
+		CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE,
+		SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4041,6 +4080,46 @@ mod tests {
 
 		let ids = merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
 		assert_eq!(ids, vec!["top", "mid", "low"]);
+	}
+
+	#[test]
+	fn catalog_backed_random_session_samples_beyond_newest_prefix() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = new_source("rust");
+		let posts = (0..300)
+			.map(|index| test_post(&format!("catalog-random-{index:03}"), "rust", 10_000 - index as u64))
+			.collect::<Vec<_>>();
+		let newest_prefix_ids = posts.iter().take(POSTS_PER_PAGE * 9).map(|post| post.id.clone()).collect::<HashSet<_>>();
+		let mut expected = posts.clone();
+		sort_posts_by_deterministic_random(&mut expected);
+		expected.truncate(POSTS_PER_PAGE * 9);
+		assert!(expected.iter().any(|post| !newest_prefix_ids.contains(&post.id)));
+		let expected_ids = expected.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+		seed_source(&source, posts);
+
+		let session = FeedSession {
+			id: "random-catalog".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![source.clone()],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "sort=random".to_string(),
+				merge_sort: Some(FeedSort::Random),
+				..Default::default()
+			},
+			sources: vec![session_entry(source, SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let ids = merged_posts_for_session(&session).into_iter().map(|post| post.id).collect::<Vec<_>>();
+		assert_eq!(ids, expected_ids);
 	}
 
 	#[test]

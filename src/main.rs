@@ -150,9 +150,13 @@ fn register_subreddit_fragment_routes(app: &mut server::Server) {
 	app.at("/subreddit-fragment/:sort").get(|r| subreddit::community_fragment(r).boxed());
 }
 
+fn is_front_page_sort_route(id: &str) -> bool {
+	matches!(id, "best" | "hot" | "new" | "random" | "top" | "rising" | "controversial" | "video-length")
+}
+
 #[cfg(test)]
 mod tests {
-	use super::configured_origin;
+	use super::{configured_origin, is_front_page_sort_route};
 	use hyper::Method;
 	use redlib::server::Server;
 
@@ -185,6 +189,13 @@ mod tests {
 
 		assert_eq!(params.find("sub"), Some("rust"));
 		assert_eq!(params.find("sort"), Some("top"));
+	}
+
+	#[test]
+	fn front_page_sort_routes_include_random() {
+		assert!(is_front_page_sort_route("random"));
+		assert!(is_front_page_sort_route("new"));
+		assert!(!is_front_page_sort_route("comments"));
 	}
 }
 
@@ -653,7 +664,7 @@ async fn main() {
 		Box::pin(async move {
 			match req.param("id").as_deref() {
 				// Sort front page
-				Some("best" | "hot" | "new" | "top" | "rising" | "controversial" | "video-length") => subreddit::community(req).await,
+				Some(id) if is_front_page_sort_route(id) => subreddit::community(req).await,
 
 				// Short link for post
 				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {
