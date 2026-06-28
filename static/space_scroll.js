@@ -649,7 +649,7 @@ function subredditTemporaryAuthorFilterScope(pathname) {
 }
 
 function isFrontPageListingPagePath(pathname) {
-    return /^\/(?:best|hot|new|top|rising|controversial|video-length)?\/?$/.test(pathname);
+    return /^\/(?:best|hot|new|random|top|rising|controversial|video-length)?\/?$/.test(pathname);
 }
 
 function temporaryAuthorFilterScope() {
