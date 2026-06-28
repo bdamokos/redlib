@@ -392,6 +392,11 @@
         setLoadingState(host, "ready");
         syncAnimatedPreviewVisibility(host);
 
+        if (!shouldRenderHost(host)) {
+            stopPreviewFallback(host, false);
+            return;
+        }
+
         var playPromise = fallback.play();
         if (playPromise && typeof playPromise.catch === "function") {
             playPromise.then(function () {
@@ -546,7 +551,7 @@
         var post = host.closest(".post");
         var target = post || host;
         var rect = target.getBoundingClientRect();
-        return rect.top <= window.innerHeight;
+        return rect.bottom > scrollPaddingTop() && rect.top < window.innerHeight;
     }
 
     function releaseHost(host, jobIds) {
@@ -717,7 +722,7 @@
     function hasWaitingPreviewFallbackHosts() {
         var waiting = false;
         activeHosts.forEach(function (state, host) {
-            if (hostSupportsPreviewFallback(host, state)) {
+            if (hostSupportsPreviewFallback(host, state) && shouldRenderHost(host)) {
                 waiting = true;
             }
         });
@@ -760,7 +765,7 @@
         var layer = previewLayer(host);
         var fallback = previewFallbackVideo(host);
         var nextPath = host.dataset.previewFallbackVideoUrl || "";
-        if (!layer || !fallback || !nextPath || state.previewFallbackLoading || state.previewFallbackActive) {
+        if (!layer || !fallback || !nextPath || state.previewFallbackLoading || state.previewFallbackActive || !shouldRenderHost(host)) {
             return;
         }
 
@@ -778,12 +783,26 @@
     }
 
     function activateVisibleDirectPreviewFallbacks() {
+        syncPreviewFallbackPlayback();
         activeHosts.forEach(function (state, host) {
             if (!hostUsesDirectPreviewFallback(host) || !hostSupportsPreviewFallback(host, state) || !shouldRenderHost(host)) {
                 return;
             }
 
             activatePreviewFallback(host, state);
+        });
+    }
+
+    function syncPreviewFallbackPlayback() {
+        activeHosts.forEach(function (state, host) {
+            if (!state || (!state.previewFallbackActive && !state.previewFallbackLoading)) {
+                return;
+            }
+            if (shouldRenderHost(host)) {
+                return;
+            }
+
+            stopPreviewFallback(host, false);
         });
     }
 
