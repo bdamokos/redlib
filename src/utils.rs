@@ -359,6 +359,8 @@ pub struct Media {
 	pub video_preview_fallback_url: String,
 	/// RedGifs account that uploaded this clip (empty when unknown or not from RedGifs).
 	pub redgifs_username: String,
+	/// RedGifs upload timestamp in Unix seconds (0 when unknown or not from RedGifs).
+	pub redgifs_created_at_unix: u64,
 }
 
 impl Media {
@@ -382,6 +384,7 @@ impl Media {
 			video_preview_job_hint: String::new(),
 			video_preview_fallback_url: String::new(),
 			redgifs_username: String::new(),
+			redgifs_created_at_unix: 0,
 		}
 	}
 
@@ -410,6 +413,18 @@ impl Media {
 		Self::redgifs_render_url(&self.video_preview_fallback_url, prefs)
 	}
 
+	pub fn redgifs_created_label(&self) -> String {
+		if self.redgifs_created_at_unix == 0 {
+			String::new()
+		} else {
+			redgifs_date_label(self.redgifs_created_at_unix as i64)
+		}
+	}
+
+	pub fn redgifs_created_title(&self) -> String {
+		abs_time_title_from_unix(self.redgifs_created_at_unix)
+	}
+
 	fn resolved_dimensions(width: Option<i64>, height: Option<i64>, fallback_width: i64, fallback_height: i64) -> (i64, i64) {
 		match (width.filter(|value| *value > 0), height.filter(|value| *value > 0)) {
 			(Some(width), Some(height)) => (width, height),
@@ -435,6 +450,7 @@ impl Media {
 		let redgifs_hd_poster = redgifs_bundle.as_ref().map(|paths| paths.hd_poster_path().to_string()).unwrap_or_default();
 		let redgifs_duration_seconds = redgifs_bundle.as_ref().map(|paths| paths.duration_seconds()).unwrap_or_default();
 		let redgifs_username = redgifs_bundle.as_ref().map(|paths| paths.username().to_string()).unwrap_or_default();
+		let redgifs_created_at_unix = redgifs_bundle.as_ref().map(|paths| paths.created_at_unix()).unwrap_or_default();
 		let redgifs_preview_fallback_url = redgifs_bundle.as_ref().map(|paths| paths.mobile_video_path().to_string()).unwrap_or_default();
 		let redgifs_url = redgifs_id.as_ref().map(|id| {
 			Value::String(
@@ -599,6 +615,7 @@ impl Media {
 				video_preview_job_hint,
 				video_preview_fallback_url,
 				redgifs_username,
+				redgifs_created_at_unix,
 			},
 			gallery,
 		)
@@ -1091,6 +1108,7 @@ impl Post {
 					video_preview_job_hint: String::new(),
 					video_preview_fallback_url: String::new(),
 					redgifs_username: String::new(),
+					redgifs_created_at_unix: 0,
 				},
 				media,
 				domain: val(post, "domain"),
@@ -2850,6 +2868,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			video_preview_job_hint: String::new(),
 			video_preview_fallback_url: String::new(),
 			redgifs_username: String::new(),
+			redgifs_created_at_unix: 0,
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(
@@ -7061,6 +7080,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		video_preview_job_hint: String::new(),
 		video_preview_fallback_url: String::new(),
 		redgifs_username: String::new(),
+		redgifs_created_at_unix: 0,
 	}));
 	assert!(media_may_be_deleted_placeholder(&Media {
 		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
@@ -7081,6 +7101,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		video_preview_job_hint: String::new(),
 		video_preview_fallback_url: String::new(),
 		redgifs_username: String::new(),
+		redgifs_created_at_unix: 0,
 	}));
 	assert!(!media_may_be_deleted_placeholder(&Media {
 		url: "/img/1jgvmac4sg4h1.jpg".to_string(),
@@ -7101,6 +7122,7 @@ fn test_deleted_reddit_placeholder_probe_candidates() {
 		video_preview_job_hint: String::new(),
 		video_preview_fallback_url: String::new(),
 		redgifs_username: String::new(),
+		redgifs_created_at_unix: 0,
 	}));
 }
 
@@ -7134,6 +7156,7 @@ fn test_reddit_image_asset_key_matches_local_preview_variants() {
 		video_preview_job_hint: String::new(),
 		video_preview_fallback_url: String::new(),
 		redgifs_username: String::new(),
+		redgifs_created_at_unix: 0,
 	};
 
 	assert!(media_references_reddit_image_asset(&media, "preview.redd.it/example.jpg"));

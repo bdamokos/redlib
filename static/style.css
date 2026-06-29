@@ -2125,7 +2125,8 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     gap: 0.35rem 0.6rem;
 }
 
-.post_media_duration {
+.post_media_duration,
+.post_media_date {
     margin: 0;
     font-size: inherit;
     color: inherit;

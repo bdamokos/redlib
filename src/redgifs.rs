@@ -22,6 +22,7 @@ pub struct RedgifsMediaPaths {
 	poster_path: String,
 	hd_poster_path: String,
 	duration_seconds: i64,
+	created_at_unix: u64,
 	has_audio: bool,
 	username: String,
 }
@@ -71,6 +72,10 @@ impl RedgifsMediaPaths {
 
 	pub(crate) fn duration_seconds(&self) -> i64 {
 		self.duration_seconds
+	}
+
+	pub(crate) fn created_at_unix(&self) -> u64 {
+		self.created_at_unix
 	}
 
 	pub(crate) fn username(&self) -> &str {
@@ -298,9 +303,13 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 		return Err(format!("RedGifs API returned HTTP {status}: {preview}"));
 	}
 	let json: Value = serde_json::from_slice(&body_bytes).map_err(|err| err.to_string())?;
+	parse_api_media_paths(video_id, &json)
+}
 
-	let has_audio = json["gif"]["hasAudio"].as_bool().unwrap_or(false);
-	let urls = &json["gif"]["urls"];
+fn parse_api_media_paths(video_id: &str, json: &Value) -> Result<RedgifsMediaPaths, String> {
+	let gif = &json["gif"];
+	let has_audio = gif["hasAudio"].as_bool().unwrap_or(false);
+	let urls = &gif["urls"];
 	let selected_video_url = if has_audio {
 		urls["hd"].as_str().or_else(|| urls["sd"].as_str()).or_else(|| urls["silent"].as_str())
 	} else {
@@ -320,13 +329,9 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 		.and_then(media_path_from_url)
 		.unwrap_or_default();
 	let hd_poster_path = derive_hd_poster_path_from_media_path(&video_path).unwrap_or_else(|| poster_path.clone());
-	let duration_seconds = json["gif"]["duration"].as_f64().map(|value| value.round() as i64).unwrap_or_default();
-	let username = json["gif"]["userName"]
-		.as_str()
-		.or_else(|| json["gif"]["username"].as_str())
-		.unwrap_or_default()
-		.trim()
-		.to_string();
+	let duration_seconds = gif["duration"].as_f64().map(|value| value.round() as i64).unwrap_or_default();
+	let created_at_unix = gif["createDate"].as_i64().filter(|value| *value > 0).map(|value| value as u64).unwrap_or_default();
+	let username = gif["userName"].as_str().or_else(|| gif["username"].as_str()).unwrap_or_default().trim().to_string();
 	info!("Selected RedGifs API media for {}: has_audio={} path={}", video_id, has_audio, video_path);
 
 	Ok(RedgifsMediaPaths {
@@ -335,6 +340,7 @@ async fn fetch_media_paths_from_api(video_id: &str) -> Result<RedgifsMediaPaths,
 		poster_path,
 		hd_poster_path,
 		duration_seconds,
+		created_at_unix,
 		has_audio,
 		username,
 	})
@@ -446,6 +452,7 @@ async fn parse_watch_page_media_paths(video_id: &str, html: &str) -> Result<Redg
 		poster_path,
 		hd_poster_path,
 		duration_seconds,
+		created_at_unix: 0,
 		has_audio,
 		username,
 	})
@@ -517,9 +524,11 @@ fn validate_video_id(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		derive_hd_poster_path_from_media_path, is_valid_media_path, media_path_from_url, parse_watch_page_media_paths, watch_path_from_embed_code, watch_path_from_url,
+		derive_hd_poster_path_from_media_path, is_valid_media_path, media_path_from_url, parse_api_media_paths, parse_watch_page_media_paths, watch_path_from_embed_code,
+		watch_path_from_url,
 	};
 	use futures_lite::future::block_on;
+	use serde_json::json;
 
 	#[test]
 	fn extracts_watch_ids_from_supported_urls() {
@@ -595,6 +604,38 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_redgifs_api_metadata_with_create_date() {
+		let json = json!({
+			"gif": {
+				"hasAudio": true,
+				"duration": 58.367,
+				"createDate": 1699143549,
+				"userName": "honeynut",
+				"urls": {
+					"hd": "https://media.redgifs.com/ZanyJudiciousRook.mp4",
+					"sd": "https://media.redgifs.com/ZanyJudiciousRook-mobile.mp4",
+					"silent": "https://media.redgifs.com/ZanyJudiciousRook-silent.mp4",
+					"poster": "https://media.redgifs.com/ZanyJudiciousRook-poster.jpg"
+				}
+			}
+		});
+
+		assert_eq!(
+			parse_api_media_paths("zanyjudiciousrook", &json).unwrap(),
+			super::RedgifsMediaPaths {
+				video_path: "/redgifs/ZanyJudiciousRook.mp4".to_string(),
+				mobile_video_path: "/redgifs/ZanyJudiciousRook-mobile.mp4".to_string(),
+				poster_path: "/redgifs/ZanyJudiciousRook-poster.jpg".to_string(),
+				hd_poster_path: "/redgifs/ZanyJudiciousRook-poster.jpg".to_string(),
+				duration_seconds: 58,
+				created_at_unix: 1699143549,
+				has_audio: true,
+				username: "honeynut".to_string(),
+			}
+		);
+	}
+
+	#[test]
 	fn parses_redgifs_watch_page_metadata_as_fallback() {
 		let html = r#"
 			<html>
@@ -615,6 +656,7 @@ mod tests {
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				hd_poster_path: "/redgifs/ImperturbableLumpyShihtzu-poster.jpg".to_string(),
 				duration_seconds: 31,
+				created_at_unix: 0,
 				has_audio: false,
 				username: "imperturbablecreator".to_string(),
 			}
@@ -640,6 +682,7 @@ mod tests {
 				poster_path: "/redgifs/ImperturbableLumpyShihtzu-mobile.jpg".to_string(),
 				hd_poster_path: "/redgifs/ImperturbableLumpyShihtzu-poster.jpg".to_string(),
 				duration_seconds: 0,
+				created_at_unix: 0,
 				has_audio: false,
 				username: String::new(),
 			}

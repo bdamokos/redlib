@@ -849,7 +849,7 @@
 			{% endif %}
 		</div>
 	</div>
-	{% if !post.media.duration.is_empty() || post.media.duration_seconds > 0 || !post.media.redgifs_username.is_empty() %}
+	{% if !post.media.duration.is_empty() || post.media.duration_seconds > 0 || !post.media.redgifs_username.is_empty() || post.media.redgifs_created_at_unix > 0 %}
 	<div class="post_media_meta">
 		{% if !post.media.duration.is_empty() %}
 			<span class="post_media_duration">{{ post.media.duration }}</span>
@@ -857,7 +857,10 @@
 			<span class="post_media_duration">{{ crate::utils::format_video_duration_ref(post.media.duration_seconds) }}</span>
 		{% endif %}
 		{% if !post.media.redgifs_username.is_empty() %}
-		<a class="{{ post.redgifs_uploader_css_classes() }}" href="https://www.redgifs.com/users/{{ post.media.redgifs_username }}" rel="nofollow noopener noreferrer" title="Uploader on RedGifs">{{ post.media.redgifs_username }} on RedGifs</a>
+			<a class="{{ post.redgifs_uploader_css_classes() }}" href="https://www.redgifs.com/users/{{ post.media.redgifs_username }}" rel="nofollow noopener noreferrer" title="Uploader on RedGifs">{{ post.media.redgifs_username }} on RedGifs</a>
+		{% endif %}
+		{% if post.media.redgifs_created_at_unix > 0 %}
+			<time class="post_media_date" datetime="{{ post.media.redgifs_created_label() }}" title="{{ post.media.redgifs_created_title() }}">posted {{ post.media.redgifs_created_label() }}</time>
 		{% endif %}
 	</div>
 	{% endif %}

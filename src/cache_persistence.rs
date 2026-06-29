@@ -106,6 +106,8 @@ pub(crate) struct PersistedMedia {
 	pub video_preview_fallback_url: String,
 	#[serde(default)]
 	pub redgifs_username: String,
+	#[serde(default)]
+	pub redgifs_created_at_unix: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1095,6 +1097,7 @@ impl PersistedMedia {
 			video_preview_job_hint: value.video_preview_job_hint.clone(),
 			video_preview_fallback_url: value.video_preview_fallback_url.clone(),
 			redgifs_username: value.redgifs_username.clone(),
+			redgifs_created_at_unix: value.redgifs_created_at_unix,
 		}
 	}
 
@@ -1118,6 +1121,7 @@ impl PersistedMedia {
 			video_preview_job_hint: self.video_preview_job_hint,
 			video_preview_fallback_url: self.video_preview_fallback_url,
 			redgifs_username: self.redgifs_username,
+			redgifs_created_at_unix: self.redgifs_created_at_unix,
 		}
 	}
 }
