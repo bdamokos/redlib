@@ -575,17 +575,36 @@ fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 	}
 }
 
-fn decayed_priority_score(score: f64, anchor: Option<Instant>, half_life_secs: u64) -> f64 {
+fn elapsed_secs_at(now: Instant, then: Instant) -> u64 {
+	now.saturating_duration_since(then).as_secs()
+}
+
+fn decayed_priority_score_at(score: f64, anchor: Option<Instant>, half_life_secs: u64, now: Instant) -> f64 {
 	let Some(anchor) = anchor else {
 		return 0.0;
 	};
-	let dt = anchor.elapsed().as_secs_f64();
+	if !score.is_finite() {
+		return 0.0;
+	}
+	let dt = now.saturating_duration_since(anchor).as_secs_f64();
 	let lambda = std::f64::consts::LN_2 / half_life_secs as f64;
 	score * (-lambda * dt).exp()
 }
 
+fn decayed_priority_score(score: f64, anchor: Option<Instant>, half_life_secs: u64) -> f64 {
+	decayed_priority_score_at(score, anchor, half_life_secs, Instant::now())
+}
+
+fn visit_priority_score_at(entry: &RememberedSubredditEntry, now: Instant) -> f64 {
+	decayed_priority_score_at(entry.visit_priority_score, entry.visit_priority_last_update_at, VISIT_PRIORITY_HALFLIFE_SECS, now)
+}
+
 fn visit_priority_score_now(entry: &RememberedSubredditEntry) -> f64 {
 	decayed_priority_score(entry.visit_priority_score, entry.visit_priority_last_update_at, VISIT_PRIORITY_HALFLIFE_SECS)
+}
+
+fn feedback_priority_score_at(entry: &RememberedSubredditEntry, now: Instant) -> f64 {
+	decayed_priority_score_at(entry.feedback_priority_score, entry.feedback_priority_last_update_at, FEEDBACK_PRIORITY_HALFLIFE_SECS, now)
 }
 
 fn feedback_priority_score_now(entry: &RememberedSubredditEntry) -> f64 {
@@ -925,13 +944,17 @@ fn freshness_target_secs(estimated_post_interval_secs: u64) -> u64 {
 }
 
 fn effective_freshness_target_secs(entry: &RememberedSubredditEntry) -> u64 {
+	effective_freshness_target_secs_at(entry, Instant::now())
+}
+
+fn effective_freshness_target_secs_at(entry: &RememberedSubredditEntry, now: Instant) -> u64 {
 	let mut base = freshness_target_secs(entry.estimated_post_interval_secs);
 	if entry.consecutive_failures >= 2 {
 		base = base.saturating_mul(entry.consecutive_failures.max(1).min(8) as u64);
 	}
-	let score = visit_priority_score_now(entry);
+	let score = visit_priority_score_at(entry, now);
 	let mut target = base as f64 / (1.0 + VISIT_PRIORITY_SENSITIVITY * score);
-	let feedback_score = feedback_priority_score_now(entry);
+	let feedback_score = feedback_priority_score_at(entry, now);
 	if feedback_score >= 0.0 {
 		target /= 1.0 + FEEDBACK_PRIORITY_SENSITIVITY * feedback_score;
 	} else {
@@ -941,27 +964,31 @@ fn effective_freshness_target_secs(entry: &RememberedSubredditEntry) -> u64 {
 }
 
 fn remembered_entry_refresh_blocked(entry: &RememberedSubredditEntry) -> bool {
-	entry.banned_until.is_some_and(|until| until > Instant::now())
+	remembered_entry_refresh_blocked_at(entry, Instant::now())
 }
 
-fn refresh_ratio(entry: &RememberedSubredditEntry) -> (u128, u128) {
-	let elapsed = entry.last_refresh_succeeded_at.map(|instant| instant.elapsed().as_secs() as u128).unwrap_or(u128::MAX);
-	(elapsed, effective_freshness_target_secs(entry) as u128)
+fn remembered_entry_refresh_blocked_at(entry: &RememberedSubredditEntry, now: Instant) -> bool {
+	entry.banned_until.is_some_and(|until| until > now)
 }
 
-fn compare_refresh_ratio(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry) -> Ordering {
-	let (left_num, left_den) = refresh_ratio(left);
-	let (right_num, right_den) = refresh_ratio(right);
+fn refresh_ratio_at(entry: &RememberedSubredditEntry, now: Instant) -> (u128, u128) {
+	let elapsed = entry.last_refresh_succeeded_at.map(|instant| elapsed_secs_at(now, instant) as u128).unwrap_or(u128::MAX);
+	(elapsed, effective_freshness_target_secs_at(entry, now) as u128)
+}
+
+fn compare_refresh_ratio_at(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry, now: Instant) -> Ordering {
+	let (left_num, left_den) = refresh_ratio_at(left, now);
+	let (right_num, right_den) = refresh_ratio_at(right, now);
 	right_num.saturating_mul(left_den).cmp(&left_num.saturating_mul(right_den))
 }
 
-fn recent_request_priority(entry: &RememberedSubredditEntry) -> bool {
-	entry.last_requested_at.elapsed().as_secs() <= RECENT_REQUEST_PRIORITY_SECS
+fn recent_request_priority_at(entry: &RememberedSubredditEntry, now: Instant) -> bool {
+	elapsed_secs_at(now, entry.last_requested_at) <= RECENT_REQUEST_PRIORITY_SECS
 }
 
-fn remembered_refresh_priority(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry) -> Ordering {
-	let left_recent = recent_request_priority(left);
-	let right_recent = recent_request_priority(right);
+fn remembered_refresh_priority_at(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry, now: Instant) -> Ordering {
+	let left_recent = recent_request_priority_at(left, now);
+	let right_recent = recent_request_priority_at(right, now);
 	match right_recent.cmp(&left_recent) {
 		Ordering::Equal => {}
 		ordering => return ordering,
@@ -976,16 +1003,16 @@ fn remembered_refresh_priority(left: &RememberedSubredditEntry, right: &Remember
 
 	let left_overdue = left
 		.last_refresh_succeeded_at
-		.is_none_or(|instant| instant.elapsed().as_secs() >= effective_freshness_target_secs(left));
+		.is_none_or(|instant| elapsed_secs_at(now, instant) >= effective_freshness_target_secs_at(left, now));
 	let right_overdue = right
 		.last_refresh_succeeded_at
-		.is_none_or(|instant| instant.elapsed().as_secs() >= effective_freshness_target_secs(right));
+		.is_none_or(|instant| elapsed_secs_at(now, instant) >= effective_freshness_target_secs_at(right, now));
 	match right_overdue.cmp(&left_overdue) {
 		Ordering::Equal => {}
 		ordering => return ordering,
 	}
 
-	match compare_refresh_ratio(left, right) {
+	match compare_refresh_ratio_at(left, right, now) {
 		Ordering::Equal => {}
 		ordering => return ordering,
 	}
@@ -1509,12 +1536,13 @@ fn spawn_author_link_prefetch(posts: &[Post]) {
 
 pub fn pick_next_remembered_feed_to_refresh() -> Option<FeedSource> {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let now = Instant::now();
 	let mut entries = remembered
 		.values()
-		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked(entry) && !entry.refresh_in_flight)
+		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked_at(entry, now) && !entry.refresh_in_flight)
 		.cloned()
 		.collect::<Vec<_>>();
-	entries.sort_by(remembered_refresh_priority);
+	entries.sort_by(|left, right| remembered_refresh_priority_at(left, right, now));
 	entries.into_iter().find_map(|entry| remembered_feed_source_from_key(&entry.name))
 }
 
@@ -3286,12 +3314,13 @@ fn persisted_source_entry_is_servable(entry: &PersistedSourceCacheEntry, remembe
 
 fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+	let now = Instant::now();
 	let mut entries = remembered
 		.values()
-		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked(entry) && !entry.refresh_in_flight)
+		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked_at(entry, now) && !entry.refresh_in_flight)
 		.cloned()
 		.collect::<Vec<_>>();
-	entries.sort_by(remembered_refresh_priority);
+	entries.sort_by(|left, right| remembered_refresh_priority_at(left, right, now));
 
 	let seconds_until_tick = cache_status_seconds_until_daemon_tick();
 
@@ -3440,13 +3469,14 @@ mod tests {
 		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, prune_source_cache,
 		publish_plain_subreddit_refresh, random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
 		record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request,
-		remembered_refresh_priority, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys,
+		remembered_refresh_priority_at, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys,
 		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random,
 		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts,
 		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
 		RememberedFailureDisposition, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS,
-		ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, REMEMBERED_SUBREDDITS,
-		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS,
+		PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, SOURCE_CACHE,
+		SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4656,7 +4686,27 @@ mod tests {
 		failing.estimated_post_interval_secs = 1_000;
 		failing.consecutive_failures = 4;
 
-		assert_eq!(remembered_refresh_priority(&steady, &failing), Ordering::Less);
+		assert_eq!(remembered_refresh_priority_at(&steady, &failing, Instant::now()), Ordering::Less);
+	}
+
+	#[test]
+	fn remembered_feed_picker_handles_many_boundary_priority_rows() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = Instant::now();
+
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		for index in 0..1_500 {
+			let mut entry = remembered_entry(&format!("feed_{index:04}"));
+			entry.last_requested_at = now - Duration::from_secs(RECENT_REQUEST_PRIORITY_SECS);
+			entry.last_refresh_succeeded_at = Some(now - Duration::from_secs(MIN_FRESHNESS_TARGET_SECS));
+			entry.estimated_post_interval_secs = MIN_ESTIMATED_POST_INTERVAL_SECS;
+			remembered.insert(entry.name.clone(), entry);
+		}
+		drop(remembered);
+
+		let picked = pick_next_remembered_feed_to_refresh().expect("boundary rows should remain sortable");
+		assert!(picked.display_name().starts_with("feed_"));
 	}
 
 	#[test]
