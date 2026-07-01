@@ -1703,11 +1703,9 @@ fn session_is_expired(entry: &FeedSession) -> bool {
 
 fn source_priority(source: &FeedSource) -> (u8, String, String) {
 	match source {
-		FeedSource::Subreddit { name, sort } if name.starts_with("u_") => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), "0".to_string()),
-		FeedSource::UserComments { name, sort } if name.starts_with("u_") => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), "1".to_string()),
-		FeedSource::Subreddit { name, sort } => (1, format!("{}:{}", sort.as_str(), name.to_lowercase()), String::new()),
-		FeedSource::UserComments { name, sort } => (1, format!("{}:{}", sort.as_str(), name.to_lowercase()), "1".to_string()),
-		FeedSource::Flair { subreddit, flair, sort } => (2, format!("{}:{}", sort.as_str(), subreddit.to_lowercase()), flair.to_lowercase()),
+		FeedSource::Subreddit { name, sort } => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), "0".to_string()),
+		FeedSource::UserComments { name, sort } => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), "1".to_string()),
+		FeedSource::Flair { subreddit, flair, sort } => (1, format!("{}:{}", sort.as_str(), subreddit.to_lowercase()), flair.to_lowercase()),
 	}
 }
 
@@ -3733,15 +3731,15 @@ mod tests {
 	}
 
 	#[test]
-	fn sorts_user_sources_before_subreddits_and_flairs() {
+	fn sorts_subreddit_sources_together_before_flairs() {
 		let _guard = test_lock();
 		reset_test_caches();
 		let mut sources = vec![new_flair_source("zeta", "Tag"), new_source("rust"), new_source("u_demo")];
 
 		sort_sources(&mut sources);
 
-		assert!(matches!(&sources[0], FeedSource::Subreddit { name, .. } if name == "u_demo"));
-		assert!(matches!(&sources[1], FeedSource::Subreddit { name, .. } if name == "rust"));
+		assert!(matches!(&sources[0], FeedSource::Subreddit { name, .. } if name == "rust"));
+		assert!(matches!(&sources[1], FeedSource::Subreddit { name, .. } if name == "u_demo"));
 		assert!(matches!(&sources[2], FeedSource::Flair { subreddit, .. } if subreddit == "zeta"));
 	}
 
@@ -5486,7 +5484,7 @@ mod tests {
 			revision: 0,
 		};
 
-		assert_eq!(warm_targets(&session, 3), vec![2, 1, 0]);
+		assert_eq!(warm_targets(&session, 3), vec![1, 2, 0]);
 	}
 
 	#[test]

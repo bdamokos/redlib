@@ -30,6 +30,7 @@ const FRONT_CURSOR_PARAM: &str = "front_cursor";
 const FEED_SESSION_PARAM: &str = "feed_session";
 const FOLLOWING_FRONT_PAGE: &str = "following";
 const FOLLOWING_ROUTE: &str = "/following";
+const FOLLOWED_USER_FRONT_PAGE_BIAS_STRIDE: usize = 4;
 const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_FILTERED_PAGE_ADVANCE: usize = 3;
@@ -1156,6 +1157,54 @@ fn followed_user_subscriptions(preferences: &Preferences) -> Vec<String> {
 	preferences.subscriptions.iter().filter(|name| is_followed_user_subscription(name)).cloned().collect()
 }
 
+fn ordered_front_page_subscriptions(subscriptions: &[String]) -> Vec<String> {
+	let mut followed_users = Vec::new();
+	let mut followed_subreddits = Vec::new();
+
+	for subscription in subscriptions {
+		if is_followed_user_subscription(subscription) {
+			followed_users.push(subscription.clone());
+		} else {
+			followed_subreddits.push(subscription.clone());
+		}
+	}
+
+	followed_users.sort_by_key(|name| name.to_lowercase());
+	followed_subreddits.sort_by_key(|name| name.to_lowercase());
+
+	if followed_users.is_empty() {
+		return followed_subreddits;
+	}
+	if followed_subreddits.is_empty() {
+		return followed_users;
+	}
+
+	let mut ordered = Vec::with_capacity(subscriptions.len());
+	let mut user_index = 0;
+	let mut subreddit_index = 0;
+	while user_index < followed_users.len() || subreddit_index < followed_subreddits.len() {
+		if user_index < followed_users.len() {
+			ordered.push(followed_users[user_index].clone());
+			user_index += 1;
+		}
+
+		for _ in 1..FOLLOWED_USER_FRONT_PAGE_BIAS_STRIDE {
+			if subreddit_index >= followed_subreddits.len() {
+				break;
+			}
+			ordered.push(followed_subreddits[subreddit_index].clone());
+			subreddit_index += 1;
+		}
+
+		if subreddit_index >= followed_subreddits.len() {
+			ordered.extend(followed_users[user_index..].iter().cloned());
+			break;
+		}
+	}
+
+	ordered
+}
+
 fn is_following_route(path: &str) -> bool {
 	let path = path.strip_prefix("/subreddit-fragment").unwrap_or(path);
 	path == FOLLOWING_ROUTE || path.starts_with("/following/")
@@ -1200,17 +1249,19 @@ fn build_subscription_sources(subscriptions: &[String], sort: FeedSort) -> Vec<F
 }
 
 fn build_feed_sources(preferences: &Preferences, sort: FeedSort) -> Vec<FeedSource> {
-	let mut sources = build_subscription_sources(&preferences.subscriptions, sort);
+	let mut sources = ordered_front_page_subscriptions(&preferences.subscriptions)
+		.into_iter()
+		.map(|name| FeedSource::subreddit(name, sort))
+		.collect::<Vec<_>>();
 
-	sources.extend(
-		preferences
-			.flair_subscriptions
-			.iter()
-			.cloned()
-			.map(|subscription| FeedSource::flair(subscription.subreddit, subscription.flair, sort)),
-	);
-
-	crate::post_cache::sort_sources(&mut sources);
+	let mut flair_sources = preferences
+		.flair_subscriptions
+		.iter()
+		.cloned()
+		.map(|subscription| FeedSource::flair(subscription.subreddit, subscription.flair, sort))
+		.collect::<Vec<_>>();
+	crate::post_cache::sort_sources(&mut flair_sources);
+	sources.extend(flair_sources);
 	sources
 }
 
@@ -1253,7 +1304,9 @@ fn build_front_page_session_sources(
 	} else {
 		vec![FeedSource::subreddit(sub_name.to_string(), listing_sort)]
 	};
-	crate::post_cache::sort_sources(&mut sources);
+	if !(front_page_is_default && has_saved_feeds) {
+		crate::post_cache::sort_sources(&mut sources);
+	}
 	sources
 }
 
@@ -1292,7 +1345,7 @@ fn build_aggregate_sources(preferences: &Preferences, front_page: &str, sort: &s
 	let subscriptions = if is_following_front_page(front_page) {
 		followed_user_subscriptions(preferences)
 	} else {
-		preferences.subscriptions.clone()
+		ordered_front_page_subscriptions(&preferences.subscriptions)
 	};
 
 	let mut sources = split_subscriptions_for_listing(&subscriptions, sort, reddit_query)
@@ -4099,6 +4152,63 @@ mod tests {
 			.iter()
 			.any(|source| matches!(source, FeedSource::Subreddit { name, sort: FeedSort::New } if name == "rust")));
 		assert!(sources.iter().all(|source| !matches!(source, FeedSource::UserComments { .. })));
+	}
+
+	#[test]
+	fn default_front_page_reduces_followed_user_source_bias() {
+		let subscriptions = vec![
+			"u_charlie".to_string(),
+			"rust".to_string(),
+			"u_alpha".to_string(),
+			"programming".to_string(),
+			"webdev".to_string(),
+			"u_bravo".to_string(),
+			"science".to_string(),
+			"askreddit".to_string(),
+		];
+
+		assert_eq!(
+			super::ordered_front_page_subscriptions(&subscriptions),
+			vec![
+				"u_alpha".to_string(),
+				"askreddit".to_string(),
+				"programming".to_string(),
+				"rust".to_string(),
+				"u_bravo".to_string(),
+				"science".to_string(),
+				"webdev".to_string(),
+				"u_charlie".to_string(),
+			]
+		);
+	}
+
+	#[test]
+	fn default_front_page_sources_keep_followed_users_to_one_in_four() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec![
+			"u_charlie".to_string(),
+			"rust".to_string(),
+			"u_alpha".to_string(),
+			"programming".to_string(),
+			"webdev".to_string(),
+			"u_bravo".to_string(),
+			"science".to_string(),
+			"askreddit".to_string(),
+		];
+
+		let sources = super::build_front_page_session_sources(&prefs, "default", true, true, "unused", "new");
+		let source_names = sources
+			.iter()
+			.map(|source| match source {
+				FeedSource::Subreddit { name, .. } => name.clone(),
+				other => panic!("unexpected source: {other:?}"),
+			})
+			.collect::<Vec<_>>();
+
+		assert_eq!(
+			source_names,
+			vec!["u_alpha", "askreddit", "programming", "rust", "u_bravo", "science", "webdev", "u_charlie"]
+		);
 	}
 
 	#[test]
