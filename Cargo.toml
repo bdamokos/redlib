@@ -22,6 +22,8 @@ clap = { version = "4.5.23", default-features = false, features = [
     "std",
     "env",
     "derive",
+    "help",
+    "usage",
 ] }
 regex = "1.10.2"
 serde = { version = "1.0.193", features = ["derive"] }

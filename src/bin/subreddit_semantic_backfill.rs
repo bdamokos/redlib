@@ -27,6 +27,9 @@ struct Args {
 	refresh_missing_metadata: bool,
 
 	#[arg(long)]
+	metadata_refresh_limit: Option<usize>,
+
+	#[arg(long)]
 	name_only_if_missing_metadata: bool,
 
 	#[arg(long)]
@@ -34,6 +37,9 @@ struct Args {
 
 	#[arg(long)]
 	dry_run: bool,
+
+	#[arg(long)]
+	quiet: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +171,18 @@ async fn main() -> Result<(), String> {
 	std::env::set_var("REDLIB_SUBREDDIT_SEMANTIC_MODEL", &args.model);
 
 	cache_persistence::init();
+	let metadata_refresh_enabled = args.refresh_missing_metadata && args.metadata_refresh_limit.unwrap_or(usize::MAX) > 0;
+	if metadata_refresh_enabled {
+		std::sync::LazyLock::force(&redlib::client::OAUTH_CLIENT);
+		redlib::oauth::force_refresh_token().await;
+		let status = redlib::oauth::oauth_status_snapshot();
+		if !status.available {
+			eprintln!(
+				"oauth unavailable for metadata refresh{}",
+				status.last_error.as_ref().map(|error| format!(": {error}")).unwrap_or_default()
+			);
+		}
+	}
 
 	let mut names = materialized_catalog::cached_catalog_subreddit_names().into_iter().collect::<BTreeSet<_>>();
 	let cached_metadata = subreddit::cached_subreddit_metadata_entries();
@@ -186,6 +204,8 @@ async fn main() -> Result<(), String> {
 		.collect::<HashMap<_, _>>();
 
 	let total_candidates = names.len();
+	let mut metadata_refresh_attempted = 0usize;
+	let mut metadata_refresh_skipped = 0usize;
 	let mut refreshed_metadata = 0usize;
 	let mut public_fallback_metadata = 0usize;
 	let mut name_only_metadata = 0usize;
@@ -198,28 +218,44 @@ async fn main() -> Result<(), String> {
 	for name in names.into_iter().take(args.limit.unwrap_or(usize::MAX)) {
 		let metadata = match metadata_by_name.get(&name).cloned().or_else(|| subreddit::cached_subreddit_metadata_for_name(&name)) {
 			Some(metadata) => metadata,
-			None if args.refresh_missing_metadata => match refresh_subreddit_metadata_for_backfill(&name).await {
-				Ok((metadata, used_public_fallback)) => {
-					refreshed_metadata += 1;
-					if used_public_fallback {
-						public_fallback_metadata += 1;
-					}
-					metadata
-				}
-				Err(error) => {
-					missing_metadata += 1;
-					eprintln!("metadata failed r/{name}: {error}");
-					if args.name_only_if_missing_metadata {
-						name_only_metadata += 1;
-						utils::Subreddit {
-							name: name.clone(),
-							..utils::Subreddit::default()
+			None if args.refresh_missing_metadata && args.metadata_refresh_limit.map(|limit| metadata_refresh_attempted < limit).unwrap_or(true) => {
+				metadata_refresh_attempted += 1;
+				match refresh_subreddit_metadata_for_backfill(&name).await {
+					Ok((metadata, used_public_fallback)) => {
+						refreshed_metadata += 1;
+						if used_public_fallback {
+							public_fallback_metadata += 1;
 						}
-					} else {
-						continue;
+						metadata
+					}
+					Err(error) => {
+						missing_metadata += 1;
+						eprintln!("metadata failed r/{name}: {error}");
+						if args.name_only_if_missing_metadata {
+							name_only_metadata += 1;
+							utils::Subreddit {
+								name: name.clone(),
+								..utils::Subreddit::default()
+							}
+						} else {
+							continue;
+						}
 					}
 				}
-			},
+			}
+			None if args.refresh_missing_metadata => {
+				metadata_refresh_skipped += 1;
+				if args.name_only_if_missing_metadata {
+					name_only_metadata += 1;
+					utils::Subreddit {
+						name: name.clone(),
+						..utils::Subreddit::default()
+					}
+				} else {
+					missing_metadata += 1;
+					continue;
+				}
+			}
 			None => {
 				if args.name_only_if_missing_metadata {
 					name_only_metadata += 1;
@@ -246,7 +282,9 @@ async fn main() -> Result<(), String> {
 		}
 		let text_hash = subreddit_semantics::semantic_text_hash(&text);
 		if args.dry_run {
-			println!("would embed r/{name} chars={} hash={}", text.chars().count(), text_hash);
+			if !args.quiet {
+				println!("would embed r/{name} chars={} hash={}", text.chars().count(), text_hash);
+			}
 			continue;
 		}
 
@@ -254,7 +292,9 @@ async fn main() -> Result<(), String> {
 			Ok(embedding) => {
 				subreddit_semantics::store_embedding(&name, &args.model, &text_hash, embedding, cache_persistence::unix_now())?;
 				embedded += 1;
-				println!("embedded r/{name}");
+				if !args.quiet {
+					println!("embedded r/{name}");
+				}
 			}
 			Err(error) => {
 				failed += 1;
@@ -268,7 +308,7 @@ async fn main() -> Result<(), String> {
 	}
 
 	println!(
-		"subreddit_semantic_backfill: candidates={total_candidates} embedded={embedded} already_current={already_current} refreshed_metadata={refreshed_metadata} public_fallback_metadata={public_fallback_metadata} name_only_metadata={name_only_metadata} missing_metadata={missing_metadata} failed={failed} cache={}",
+		"subreddit_semantic_backfill: candidates={total_candidates} embedded={embedded} already_current={already_current} metadata_refresh_attempted={metadata_refresh_attempted} metadata_refresh_skipped={metadata_refresh_skipped} refreshed_metadata={refreshed_metadata} public_fallback_metadata={public_fallback_metadata} name_only_metadata={name_only_metadata} missing_metadata={missing_metadata} failed={failed} cache={}",
 		cache_persistence::snapshot_path().display()
 	);
 	Ok(())
