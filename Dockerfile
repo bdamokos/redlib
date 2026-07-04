@@ -33,9 +33,10 @@ ENV GIT_HASH=${GIT_HASH}
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     --mount=type=cache,target=/usr/src/redlib/target,sharing=locked \
-    cargo build --release --locked --bin redlib --bin subreddit_semantic_backfill && \
+    cargo build --release --locked --bin redlib --bin subreddit_semantic_backfill --bin subreddit_content_semantic_backfill && \
     install -Dm755 target/release/redlib /tmp/redlib && \
-    install -Dm755 target/release/subreddit_semantic_backfill /tmp/subreddit_semantic_backfill
+    install -Dm755 target/release/subreddit_semantic_backfill /tmp/subreddit_semantic_backfill && \
+    install -Dm755 target/release/subreddit_content_semantic_backfill /tmp/subreddit_content_semantic_backfill
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -52,6 +53,7 @@ RUN apt-get update && apt-get install -y \
 # Copy the binary from builder
 COPY --from=builder /tmp/redlib /usr/local/bin/redlib
 COPY --from=builder /tmp/subreddit_semantic_backfill /usr/local/bin/subreddit_semantic_backfill
+COPY --from=builder /tmp/subreddit_content_semantic_backfill /usr/local/bin/subreddit_content_semantic_backfill
 
 # Copy the templates directory
 COPY --from=builder /usr/src/redlib/templates /templates

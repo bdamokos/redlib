@@ -19,6 +19,7 @@ pub mod server;
 pub mod settings;
 pub mod site_icon;
 pub mod subreddit;
+pub mod subreddit_content_semantics;
 pub mod subreddit_semantics;
 pub mod suggested_profiles;
 pub mod suggested_subreddits;

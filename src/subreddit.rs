@@ -328,6 +328,7 @@ pub struct CacheStatusTemplate {
 	upcoming_sources: Vec<crate::post_cache::CacheStatusSource>,
 	recent_sources: Vec<crate::post_cache::CacheStatusSource>,
 	semantic_database: crate::subreddit_semantics::SubredditSemanticDatabaseStatus,
+	content_semantic_database: crate::subreddit_content_semantics::SubredditContentSemanticDatabaseStatus,
 }
 
 crate::impl_template_str_eq!(CacheStatusTemplate);
@@ -4824,6 +4825,7 @@ pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, Str
 	let prefs = Preferences::new(&req);
 	let status = crate::post_cache::cache_status_for_preferences(&prefs);
 	let semantic_database = crate::subreddit_semantics::embedding_database_status();
+	let content_semantic_database = crate::subreddit_content_semantics::embedding_database_status();
 	let seconds_until_daemon_tick = crate::post_cache::cache_status_seconds_until_daemon_tick();
 	let mut upcoming_sources = status
 		.sources
@@ -4851,6 +4853,7 @@ pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, Str
 		upcoming_sources,
 		recent_sources,
 		semantic_database,
+		content_semantic_database,
 	}))
 }
 

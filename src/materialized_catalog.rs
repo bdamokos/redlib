@@ -1,6 +1,7 @@
 #[cfg(test)]
 use crate::cache_persistence::PersistedPost;
 use crate::post_cache::{deterministic_random_post_sort_key_with_seed, session_random_rotation_seed, FeedSession, FeedSort, FeedSource, SessionSourceState};
+use crate::subreddit_content_semantics;
 use crate::subreddit_semantics;
 use crate::utils::{post_feedback_score_adjustment, post_feedback_summary_affinity, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
 use log::warn;
@@ -422,6 +423,43 @@ fn embedding_cosine(left: &[f32], right: &[f32]) -> f64 {
 		return 0.0;
 	};
 	suggested_profile_dense_dot(&left, &right)
+}
+
+fn normalize_f32_vector(vector: &mut [f32]) -> bool {
+	let norm = vector.iter().map(|value| (*value as f64) * (*value as f64)).sum::<f64>().sqrt();
+	if norm <= 0.0 {
+		return false;
+	}
+	for value in vector {
+		*value = (*value as f64 / norm) as f32;
+	}
+	true
+}
+
+fn blended_subreddit_semantic_embedding(subreddit: &str, model: &str) -> Option<Vec<f32>> {
+	let metadata = subreddit_semantics::embedding_for_subreddit_model(subreddit, model);
+	let content = subreddit_content_semantics::embedding_for_subreddit_model(subreddit, model);
+	let content_mix = subreddit_content_semantics::content_mix_percent();
+
+	match (metadata, content) {
+		(Some(_metadata), Some(content)) if content_mix >= 100 => Some(content),
+		(Some(metadata), Some(content)) if metadata.len() == content.len() && content_mix > 0 => {
+			let mix = (content_mix as f64) / 100.0;
+			let mut blended = metadata
+				.iter()
+				.zip(content.iter())
+				.map(|(metadata, content)| ((*metadata as f64 * (1.0 - mix)) + (*content as f64 * mix)) as f32)
+				.collect::<Vec<_>>();
+			normalize_f32_vector(&mut blended).then_some(blended)
+		}
+		(Some(metadata), _) => Some(metadata),
+		(None, Some(content)) if content_mix > 0 => Some(content),
+		_ => None,
+	}
+}
+
+fn active_semantic_embedding_count() -> usize {
+	subreddit_semantics::active_embedding_count().max(subreddit_content_semantics::active_usable_embedding_count())
 }
 
 fn normalize_suggested_profile_dense_vector(vector: &mut [f64]) -> f64 {
@@ -1567,16 +1605,19 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 	if let Err(error) = subreddit_semantics::refresh_persisted_embeddings_sidecar() {
 		warn!("related subreddits: failed to refresh subreddit semantic embeddings sidecar: {error}");
 	}
+	if let Err(error) = subreddit_content_semantics::refresh_persisted_embeddings_sidecar() {
+		warn!("related subreddits: failed to refresh subreddit content semantic embeddings sidecar: {error}");
+	}
 	let semantic_model = subreddit_semantics::embedding_model();
-	let Some(current_embedding) = subreddit_semantics::embedding_for_subreddit_model(&subreddit, &semantic_model) else {
+	let Some(current_embedding) = blended_subreddit_semantic_embedding(&subreddit, &semantic_model) else {
 		return RelatedSubredditReport {
-			semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+			semantic_embedding_count: active_semantic_embedding_count(),
 			..RelatedSubredditReport::default()
 		};
 	};
 	let Some(current_vector) = normalized_f32_embedding(&current_embedding) else {
 		return RelatedSubredditReport {
-			semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+			semantic_embedding_count: active_semantic_embedding_count(),
 			..RelatedSubredditReport::default()
 		};
 	};
@@ -1605,18 +1646,24 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 		(subreddit_stats, profile_counts_by_profile)
 	};
 
+	let content_entries = subreddit_content_semantics::active_entries_for_model(&semantic_model);
+	let content_post_counts = content_entries.iter().map(|entry| (entry.subreddit.clone(), entry.post_count)).collect::<HashMap<_, _>>();
 	let mut candidate_subreddits = subreddit_stats.keys().cloned().collect::<HashSet<_>>();
 	candidate_subreddits.extend(followed_subreddits.iter().cloned());
+	candidate_subreddits.extend(content_entries.into_iter().map(|entry| entry.subreddit));
 	let mut related_subreddits = candidate_subreddits
 		.into_iter()
 		.filter(|candidate| candidate != &subreddit && !normalized_filters.contains(candidate))
 		.filter_map(|candidate| {
-			let embedding = subreddit_semantics::embedding_for_subreddit_model(&candidate, &semantic_model)?;
+			let embedding = blended_subreddit_semantic_embedding(&candidate, &semantic_model)?;
 			let similarity = embedding_cosine(&current_embedding, &embedding);
 			if similarity < RELATED_SUBREDDIT_MIN_SIMILARITY {
 				return None;
 			}
-			let (cached_profile_count, cached_post_count) = subreddit_stats.get(&candidate).copied().unwrap_or_default();
+			let (cached_profile_count, cached_post_count) = subreddit_stats
+				.get(&candidate)
+				.copied()
+				.unwrap_or_else(|| (0, content_post_counts.get(&candidate).copied().unwrap_or_default()));
 			Some((
 				followed_subreddits.contains(&candidate),
 				RelatedSubredditEntry {
@@ -1671,7 +1718,7 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 			if profile_embeddings.contains_key(&candidate) {
 				continue;
 			}
-			if let Some(embedding) = subreddit_semantics::embedding_for_subreddit_model(&candidate, &semantic_model) {
+			if let Some(embedding) = blended_subreddit_semantic_embedding(&candidate, &semantic_model) {
 				profile_embeddings.insert(candidate, embedding);
 			}
 		}
@@ -1729,7 +1776,7 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 	}
 
 	RelatedSubredditReport {
-		semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+		semantic_embedding_count: active_semantic_embedding_count(),
 		followed_subreddits: followed_related_subreddits,
 		cached_subreddits: cached_related_subreddits,
 		followed_profiles: followed_related_profiles,
@@ -2353,6 +2400,9 @@ fn suggested_profiles_semantic_mode(
 	if let Err(error) = subreddit_semantics::refresh_persisted_embeddings_sidecar() {
 		warn!("suggested profiles: failed to refresh subreddit semantic embeddings sidecar: {error}");
 	}
+	if let Err(error) = subreddit_content_semantics::refresh_persisted_embeddings_sidecar() {
+		warn!("suggested profiles: failed to refresh subreddit content semantic embeddings sidecar: {error}");
+	}
 	let followed_profiles = followed_profiles
 		.iter()
 		.map(|name| normalize_profile_name(name))
@@ -2376,7 +2426,7 @@ fn suggested_profiles_semantic_mode(
 		return SuggestedProfilesReport {
 			followed_profile_count: followed_profiles.len(),
 			cached_profile_count: catalog.author_community_counts.len(),
-			semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+			semantic_embedding_count: active_semantic_embedding_count(),
 			semantic_mix_percent,
 			..SuggestedProfilesReport::default()
 		};
@@ -2471,14 +2521,14 @@ fn suggested_profiles_semantic_mode(
 	let semantic_model = subreddit_semantics::embedding_model();
 	let mut semantic_embeddings = HashMap::new();
 	for subreddit in subreddit_profile_counts.keys() {
-		if let Some(embedding) = subreddit_semantics::embedding_for_subreddit_model(subreddit, &semantic_model) {
+		if let Some(embedding) = blended_subreddit_semantic_embedding(subreddit, &semantic_model) {
 			semantic_embeddings.insert(subreddit.clone(), embedding);
 		}
 	}
 	if let Some(SuggestedProfileVectorCenterRequest::Subreddit(subreddit)) = vector_center {
 		let subreddit = normalize_vector_center_subreddit_name(subreddit);
 		if !semantic_embeddings.contains_key(&subreddit) {
-			if let Some(embedding) = subreddit_semantics::embedding_for_subreddit_model(&subreddit, &semantic_model) {
+			if let Some(embedding) = blended_subreddit_semantic_embedding(&subreddit, &semantic_model) {
 				semantic_embeddings.insert(subreddit, embedding);
 			}
 		}

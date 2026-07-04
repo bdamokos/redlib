@@ -1,8 +1,10 @@
 use crate::config::get_setting;
-use crate::{post_cache, subreddit, subreddit_semantics, utils};
+use crate::{post_cache, subreddit, subreddit_content_semantics, subreddit_semantics, utils};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+#[cfg(not(test))]
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,8 @@ const LEGACY_SNAPSHOT_VERSION_V3: u8 = 3;
 const LEGACY_SNAPSHOT_VERSION_V2: u8 = 2;
 const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v2.bin";
 const SOURCE_CACHE_DIR_NAME: &str = "sources.v2";
+#[cfg(not(test))]
+const LEGACY_SOURCE_CACHE_DIR_NAME: &str = "sources.v1";
 const DEFAULT_CACHE_DIR: &str = "/var/lib/redlib/cache";
 const WRITE_DEBOUNCE_SECS: u64 = 1;
 
@@ -248,6 +252,12 @@ pub(crate) struct PersistedSourceCacheEntry {
 	pub refresh_origin: Option<PersistedRefreshOrigin>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PersistedSourceCacheFile {
+	pub key: String,
+	pub entry: PersistedSourceCacheEntry,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedRememberedSubredditEntry {
 	pub name: String,
@@ -430,6 +440,11 @@ fn source_cache_path(source_cache_key: &str) -> PathBuf {
 	source_cache_dir().join(format!("{}.bin", URL_SAFE_NO_PAD.encode(source_cache_key.as_bytes())))
 }
 
+#[cfg(not(test))]
+fn readable_source_cache_dirs() -> Vec<PathBuf> {
+	vec![source_cache_dir(), Path::new(&cache_dir()).join(LEGACY_SOURCE_CACHE_DIR_NAME)]
+}
+
 pub fn unix_now() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0)).as_secs()
 }
@@ -468,6 +483,9 @@ pub fn init() {
 	}
 	if let Err(error) = subreddit_semantics::load_persisted_embeddings_sidecar() {
 		warn!("cache_persistence: failed to load subreddit semantic embeddings sidecar: {error}");
+	}
+	if let Err(error) = subreddit_content_semantics::load_persisted_embeddings_sidecar() {
+		warn!("cache_persistence: failed to load subreddit content semantic embeddings sidecar: {error}");
 	}
 
 	match source_cache_seed_entries() {
@@ -543,60 +561,134 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 
 #[cfg(not(test))]
 pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
-	let entries = match fs::read_dir(source_cache_dir()) {
-		Ok(entries) => entries,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-		Err(error) => return Err(error.to_string()),
-	};
-
 	let mut seeds = Vec::new();
-	for entry in entries {
-		let entry = match entry {
-			Ok(entry) => entry,
-			Err(error) => {
-				warn!("cache_persistence: failed to read source cache dir entry: {error}");
+	let mut seen_keys = HashSet::new();
+	for dir in readable_source_cache_dirs() {
+		let entries = match fs::read_dir(&dir) {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(error.to_string()),
+		};
+
+		for entry in entries {
+			let entry = match entry {
+				Ok(entry) => entry,
+				Err(error) => {
+					warn!("cache_persistence: failed to read source cache dir entry: {error}");
+					continue;
+				}
+			};
+			let path = entry.path();
+			if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
 				continue;
 			}
-		};
-		let path = entry.path();
-		if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
-			continue;
+			let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+				continue;
+			};
+			let decoded = match URL_SAFE_NO_PAD.decode(stem) {
+				Ok(decoded) => decoded,
+				Err(error) => {
+					warn!("cache_persistence: ignoring source cache file with undecodable name {:?}: {error}", path.file_name());
+					continue;
+				}
+			};
+			let key = match String::from_utf8(decoded) {
+				Ok(key) => key,
+				Err(error) => {
+					warn!("cache_persistence: ignoring source cache file with non-utf8 key {:?}: {error}", path.file_name());
+					continue;
+				}
+			};
+			if !seen_keys.insert(key.clone()) {
+				continue;
+			}
+			let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+				Ok(modified) => modified,
+				Err(error) => {
+					warn!("cache_persistence: failed to stat source cache file {:?}: {error}", path.file_name());
+					continue;
+				}
+			};
+			let fetched_at_unix = match modified.duration_since(UNIX_EPOCH) {
+				Ok(duration) => duration.as_secs(),
+				Err(error) => {
+					warn!("cache_persistence: source cache file {:?} has pre-epoch mtime: {error}", path.file_name());
+					continue;
+				}
+			};
+			seeds.push((key, fetched_at_unix));
 		}
-		let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-			continue;
-		};
-		let decoded = match URL_SAFE_NO_PAD.decode(stem) {
-			Ok(decoded) => decoded,
-			Err(error) => {
-				warn!("cache_persistence: ignoring source cache file with undecodable name {:?}: {error}", path.file_name());
-				continue;
-			}
-		};
-		let key = match String::from_utf8(decoded) {
-			Ok(key) => key,
-			Err(error) => {
-				warn!("cache_persistence: ignoring source cache file with non-utf8 key {:?}: {error}", path.file_name());
-				continue;
-			}
-		};
-		let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
-			Ok(modified) => modified,
-			Err(error) => {
-				warn!("cache_persistence: failed to stat source cache file {:?}: {error}", path.file_name());
-				continue;
-			}
-		};
-		let fetched_at_unix = match modified.duration_since(UNIX_EPOCH) {
-			Ok(duration) => duration.as_secs(),
-			Err(error) => {
-				warn!("cache_persistence: source cache file {:?} has pre-epoch mtime: {error}", path.file_name());
-				continue;
-			}
-		};
-		seeds.push((key, fetched_at_unix));
 	}
 
 	Ok(seeds)
+}
+
+#[cfg(not(test))]
+pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceCacheFile>, String> {
+	let mut files = Vec::new();
+	let mut seen_keys = HashSet::new();
+	for dir in readable_source_cache_dirs() {
+		let entries = match fs::read_dir(&dir) {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(error.to_string()),
+		};
+
+		for entry in entries {
+			let entry = match entry {
+				Ok(entry) => entry,
+				Err(error) => {
+					warn!("cache_persistence: failed to read source cache dir entry: {error}");
+					continue;
+				}
+			};
+			let path = entry.path();
+			if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
+				continue;
+			}
+			let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+				continue;
+			};
+			let decoded = match URL_SAFE_NO_PAD.decode(stem) {
+				Ok(decoded) => decoded,
+				Err(error) => {
+					warn!("cache_persistence: ignoring source cache file with undecodable name {:?}: {error}", path.file_name());
+					continue;
+				}
+			};
+			let key = match String::from_utf8(decoded) {
+				Ok(key) => key,
+				Err(error) => {
+					warn!("cache_persistence: ignoring source cache file with non-utf8 key {:?}: {error}", path.file_name());
+					continue;
+				}
+			};
+			if !seen_keys.insert(key.clone()) {
+				continue;
+			}
+			let bytes = match fs::read(&path) {
+				Ok(bytes) => bytes,
+				Err(error) => {
+					warn!("cache_persistence: failed to read source cache file {:?}: {error}", path.file_name());
+					continue;
+				}
+			};
+			let entry = match bincode::deserialize::<PersistedSourceCacheEntry>(&bytes) {
+				Ok(entry) => entry,
+				Err(error) => {
+					warn!("cache_persistence: failed to deserialize source cache file {:?}: {error}", path.file_name());
+					continue;
+				}
+			};
+			files.push(PersistedSourceCacheFile { key, entry });
+		}
+	}
+	Ok(files)
+}
+
+#[cfg(test)]
+pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceCacheFile>, String> {
+	Ok(Vec::new())
 }
 
 #[cfg(test)]

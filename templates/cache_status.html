@@ -80,10 +80,65 @@
 		{% match semantic_database.last_run_error %}{% when Some with (error) %}
 		<p><strong>Backfill status read error:</strong> {{ error }}</p>
 		{% when None %}{% endmatch %}
-	</div>
+		</div>
 
-	<div class="panel">
-		<p><strong>How the next update time is calculated:</strong> the background daemon's next wake-up is in about {{ self.human_duration(seconds_until_daemon_tick) }}, and each wake-up refreshes one eligible remembered feed.</p>
+		<div class="panel semantic_database_status">
+			<h2>Content Semantic Embedding Database</h2>
+			<div class="cache_status_metric_grid">
+				<p><strong>Active model:</strong> {{ content_semantic_database.model }}</p>
+				<p><strong>Semantic content mix:</strong> {{ content_semantic_database.content_mix_percent }}%</p>
+				<p><strong>Vectorized subreddits:</strong> {{ content_semantic_database.active_model_entry_count }}</p>
+				<p><strong>Usable subreddits:</strong> {{ content_semantic_database.usable_model_entry_count }}</p>
+				<p><strong>Total loaded rows:</strong> {{ content_semantic_database.loaded_entry_count }}</p>
+				<p><strong>Sidecar rows:</strong> {{ content_semantic_database.sidecar_entry_count }}</p>
+				<p><strong>Embedding dimensions:</strong> {% match content_semantic_database.embedding_dimensions %}{% when Some with (dimensions) %}{{ dimensions }}{% when None %}-{% endmatch %}</p>
+			</div>
+			<p><strong>Quality gates:</strong> at least {{ content_semantic_database.min_posts_per_subreddit }} retained sampled posts and {{ content_semantic_database.min_corpus_text_chars }} sampled text characters; max top-5 mean similarity {{ content_semantic_database.max_top5_mean_similarity }}.</p>
+			<p><strong>Top-5 mean similarity:</strong>
+				average {% match content_semantic_database.top5_mean_similarity_average %}{% when Some with (score) %}{{ score }}{% when None %}-{% endmatch %};
+				p95 {% match content_semantic_database.top5_mean_similarity_p95 %}{% when Some with (score) %}{{ score }}{% when None %}-{% endmatch %}
+			</p>
+			<p><strong>Sidecar file:</strong>
+				{% if content_semantic_database.sidecar_exists %}
+				{{ content_semantic_database.sidecar_path }}{% match content_semantic_database.sidecar_size_bytes %}{% when Some with (bytes) %} ({{ self.human_bytes(bytes) }}){% when None %}{% endmatch %}
+				{% else %}
+				not written yet at {{ content_semantic_database.sidecar_path }}
+				{% endif %}
+			</p>
+			<p><strong>Last sidecar write:</strong>
+				{% match content_semantic_database.sidecar_modified_age_secs %}{% when Some with (seconds) %}about {{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}
+				{% match content_semantic_database.sidecar_saved_at_unix %}{% when Some with (timestamp) %}(saved at Unix time {{ timestamp }}){% when None %}{% endmatch %}
+			</p>
+			<p><strong>Embedding age range:</strong>
+				newest {% match content_semantic_database.newest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %};
+				oldest {% match content_semantic_database.oldest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %}
+			</p>
+			{% match content_semantic_database.last_run %}
+			{% when Some with (run) %}
+			<p><strong>Last backfill run:</strong> {{ self.backfill_state_label(run.state.as_str()) }} for {{ run.model }}
+				{% match run.finished_at_unix %}{% when Some with (timestamp) %}finished at Unix time {{ timestamp }}{% when None %}started at Unix time {{ run.started_at_unix }}{% endmatch %}
+				{% if run.dry_run %}(dry run){% endif %}{% if run.force %}(forced){% endif %}
+			</p>
+			<p><strong>Run totals:</strong> {{ run.counters.source_files }} source files, {{ run.counters.unique_posts }} unique candidate posts, {{ run.counters.candidate_subreddits }} candidate subreddits, {{ run.counters.embedded }} sampled posts embedded, {{ run.counters.already_current }} already current or outside the retained sample, {{ run.counters.too_small_subreddits }} too small, {{ run.counters.failed }} failed.</p>
+			{% match run.error %}{% when Some with (error) %}
+			<p><strong>Run error:</strong> {{ error }}</p>
+			{% when None %}{% endmatch %}
+			{% when None %}
+			<p><strong>Last backfill run:</strong> no persisted run status yet.</p>
+			{% endmatch %}
+			{% match content_semantic_database.refresh_error %}{% when Some with (error) %}
+			<p><strong>Refresh error:</strong> {{ error }}</p>
+			{% when None %}{% endmatch %}
+			{% match content_semantic_database.sidecar_read_error %}{% when Some with (error) %}
+			<p><strong>Sidecar read error:</strong> {{ error }}</p>
+			{% when None %}{% endmatch %}
+			{% match content_semantic_database.last_run_error %}{% when Some with (error) %}
+			<p><strong>Backfill status read error:</strong> {{ error }}</p>
+			{% when None %}{% endmatch %}
+		</div>
+
+		<div class="panel">
+			<p><strong>How the next update time is calculated:</strong> the background daemon's next wake-up is in about {{ self.human_duration(seconds_until_daemon_tick) }}, and each wake-up refreshes one eligible remembered feed.</p>
 		<p>It does <em>not</em> simply walk uncached feeds in order. Feeds that have never refreshed successfully go first, then overdue feeds, then feeds with the highest age-vs-target freshness ratio, with recent user requests used as a tiebreaker.</p>
 		<p>So a feed's “Next Fetch” time is roughly: <em>time until the next daemon tick + (its queue position × one daemon interval)</em>.</p>
 		<p>The per-feed “Refresh frequency” is adaptive: it is estimated from how often that feed posts, clamped to a minimum and maximum, and stretched further after repeated failures.</p>
