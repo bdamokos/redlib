@@ -3368,7 +3368,16 @@ mod tests {
 				name: "demo_user".to_string(),
 				count: 3,
 			}],
-			related_subreddits: Default::default(),
+			related_subreddits: crate::materialized_catalog::RelatedSubredditReport {
+				semantic_embedding_count: 42,
+				cached_subreddits: vec![crate::materialized_catalog::RelatedSubredditEntry {
+					name: "rustlang".to_string(),
+					score_percent: 91,
+					cached_profile_count: 4,
+					cached_post_count: 12,
+				}],
+				..Default::default()
+			},
 			sort: ("hot".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
@@ -3403,8 +3412,14 @@ mod tests {
 		.unwrap();
 
 		assert!(!html.contains("submitted_duplicates.js"));
+		let users_index = html.find("id=\"sub_top_users\"").expect("sidebar should keep user stats");
+		let related_index = html.find("id=\"sub_related\"").expect("sidebar should render related recommendations");
+		assert!(users_index < related_index, "user stats should remain above related recommendations");
 		assert!(html.contains("/user/demo_user\">u/demo_user</a>"));
 		assert!(html.contains(">3</span>"));
+		assert!(html.contains("42 embeddings"));
+		assert!(html.contains("/r/rustlang"));
+		assert!(html.contains("91% semantic"));
 	}
 
 	#[test]
