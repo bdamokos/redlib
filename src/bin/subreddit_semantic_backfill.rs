@@ -1,6 +1,10 @@
 use clap::Parser;
 use hyper::{body::to_bytes, header, Body, Client, Method, Request, Uri};
-use redlib::{cache_persistence, materialized_catalog, subreddit, subreddit_semantics, utils};
+use redlib::{
+	cache_persistence, materialized_catalog, subreddit,
+	subreddit_semantics::{self, SubredditSemanticBackfillCounters, SubredditSemanticBackfillStatus},
+	utils,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -171,6 +175,78 @@ async fn main() -> Result<(), String> {
 	std::env::set_var("REDLIB_SUBREDDIT_SEMANTIC_MODEL", &args.model);
 	std::env::set_var("REDLIB_CACHE_PERSISTENCE_READ_ONLY", "on");
 
+	let started_at_unix = cache_persistence::unix_now();
+	let mut counters = SubredditSemanticBackfillCounters::default();
+	record_backfill_status(SubredditSemanticBackfillStatus {
+		state: "running".to_string(),
+		model: args.model.clone(),
+		started_at_unix,
+		finished_at_unix: None,
+		counters: counters.clone(),
+		dry_run: args.dry_run,
+		force: args.force,
+		limit: args.limit,
+		error: None,
+	});
+
+	match run_backfill(&args, &mut counters).await {
+		Ok(()) => {
+			let state = if counters.failed > 0 { "completed_with_errors" } else { "completed" };
+			record_backfill_status(SubredditSemanticBackfillStatus {
+				state: state.to_string(),
+				model: args.model.clone(),
+				started_at_unix,
+				finished_at_unix: Some(cache_persistence::unix_now()),
+				counters: counters.clone(),
+				dry_run: args.dry_run,
+				force: args.force,
+				limit: args.limit,
+				error: None,
+			});
+			print_backfill_summary(&counters);
+			Ok(())
+		}
+		Err(error) => {
+			record_backfill_status(SubredditSemanticBackfillStatus {
+				state: "failed".to_string(),
+				model: args.model.clone(),
+				started_at_unix,
+				finished_at_unix: Some(cache_persistence::unix_now()),
+				counters,
+				dry_run: args.dry_run,
+				force: args.force,
+				limit: args.limit,
+				error: Some(error.clone()),
+			});
+			Err(error)
+		}
+	}
+}
+
+fn record_backfill_status(status: SubredditSemanticBackfillStatus) {
+	if let Err(error) = subreddit_semantics::write_backfill_status(&status) {
+		eprintln!("backfill status write failed: {error}");
+	}
+}
+
+fn print_backfill_summary(counters: &SubredditSemanticBackfillCounters) {
+	println!(
+		"subreddit_semantic_backfill: candidates={} embedded={} already_current={} metadata_refresh_attempted={} metadata_refresh_skipped={} refreshed_metadata={} public_fallback_metadata={} name_only_metadata={} missing_metadata={} failed={} cache={}",
+		counters.total_candidates,
+		counters.embedded,
+		counters.already_current,
+		counters.metadata_refresh_attempted,
+		counters.metadata_refresh_skipped,
+		counters.refreshed_metadata,
+		counters.public_fallback_metadata,
+		counters.name_only_metadata,
+		counters.missing_metadata,
+		counters.failed,
+		subreddit_semantics::persisted_embeddings_sidecar_path().display()
+	);
+}
+
+async fn run_backfill(args: &Args, counters: &mut SubredditSemanticBackfillCounters) -> Result<(), String> {
 	cache_persistence::init();
 	let metadata_refresh_enabled = args.refresh_missing_metadata && args.metadata_refresh_limit.unwrap_or(usize::MAX) > 0;
 	if metadata_refresh_enabled {
@@ -204,36 +280,27 @@ async fn main() -> Result<(), String> {
 		.map(|metadata| (subreddit_semantics::normalize_subreddit_name(&metadata.name), metadata))
 		.collect::<HashMap<_, _>>();
 
-	let total_candidates = names.len();
-	let mut metadata_refresh_attempted = 0usize;
-	let mut metadata_refresh_skipped = 0usize;
-	let mut refreshed_metadata = 0usize;
-	let mut public_fallback_metadata = 0usize;
-	let mut name_only_metadata = 0usize;
-	let mut missing_metadata = 0usize;
-	let mut already_current = 0usize;
-	let mut embedded = 0usize;
-	let mut failed = 0usize;
+	counters.total_candidates = names.len();
 	let client = Client::new();
 
 	for name in names.into_iter().take(args.limit.unwrap_or(usize::MAX)) {
 		let metadata = match metadata_by_name.get(&name).cloned().or_else(|| subreddit::cached_subreddit_metadata_for_name(&name)) {
 			Some(metadata) => metadata,
-			None if args.refresh_missing_metadata && args.metadata_refresh_limit.map(|limit| metadata_refresh_attempted < limit).unwrap_or(true) => {
-				metadata_refresh_attempted += 1;
+			None if args.refresh_missing_metadata && args.metadata_refresh_limit.map(|limit| counters.metadata_refresh_attempted < limit).unwrap_or(true) => {
+				counters.metadata_refresh_attempted += 1;
 				match refresh_subreddit_metadata_for_backfill(&name).await {
 					Ok((metadata, used_public_fallback)) => {
-						refreshed_metadata += 1;
+						counters.refreshed_metadata += 1;
 						if used_public_fallback {
-							public_fallback_metadata += 1;
+							counters.public_fallback_metadata += 1;
 						}
 						metadata
 					}
 					Err(error) => {
-						missing_metadata += 1;
+						counters.missing_metadata += 1;
 						eprintln!("metadata failed r/{name}: {error}");
 						if args.name_only_if_missing_metadata {
-							name_only_metadata += 1;
+							counters.name_only_metadata += 1;
 							utils::Subreddit {
 								name: name.clone(),
 								..utils::Subreddit::default()
@@ -245,40 +312,40 @@ async fn main() -> Result<(), String> {
 				}
 			}
 			None if args.refresh_missing_metadata => {
-				metadata_refresh_skipped += 1;
+				counters.metadata_refresh_skipped += 1;
 				if args.name_only_if_missing_metadata {
-					name_only_metadata += 1;
+					counters.name_only_metadata += 1;
 					utils::Subreddit {
 						name: name.clone(),
 						..utils::Subreddit::default()
 					}
 				} else {
-					missing_metadata += 1;
+					counters.missing_metadata += 1;
 					continue;
 				}
 			}
 			None => {
 				if args.name_only_if_missing_metadata {
-					name_only_metadata += 1;
+					counters.name_only_metadata += 1;
 					utils::Subreddit {
 						name: name.clone(),
 						..utils::Subreddit::default()
 					}
 				} else {
-					missing_metadata += 1;
+					counters.missing_metadata += 1;
 					continue;
 				}
 			}
 		};
 
 		if !args.force && subreddit_semantics::has_current_embedding(&metadata, &args.model) {
-			already_current += 1;
+			counters.already_current += 1;
 			continue;
 		}
 
 		let text = subreddit_semantics::semantic_text_for_subreddit(&metadata);
 		if text.is_empty() {
-			missing_metadata += 1;
+			counters.missing_metadata += 1;
 			continue;
 		}
 		let text_hash = subreddit_semantics::semantic_text_hash(&text);
@@ -292,13 +359,13 @@ async fn main() -> Result<(), String> {
 		match ollama_embedding(&client, &args.ollama_url, &args.model, &text).await {
 			Ok(embedding) => {
 				subreddit_semantics::store_embedding(&name, &args.model, &text_hash, embedding, cache_persistence::unix_now())?;
-				embedded += 1;
+				counters.embedded += 1;
 				if !args.quiet {
 					println!("embedded r/{name}");
 				}
 			}
 			Err(error) => {
-				failed += 1;
+				counters.failed += 1;
 				eprintln!("embedding failed r/{name}: {error}");
 			}
 		}
@@ -308,9 +375,5 @@ async fn main() -> Result<(), String> {
 		subreddit_semantics::write_persisted_embeddings_sidecar_now()?;
 	}
 
-	println!(
-		"subreddit_semantic_backfill: candidates={total_candidates} embedded={embedded} already_current={already_current} metadata_refresh_attempted={metadata_refresh_attempted} metadata_refresh_skipped={metadata_refresh_skipped} refreshed_metadata={refreshed_metadata} public_fallback_metadata={public_fallback_metadata} name_only_metadata={name_only_metadata} missing_metadata={missing_metadata} failed={failed} cache={}",
-		subreddit_semantics::persisted_embeddings_sidecar_path().display()
-	);
 	Ok(())
 }

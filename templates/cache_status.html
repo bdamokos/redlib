@@ -32,6 +32,56 @@
 		<p><strong>Blocked feeds:</strong> {{ summary.blocked_sources }}</p>
 	</div>
 
+	<div class="panel semantic_database_status">
+		<h2>Semantic Embedding Database</h2>
+		<div class="cache_status_metric_grid">
+			<p><strong>Active model:</strong> {{ semantic_database.model }}</p>
+			<p><strong>Vectorized subreddits:</strong> {{ semantic_database.active_model_entry_count }}</p>
+			<p><strong>Total loaded rows:</strong> {{ semantic_database.loaded_entry_count }}</p>
+			<p><strong>Other-model rows:</strong> {{ semantic_database.other_model_entry_count }}</p>
+			<p><strong>Sidecar rows:</strong> {{ semantic_database.sidecar_entry_count }}</p>
+			<p><strong>Embedding dimensions:</strong> {% match semantic_database.embedding_dimensions %}{% when Some with (dimensions) %}{{ dimensions }}{% when None %}-{% endmatch %}</p>
+		</div>
+		<p><strong>Sidecar file:</strong>
+			{% if semantic_database.sidecar_exists %}
+			{{ semantic_database.sidecar_path }}{% match semantic_database.sidecar_size_bytes %}{% when Some with (bytes) %} ({{ self.human_bytes(bytes) }}){% when None %}{% endmatch %}
+			{% else %}
+			not written yet at {{ semantic_database.sidecar_path }}
+			{% endif %}
+		</p>
+		<p><strong>Last sidecar write:</strong>
+			{% match semantic_database.sidecar_modified_age_secs %}{% when Some with (seconds) %}about {{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}
+			{% match semantic_database.sidecar_saved_at_unix %}{% when Some with (timestamp) %}(saved at Unix time {{ timestamp }}){% when None %}{% endmatch %}
+		</p>
+		<p><strong>Embedding age range:</strong>
+			newest {% match semantic_database.newest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %};
+			oldest {% match semantic_database.oldest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %}
+		</p>
+		{% match semantic_database.last_run %}
+		{% when Some with (run) %}
+		<p><strong>Last backfill run:</strong> {{ self.backfill_state_label(run.state.as_str()) }} for {{ run.model }}
+			{% match run.finished_at_unix %}{% when Some with (timestamp) %}finished at Unix time {{ timestamp }}{% when None %}started at Unix time {{ run.started_at_unix }}{% endmatch %}
+			{% if run.dry_run %}(dry run){% endif %}{% if run.force %}(forced){% endif %}
+		</p>
+		<p><strong>Run totals:</strong> {{ run.counters.total_candidates }} candidates, {{ run.counters.embedded }} embedded, {{ run.counters.already_current }} already current, {{ run.counters.failed }} failed, {{ run.counters.missing_metadata }} missing metadata.</p>
+		<p><strong>Metadata refresh:</strong> {{ run.counters.metadata_refresh_attempted }} attempted, {{ run.counters.refreshed_metadata }} refreshed, {{ run.counters.public_fallback_metadata }} via public fallback, {{ run.counters.metadata_refresh_skipped }} skipped, {{ run.counters.name_only_metadata }} name-only records.</p>
+		{% match run.error %}{% when Some with (error) %}
+		<p><strong>Run error:</strong> {{ error }}</p>
+		{% when None %}{% endmatch %}
+		{% when None %}
+		<p><strong>Last backfill run:</strong> no persisted run status yet.</p>
+		{% endmatch %}
+		{% match semantic_database.refresh_error %}{% when Some with (error) %}
+		<p><strong>Refresh error:</strong> {{ error }}</p>
+		{% when None %}{% endmatch %}
+		{% match semantic_database.sidecar_read_error %}{% when Some with (error) %}
+		<p><strong>Sidecar read error:</strong> {{ error }}</p>
+		{% when None %}{% endmatch %}
+		{% match semantic_database.last_run_error %}{% when Some with (error) %}
+		<p><strong>Backfill status read error:</strong> {{ error }}</p>
+		{% when None %}{% endmatch %}
+	</div>
+
 	<div class="panel">
 		<p><strong>How the next update time is calculated:</strong> the background daemon's next wake-up is in about {{ self.human_duration(seconds_until_daemon_tick) }}, and each wake-up refreshes one eligible remembered feed.</p>
 		<p>It does <em>not</em> simply walk uncached feeds in order. Feeds that have never refreshed successfully go first, then overdue feeds, then feeds with the highest age-vs-target freshness ratio, with recent user requests used as a tiebreaker.</p>

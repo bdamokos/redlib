@@ -317,6 +317,7 @@ pub struct CacheStatusTemplate {
 	seconds_until_daemon_tick: u64,
 	upcoming_sources: Vec<crate::post_cache::CacheStatusSource>,
 	recent_sources: Vec<crate::post_cache::CacheStatusSource>,
+	semantic_database: crate::subreddit_semantics::SubredditSemanticDatabaseStatus,
 }
 
 crate::impl_template_str_eq!(CacheStatusTemplate);
@@ -348,6 +349,27 @@ impl CacheStatusTemplate {
 			"idle" => "remembered, but not currently queued",
 			"not_cached" => "not cached yet",
 			"session_only" => "only fetched while you browse",
+			_ => "unknown",
+		}
+	}
+
+	fn human_bytes(&self, bytes: &u64) -> String {
+		let bytes = *bytes as f64;
+		if bytes >= 1024.0 * 1024.0 {
+			format!("{:.1} MiB", bytes / 1024.0 / 1024.0)
+		} else if bytes >= 1024.0 {
+			format!("{:.1} KiB", bytes / 1024.0)
+		} else {
+			format!("{bytes:.0} B")
+		}
+	}
+
+	fn backfill_state_label(&self, state: &str) -> &'static str {
+		match state {
+			"running" => "running",
+			"completed" => "completed",
+			"completed_with_errors" => "completed with errors",
+			"failed" => "failed",
 			_ => "unknown",
 		}
 	}
@@ -4738,6 +4760,7 @@ pub async fn feed_status_api(req: Request<Body>) -> Result<Response<Body>, Strin
 pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, String> {
 	let prefs = Preferences::new(&req);
 	let status = crate::post_cache::cache_status_for_preferences(&prefs);
+	let semantic_database = crate::subreddit_semantics::embedding_database_status();
 	let seconds_until_daemon_tick = crate::post_cache::cache_status_seconds_until_daemon_tick();
 	let mut upcoming_sources = status
 		.sources
@@ -4764,6 +4787,7 @@ pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, Str
 		seconds_until_daemon_tick,
 		upcoming_sources,
 		recent_sources,
+		semantic_database,
 	}))
 }
 

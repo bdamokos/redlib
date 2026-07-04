@@ -9,12 +9,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_SUBREDDIT_SEMANTIC_MODEL: &str = "nomic-embed-text";
 const SUBREDDIT_SEMANTIC_SIDECAR_VERSION: u8 = 1;
 const SUBREDDIT_SEMANTIC_SIDECAR_FILE_NAME: &str = "subreddit-semantic-embeddings.v1.bin";
 const SUBREDDIT_SEMANTIC_SIDECAR_LOCK_FILE_NAME: &str = "subreddit-semantic-embeddings.v1.lock";
+const SUBREDDIT_SEMANTIC_BACKFILL_STATUS_FILE_NAME: &str = "subreddit-semantic-backfill-status.v1.json";
 const MAX_SUBREDDIT_SEMANTIC_TEXT_CHARS: usize = 1_200;
 const SIDECAR_LOCK_TIMEOUT_SECS: u64 = 30;
 const SIDECAR_STALE_LOCK_SECS: u64 = 30 * 60;
@@ -38,6 +39,55 @@ struct PersistedSubredditSemanticEmbeddingFile {
 	version: u8,
 	saved_at_unix: u64,
 	entries: Vec<PersistedSubredditSemanticEmbedding>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubredditSemanticBackfillCounters {
+	pub total_candidates: usize,
+	pub embedded: usize,
+	pub already_current: usize,
+	pub metadata_refresh_attempted: usize,
+	pub metadata_refresh_skipped: usize,
+	pub refreshed_metadata: usize,
+	pub public_fallback_metadata: usize,
+	pub name_only_metadata: usize,
+	pub missing_metadata: usize,
+	pub failed: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubredditSemanticBackfillStatus {
+	pub state: String,
+	pub model: String,
+	pub started_at_unix: u64,
+	pub finished_at_unix: Option<u64>,
+	pub counters: SubredditSemanticBackfillCounters,
+	pub dry_run: bool,
+	pub force: bool,
+	pub limit: Option<usize>,
+	pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubredditSemanticDatabaseStatus {
+	pub model: String,
+	pub sidecar_path: String,
+	pub sidecar_exists: bool,
+	pub sidecar_size_bytes: Option<u64>,
+	pub sidecar_modified_unix: Option<u64>,
+	pub sidecar_modified_age_secs: Option<u64>,
+	pub sidecar_saved_at_unix: Option<u64>,
+	pub sidecar_entry_count: usize,
+	pub loaded_entry_count: usize,
+	pub active_model_entry_count: usize,
+	pub other_model_entry_count: usize,
+	pub embedding_dimensions: Option<usize>,
+	pub oldest_embedding_at_unix: Option<u64>,
+	pub newest_embedding_at_unix: Option<u64>,
+	pub refresh_error: Option<String>,
+	pub sidecar_read_error: Option<String>,
+	pub last_run: Option<SubredditSemanticBackfillStatus>,
+	pub last_run_error: Option<String>,
 }
 
 pub fn embedding_model() -> String {
@@ -198,6 +248,14 @@ fn persisted_embeddings_lock_path() -> PathBuf {
 	Path::new(&crate::cache_persistence::cache_dir()).join(SUBREDDIT_SEMANTIC_SIDECAR_LOCK_FILE_NAME)
 }
 
+pub fn backfill_status_path() -> PathBuf {
+	Path::new(&crate::cache_persistence::cache_dir()).join(SUBREDDIT_SEMANTIC_BACKFILL_STATUS_FILE_NAME)
+}
+
+fn system_time_to_unix(time: SystemTime) -> Option<u64> {
+	time.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+}
+
 pub(crate) fn snapshot_persisted_embeddings(_now_unix: u64) -> Vec<PersistedSubredditSemanticEmbedding> {
 	let Ok(cache) = SUBREDDIT_SEMANTIC_CACHE.lock() else {
 		return Vec::new();
@@ -238,6 +296,104 @@ fn read_persisted_embeddings_file(path: &Path) -> Result<Option<PersistedSubredd
 		return Err(format!("unsupported semantic embeddings sidecar version {}", file.version));
 	}
 	Ok(Some(file))
+}
+
+fn read_backfill_status_file(path: &Path) -> Result<Option<SubredditSemanticBackfillStatus>, String> {
+	let bytes = match fs::read(path) {
+		Ok(bytes) => bytes,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.to_string()),
+	};
+	serde_json::from_slice(&bytes).map(Some).map_err(|error| error.to_string())
+}
+
+pub fn read_backfill_status() -> Result<Option<SubredditSemanticBackfillStatus>, String> {
+	read_backfill_status_file(&backfill_status_path())
+}
+
+pub fn write_backfill_status(status: &SubredditSemanticBackfillStatus) -> Result<(), String> {
+	let final_path = backfill_status_path();
+	if let Some(parent) = final_path.parent() {
+		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+	}
+
+	let bytes = serde_json::to_vec_pretty(status).map_err(|error| error.to_string())?;
+	let temp_path = final_path.with_extension(format!("json.tmp.{}", std::process::id()));
+	let mut temp_file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	temp_file.write_all(&bytes).map_err(|error| error.to_string())?;
+	temp_file.sync_all().map_err(|error| error.to_string())?;
+	drop(temp_file);
+	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())
+}
+
+pub fn embedding_database_status() -> SubredditSemanticDatabaseStatus {
+	let model = embedding_model();
+	let refresh_error = refresh_persisted_embeddings_sidecar().err();
+	let now_unix = crate::cache_persistence::unix_now();
+	let sidecar_path = persisted_embeddings_sidecar_path();
+	let sidecar_metadata = fs::metadata(&sidecar_path).ok();
+	let sidecar_modified_unix = sidecar_metadata.as_ref().and_then(|metadata| metadata.modified().ok()).and_then(system_time_to_unix);
+	let sidecar_modified_age_secs = sidecar_modified_unix.map(|modified_at| now_unix.saturating_sub(modified_at));
+	let (sidecar_saved_at_unix, sidecar_entry_count, sidecar_read_error) = match read_persisted_embeddings_file(&sidecar_path) {
+		Ok(Some(file)) => (Some(file.saved_at_unix), file.entries.len(), None),
+		Ok(None) => (None, 0, None),
+		Err(error) => (None, 0, Some(error)),
+	};
+
+	let entries = snapshot_persisted_embeddings(now_unix);
+	let mut active_model_entry_count = 0usize;
+	let mut other_model_entry_count = 0usize;
+	let mut embedding_dimensions = None;
+	let mut oldest_embedding_at_unix = None;
+	let mut newest_embedding_at_unix = None;
+	for entry in &entries {
+		if entry.embedding.is_empty() {
+			continue;
+		}
+		if entry.model == model {
+			active_model_entry_count += 1;
+			if embedding_dimensions.is_none() {
+				embedding_dimensions = Some(entry.embedding.len());
+			}
+			oldest_embedding_at_unix = Some(
+				oldest_embedding_at_unix
+					.map(|oldest: u64| oldest.min(entry.embedded_at_unix))
+					.unwrap_or(entry.embedded_at_unix),
+			);
+			newest_embedding_at_unix = Some(
+				newest_embedding_at_unix
+					.map(|newest: u64| newest.max(entry.embedded_at_unix))
+					.unwrap_or(entry.embedded_at_unix),
+			);
+		} else {
+			other_model_entry_count += 1;
+		}
+	}
+	let (last_run, last_run_error) = match read_backfill_status() {
+		Ok(status) => (status, None),
+		Err(error) => (None, Some(error)),
+	};
+
+	SubredditSemanticDatabaseStatus {
+		model,
+		sidecar_path: sidecar_path.display().to_string(),
+		sidecar_exists: sidecar_metadata.is_some(),
+		sidecar_size_bytes: sidecar_metadata.as_ref().map(|metadata| metadata.len()),
+		sidecar_modified_unix,
+		sidecar_modified_age_secs,
+		sidecar_saved_at_unix,
+		sidecar_entry_count,
+		loaded_entry_count: entries.len(),
+		active_model_entry_count,
+		other_model_entry_count,
+		embedding_dimensions,
+		oldest_embedding_at_unix,
+		newest_embedding_at_unix,
+		refresh_error,
+		sidecar_read_error,
+		last_run,
+		last_run_error,
+	}
 }
 
 pub(crate) fn load_persisted_embeddings_sidecar() -> Result<(), String> {
@@ -386,6 +542,11 @@ mod tests {
 		path: PathBuf,
 	}
 
+	struct EnvVarGuard {
+		key: &'static str,
+		previous: Option<OsString>,
+	}
+
 	impl CacheDirGuard {
 		fn new(label: &str) -> Self {
 			let previous = std::env::var_os("REDLIB_CACHE_DIR");
@@ -394,6 +555,14 @@ mod tests {
 			std::fs::create_dir_all(&path).unwrap();
 			std::env::set_var("REDLIB_CACHE_DIR", &path);
 			Self { previous, path }
+		}
+	}
+
+	impl EnvVarGuard {
+		fn set(key: &'static str, value: &str) -> Self {
+			let previous = std::env::var_os(key);
+			std::env::set_var(key, value);
+			Self { key, previous }
 		}
 	}
 
@@ -406,6 +575,16 @@ mod tests {
 			}
 			let _ = std::fs::remove_dir_all(&self.path);
 			clear_test_cache();
+		}
+	}
+
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			if let Some(previous) = &self.previous {
+				std::env::set_var(self.key, previous);
+			} else {
+				std::env::remove_var(self.key);
+			}
 		}
 	}
 
@@ -472,5 +651,47 @@ mod tests {
 		assert!(refresh_persisted_embeddings_sidecar().unwrap());
 		assert!(embedding_for_subreddit_model("rust", "test-model").is_some());
 		assert!(embedding_for_subreddit_model("baking", "test-model").is_some());
+	}
+
+	#[test]
+	fn database_status_reports_sidecar_and_backfill_status() {
+		let _lock = TEST_ENV_LOCK.lock().unwrap();
+		let _guard = CacheDirGuard::new("status");
+		let _model_guard = EnvVarGuard::set("REDLIB_SUBREDDIT_SEMANTIC_MODEL", "test-model");
+		clear_test_cache();
+
+		store_embedding("Rust", "test-model", "rust-hash", vec![1.0, 0.0], 10).unwrap();
+		store_embedding("Baking", "other-model", "baking-hash", vec![0.0, 1.0], 20).unwrap();
+		write_persisted_embeddings_sidecar_now().unwrap();
+		write_backfill_status(&SubredditSemanticBackfillStatus {
+			state: "completed".to_string(),
+			model: "test-model".to_string(),
+			started_at_unix: 100,
+			finished_at_unix: Some(120),
+			counters: SubredditSemanticBackfillCounters {
+				total_candidates: 3,
+				embedded: 1,
+				already_current: 2,
+				..SubredditSemanticBackfillCounters::default()
+			},
+			dry_run: false,
+			force: false,
+			limit: Some(3),
+			error: None,
+		})
+		.unwrap();
+		clear_test_cache();
+
+		let status = embedding_database_status();
+		assert!(status.sidecar_exists);
+		assert_eq!(status.model, "test-model");
+		assert_eq!(status.sidecar_entry_count, 2);
+		assert_eq!(status.loaded_entry_count, 2);
+		assert_eq!(status.active_model_entry_count, 1);
+		assert_eq!(status.other_model_entry_count, 1);
+		assert_eq!(status.embedding_dimensions, Some(2));
+		assert_eq!(status.oldest_embedding_at_unix, Some(10));
+		assert_eq!(status.newest_embedding_at_unix, Some(10));
+		assert_eq!(status.last_run.unwrap().counters.embedded, 1);
 	}
 }

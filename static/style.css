@@ -3950,6 +3950,22 @@ th {
     margin-top: 12px;
 }
 
+.cache_status_page h2 {
+    margin: 0 0 10px;
+    font-size: 1.25rem;
+}
+
+.cache_status_metric_grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px 16px;
+    margin-bottom: 10px;
+}
+
+.cache_status_metric_grid p {
+    margin: 0;
+}
+
 .cache_status_page .sortable_table {
     min-width: 100%;
     width: max-content;
