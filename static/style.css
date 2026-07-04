@@ -3258,10 +3258,65 @@ input[type="submit"] {
     color: var(--accent);
 }
 
+.suggested_profiles_semantic_mix {
+    align-items: center;
+    background: var(--post);
+    border: var(--panel-border);
+    border-radius: 5px;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: auto minmax(120px, 220px) auto auto;
+    max-width: 100%;
+    padding: 8px 10px;
+}
+
+.suggested_profiles_semantic_mix label {
+    color: var(--visited);
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.suggested_profiles_semantic_mix input[type="range"] {
+    min-width: 0;
+    width: 100%;
+}
+
+.suggested_profiles_semantic_mix output {
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.suggested_profiles_semantic_mix button {
+    padding: 7px 10px;
+}
+
+.suggested_profiles_mix_steps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    grid-column: 1 / -1;
+}
+
+.suggested_profiles_mix_steps a {
+    background: var(--outside);
+    border-radius: 5px;
+    color: var(--visited);
+    font-size: 12px;
+    font-weight: 700;
+    padding: 4px 8px;
+    text-decoration: none;
+}
+
+.suggested_profiles_mix_steps a:hover {
+    color: var(--text);
+}
+
 .suggested_profiles_stats {
     display: grid;
     gap: 12px;
-    grid-template-columns: repeat(4, minmax(70px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(70px, 1fr));
     width: 100%;
 }
 

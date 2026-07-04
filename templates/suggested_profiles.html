@@ -27,7 +27,28 @@
 			<span>Scoring</span>
 			<a href="{{ self.overlap_mode_path() }}" class="{% if self.is_overlap_mode() %}active{% endif %}"{% if self.is_overlap_mode() %} aria-current="page"{% endif %}>Overlap</a>
 			<a href="{{ self.vector_mode_path() }}" class="{% if self.is_vector_mode() %}active{% endif %}"{% if self.is_vector_mode() %} aria-current="page"{% endif %}>Vector</a>
+			<a href="{{ self.semantic_mode_path() }}" class="{% if self.is_semantic_mode() %}active{% endif %}"{% if self.is_semantic_mode() %} aria-current="page"{% endif %}>Semantic</a>
 		</nav>
+		{% if self.is_semantic_mode() %}
+		<form class="suggested_profiles_semantic_mix" action="/suggested-profiles" method="get">
+			<input type="hidden" name="mode" value="semantic">
+			{% let center_id = self.current_vector_center_id() %}
+			{% if !center_id.is_empty() %}
+			<input type="hidden" name="center" value="{{ center_id }}">
+			{% endif %}
+			<label for="semantic_mix">Semantic mix</label>
+			<input id="semantic_mix" name="mix" type="range" min="0" max="100" step="5" value="{{ semantic_mix_percent }}">
+			<output for="semantic_mix">{{ semantic_mix_percent }}%</output>
+			<button type="submit">Apply</button>
+			<div class="suggested_profiles_mix_steps" aria-label="Semantic mix presets">
+				<a href="{{ self.semantic_mix_path(0) }}">0</a>
+				<a href="{{ self.semantic_mix_path(25) }}">25</a>
+				<a href="{{ self.semantic_mix_path(50) }}">50</a>
+				<a href="{{ self.semantic_mix_path(75) }}">75</a>
+				<a href="{{ self.semantic_mix_path(100) }}">100</a>
+			</div>
+		</form>
+		{% endif %}
 		<div class="suggested_profiles_stats" aria-label="Suggestion source summary">
 			<div>
 				<strong>{{ report.followed_profile_count }}</strong>
@@ -45,10 +66,16 @@
 				<strong>{{ report.cached_profile_count }}</strong>
 				<span>cached authors available</span>
 			</div>
+			{% if self.is_semantic_mode() %}
+			<div>
+				<strong>{{ report.semantic_embedding_count }}</strong>
+				<span>subreddit embeddings</span>
+			</div>
+			{% endif %}
 		</div>
 	</header>
 
-	{% if self.is_vector_mode() && (report.vector_cluster_centers.len() > 0 || report.vector_subreddit_centers.len() > 0) %}
+	{% if (self.is_vector_mode() || self.is_semantic_mode()) && (report.vector_cluster_centers.len() > 0 || report.vector_subreddit_centers.len() > 0) %}
 	<section class="suggested_profiles_center panel" aria-label="Vector center">
 		<div class="suggested_profiles_center_summary">
 			<span>Vector center</span>
@@ -91,7 +118,7 @@
 	{% if report.followed_subreddits.len() > 0 %}
 	<section class="suggested_profiles_signal">
 		<span>Your followed profiles post most in</span>
-		{% if self.is_vector_mode() && report.taste_centroid_count > 1 %}
+		{% if (self.is_vector_mode() || self.is_semantic_mode()) && report.taste_centroid_count > 1 %}
 			<span class="suggested_profiles_centroid_count">{{ report.taste_centroid_count }} taste centroids</span>
 		{% endif %}
 		{% for subreddit in report.followed_subreddits %}
@@ -134,6 +161,12 @@
 							Near {{ active_center }}: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} centered-vector subreddits.
 							{% else %}
 							Vector similarity: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts overlap across {{ suggestion.overlap_subreddits.len() }} taste-vector subreddits.
+							{% endif %}
+							{% else if self.is_semantic_mode() %}
+							{% if let Some(active_center) = report.active_vector_center_label %}
+							{{ report.semantic_mix_percent }}% semantic near {{ active_center }}: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts represented across {{ suggestion.overlap_subreddits.len() }} signal subreddits.
+							{% else %}
+							{{ report.semantic_mix_percent }}% semantic blend: {{ suggestion.matched_posts }} of {{ suggestion.cached_posts }} cached posts represented across {{ suggestion.overlap_subreddits.len() }} signal subreddits.
 							{% endif %}
 							{% else %}
 							{% if suggestion.overlap_subreddits.len() == 1 %}

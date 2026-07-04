@@ -1,0 +1,275 @@
+use clap::Parser;
+use hyper::{body::to_bytes, header, Body, Client, Method, Request, Uri};
+use redlib::{cache_persistence, materialized_catalog, subreddit, subreddit_semantics, utils};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
+
+#[derive(Debug, Parser)]
+#[command(about = "Backfill subreddit semantic embeddings into the Redlib cache snapshot using local Ollama.")]
+struct Args {
+	#[arg(long, env = "REDLIB_CACHE_DIR")]
+	cache_dir: Option<String>,
+
+	#[arg(long, env = "REDLIB_SUBREDDIT_SEMANTIC_MODEL", default_value = subreddit_semantics::DEFAULT_SUBREDDIT_SEMANTIC_MODEL)]
+	model: String,
+
+	#[arg(long, env = "OLLAMA_BASE_URL", default_value = "http://127.0.0.1:11434")]
+	ollama_url: String,
+
+	#[arg(long)]
+	limit: Option<usize>,
+
+	#[arg(long = "subreddit")]
+	subreddits: Vec<String>,
+
+	#[arg(long)]
+	refresh_missing_metadata: bool,
+
+	#[arg(long)]
+	name_only_if_missing_metadata: bool,
+
+	#[arg(long)]
+	force: bool,
+
+	#[arg(long)]
+	dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaEmbeddingsResponse {
+	embedding: Option<Vec<f32>>,
+	embeddings: Option<Vec<Vec<f32>>>,
+}
+
+fn normalize_ollama_url(value: &str) -> String {
+	value.trim().trim_end_matches('/').to_string()
+}
+
+fn body_snippet(bytes: &[u8]) -> String {
+	const MAX_ERROR_BODY_CHARS: usize = 180;
+	let text = String::from_utf8_lossy(bytes);
+	let mut snippet = text.chars().take(MAX_ERROR_BODY_CHARS).collect::<String>();
+	if text.chars().nth(MAX_ERROR_BODY_CHARS).is_some() {
+		snippet.push_str("...");
+	}
+	snippet
+}
+
+async fn ollama_embedding(client: &Client<hyper::client::HttpConnector>, base_url: &str, model: &str, prompt: &str) -> Result<Vec<f32>, String> {
+	let uri = format!("{}/api/embeddings", normalize_ollama_url(base_url))
+		.parse::<Uri>()
+		.map_err(|error| error.to_string())?;
+	let body = json!({
+		"model": model,
+		"prompt": prompt,
+	})
+	.to_string();
+	let request = Request::builder()
+		.method(Method::POST)
+		.uri(uri)
+		.header("content-type", "application/json")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())?;
+	let response = client.request(request).await.map_err(|error| error.to_string())?;
+	let status = response.status();
+	let bytes = to_bytes(response.into_body()).await.map_err(|error| error.to_string())?;
+	if !status.is_success() {
+		return Err(format!("Ollama returned HTTP {status}: {}", body_snippet(&bytes)));
+	}
+	let parsed: OllamaEmbeddingsResponse = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+	parsed
+		.embedding
+		.or_else(|| parsed.embeddings.and_then(|mut embeddings| embeddings.drain(..).next()))
+		.filter(|embedding| !embedding.is_empty())
+		.ok_or_else(|| "Ollama response did not contain an embedding".to_string())
+}
+
+async fn public_subreddit_metadata_from_base(name: &str, base_url: &str) -> Result<utils::Subreddit, String> {
+	let uri = format!("{}/r/{name}/about.json?raw_json=1", base_url.trim_end_matches('/'))
+		.parse::<Uri>()
+		.map_err(|error| error.to_string())?;
+	let request = Request::builder()
+		.method(Method::GET)
+		.uri(uri)
+		.header(header::ACCEPT, "application/json")
+		.header(header::USER_AGENT, "redlib-semantic-backfill/0.1")
+		.body(Body::empty())
+		.map_err(|error| error.to_string())?;
+	let response = redlib::client::CLIENT.request(request).await.map_err(|error| error.to_string())?;
+	let status = response.status();
+	let bytes = to_bytes(response.into_body()).await.map_err(|error| error.to_string())?;
+	if !status.is_success() {
+		return Err(format!("public Reddit metadata returned HTTP {status}: {}", body_snippet(&bytes)));
+	}
+	let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+	if value["data"].is_null() {
+		return Err("public Reddit metadata response did not contain data".to_string());
+	}
+
+	let members = value["data"]["subscribers"].as_u64().unwrap_or_default() as i64;
+	let active = value["data"]["accounts_active"].as_u64().unwrap_or_default() as i64;
+	let community_icon = value["data"]["community_icon"].as_str().unwrap_or_default();
+	let icon = if community_icon.is_empty() {
+		utils::val(&value, "icon_img")
+	} else {
+		community_icon.to_string()
+	};
+	let info = utils::rewrite_urls(&utils::val(&value, "description_html"));
+	let mut subreddit = utils::Subreddit {
+		name: utils::val(&value, "display_name"),
+		title: utils::val(&value, "title"),
+		description: utils::val(&value, "public_description"),
+		has_sidebar: !info.trim().is_empty(),
+		info,
+		icon: utils::format_url(&icon),
+		members: utils::format_num(members),
+		active: utils::format_num(active),
+		wiki: value["data"]["wiki_enabled"].as_bool().unwrap_or_default(),
+		nsfw: value["data"]["over18"].as_bool().unwrap_or_default(),
+	};
+	if subreddit.name.trim().is_empty() {
+		subreddit.name = name.to_string();
+	}
+	subreddit::cache_subreddit_metadata(&subreddit);
+	Ok(subreddit)
+}
+
+async fn public_subreddit_metadata(name: &str) -> Result<utils::Subreddit, String> {
+	let mut errors = Vec::new();
+	for base_url in ["https://api.reddit.com", "https://www.reddit.com", "https://old.reddit.com"] {
+		match public_subreddit_metadata_from_base(name, base_url).await {
+			Ok(metadata) => return Ok(metadata),
+			Err(error) => errors.push(format!("{base_url}: {error}")),
+		}
+	}
+	Err(errors.join("; "))
+}
+
+async fn refresh_subreddit_metadata_for_backfill(name: &str) -> Result<(utils::Subreddit, bool), String> {
+	match subreddit::refresh_subreddit_metadata(name, false).await {
+		Ok(metadata) => Ok((metadata, false)),
+		Err(primary_error) => match public_subreddit_metadata(name).await {
+			Ok(metadata) => Ok((metadata, true)),
+			Err(fallback_error) => Err(format!("{primary_error}; public fallback failed: {fallback_error}")),
+		},
+	}
+}
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+	let args = Args::parse();
+	if let Some(cache_dir) = &args.cache_dir {
+		std::env::set_var("REDLIB_CACHE_DIR", cache_dir);
+	}
+	std::env::set_var("REDLIB_SUBREDDIT_SEMANTIC_MODEL", &args.model);
+
+	cache_persistence::init();
+
+	let mut names = materialized_catalog::cached_catalog_subreddit_names().into_iter().collect::<BTreeSet<_>>();
+	let cached_metadata = subreddit::cached_subreddit_metadata_entries();
+	for metadata in &cached_metadata {
+		let name = subreddit_semantics::normalize_subreddit_name(&metadata.name);
+		if !name.is_empty() {
+			names.insert(name);
+		}
+	}
+	for subreddit in &args.subreddits {
+		let name = subreddit_semantics::normalize_subreddit_name(subreddit);
+		if !name.is_empty() {
+			names.insert(name);
+		}
+	}
+	let metadata_by_name = cached_metadata
+		.into_iter()
+		.map(|metadata| (subreddit_semantics::normalize_subreddit_name(&metadata.name), metadata))
+		.collect::<HashMap<_, _>>();
+
+	let total_candidates = names.len();
+	let mut refreshed_metadata = 0usize;
+	let mut public_fallback_metadata = 0usize;
+	let mut name_only_metadata = 0usize;
+	let mut missing_metadata = 0usize;
+	let mut already_current = 0usize;
+	let mut embedded = 0usize;
+	let mut failed = 0usize;
+	let client = Client::new();
+
+	for name in names.into_iter().take(args.limit.unwrap_or(usize::MAX)) {
+		let metadata = match metadata_by_name.get(&name).cloned().or_else(|| subreddit::cached_subreddit_metadata_for_name(&name)) {
+			Some(metadata) => metadata,
+			None if args.refresh_missing_metadata => match refresh_subreddit_metadata_for_backfill(&name).await {
+				Ok((metadata, used_public_fallback)) => {
+					refreshed_metadata += 1;
+					if used_public_fallback {
+						public_fallback_metadata += 1;
+					}
+					metadata
+				}
+				Err(error) => {
+					missing_metadata += 1;
+					eprintln!("metadata failed r/{name}: {error}");
+					if args.name_only_if_missing_metadata {
+						name_only_metadata += 1;
+						utils::Subreddit {
+							name: name.clone(),
+							..utils::Subreddit::default()
+						}
+					} else {
+						continue;
+					}
+				}
+			},
+			None => {
+				if args.name_only_if_missing_metadata {
+					name_only_metadata += 1;
+					utils::Subreddit {
+						name: name.clone(),
+						..utils::Subreddit::default()
+					}
+				} else {
+					missing_metadata += 1;
+					continue;
+				}
+			}
+		};
+
+		if !args.force && subreddit_semantics::has_current_embedding(&metadata, &args.model) {
+			already_current += 1;
+			continue;
+		}
+
+		let text = subreddit_semantics::semantic_text_for_subreddit(&metadata);
+		if text.is_empty() {
+			missing_metadata += 1;
+			continue;
+		}
+		let text_hash = subreddit_semantics::semantic_text_hash(&text);
+		if args.dry_run {
+			println!("would embed r/{name} chars={} hash={}", text.chars().count(), text_hash);
+			continue;
+		}
+
+		match ollama_embedding(&client, &args.ollama_url, &args.model, &text).await {
+			Ok(embedding) => {
+				subreddit_semantics::store_embedding(&name, &args.model, &text_hash, embedding, cache_persistence::unix_now())?;
+				embedded += 1;
+				println!("embedded r/{name}");
+			}
+			Err(error) => {
+				failed += 1;
+				eprintln!("embedding failed r/{name}: {error}");
+			}
+		}
+	}
+
+	if !args.dry_run {
+		cache_persistence::write_snapshot_now()?;
+	}
+
+	println!(
+		"subreddit_semantic_backfill: candidates={total_candidates} embedded={embedded} already_current={already_current} refreshed_metadata={refreshed_metadata} public_fallback_metadata={public_fallback_metadata} name_only_metadata={name_only_metadata} missing_metadata={missing_metadata} failed={failed} cache={}",
+		cache_persistence::snapshot_path().display()
+	);
+	Ok(())
+}

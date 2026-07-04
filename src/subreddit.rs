@@ -375,6 +375,23 @@ fn cached_subreddit_metadata(sub: &str) -> Option<Subreddit> {
 	Some(entry.subreddit.clone())
 }
 
+pub fn cached_subreddit_metadata_for_name(sub: &str) -> Option<Subreddit> {
+	cached_subreddit_metadata(sub)
+}
+
+pub fn cached_subreddit_metadata_entries() -> Vec<Subreddit> {
+	let Ok(cache) = SUBREDDIT_METADATA_CACHE.lock() else {
+		return Vec::new();
+	};
+	let mut entries = cache
+		.values()
+		.map(|entry| entry.subreddit.clone())
+		.filter(|subreddit| !subreddit.name.is_empty())
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()).then_with(|| left.name.cmp(&right.name)));
+	entries
+}
+
 fn cached_subreddit_nsfw_status(sub: &str) -> Option<bool> {
 	let mut cache = SUBREDDIT_NSFW_CACHE.lock().ok()?;
 	let key = sub.to_lowercase();
@@ -425,7 +442,7 @@ pub(crate) fn remove_subreddit_metadata_cache(sub: &str) {
 	crate::cache_persistence::mark_dirty();
 }
 
-pub(crate) fn cache_subreddit_metadata(subreddit: &Subreddit) {
+pub fn cache_subreddit_metadata(subreddit: &Subreddit) {
 	store_subreddit_metadata(subreddit);
 }
 
@@ -5194,7 +5211,7 @@ pub async fn sidebar_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 // }
 
 // SUBREDDIT
-pub(crate) async fn refresh_subreddit_metadata(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
+pub async fn refresh_subreddit_metadata(sub: &str, quarantined: bool) -> Result<Subreddit, String> {
 	// Build the Reddit JSON API url
 	let path: String = format!("/r/{sub}/about.json?raw_json=1");
 

@@ -1,4 +1,4 @@
-use crate::materialized_catalog::{SuggestedProfileScoringMode, SuggestedProfileVectorCenterRequest, SuggestedProfilesReport};
+use crate::materialized_catalog::{SuggestedProfileScoringMode, SuggestedProfileVectorCenterRequest, SuggestedProfilesReport, SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT};
 use crate::utils::{get_filters, param, read_sharded_cookie, template, Preferences};
 use askama::Template;
 use hyper::{Body, Request, Response};
@@ -19,6 +19,7 @@ struct SuggestedProfilesTemplate {
 	report: SuggestedProfilesReport,
 	scoring_mode: SuggestedProfileScoringMode,
 	vector_center: Option<SuggestedProfileVectorCenterRequest>,
+	semantic_mix_percent: u8,
 	suggestion_limit: usize,
 	next_suggestion_limit: usize,
 	has_more_suggestions: bool,
@@ -41,24 +42,58 @@ impl SuggestedProfilesTemplate {
 
 	fn load_more_path(&self) -> String {
 		let center_id = self.vector_center.as_ref().map(SuggestedProfileVectorCenterRequest::id);
-		page_path_for_limit_center_id(self.next_suggestion_limit, self.scoring_mode, center_id.as_deref())
+		page_path_for_limit_center_id(self.next_suggestion_limit, self.scoring_mode, center_id.as_deref(), self.semantic_mix_percent)
 	}
 
 	fn overlap_mode_path(&self) -> String {
-		page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Overlap, None)
+		page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Overlap, None, self.semantic_mix_percent)
 	}
 
 	fn vector_mode_path(&self) -> String {
 		let center_id = self.vector_center.as_ref().map(SuggestedProfileVectorCenterRequest::id);
-		page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Vector, center_id.as_deref())
+		page_path_for_limit_center_id(
+			SUGGESTED_PROFILE_DEFAULT_LIMIT,
+			SuggestedProfileScoringMode::Vector,
+			center_id.as_deref(),
+			self.semantic_mix_percent,
+		)
+	}
+
+	fn semantic_mode_path(&self) -> String {
+		let center_id = self.vector_center.as_ref().map(SuggestedProfileVectorCenterRequest::id);
+		page_path_for_limit_center_id(
+			SUGGESTED_PROFILE_DEFAULT_LIMIT,
+			SuggestedProfileScoringMode::Semantic,
+			center_id.as_deref(),
+			self.semantic_mix_percent,
+		)
 	}
 
 	fn vector_center_path(&self, center_id: &str) -> String {
-		page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Vector, Some(center_id))
+		let mode = if self.is_semantic_mode() {
+			SuggestedProfileScoringMode::Semantic
+		} else {
+			SuggestedProfileScoringMode::Vector
+		};
+		page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, mode, Some(center_id), self.semantic_mix_percent)
 	}
 
 	fn clear_vector_center_path(&self) -> String {
-		page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Vector, None)
+		page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, self.scoring_mode, None, self.semantic_mix_percent)
+	}
+
+	fn semantic_mix_path(&self, semantic_mix_percent: u8) -> String {
+		let center_id = self.vector_center.as_ref().map(SuggestedProfileVectorCenterRequest::id);
+		page_path_for_limit_center_id(
+			SUGGESTED_PROFILE_DEFAULT_LIMIT,
+			SuggestedProfileScoringMode::Semantic,
+			center_id.as_deref(),
+			semantic_mix_percent,
+		)
+	}
+
+	fn current_vector_center_id(&self) -> String {
+		self.vector_center.as_ref().map(SuggestedProfileVectorCenterRequest::id).unwrap_or_default()
 	}
 
 	fn is_overlap_mode(&self) -> bool {
@@ -67,6 +102,10 @@ impl SuggestedProfilesTemplate {
 
 	fn is_vector_mode(&self) -> bool {
 		self.scoring_mode == SuggestedProfileScoringMode::Vector
+	}
+
+	fn is_semantic_mode(&self) -> bool {
+		self.scoring_mode == SuggestedProfileScoringMode::Semantic
 	}
 
 	fn next_batch_size(&self) -> usize {
@@ -121,8 +160,17 @@ fn requested_scoring_mode(req: &Request<Body>) -> SuggestedProfileScoringMode {
 	let query = format!("?{}", req.uri().query().unwrap_or_default());
 	match param(&query, "mode").as_deref() {
 		Some("vector") => SuggestedProfileScoringMode::Vector,
+		Some("semantic") => SuggestedProfileScoringMode::Semantic,
 		_ => SuggestedProfileScoringMode::Overlap,
 	}
+}
+
+fn requested_semantic_mix_percent(req: &Request<Body>) -> u8 {
+	let query = format!("?{}", req.uri().query().unwrap_or_default());
+	param(&query, "mix")
+		.and_then(|mix| mix.parse::<u8>().ok())
+		.map(|mix| mix.min(100))
+		.unwrap_or(SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT)
 }
 
 fn requested_vector_center(req: &Request<Body>) -> Option<SuggestedProfileVectorCenterRequest> {
@@ -132,14 +180,27 @@ fn requested_vector_center(req: &Request<Body>) -> Option<SuggestedProfileVector
 
 #[cfg(test)]
 fn page_path_for_limit(limit: usize, mode: SuggestedProfileScoringMode) -> String {
-	page_path_for_limit_center_id(limit, mode, None)
+	page_path_for_limit_center_id(limit, mode, None, SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT)
 }
 
-fn page_path_for_limit_center_id(limit: usize, mode: SuggestedProfileScoringMode, center_id: Option<&str>) -> String {
-	let effective_mode = if center_id.is_some() { SuggestedProfileScoringMode::Vector } else { mode };
+fn page_path_for_limit_center_id(limit: usize, mode: SuggestedProfileScoringMode, center_id: Option<&str>, semantic_mix_percent: u8) -> String {
+	let effective_mode = if center_id.is_some() && mode == SuggestedProfileScoringMode::Overlap {
+		SuggestedProfileScoringMode::Vector
+	} else {
+		mode
+	};
 	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-	if effective_mode == SuggestedProfileScoringMode::Vector {
-		serializer.append_pair("mode", "vector");
+	match effective_mode {
+		SuggestedProfileScoringMode::Overlap => {}
+		SuggestedProfileScoringMode::Vector => {
+			serializer.append_pair("mode", "vector");
+		}
+		SuggestedProfileScoringMode::Semantic => {
+			serializer.append_pair("mode", "semantic");
+			if semantic_mix_percent != SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT {
+				serializer.append_pair("mix", &semantic_mix_percent.min(100).to_string());
+			}
+		}
 	}
 	if let Some(center_id) = center_id {
 		serializer.append_pair("center", center_id);
@@ -155,8 +216,8 @@ fn page_path_for_limit_center_id(limit: usize, mode: SuggestedProfileScoringMode
 	}
 }
 
-fn redirect_url_for_limit(limit: usize, mode: SuggestedProfileScoringMode, center_id: Option<&str>) -> String {
-	let path = page_path_for_limit_center_id(limit, mode, center_id);
+fn redirect_url_for_limit(limit: usize, mode: SuggestedProfileScoringMode, center_id: Option<&str>, semantic_mix_percent: u8) -> String {
+	let path = page_path_for_limit_center_id(limit, mode, center_id, semantic_mix_percent);
 	url::form_urlencoded::byte_serialize(path.trim_start_matches('/').as_bytes()).collect()
 }
 
@@ -169,12 +230,16 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 	excluded.extend(ignored_profiles(&req, crate::cache_persistence::unix_now()));
 	let suggestion_limit = requested_suggestion_limit(&req);
 	let requested_center = requested_vector_center(&req);
-	let scoring_mode = if requested_center.is_some() {
+	let requested_mode = requested_scoring_mode(&req);
+	let scoring_mode = if requested_center.is_some() && requested_mode == SuggestedProfileScoringMode::Overlap {
 		SuggestedProfileScoringMode::Vector
 	} else {
-		requested_scoring_mode(&req)
+		requested_mode
 	};
-	let vector_center = (scoring_mode == SuggestedProfileScoringMode::Vector).then_some(requested_center).flatten();
+	let semantic_mix_percent = requested_semantic_mix_percent(&req);
+	let vector_center = matches!(scoring_mode, SuggestedProfileScoringMode::Vector | SuggestedProfileScoringMode::Semantic)
+		.then_some(requested_center)
+		.flatten();
 	let vector_center_id = vector_center.as_ref().map(SuggestedProfileVectorCenterRequest::id);
 	let fetch_limit = if suggestion_limit < SUGGESTED_PROFILE_MAX_LIMIT {
 		suggestion_limit + 1
@@ -182,7 +247,7 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 		suggestion_limit
 	};
 	let author_feedback = prefs.post_feedback_by_model_and_author();
-	let mut report = crate::materialized_catalog::suggested_profiles_with_mode_center_and_feedback(
+	let mut report = crate::materialized_catalog::suggested_profiles_with_mode_center_mix_and_feedback(
 		&followed,
 		&followed_subreddits,
 		&excluded,
@@ -190,6 +255,7 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 		fetch_limit,
 		scoring_mode,
 		vector_center.as_ref(),
+		semantic_mix_percent,
 	);
 	let has_more_suggestions = report.suggestions.len() > suggestion_limit && suggestion_limit < SUGGESTED_PROFILE_MAX_LIMIT;
 	report.suggestions.truncate(suggestion_limit);
@@ -197,10 +263,11 @@ pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(template(&SuggestedProfilesTemplate {
 		prefs,
 		url: "/suggested-profiles".to_string(),
-		redirect_url: redirect_url_for_limit(suggestion_limit, scoring_mode, vector_center_id.as_deref()),
+		redirect_url: redirect_url_for_limit(suggestion_limit, scoring_mode, vector_center_id.as_deref(), semantic_mix_percent),
 		report,
 		scoring_mode,
 		vector_center,
+		semantic_mix_percent,
 		suggestion_limit,
 		next_suggestion_limit: (suggestion_limit + SUGGESTED_PROFILE_INCREMENT).min(SUGGESTED_PROFILE_MAX_LIMIT),
 		has_more_suggestions,
@@ -297,16 +364,38 @@ mod tests {
 	#[test]
 	fn page_paths_preserve_vector_center_for_load_more() {
 		assert_eq!(
-			page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Vector, Some("subreddit:rust")),
+			page_path_for_limit_center_id(
+				SUGGESTED_PROFILE_DEFAULT_LIMIT,
+				SuggestedProfileScoringMode::Vector,
+				Some("subreddit:rust"),
+				SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT
+			),
 			"/suggested-profiles?mode=vector&center=subreddit%3Arust"
 		);
 		assert_eq!(
-			page_path_for_limit_center_id(80, SuggestedProfileScoringMode::Vector, Some("cluster:2")),
+			page_path_for_limit_center_id(80, SuggestedProfileScoringMode::Vector, Some("cluster:2"), SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT),
 			"/suggested-profiles?mode=vector&center=cluster%3A2&limit=80"
 		);
 		assert_eq!(
-			page_path_for_limit_center_id(80, SuggestedProfileScoringMode::Overlap, Some("subreddit:rust")),
+			page_path_for_limit_center_id(
+				80,
+				SuggestedProfileScoringMode::Overlap,
+				Some("subreddit:rust"),
+				SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT
+			),
 			"/suggested-profiles?mode=vector&center=subreddit%3Arust&limit=80"
+		);
+	}
+
+	#[test]
+	fn page_paths_preserve_semantic_mix() {
+		assert_eq!(
+			page_path_for_limit_center_id(SUGGESTED_PROFILE_DEFAULT_LIMIT, SuggestedProfileScoringMode::Semantic, None, 75),
+			"/suggested-profiles?mode=semantic&mix=75"
+		);
+		assert_eq!(
+			page_path_for_limit_center_id(80, SuggestedProfileScoringMode::Semantic, Some("cluster:2"), 25),
+			"/suggested-profiles?mode=semantic&mix=25&center=cluster%3A2&limit=80"
 		);
 	}
 }

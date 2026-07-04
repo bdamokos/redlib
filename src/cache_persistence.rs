@@ -1,5 +1,5 @@
 use crate::config::get_setting;
-use crate::{post_cache, subreddit, utils};
+use crate::{post_cache, subreddit, subreddit_semantics, utils};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,8 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-const SNAPSHOT_VERSION: u8 = 5;
+const SNAPSHOT_VERSION: u8 = 6;
+const LEGACY_SNAPSHOT_VERSION_V5: u8 = 5;
 const LEGACY_SNAPSHOT_VERSION_V4: u8 = 4;
 const LEGACY_SNAPSHOT_VERSION_V3: u8 = 3;
 const LEGACY_SNAPSHOT_VERSION_V2: u8 = 2;
@@ -349,6 +350,21 @@ struct PersistedCacheSnapshot {
 	subreddit_users: Vec<PersistedSubredditUsersEntry>,
 	author_history: Vec<crate::materialized_catalog::PersistedAuthorHistoryEntry>,
 	rejected_author_redgifs_profiles: Vec<crate::materialized_catalog::PersistedRejectedAuthorRedgifsProfileEntry>,
+	subreddit_semantic_embeddings: Vec<crate::subreddit_semantics::PersistedSubredditSemanticEmbedding>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCacheSnapshotV5 {
+	version: u8,
+	saved_at_unix: u64,
+	source_entries: Vec<PersistedSourceCacheEntry>,
+	remembered_subreddits: Vec<PersistedRememberedSubredditEntry>,
+	subreddit_metadata: Vec<PersistedSubredditMetadataEntry>,
+	subreddit_nsfw: Vec<PersistedSubredditNsfwEntry>,
+	subreddit_flairs: Vec<PersistedSubredditFlairsEntry>,
+	subreddit_users: Vec<PersistedSubredditUsersEntry>,
+	author_history: Vec<crate::materialized_catalog::PersistedAuthorHistoryEntry>,
+	rejected_author_redgifs_profiles: Vec<crate::materialized_catalog::PersistedRejectedAuthorRedgifsProfileEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -402,7 +418,7 @@ pub fn cache_dir() -> String {
 	get_setting("REDLIB_CACHE_DIR").unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string())
 }
 
-pub(crate) fn snapshot_path() -> PathBuf {
+pub fn snapshot_path() -> PathBuf {
 	Path::new(&cache_dir()).join(SNAPSHOT_FILE_NAME)
 }
 
@@ -414,7 +430,7 @@ fn source_cache_path(source_cache_key: &str) -> PathBuf {
 	source_cache_dir().join(format!("{}.bin", URL_SAFE_NO_PAD.encode(source_cache_key.as_bytes())))
 }
 
-pub(crate) fn unix_now() -> u64 {
+pub fn unix_now() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0)).as_secs()
 }
 
@@ -600,6 +616,7 @@ fn load_snapshot() -> Result<(), String> {
 	crate::materialized_catalog::restore_persisted_rejected_author_redgifs_profiles(snapshot.rejected_author_redgifs_profiles, snapshot.saved_at_unix, now_unix);
 	crate::materialized_catalog::restore_persisted_author_history(snapshot.author_history, snapshot.saved_at_unix, now_unix);
 	subreddit::restore_persisted_state(snapshot.subreddit_metadata, snapshot.subreddit_nsfw, snapshot.saved_at_unix, now_unix);
+	subreddit_semantics::restore_persisted_embeddings(snapshot.subreddit_semantic_embeddings, snapshot.saved_at_unix, now_unix);
 	utils::restore_persisted_state(snapshot.subreddit_flairs, snapshot.subreddit_users, snapshot.saved_at_unix, now_unix);
 	Ok(())
 }
@@ -619,6 +636,7 @@ fn write_snapshot() -> Result<(), String> {
 		subreddit_users: utils::snapshot_persisted_subreddit_users(now_unix),
 		author_history,
 		rejected_author_redgifs_profiles,
+		subreddit_semantic_embeddings: subreddit_semantics::snapshot_persisted_embeddings(now_unix),
 	};
 
 	let bytes = serialize_snapshot(&snapshot)?;
@@ -636,6 +654,10 @@ fn write_snapshot() -> Result<(), String> {
 	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())
 }
 
+pub fn write_snapshot_now() -> Result<(), String> {
+	write_snapshot()
+}
+
 fn load_catalog_snapshot_or_rebuild() {
 	post_cache::rebuild_materialized_catalog_from_source_cache();
 }
@@ -647,13 +669,27 @@ fn serialize_snapshot(snapshot: &PersistedCacheSnapshot) -> Result<Vec<u8>, Stri
 fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> {
 	let current_error = match bincode::deserialize::<PersistedCacheSnapshot>(bytes) {
 		Ok(snapshot) if snapshot.version == SNAPSHOT_VERSION => return Ok(snapshot),
-		Ok(mut snapshot) if snapshot.version == LEGACY_SNAPSHOT_VERSION_V4 => {
-			snapshot.version = SNAPSHOT_VERSION;
-			return Ok(snapshot);
-		}
 		Ok(snapshot) => format!("unsupported snapshot version {}", snapshot.version),
 		Err(error) => error.to_string(),
 	};
+
+	if let Ok(legacy) = bincode::deserialize::<PersistedCacheSnapshotV5>(bytes) {
+		if legacy.version == LEGACY_SNAPSHOT_VERSION_V5 || legacy.version == LEGACY_SNAPSHOT_VERSION_V4 {
+			return Ok(PersistedCacheSnapshot {
+				version: SNAPSHOT_VERSION,
+				saved_at_unix: legacy.saved_at_unix,
+				source_entries: legacy.source_entries,
+				remembered_subreddits: legacy.remembered_subreddits,
+				subreddit_metadata: legacy.subreddit_metadata,
+				subreddit_nsfw: legacy.subreddit_nsfw,
+				subreddit_flairs: legacy.subreddit_flairs,
+				subreddit_users: legacy.subreddit_users,
+				author_history: legacy.author_history,
+				rejected_author_redgifs_profiles: legacy.rejected_author_redgifs_profiles,
+				subreddit_semantic_embeddings: Vec::new(),
+			});
+		}
+	}
 
 	if let Ok(legacy) = bincode::deserialize::<PersistedCacheSnapshotV4WithoutFeedback>(bytes) {
 		if legacy.version == LEGACY_SNAPSHOT_VERSION_V4 {
@@ -668,6 +704,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				subreddit_users: legacy.subreddit_users,
 				author_history: legacy.author_history,
 				rejected_author_redgifs_profiles: legacy.rejected_author_redgifs_profiles,
+				subreddit_semantic_embeddings: Vec::new(),
 			});
 		}
 	}
@@ -685,6 +722,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				subreddit_users: legacy.subreddit_users,
 				author_history: legacy.author_history,
 				rejected_author_redgifs_profiles: Vec::new(),
+				subreddit_semantic_embeddings: Vec::new(),
 			});
 		}
 	}
@@ -704,6 +742,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 		subreddit_users: legacy.subreddit_users,
 		author_history: Vec::new(),
 		rejected_author_redgifs_profiles: Vec::new(),
+		subreddit_semantic_embeddings: Vec::new(),
 	})
 }
 
@@ -761,6 +800,7 @@ mod tests {
 			subreddit_users: Vec::new(),
 			author_history: Vec::new(),
 			rejected_author_redgifs_profiles: Vec::new(),
+			subreddit_semantic_embeddings: Vec::new(),
 		}
 	}
 
