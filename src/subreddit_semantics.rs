@@ -4,14 +4,25 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 pub const DEFAULT_SUBREDDIT_SEMANTIC_MODEL: &str = "nomic-embed-text";
+const SUBREDDIT_SEMANTIC_SIDECAR_VERSION: u8 = 1;
+const SUBREDDIT_SEMANTIC_SIDECAR_FILE_NAME: &str = "subreddit-semantic-embeddings.v1.bin";
+const SUBREDDIT_SEMANTIC_SIDECAR_LOCK_FILE_NAME: &str = "subreddit-semantic-embeddings.v1.lock";
 const MAX_SUBREDDIT_SEMANTIC_TEXT_CHARS: usize = 1_200;
+const SIDECAR_LOCK_TIMEOUT_SECS: u64 = 30;
+const SIDECAR_STALE_LOCK_SECS: u64 = 30 * 60;
 
 static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
 static WHITESPACE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 static SUBREDDIT_SEMANTIC_CACHE: LazyLock<Mutex<HashMap<String, PersistedSubredditSemanticEmbedding>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static SUBREDDIT_SEMANTIC_SIDECAR_MTIME: LazyLock<Mutex<Option<SystemTime>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PersistedSubredditSemanticEmbedding {
@@ -20,6 +31,13 @@ pub struct PersistedSubredditSemanticEmbedding {
 	pub text_hash: String,
 	pub embedding: Vec<f32>,
 	pub embedded_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedSubredditSemanticEmbeddingFile {
+	version: u8,
+	saved_at_unix: u64,
+	entries: Vec<PersistedSubredditSemanticEmbedding>,
 }
 
 pub fn embedding_model() -> String {
@@ -124,7 +142,6 @@ pub fn store_embedding(subreddit: &str, model: &str, text_hash: &str, embedding:
 			embedded_at_unix,
 		},
 	);
-	crate::cache_persistence::mark_dirty();
 	Ok(())
 }
 
@@ -173,6 +190,14 @@ pub fn active_embedding_count() -> usize {
 	embedding_count_for_model(&embedding_model())
 }
 
+pub fn persisted_embeddings_sidecar_path() -> PathBuf {
+	Path::new(&crate::cache_persistence::cache_dir()).join(SUBREDDIT_SEMANTIC_SIDECAR_FILE_NAME)
+}
+
+fn persisted_embeddings_lock_path() -> PathBuf {
+	Path::new(&crate::cache_persistence::cache_dir()).join(SUBREDDIT_SEMANTIC_SIDECAR_LOCK_FILE_NAME)
+}
+
 pub(crate) fn snapshot_persisted_embeddings(_now_unix: u64) -> Vec<PersistedSubredditSemanticEmbedding> {
 	let Ok(cache) = SUBREDDIT_SEMANTIC_CACHE.lock() else {
 		return Vec::new();
@@ -182,21 +207,158 @@ pub(crate) fn snapshot_persisted_embeddings(_now_unix: u64) -> Vec<PersistedSubr
 	entries
 }
 
+fn normalized_entry(mut entry: PersistedSubredditSemanticEmbedding) -> Option<(String, PersistedSubredditSemanticEmbedding)> {
+	entry.subreddit = normalize_subreddit_name(&entry.subreddit);
+	entry.model = entry.model.trim().to_string();
+	entry.text_hash = entry.text_hash.trim().to_string();
+	entry.embedding = normalized_embedding(entry.embedding)?;
+	(!entry.subreddit.is_empty() && !entry.model.is_empty() && !entry.text_hash.is_empty()).then_some((entry.subreddit.clone(), entry))
+}
+
+fn normalized_entries_map(entries: Vec<PersistedSubredditSemanticEmbedding>) -> HashMap<String, PersistedSubredditSemanticEmbedding> {
+	entries.into_iter().filter_map(normalized_entry).collect::<HashMap<_, _>>()
+}
+
 pub(crate) fn restore_persisted_embeddings(entries: Vec<PersistedSubredditSemanticEmbedding>, _saved_at_unix: u64, _now_unix: u64) {
-	let restored = entries
-		.into_iter()
-		.filter_map(|mut entry| {
-			entry.subreddit = normalize_subreddit_name(&entry.subreddit);
-			entry.model = entry.model.trim().to_string();
-			entry.text_hash = entry.text_hash.trim().to_string();
-			entry.embedding = normalized_embedding(entry.embedding)?;
-			(!entry.subreddit.is_empty() && !entry.model.is_empty() && !entry.text_hash.is_empty()).then_some((entry.subreddit.clone(), entry))
-		})
-		.collect::<HashMap<_, _>>();
+	let restored = normalized_entries_map(entries);
 
 	if let Ok(mut cache) = SUBREDDIT_SEMANTIC_CACHE.lock() {
 		cache.extend(restored);
 	}
+}
+
+fn read_persisted_embeddings_file(path: &Path) -> Result<Option<PersistedSubredditSemanticEmbeddingFile>, String> {
+	let bytes = match fs::read(path) {
+		Ok(bytes) => bytes,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.to_string()),
+	};
+	let file: PersistedSubredditSemanticEmbeddingFile = bincode::deserialize(&bytes).map_err(|error| error.to_string())?;
+	if file.version != SUBREDDIT_SEMANTIC_SIDECAR_VERSION {
+		return Err(format!("unsupported semantic embeddings sidecar version {}", file.version));
+	}
+	Ok(Some(file))
+}
+
+pub(crate) fn load_persisted_embeddings_sidecar() -> Result<(), String> {
+	let path = persisted_embeddings_sidecar_path();
+	let modified = fs::metadata(&path).and_then(|metadata| metadata.modified()).ok();
+	let Some(file) = read_persisted_embeddings_file(&path)? else {
+		if let Ok(mut mtime) = SUBREDDIT_SEMANTIC_SIDECAR_MTIME.lock() {
+			*mtime = None;
+		}
+		return Ok(());
+	};
+	restore_persisted_embeddings(file.entries, file.saved_at_unix, crate::cache_persistence::unix_now());
+	if let Ok(mut mtime) = SUBREDDIT_SEMANTIC_SIDECAR_MTIME.lock() {
+		*mtime = modified;
+	}
+	Ok(())
+}
+
+pub fn refresh_persisted_embeddings_sidecar() -> Result<bool, String> {
+	let path = persisted_embeddings_sidecar_path();
+	let modified = match fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+		Ok(modified) => modified,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			if let Ok(mut mtime) = SUBREDDIT_SEMANTIC_SIDECAR_MTIME.lock() {
+				*mtime = None;
+			}
+			return Ok(false);
+		}
+		Err(error) => return Err(error.to_string()),
+	};
+
+	if SUBREDDIT_SEMANTIC_SIDECAR_MTIME.lock().ok().and_then(|mtime| *mtime) == Some(modified) {
+		return Ok(false);
+	}
+
+	load_persisted_embeddings_sidecar()?;
+	Ok(true)
+}
+
+struct SidecarLock {
+	path: PathBuf,
+}
+
+impl Drop for SidecarLock {
+	fn drop(&mut self) {
+		let _ = fs::remove_file(&self.path);
+	}
+}
+
+fn lock_file_is_stale(path: &Path) -> bool {
+	fs::metadata(path)
+		.and_then(|metadata| metadata.modified())
+		.ok()
+		.and_then(|modified| modified.elapsed().ok())
+		.is_some_and(|age| age > Duration::from_secs(SIDECAR_STALE_LOCK_SECS))
+}
+
+fn acquire_sidecar_lock() -> Result<SidecarLock, String> {
+	let lock_path = persisted_embeddings_lock_path();
+	if let Some(parent) = lock_path.parent() {
+		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+	}
+
+	let started = Instant::now();
+	loop {
+		match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+			Ok(mut file) => {
+				file.write_all(std::process::id().to_string().as_bytes()).map_err(|error| error.to_string())?;
+				file.sync_all().map_err(|error| error.to_string())?;
+				return Ok(SidecarLock { path: lock_path });
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+				if lock_file_is_stale(&lock_path) {
+					let _ = fs::remove_file(&lock_path);
+					continue;
+				}
+				if started.elapsed() > Duration::from_secs(SIDECAR_LOCK_TIMEOUT_SECS) {
+					return Err(format!("timed out waiting for semantic embeddings sidecar lock {}", lock_path.display()));
+				}
+				thread::sleep(Duration::from_millis(100));
+			}
+			Err(error) => return Err(error.to_string()),
+		}
+	}
+}
+
+pub fn write_persisted_embeddings_sidecar_now() -> Result<(), String> {
+	let final_path = persisted_embeddings_sidecar_path();
+	if let Some(parent) = final_path.parent() {
+		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+	}
+
+	let _lock = acquire_sidecar_lock()?;
+	let mut entries_by_subreddit = read_persisted_embeddings_file(&final_path)?
+		.map(|file| normalized_entries_map(file.entries))
+		.unwrap_or_default();
+	for entry in snapshot_persisted_embeddings(crate::cache_persistence::unix_now()) {
+		entries_by_subreddit.insert(entry.subreddit.clone(), entry);
+	}
+	let mut entries = entries_by_subreddit.into_values().collect::<Vec<_>>();
+	entries.sort_by(|left, right| left.subreddit.cmp(&right.subreddit).then_with(|| left.model.cmp(&right.model)));
+
+	let file = PersistedSubredditSemanticEmbeddingFile {
+		version: SUBREDDIT_SEMANTIC_SIDECAR_VERSION,
+		saved_at_unix: crate::cache_persistence::unix_now(),
+		entries,
+	};
+	let bytes = bincode::serialize(&file).map_err(|error| error.to_string())?;
+	let temp_path = final_path.with_extension(format!("tmp.{}", std::process::id()));
+	let mut temp_file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	temp_file.write_all(&bytes).map_err(|error| error.to_string())?;
+	temp_file.sync_all().map_err(|error| error.to_string())?;
+	drop(temp_file);
+	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())?;
+
+	if let Ok(modified) = fs::metadata(&final_path).and_then(|metadata| metadata.modified()) {
+		if let Ok(mut mtime) = SUBREDDIT_SEMANTIC_SIDECAR_MTIME.lock() {
+			*mtime = Some(modified);
+		}
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -204,11 +366,48 @@ pub(crate) fn clear_test_cache() {
 	if let Ok(mut cache) = SUBREDDIT_SEMANTIC_CACHE.lock() {
 		cache.clear();
 	}
+	if let Ok(mut mtime) = SUBREDDIT_SEMANTIC_SIDECAR_MTIME.lock() {
+		*mtime = None;
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::ffi::OsString;
+	use std::path::PathBuf;
+	use std::sync::{LazyLock, Mutex};
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+	struct CacheDirGuard {
+		previous: Option<OsString>,
+		path: PathBuf,
+	}
+
+	impl CacheDirGuard {
+		fn new(label: &str) -> Self {
+			let previous = std::env::var_os("REDLIB_CACHE_DIR");
+			let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+			let path = std::env::temp_dir().join(format!("redlib-semantic-{label}-{}-{unique}", std::process::id()));
+			std::fs::create_dir_all(&path).unwrap();
+			std::env::set_var("REDLIB_CACHE_DIR", &path);
+			Self { previous, path }
+		}
+	}
+
+	impl Drop for CacheDirGuard {
+		fn drop(&mut self) {
+			if let Some(previous) = &self.previous {
+				std::env::set_var("REDLIB_CACHE_DIR", previous);
+			} else {
+				std::env::remove_var("REDLIB_CACHE_DIR");
+			}
+			let _ = std::fs::remove_dir_all(&self.path);
+			clear_test_cache();
+		}
+	}
 
 	#[test]
 	fn semantic_text_combines_name_title_and_description() {
@@ -235,5 +434,43 @@ mod tests {
 		assert!((embedding[0] - 0.6).abs() < 0.0001);
 		assert!((embedding[1] - 0.8).abs() < 0.0001);
 		assert_eq!(embedding_for_subreddit_model("rust", "other-model"), None);
+	}
+
+	#[test]
+	fn sidecar_round_trips_embeddings() {
+		let _lock = TEST_ENV_LOCK.lock().unwrap();
+		let _guard = CacheDirGuard::new("round-trip");
+		clear_test_cache();
+
+		store_embedding("Rust", "test-model", "hash", vec![3.0, 4.0], 1).unwrap();
+		write_persisted_embeddings_sidecar_now().unwrap();
+		assert!(persisted_embeddings_sidecar_path().is_file());
+
+		clear_test_cache();
+		assert_eq!(embedding_for_subreddit_model("rust", "test-model"), None);
+		assert!(refresh_persisted_embeddings_sidecar().unwrap());
+
+		let embedding = embedding_for_subreddit_model("rust", "test-model").unwrap();
+		assert!((embedding[0] - 0.6).abs() < 0.0001);
+		assert!((embedding[1] - 0.8).abs() < 0.0001);
+	}
+
+	#[test]
+	fn sidecar_write_merges_existing_entries() {
+		let _lock = TEST_ENV_LOCK.lock().unwrap();
+		let _guard = CacheDirGuard::new("merge");
+		clear_test_cache();
+
+		store_embedding("Rust", "test-model", "rust-hash", vec![1.0, 0.0], 1).unwrap();
+		write_persisted_embeddings_sidecar_now().unwrap();
+		clear_test_cache();
+
+		store_embedding("Baking", "test-model", "baking-hash", vec![0.0, 2.0], 2).unwrap();
+		write_persisted_embeddings_sidecar_now().unwrap();
+		clear_test_cache();
+
+		assert!(refresh_persisted_embeddings_sidecar().unwrap());
+		assert!(embedding_for_subreddit_model("rust", "test-model").is_some());
+		assert!(embedding_for_subreddit_model("baking", "test-model").is_some());
 	}
 }

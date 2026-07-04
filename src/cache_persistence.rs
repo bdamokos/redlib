@@ -434,6 +434,13 @@ pub fn unix_now() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0)).as_secs()
 }
 
+fn persistence_read_only() -> bool {
+	std::env::var("REDLIB_CACHE_PERSISTENCE_READ_ONLY")
+		.ok()
+		.map(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+		.unwrap_or(false)
+}
+
 pub(crate) fn instant_to_unix(instant: Instant, now_unix: u64) -> u64 {
 	now_unix.saturating_sub(instant.elapsed().as_secs())
 }
@@ -459,6 +466,9 @@ pub fn init() {
 	if let Err(error) = load_snapshot() {
 		warn!("cache_persistence: failed to load persisted cache snapshot: {error}");
 	}
+	if let Err(error) = subreddit_semantics::load_persisted_embeddings_sidecar() {
+		warn!("cache_persistence: failed to load subreddit semantic embeddings sidecar: {error}");
+	}
 
 	match source_cache_seed_entries() {
 		Ok(entries) => {
@@ -472,7 +482,7 @@ pub fn init() {
 	}
 	load_catalog_snapshot_or_rebuild();
 
-	if PERSISTENCE_EVENTS.get().is_none() {
+	if !persistence_read_only() && PERSISTENCE_EVENTS.get().is_none() {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		if PERSISTENCE_EVENTS.set(tx).is_ok() {
 			tokio::spawn(async move {

@@ -3,6 +3,7 @@ use crate::cache_persistence::PersistedPost;
 use crate::post_cache::{deterministic_random_post_sort_key_with_seed, session_random_rotation_seed, FeedSession, FeedSort, FeedSource, SessionSourceState};
 use crate::subreddit_semantics;
 use crate::utils::{post_feedback_score_adjustment, post_feedback_summary_affinity, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -2071,6 +2072,9 @@ fn suggested_profiles_semantic_mode(
 	semantic_mix_percent: u8,
 ) -> SuggestedProfilesReport {
 	let semantic_mix_percent = semantic_mix_percent.min(100);
+	if let Err(error) = subreddit_semantics::refresh_persisted_embeddings_sidecar() {
+		warn!("suggested profiles: failed to refresh subreddit semantic embeddings sidecar: {error}");
+	}
 	let followed_profiles = followed_profiles
 		.iter()
 		.map(|name| normalize_profile_name(name))

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Parser)]
-#[command(about = "Backfill subreddit semantic embeddings into the Redlib cache snapshot using local Ollama.")]
+#[command(about = "Backfill subreddit semantic embeddings into the Redlib semantic sidecar using local Ollama.")]
 struct Args {
 	#[arg(long, env = "REDLIB_CACHE_DIR")]
 	cache_dir: Option<String>,
@@ -169,6 +169,7 @@ async fn main() -> Result<(), String> {
 		std::env::set_var("REDLIB_CACHE_DIR", cache_dir);
 	}
 	std::env::set_var("REDLIB_SUBREDDIT_SEMANTIC_MODEL", &args.model);
+	std::env::set_var("REDLIB_CACHE_PERSISTENCE_READ_ONLY", "on");
 
 	cache_persistence::init();
 	let metadata_refresh_enabled = args.refresh_missing_metadata && args.metadata_refresh_limit.unwrap_or(usize::MAX) > 0;
@@ -304,12 +305,12 @@ async fn main() -> Result<(), String> {
 	}
 
 	if !args.dry_run {
-		cache_persistence::write_snapshot_now()?;
+		subreddit_semantics::write_persisted_embeddings_sidecar_now()?;
 	}
 
 	println!(
 		"subreddit_semantic_backfill: candidates={total_candidates} embedded={embedded} already_current={already_current} metadata_refresh_attempted={metadata_refresh_attempted} metadata_refresh_skipped={metadata_refresh_skipped} refreshed_metadata={refreshed_metadata} public_fallback_metadata={public_fallback_metadata} name_only_metadata={name_only_metadata} missing_metadata={missing_metadata} failed={failed} cache={}",
-		cache_persistence::snapshot_path().display()
+		subreddit_semantics::persisted_embeddings_sidecar_path().display()
 	);
 	Ok(())
 }
