@@ -61,6 +61,74 @@
 				</ul>
 			</div>
 			{% endif %}
+			{% if related_subreddits.followed_subreddits.len() > 0 || related_subreddits.cached_subreddits.len() > 0 || related_subreddits.followed_profiles.len() > 0 || related_subreddits.cached_profiles.len() > 0 %}
+			<div id="sub_related">
+				<div class="sub_flairs_header">
+					<label>Related</label>
+					{% if related_subreddits.semantic_embedding_count > 0 %}
+					<span>{{ related_subreddits.semantic_embedding_count }} embeddings</span>
+					{% endif %}
+				</div>
+				{% if related_subreddits.followed_subreddits.len() > 0 %}
+				<div class="sub_related_group">
+					<p>Following nearby</p>
+					<ul class="sub_related_list">
+						{% for related in related_subreddits.followed_subreddits %}
+						<li>
+							<a href="/r/{{ related.name }}">r/{{ related.name }}</a>
+							<span>{{ related.score_percent }}% semantic{% if related.cached_post_count > 0 %} · {{ related.cached_post_count }} cached posts{% endif %}</span>
+						</li>
+						{% endfor %}
+					</ul>
+				</div>
+				{% endif %}
+				{% if related_subreddits.cached_subreddits.len() > 0 %}
+				<div class="sub_related_group">
+					<p>Known from cache</p>
+					<ul class="sub_related_list">
+						{% for related in related_subreddits.cached_subreddits %}
+						<li>
+							<a href="/r/{{ related.name }}">r/{{ related.name }}</a>
+							<span>{{ related.score_percent }}% semantic · {{ related.cached_profile_count }} profiles · {{ related.cached_post_count }} posts</span>
+						</li>
+						{% endfor %}
+					</ul>
+				</div>
+				{% endif %}
+				{% if related_subreddits.followed_profiles.len() > 0 %}
+				<div class="sub_related_group">
+					<p>Following profiles nearby</p>
+					<ul class="sub_related_list">
+						{% for profile in related_subreddits.followed_profiles %}
+						<li>
+							<a href="/user/{{ profile.name }}">u/{{ profile.name }}</a>
+							<span>{{ profile.score_percent }}% semantic · {{ profile.cached_posts }} posts{% if profile.current_subreddit_posts > 0 %} · {{ profile.current_subreddit_posts }} here{% endif %}</span>
+							{% if profile.signal_subreddits.len() > 0 %}
+							<small>{% for signal in profile.signal_subreddits %}r/{{ signal }}{% if !loop.last %}, {% endif %}{% endfor %}</small>
+							{% endif %}
+						</li>
+						{% endfor %}
+					</ul>
+				</div>
+				{% endif %}
+				{% if related_subreddits.cached_profiles.len() > 0 %}
+				<div class="sub_related_group">
+					<p>Profiles from cache</p>
+					<ul class="sub_related_list">
+						{% for profile in related_subreddits.cached_profiles %}
+						<li>
+							<a href="/user/{{ profile.name }}">u/{{ profile.name }}</a>
+							<span>{{ profile.score_percent }}% semantic · {{ profile.cached_posts }} posts{% if profile.current_subreddit_posts > 0 %} · {{ profile.current_subreddit_posts }} here{% endif %}</span>
+							{% if profile.signal_subreddits.len() > 0 %}
+							<small>{% for signal in profile.signal_subreddits %}r/{{ signal }}{% if !loop.last %}, {% endif %}{% endfor %}</small>
+							{% endif %}
+						</li>
+						{% endfor %}
+					</ul>
+				</div>
+				{% endif %}
+			</div>
+			{% endif %}
 			<div id="sub_actions">
 				<div id="sub_subscription">
 					{% if prefs.has_subscription(sub.name) %}

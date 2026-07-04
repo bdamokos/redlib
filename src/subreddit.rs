@@ -71,6 +71,7 @@ pub struct SubredditTemplate {
 	sub: Subreddit,
 	posts: Vec<Post>,
 	top_users: Vec<SubredditUserEntry>,
+	related_subreddits: crate::materialized_catalog::RelatedSubredditReport,
 	sort: (String, String),
 	sort_options: Vec<SortOption>,
 	flair_filters: Vec<FlairFilterOption>,
@@ -113,6 +114,7 @@ crate::impl_template_str_eq!(SubredditTemplate);
 pub struct SubredditShellTemplate {
 	sub: Subreddit,
 	top_users: Vec<SubredditUserEntry>,
+	related_subreddits: crate::materialized_catalog::RelatedSubredditReport,
 	flair_filters: Vec<FlairFilterOption>,
 	active_flair_filter: String,
 	active_flair_filter_encoded: String,
@@ -138,6 +140,7 @@ struct SubredditFragmentTemplate {
 	sub: Subreddit,
 	posts: Vec<Post>,
 	top_users: Vec<SubredditUserEntry>,
+	related_subreddits: crate::materialized_catalog::RelatedSubredditReport,
 	sort: (String, String),
 	sort_options: Vec<SortOption>,
 	flair_filters: Vec<FlairFilterOption>,
@@ -200,6 +203,13 @@ impl FeedFragmentTemplate {
 struct SubredditUserEntry {
 	name: String,
 	count: u32,
+}
+
+fn related_subreddit_sidebar(sub: &Subreddit, prefs: &Preferences, filters: &HashSet<String>) -> crate::materialized_catalog::RelatedSubredditReport {
+	if sub.name.is_empty() || sub.name == "all" || sub.name == "popular" || sub.name.contains('+') {
+		return crate::materialized_catalog::RelatedSubredditReport::default();
+	}
+	crate::materialized_catalog::related_subreddit_report(&sub.name, &prefs.subscriptions, filters, 5)
 }
 
 #[derive(PartialEq)]
@@ -867,6 +877,7 @@ fn render_scraped_subreddit_fragment(
 	let prefs = Preferences::new(req);
 	let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(req, "show_nsfw") != "on");
 	utils::hydrate_post_author_links_from_cache(&mut posts);
+	let related_subreddits = related_subreddit_sidebar(&scraped.subreddit, &prefs, filters);
 
 	render_subreddit_fragment(
 		req,
@@ -877,6 +888,7 @@ fn render_scraped_subreddit_fragment(
 				.into_iter()
 				.map(|(name, count)| SubredditUserEntry { name, count })
 				.collect(),
+			related_subreddits,
 			sort: (sort.to_string(), timeframe.to_string()),
 			sort_options,
 			flair_filters: build_flair_filters(url, active_flair_filter, utils::cached_subreddit_flairs(sub_name)),
@@ -1068,6 +1080,7 @@ fn render_video_mode_subreddit_fragment(
 	let mut page_posts = page_posts;
 	utils::hydrate_post_author_links_from_cache(&mut page_posts);
 	let video_mode_sidebar = build_video_mode_sidebar(&url, &listing, &page_posts, &normalized_query);
+	let related_subreddits = related_subreddit_sidebar(&sub, &prefs, filters);
 
 	render_subreddit_fragment(
 		req,
@@ -1075,6 +1088,7 @@ fn render_video_mode_subreddit_fragment(
 			sub,
 			posts: page_posts,
 			top_users,
+			related_subreddits,
 			sort: (sort, String::new()),
 			sort_options,
 			flair_filters,
@@ -2087,10 +2101,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				String::new()
 			};
 
+			let related_subreddits = related_subreddit_sidebar(&cached_sub, &prefs, &get_filters(&req));
 			let mut page_template = SubredditTemplate {
 				sub: cached_sub,
 				posts: page_posts,
 				top_users,
+				related_subreddits,
 				sort: (sort.clone(), timeframe),
 				sort_options: build_sort_options(&sort_base_path, &url, &sort, &active_flair_filter),
 				flair_filters,
@@ -2144,9 +2160,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 		}
 	}
 
+	let related_subreddits = related_subreddit_sidebar(&cached_sub, &prefs, &get_filters(&req));
 	let mut response = template(&SubredditShellTemplate {
 		sub: cached_sub,
 		top_users,
+		related_subreddits,
 		flair_filters,
 		active_flair_filter: active_flair_filter.clone(),
 		active_flair_filter_encoded: encode_query_value(&active_flair_filter),
@@ -2466,12 +2484,15 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 
 	// If all requested subs are filtered, we don't need to fetch posts.
 	if !aggregate_saved_feeds && !sub_name.is_empty() && sub_name.split('+').all(|s| filters.contains(s)) {
+		let prefs = Preferences::new(&req);
+		let related_subreddits = related_subreddit_sidebar(&sub, &prefs, &filters);
 		render_subreddit_fragment(
 			&req,
 			SubredditFragmentTemplate {
 				sub,
 				posts: Vec::new(),
 				top_users,
+				related_subreddits,
 				sort: (sort, param(&path, "t").unwrap_or_default()),
 				sort_options,
 				flair_filters,
@@ -2480,7 +2501,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 				prev_page_url: String::new(),
 				next_page_url: String::new(),
-				prefs: Preferences::new(&req),
+				prefs,
 				url,
 				redirect_url,
 				is_filtered: true,
@@ -2610,12 +2631,15 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				build_contextual_pagination(&url, &feed_session_id, cache_page, &sort)
 			};
 
+			let prefs = Preferences::new(&req);
+			let related_subreddits = related_subreddit_sidebar(&sub, &prefs, &filters);
 			return render_subreddit_fragment(
 				&req,
 				SubredditFragmentTemplate {
 					sub,
 					posts: page_posts,
 					top_users,
+					related_subreddits,
 					sort: (sort.clone(), timeframe.clone()),
 					sort_options,
 					flair_filters,
@@ -2627,7 +2651,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					),
 					prev_page_url,
 					next_page_url,
-					prefs: Preferences::new(&req),
+					prefs,
 					url: url.clone(),
 					redirect_url,
 					is_filtered: false,
@@ -2751,12 +2775,15 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			.map(|cursor| build_front_cursor_url(&url, cursor))
 			.unwrap_or_default();
 
+		let prefs = Preferences::new(&req);
+		let related_subreddits = related_subreddit_sidebar(&sub, &prefs, &filters);
 		render_subreddit_fragment(
 			&req,
 			SubredditFragmentTemplate {
 				sub,
 				posts,
 				top_users,
+				related_subreddits,
 				sort: (sort.clone(), timeframe.clone()),
 				sort_options,
 				flair_filters,
@@ -2765,7 +2792,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
 				prev_page_url,
 				next_page_url,
-				prefs: Preferences::new(&req),
+				prefs,
 				url,
 				redirect_url,
 				is_filtered: false,
@@ -2837,12 +2864,15 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				String::new()
 			};
 
+			let prefs = Preferences::new(&req);
+			let related_subreddits = related_subreddit_sidebar(&sub, &prefs, &filters);
 			return render_subreddit_fragment(
 				&req,
 				SubredditFragmentTemplate {
 					sub,
 					posts,
 					top_users,
+					related_subreddits,
 					sort: (sort.clone(), timeframe.clone()),
 					sort_options,
 					flair_filters,
@@ -2854,7 +2884,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					),
 					prev_page_url,
 					next_page_url,
-					prefs: Preferences::new(&req),
+					prefs,
 					url,
 					redirect_url,
 					is_filtered: false,
@@ -2909,6 +2939,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				utils::hydrate_post_author_links_from_cache(&mut posts);
 				let timeframe = param(&path, "t").unwrap_or_default();
 				let before = param(&path, "before").unwrap_or_default();
+				let prefs = Preferences::new(&req);
+				let related_subreddits = related_subreddit_sidebar(&sub, &prefs, &filters);
 				render_subreddit_fragment(
 					&req,
 					SubredditFragmentTemplate {
@@ -2922,6 +2954,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						} else {
 							Vec::new()
 						},
+						related_subreddits,
 						sort: (sort.clone(), timeframe.clone()),
 						sort_options,
 						flair_filters: if is_single_sub {
@@ -2958,7 +2991,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						} else {
 							String::new()
 						},
-						prefs: Preferences::new(&req),
+						prefs,
 						url,
 						redirect_url,
 						is_filtered: false,
@@ -3039,12 +3072,15 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								String::new()
 							};
 
+							let prefs = Preferences::new(&req);
+							let related_subreddits = related_subreddit_sidebar(&sub, &prefs, &filters);
 							return render_subreddit_fragment(
 								&req,
 								SubredditFragmentTemplate {
 									sub,
 									posts,
 									top_users,
+									related_subreddits,
 									sort: (sort.clone(), timeframe.clone()),
 									sort_options,
 									flair_filters,
@@ -3056,7 +3092,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 									),
 									prev_page_url,
 									next_page_url,
-									prefs: Preferences::new(&req),
+									prefs,
 									url,
 									redirect_url,
 									is_filtered: false,
@@ -3282,6 +3318,7 @@ mod tests {
 			},
 			posts: vec![test_post()],
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			sort: ("hot".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
@@ -3331,6 +3368,7 @@ mod tests {
 				name: "demo_user".to_string(),
 				count: 3,
 			}],
+			related_subreddits: Default::default(),
 			sort: ("hot".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
@@ -3377,6 +3415,7 @@ mod tests {
 				..Default::default()
 			},
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
 			active_flair_filter_encoded: String::new(),
@@ -3410,6 +3449,7 @@ mod tests {
 				..Default::default()
 			},
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
 			active_flair_filter_encoded: String::new(),
@@ -3441,6 +3481,7 @@ mod tests {
 				..Default::default()
 			},
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
 			active_flair_filter_encoded: String::new(),
@@ -3472,6 +3513,7 @@ mod tests {
 				..Default::default()
 			},
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
 			active_flair_filter_encoded: String::new(),
@@ -3504,6 +3546,7 @@ mod tests {
 				..Default::default()
 			},
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
 			active_flair_filter_encoded: String::new(),
@@ -3565,6 +3608,7 @@ mod tests {
 				..Default::default()
 			},
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
 			active_flair_filter_encoded: String::new(),
@@ -3592,6 +3636,7 @@ mod tests {
 		let html = super::SubredditShellTemplate {
 			sub: Subreddit::default(),
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			flair_filters: Vec::new(),
 			active_flair_filter: String::new(),
 			active_flair_filter_encoded: String::new(),
@@ -3649,6 +3694,7 @@ mod tests {
 			},
 			posts: vec![test_post()],
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			sort: ("new".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
@@ -3750,6 +3796,7 @@ mod tests {
 			},
 			posts: vec![test_post()],
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			sort: ("hot".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),
@@ -3792,6 +3839,7 @@ mod tests {
 			sub: Subreddit::default(),
 			posts: vec![test_post()],
 			top_users: Vec::new(),
+			related_subreddits: Default::default(),
 			sort: ("hot".to_string(), String::new()),
 			sort_options: Vec::new(),
 			flair_filters: Vec::new(),

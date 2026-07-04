@@ -957,6 +957,52 @@ aside {
     margin-top: 20px;
 }
 
+#sub_related {
+    margin-top: 20px;
+}
+
+.sub_related_group {
+    margin-top: 12px;
+}
+
+.sub_related_group > p {
+    color: var(--visited);
+    font-size: 12px;
+    font-weight: 700;
+    margin: 0 0 6px;
+    text-transform: uppercase;
+}
+
+.sub_related_list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.sub_related_list li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.sub_related_list a {
+    font-weight: 700;
+    overflow-wrap: anywhere;
+    text-decoration: none;
+}
+
+.sub_related_list span,
+.sub_related_list small,
+.sub_flairs_header span {
+    color: var(--visited);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
 .video_mode_sidebar {
     margin-bottom: 20px;
 }
@@ -3290,6 +3336,16 @@ input[type="submit"] {
 
 .suggested_profiles_semantic_mix button {
     padding: 7px 10px;
+}
+
+.suggested_profiles_mix_scale {
+    color: var(--visited);
+    display: flex;
+    font-size: 12px;
+    gap: 12px;
+    grid-column: 2 / 4;
+    justify-content: space-between;
+    line-height: 1.2;
 }
 
 .suggested_profiles_mix_steps {

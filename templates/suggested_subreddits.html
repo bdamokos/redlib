@@ -36,16 +36,20 @@
 			{% if !center_id.is_empty() %}
 			<input type="hidden" name="center" value="{{ center_id }}">
 			{% endif %}
-			<label for="semantic_mix">Semantic mix</label>
+			<label for="semantic_mix">Semantic weight</label>
 			<input id="semantic_mix" name="mix" type="range" min="0" max="100" step="5" value="{{ semantic_mix_percent }}">
-			<output for="semantic_mix">{{ semantic_mix_percent }}%</output>
+			<output for="semantic_mix">{{ semantic_mix_percent }}% semantic</output>
 			<button type="submit">Apply</button>
+			<div class="suggested_profiles_mix_scale" aria-hidden="true">
+				<span>0% vector</span>
+				<span>100% semantic</span>
+			</div>
 			<div class="suggested_profiles_mix_steps" aria-label="Semantic mix presets">
-				<a href="{{ self.semantic_mix_path(0) }}">0</a>
+				<a href="{{ self.semantic_mix_path(0) }}">0 vector</a>
 				<a href="{{ self.semantic_mix_path(25) }}">25</a>
 				<a href="{{ self.semantic_mix_path(50) }}">50</a>
 				<a href="{{ self.semantic_mix_path(75) }}">75</a>
-				<a href="{{ self.semantic_mix_path(100) }}">100</a>
+				<a href="{{ self.semantic_mix_path(100) }}">100 semantic</a>
 			</div>
 		</form>
 		{% endif %}

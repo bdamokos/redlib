@@ -24,6 +24,8 @@ const SUGGESTED_PROFILE_VECTOR_SINGLE_OVERLAP_FACTOR: f64 = 0.45;
 const SUGGESTED_PROFILE_VECTOR_TWO_OVERLAP_FACTOR: f64 = 0.80;
 const SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD: usize = 4;
 const SUGGESTED_PROFILE_FEEDBACK_MAX_SCORE_ADJUSTMENT: f64 = 0.25;
+const RELATED_SUBREDDIT_MIN_SIMILARITY: f64 = 0.15;
+const RELATED_PROFILE_MIN_SIMILARITY: f64 = 0.15;
 const AUTHOR_HISTORY_MAX_POST_AGE_SECS: u64 = 180 * 24 * 60 * 60;
 const AUTHOR_HISTORY_MAX_POSTS_PER_AUTHOR: usize = 160;
 const AUTHOR_HISTORY_GLOBAL_MAX_POSTS: usize = 60_000;
@@ -135,6 +137,32 @@ pub struct SuggestedProfileMediaPost {
 	pub nsfw: bool,
 	pub spoiler: bool,
 	pub created_ts: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RelatedSubredditReport {
+	pub semantic_embedding_count: usize,
+	pub followed_subreddits: Vec<RelatedSubredditEntry>,
+	pub cached_subreddits: Vec<RelatedSubredditEntry>,
+	pub followed_profiles: Vec<RelatedProfileEntry>,
+	pub cached_profiles: Vec<RelatedProfileEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelatedSubredditEntry {
+	pub name: String,
+	pub score_percent: u32,
+	pub cached_profile_count: usize,
+	pub cached_post_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelatedProfileEntry {
+	pub name: String,
+	pub score_percent: u32,
+	pub cached_posts: usize,
+	pub current_subreddit_posts: usize,
+	pub signal_subreddits: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -369,6 +397,31 @@ fn suggested_profile_dense_dot(left: &[f64], right: &[f64]) -> f64 {
 		return 0.0;
 	}
 	left.iter().zip(right).map(|(left, right)| left * right).sum()
+}
+
+fn normalize_f64_vector(vector: &mut [f64]) -> f64 {
+	let norm = vector.iter().map(|weight| weight * weight).sum::<f64>().sqrt();
+	if norm > 0.0 {
+		for weight in vector {
+			*weight /= norm;
+		}
+	}
+	norm
+}
+
+fn normalized_f32_embedding(embedding: &[f32]) -> Option<Vec<f64>> {
+	let mut vector = embedding.iter().map(|value| *value as f64).collect::<Vec<_>>();
+	(normalize_f64_vector(&mut vector) > 0.0).then_some(vector)
+}
+
+fn embedding_cosine(left: &[f32], right: &[f32]) -> f64 {
+	let Some(left) = normalized_f32_embedding(left) else {
+		return 0.0;
+	};
+	let Some(right) = normalized_f32_embedding(right) else {
+		return 0.0;
+	};
+	suggested_profile_dense_dot(&left, &right)
 }
 
 fn normalize_suggested_profile_dense_vector(vector: &mut [f64]) -> f64 {
@@ -1457,6 +1510,231 @@ pub fn cached_catalog_subreddit_names() -> Vec<String> {
 	let mut names = names.into_iter().collect::<Vec<_>>();
 	names.sort();
 	names
+}
+
+fn related_score_percent(score: f64) -> u32 {
+	(score * 100.0).round().clamp(1.0, 100.0) as u32
+}
+
+fn normalized_followed_sets(subscriptions: &[String]) -> (HashSet<String>, HashSet<String>) {
+	let mut subreddits = HashSet::new();
+	let mut profiles = HashSet::new();
+	for subscription in subscriptions {
+		let normalized = subscription.trim().to_lowercase();
+		if normalized.is_empty() {
+			continue;
+		}
+		if let Some(profile) = normalized.strip_prefix("u_") {
+			if !profile.is_empty() {
+				profiles.insert(profile.to_string());
+			}
+		} else {
+			let subreddit = subreddit_semantics::normalize_subreddit_name(&normalized);
+			if !subreddit.is_empty() && !subreddit.starts_with("u_") {
+				subreddits.insert(subreddit);
+			}
+		}
+	}
+	(subreddits, profiles)
+}
+
+fn related_profile_signals(counts: &HashMap<String, usize>, current_embedding: &[f32], embeddings: &HashMap<String, Vec<f32>>, limit: usize) -> Vec<String> {
+	let mut signals = sorted_subreddit_counts(counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS)
+		.into_iter()
+		.filter_map(|(subreddit, count)| {
+			let embedding = embeddings.get(&subreddit)?;
+			let similarity = embedding_cosine(current_embedding, embedding);
+			(similarity > 0.0).then_some((subreddit, similarity * suggested_profile_vector_count_weight(count), count))
+		})
+		.collect::<Vec<_>>();
+	signals.sort_by(|left, right| {
+		right
+			.1
+			.partial_cmp(&left.1)
+			.unwrap_or(std::cmp::Ordering::Equal)
+			.then_with(|| right.2.cmp(&left.2))
+			.then_with(|| left.0.cmp(&right.0))
+	});
+	signals.truncate(limit);
+	signals.into_iter().map(|(subreddit, _, _)| subreddit).collect()
+}
+
+pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String], filters: &HashSet<String>, limit: usize) -> RelatedSubredditReport {
+	let subreddit = subreddit_semantics::normalize_subreddit_name(subreddit);
+	if subreddit.is_empty() || subreddit == "all" || subreddit == "popular" || subreddit.contains('+') || limit == 0 {
+		return RelatedSubredditReport::default();
+	}
+	if let Err(error) = subreddit_semantics::refresh_persisted_embeddings_sidecar() {
+		warn!("related subreddits: failed to refresh subreddit semantic embeddings sidecar: {error}");
+	}
+	let semantic_model = subreddit_semantics::embedding_model();
+	let Some(current_embedding) = subreddit_semantics::embedding_for_subreddit_model(&subreddit, &semantic_model) else {
+		return RelatedSubredditReport {
+			semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+			..RelatedSubredditReport::default()
+		};
+	};
+	let Some(current_vector) = normalized_f32_embedding(&current_embedding) else {
+		return RelatedSubredditReport {
+			semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+			..RelatedSubredditReport::default()
+		};
+	};
+
+	let (followed_subreddits, followed_profiles) = normalized_followed_sets(subscriptions);
+	let normalized_filters = filters.iter().map(|filter| filter.trim().to_lowercase()).collect::<HashSet<_>>();
+	let (subreddit_stats, profile_counts_by_profile) = {
+		let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+		let mut subreddit_stats: HashMap<String, (usize, usize)> = HashMap::new();
+		for counts in catalog.author_community_counts.values() {
+			for (candidate, count) in counts {
+				let candidate = subreddit_semantics::normalize_subreddit_name(candidate);
+				if candidate.is_empty() || candidate.starts_with("u_") || *count == 0 {
+					continue;
+				}
+				let stats = subreddit_stats.entry(candidate).or_default();
+				stats.0 += 1;
+				stats.1 += *count;
+			}
+		}
+		let profile_counts_by_profile = catalog
+			.author_community_counts
+			.iter()
+			.map(|(profile, counts)| (profile.clone(), counts.clone()))
+			.collect::<HashMap<_, _>>();
+		(subreddit_stats, profile_counts_by_profile)
+	};
+
+	let mut candidate_subreddits = subreddit_stats.keys().cloned().collect::<HashSet<_>>();
+	candidate_subreddits.extend(followed_subreddits.iter().cloned());
+	let mut related_subreddits = candidate_subreddits
+		.into_iter()
+		.filter(|candidate| candidate != &subreddit && !normalized_filters.contains(candidate))
+		.filter_map(|candidate| {
+			let embedding = subreddit_semantics::embedding_for_subreddit_model(&candidate, &semantic_model)?;
+			let similarity = embedding_cosine(&current_embedding, &embedding);
+			if similarity < RELATED_SUBREDDIT_MIN_SIMILARITY {
+				return None;
+			}
+			let (cached_profile_count, cached_post_count) = subreddit_stats.get(&candidate).copied().unwrap_or_default();
+			Some((
+				followed_subreddits.contains(&candidate),
+				RelatedSubredditEntry {
+					name: candidate,
+					score_percent: related_score_percent(similarity),
+					cached_profile_count,
+					cached_post_count,
+				},
+			))
+		})
+		.collect::<Vec<_>>();
+	related_subreddits.sort_by(|left, right| {
+		right
+			.1
+			.score_percent
+			.cmp(&left.1.score_percent)
+			.then_with(|| right.1.cached_profile_count.cmp(&left.1.cached_profile_count))
+			.then_with(|| right.1.cached_post_count.cmp(&left.1.cached_post_count))
+			.then_with(|| left.1.name.cmp(&right.1.name))
+	});
+	let mut followed_related_subreddits = Vec::new();
+	let mut cached_related_subreddits = Vec::new();
+	for (followed, entry) in related_subreddits {
+		if followed {
+			if followed_related_subreddits.len() < limit {
+				followed_related_subreddits.push(entry);
+			}
+		} else if cached_related_subreddits.len() < limit {
+			cached_related_subreddits.push(entry);
+		}
+		if followed_related_subreddits.len() >= limit && cached_related_subreddits.len() >= limit {
+			break;
+		}
+	}
+
+	let mut profile_signal_subreddits = HashSet::from([subreddit.clone()]);
+	profile_signal_subreddits.extend(followed_related_subreddits.iter().map(|entry| entry.name.clone()));
+	profile_signal_subreddits.extend(cached_related_subreddits.iter().map(|entry| entry.name.clone()));
+	let profile_counts_by_profile = profile_counts_by_profile
+		.into_iter()
+		.filter(|(_, counts)| {
+			counts
+				.keys()
+				.map(|candidate| subreddit_semantics::normalize_subreddit_name(candidate))
+				.any(|candidate| profile_signal_subreddits.contains(&candidate))
+		})
+		.collect::<HashMap<_, _>>();
+
+	let mut profile_embeddings = HashMap::new();
+	for counts in profile_counts_by_profile.values() {
+		for (candidate, _) in sorted_subreddit_counts(counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS) {
+			if profile_embeddings.contains_key(&candidate) {
+				continue;
+			}
+			if let Some(embedding) = subreddit_semantics::embedding_for_subreddit_model(&candidate, &semantic_model) {
+				profile_embeddings.insert(candidate, embedding);
+			}
+		}
+	}
+	let subreddit_weights = profile_embeddings.keys().map(|name| (name.clone(), 1.0)).collect::<HashMap<_, _>>();
+	let mut related_profiles = profile_counts_by_profile
+		.into_iter()
+		.filter(|(profile, _)| !profile.is_empty() && profile != "[deleted]" && !normalized_filters.contains(&format!("u_{profile}")))
+		.filter_map(|(profile, counts)| {
+			let profile_counts = sorted_subreddit_counts(&counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
+			let cached_posts = profile_counts.iter().map(|(_, count)| *count).sum::<usize>();
+			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
+				return None;
+			}
+			let vector = suggested_profile_semantic_vector(&counts, &subreddit_weights, &profile_embeddings, SUGGESTED_PROFILE_VECTOR_SUBREDDITS)?;
+			let similarity = suggested_profile_dense_dot(&current_vector, &vector);
+			if similarity < RELATED_PROFILE_MIN_SIMILARITY {
+				return None;
+			}
+			let confidence = (cached_posts as f64 / 12.0).sqrt().min(1.0);
+			Some((
+				followed_profiles.contains(&profile),
+				RelatedProfileEntry {
+					name: profile,
+					score_percent: related_score_percent(similarity * confidence),
+					cached_posts,
+					current_subreddit_posts: counts.get(&subreddit).copied().unwrap_or_default(),
+					signal_subreddits: related_profile_signals(&counts, &current_embedding, &profile_embeddings, 3),
+				},
+			))
+		})
+		.collect::<Vec<_>>();
+	related_profiles.sort_by(|left, right| {
+		right
+			.1
+			.score_percent
+			.cmp(&left.1.score_percent)
+			.then_with(|| right.1.current_subreddit_posts.cmp(&left.1.current_subreddit_posts))
+			.then_with(|| right.1.cached_posts.cmp(&left.1.cached_posts))
+			.then_with(|| left.1.name.cmp(&right.1.name))
+	});
+	let mut followed_related_profiles = Vec::new();
+	let mut cached_related_profiles = Vec::new();
+	for (followed, entry) in related_profiles {
+		if followed {
+			if followed_related_profiles.len() < limit {
+				followed_related_profiles.push(entry);
+			}
+		} else if cached_related_profiles.len() < limit {
+			cached_related_profiles.push(entry);
+		}
+		if followed_related_profiles.len() >= limit && cached_related_profiles.len() >= limit {
+			break;
+		}
+	}
+
+	RelatedSubredditReport {
+		semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+		followed_subreddits: followed_related_subreddits,
+		cached_subreddits: cached_related_subreddits,
+		followed_profiles: followed_related_profiles,
+		cached_profiles: cached_related_profiles,
+	}
 }
 
 #[cfg(test)]
@@ -2580,10 +2858,10 @@ impl PersistedCatalogSourceKey {
 mod tests {
 	use super::{
 		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_author_posts_limited, query_source_candidates, record_author_history_from_posts,
-		rejected_author_redgifs_profile_count, reset_catalog, restore_catalog, restore_persisted_author_history, restore_persisted_rejected_author_redgifs_profiles,
-		snapshot_catalog, snapshot_persisted_author_history, snapshot_persisted_rejected_author_redgifs_profiles, suggested_profiles, suggested_profiles_with_mode,
-		suggested_profiles_with_mode_and_feedback, suggested_profiles_with_mode_center_and_feedback, suggested_profiles_with_mode_center_mix_and_feedback,
-		SuggestedProfileScoringMode, SuggestedProfileVectorCenterRequest,
+		rejected_author_redgifs_profile_count, related_subreddit_report, reset_catalog, restore_catalog, restore_persisted_author_history,
+		restore_persisted_rejected_author_redgifs_profiles, snapshot_catalog, snapshot_persisted_author_history, snapshot_persisted_rejected_author_redgifs_profiles,
+		suggested_profiles, suggested_profiles_with_mode, suggested_profiles_with_mode_and_feedback, suggested_profiles_with_mode_center_and_feedback,
+		suggested_profiles_with_mode_center_mix_and_feedback, SuggestedProfileScoringMode, SuggestedProfileVectorCenterRequest,
 	};
 	use crate::post_cache::{FeedSort, FeedSource};
 	use crate::utils::{Author, Awards, Flags, Flair, Media, ParentComment, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
@@ -3119,6 +3397,33 @@ mod tests {
 		assert_eq!(report.semantic_mix_percent, 100);
 		assert_eq!(report.suggestions[0].name, "sourdough_match");
 		assert_eq!(report.suggestions[0].overlap_subreddits[0].name, "sourdough");
+		crate::subreddit_semantics::clear_test_cache();
+	}
+
+	#[test]
+	fn related_subreddit_report_splits_followed_and_cached_semantic_matches() {
+		let _guard = test_lock();
+		reset_catalog();
+		crate::subreddit_semantics::clear_test_cache();
+		crate::subreddit_semantics::store_embedding("baking", "nomic-embed-text", "baking-hash", vec![1.0, 0.0], 1).unwrap();
+		crate::subreddit_semantics::store_embedding("sourdough", "nomic-embed-text", "sourdough-hash", vec![0.98, 0.02], 1).unwrap();
+		crate::subreddit_semantics::store_embedding("cake", "nomic-embed-text", "cake-hash", vec![0.95, 0.05], 1).unwrap();
+		crate::subreddit_semantics::store_embedding("rust", "nomic-embed-text", "rust-hash", vec![0.0, 1.0], 1).unwrap();
+
+		apply_source_refresh(
+			&FeedSource::subreddit("u_baker", FeedSort::New),
+			&test_posts("baker-sourdough", "sourdough", "baker", 3, 900),
+		);
+		apply_source_refresh(&FeedSource::subreddit("cake", FeedSort::New), &test_posts("cake-match", "cake", "cake_author", 4, 800));
+		apply_source_refresh(&FeedSource::subreddit("rust", FeedSort::New), &test_posts("rust-match", "rust", "rust_author", 4, 700));
+
+		let report = related_subreddit_report("baking", &["sourdough".to_string(), "u_baker".to_string()], &HashSet::new(), 3);
+
+		assert_eq!(report.followed_subreddits[0].name, "sourdough");
+		assert!(report.cached_subreddits.iter().any(|entry| entry.name == "cake"));
+		assert!(!report.cached_subreddits.iter().any(|entry| entry.name == "rust"));
+		assert_eq!(report.followed_profiles[0].name, "baker");
+		assert!(report.cached_profiles.iter().any(|entry| entry.name == "cake_author"));
 		crate::subreddit_semantics::clear_test_cache();
 	}
 
