@@ -129,11 +129,11 @@
     }
 
     function mobilePreviewFocusIsUnreliable() {
-        if (!window.matchMedia) {
-            return false;
+        if (navigator.maxTouchPoints && navigator.maxTouchPoints > 0) {
+            return true;
         }
 
-        return window.matchMedia("(hover: none), (pointer: coarse)").matches;
+        return Boolean(window.matchMedia && window.matchMedia("(hover: none), (pointer: coarse)").matches);
     }
 
     function browserAllowsForegroundPreviewPlayback() {
@@ -800,6 +800,10 @@
         previewFallbackLoadingHost = host;
         state.previewFallbackLoading = true;
         state.previewFallbackFailed = false;
+        fallback.defaultMuted = true;
+        fallback.muted = true;
+        fallback.autoplay = true;
+        fallback.playsInline = true;
         fallback.hidden = true;
 
         if (fallback.getAttribute("src") !== nextPath) {
