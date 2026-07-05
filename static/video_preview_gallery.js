@@ -306,6 +306,7 @@
             return;
         }
 
+        seekVideoToPreviewFallbackTime(host, video);
         hideAnimatedPreview(host);
 
         var player = video._dashjs_player;
@@ -313,6 +314,76 @@
         if (playPromise && typeof playPromise.catch === "function") {
             playPromise.catch(function () {});
         }
+    }
+
+    function activePreviewFallbackTime(host) {
+        var layer = previewLayer(host);
+        var fallback = previewFallbackVideo(host);
+        if (!layer || !fallback || fallback.hidden || layer.dataset.previewFallbackActive !== "true") {
+            return 0;
+        }
+
+        var currentTime = Number(fallback.currentTime);
+        if (!Number.isFinite(currentTime) || currentTime <= 0.05) {
+            return 0;
+        }
+
+        return clampMediaTime(fallback, currentTime);
+    }
+
+    function clampMediaTime(video, currentTime) {
+        var clampedTime = Number(currentTime);
+        if (!Number.isFinite(clampedTime) || clampedTime <= 0) {
+            return 0;
+        }
+
+        var duration = Number(video.duration);
+        if (Number.isFinite(duration) && duration > 0) {
+            clampedTime = Math.min(clampedTime, Math.max(0, duration - 0.05));
+        }
+
+        return clampedTime;
+    }
+
+    function seekVideoToTime(video, currentTime) {
+        var seekTime = clampMediaTime(video, currentTime);
+        if (seekTime <= 0) {
+            return;
+        }
+
+        var player = video._dashjs_player;
+        try {
+            if (player && typeof player.seek === "function") {
+                player.seek(seekTime);
+                return;
+            }
+
+            var videoTime = Number(video.currentTime);
+            if (!Number.isFinite(videoTime) || Math.abs(videoTime - seekTime) > 0.25) {
+                video.currentTime = seekTime;
+            }
+        } catch (error) {}
+    }
+
+    function seekVideoToPreviewFallbackTime(host, video) {
+        var startTime = activePreviewFallbackTime(host);
+        if (startTime <= 0) {
+            return;
+        }
+
+        if (video.readyState >= 1) {
+            seekVideoToTime(video, startTime);
+            return;
+        }
+
+        var deferredSeek = function () {
+            video.removeEventListener("loadedmetadata", deferredSeek);
+            video.removeEventListener("durationchange", deferredSeek);
+            seekVideoToTime(video, startTime);
+        };
+        video.addEventListener("loadedmetadata", deferredSeek);
+        video.addEventListener("durationchange", deferredSeek);
+        seekVideoToTime(video, startTime);
     }
 
     function desktopPreviewFallbackAllowed() {
