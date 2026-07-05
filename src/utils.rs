@@ -3933,6 +3933,34 @@ pub async fn external_links_with_coomer_lookups(links: Vec<ExternalLink>) -> Vec
 	expanded_links
 }
 
+pub async fn creator_profile_links_with_archive_lookups(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
+	let mut profile_links = Vec::new();
+	for link in links {
+		if is_creator_profile_overview_link(&link) {
+			append_external_links(&mut profile_links, vec![link.clone()]);
+		}
+
+		let nested_links = nested_creator_links(&link).await.into_iter().filter(is_creator_profile_overview_link).collect::<Vec<_>>();
+		append_external_links(&mut profile_links, nested_links);
+	}
+
+	let archive_links = external_links_with_coomer_lookups(profile_links.clone())
+		.await
+		.into_iter()
+		.filter(is_creator_archive_link)
+		.collect::<Vec<_>>();
+	append_external_links(&mut profile_links, archive_links);
+	profile_links
+}
+
+pub fn is_creator_profile_overview_link(link: &ExternalLink) -> bool {
+	is_onlyfans_or_fansly_profile_url(&link.url) || redgifs_username_from_profile_url(&link.url).is_some()
+}
+
+pub fn is_creator_archive_link(link: &ExternalLink) -> bool {
+	canonical_coomer_profile_url(&link.url).is_some() || canonical_coomerfans_profile_url(&link.url).is_some()
+}
+
 pub async fn external_links_with_coomer_flags(links: Vec<ExternalLink>) -> Vec<ExternalLink> {
 	let mut pending = JoinSet::new();
 
@@ -4398,6 +4426,32 @@ fn redgifs_username_from_profile_url(url: &str) -> Option<String> {
 		_ => return None,
 	};
 	redgifs::normalize_username(username)
+}
+
+fn is_onlyfans_or_fansly_profile_url(url: &str) -> bool {
+	let Ok(parsed) = Url::parse(url) else {
+		return false;
+	};
+	let Some(host) = parsed.host_str().map(|host| host.trim().trim_matches('.').to_lowercase()) else {
+		return false;
+	};
+	if !matches!(host.as_str(), "onlyfans.com" | "www.onlyfans.com" | "fansly.com" | "www.fansly.com") {
+		return false;
+	}
+	let Some(segments) = parsed.path_segments().map(|segments| segments.filter(|segment| !segment.is_empty()).collect::<Vec<_>>()) else {
+		return false;
+	};
+	let profile_segment = match segments.as_slice() {
+		["u" | "user" | "users" | "profile", profile, ..] => *profile,
+		[profile, ..] => *profile,
+		[] => return false,
+	};
+	let profile_name = percent_decode_str(profile_segment).decode_utf8_lossy().trim().to_string();
+	!profile_name.is_empty()
+		&& !matches!(
+			profile_name.to_ascii_lowercase().as_str(),
+			"posts" | "media" | "about" | "terms" | "privacy" | "login" | "signup"
+		)
 }
 
 async fn direct_coomer_lookup_link(link: &ExternalLink) -> Option<ExternalLink> {
@@ -5606,9 +5660,10 @@ mod tests {
 		cache_author_watched_links_from_posts, cached_subreddit_users, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links,
 		coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links,
 		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration,
-		hydrate_post_author_links_from_cache, post_feedback_score_adjustment, post_feedback_summary_affinity, read_sharded_cookie, redgifs_uploader_matches_author,
-		refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links, store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards,
-		CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media, Post, PostFeedbackEntry, PostFeedbackSummary, Preferences,
+		hydrate_post_author_links_from_cache, is_creator_archive_link, is_creator_profile_overview_link, post_feedback_score_adjustment, post_feedback_summary_affinity,
+		read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links, store_subreddit_users, time,
+		user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media,
+		Post, PostFeedbackEntry, PostFeedbackSummary, Preferences,
 	};
 	use crate::cache_persistence::PersistedSubredditUsersEntry;
 	use crate::utils::ParentComment;
@@ -6188,6 +6243,75 @@ mod tests {
 		assert_eq!(deduped.len(), 2);
 		assert_eq!(deduped[0].host, "onlyfans.com");
 		assert_eq!(deduped[1].host, "fansly.com");
+	}
+
+	#[test]
+	fn creator_profile_overview_filter_accepts_profile_urls_only() {
+		let profile_links = [
+			ExternalLink {
+				label: "OnlyFans".to_string(),
+				url: "https://onlyfans.com/lady-katarina".to_string(),
+				host: "onlyfans.com".to_string(),
+				icon_path: "/site_icon/onlyfans.com".to_string(),
+				has_coomer: false,
+			},
+			ExternalLink {
+				label: "Fansly".to_string(),
+				url: "https://fansly.com/user/640681284019953664".to_string(),
+				host: "fansly.com".to_string(),
+				icon_path: "/site_icon/fansly.com".to_string(),
+				has_coomer: false,
+			},
+			ExternalLink {
+				label: "RedGifs".to_string(),
+				url: "https://www.redgifs.com/users/lady-katarina".to_string(),
+				host: "www.redgifs.com".to_string(),
+				icon_path: "/site_icon/www.redgifs.com".to_string(),
+				has_coomer: false,
+			},
+		];
+		for link in profile_links {
+			assert!(is_creator_profile_overview_link(&link), "expected {} to be included", link.url);
+		}
+
+		let root_onlyfans = ExternalLink {
+			label: "OnlyFans".to_string(),
+			url: "https://onlyfans.com/".to_string(),
+			host: "onlyfans.com".to_string(),
+			icon_path: "/site_icon/onlyfans.com".to_string(),
+			has_coomer: false,
+		};
+		let redgifs_watch = ExternalLink {
+			label: "RedGifs watch".to_string(),
+			url: "https://www.redgifs.com/watch/zanyjudiciousrook".to_string(),
+			host: "www.redgifs.com".to_string(),
+			icon_path: "/site_icon/www.redgifs.com".to_string(),
+			has_coomer: false,
+		};
+
+		assert!(!is_creator_profile_overview_link(&root_onlyfans));
+		assert!(!is_creator_profile_overview_link(&redgifs_watch));
+	}
+
+	#[test]
+	fn creator_archive_filter_accepts_coomer_profile_urls() {
+		let coomer = ExternalLink {
+			label: "Coomer".to_string(),
+			url: "https://coomer.st/onlyfans/user/lady-katarina".to_string(),
+			host: "coomer.st".to_string(),
+			icon_path: "/site_icon/coomer.st".to_string(),
+			has_coomer: false,
+		};
+		let coomerfans = ExternalLink {
+			label: "CoomerFans".to_string(),
+			url: "https://coomerfans.com/u/onlyfans/123/lady-katarina".to_string(),
+			host: "coomerfans.com".to_string(),
+			icon_path: "/site_icon/coomerfans.com".to_string(),
+			has_coomer: false,
+		};
+
+		assert!(is_creator_archive_link(&coomer));
+		assert!(is_creator_archive_link(&coomerfans));
 	}
 
 	#[test]

@@ -69,6 +69,7 @@
 			<a href="/suggested-subreddits" {% if current == "__suggested_subreddits__" %}class="selected"{% endif %}>Suggested Subreddits</a>
 			{% if prefs.has_followed_users() %}
 				<a href="/following" {% if current == "__following__" %}class="selected"{% endif %}>Following</a>
+				<a href="/creator-links" {% if current == "__creator_links__" %}class="selected"{% endif %}>Creator Links</a>
 			{% endif %}
 			{% if prefs.remove_default_feeds != "on" %}
 				<a href="/r/popular">Popular</a>

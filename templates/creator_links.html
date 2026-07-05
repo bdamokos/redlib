@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% import "utils.html" as utils %}
+
+{% block title %}Creator Links{% endblock %}
+
+{% block subscriptions %}
+{% call utils::sub_list("__creator_links__", "") %}
+{% endblock %}
+
+{% block search %}
+{% call utils::search("".to_owned(), "") %}
+{% endblock %}
+
+{% block body %}
+<main class="creator_links_page">
+	<header class="creator_links_header panel">
+		<div>
+			<p class="creator_links_kicker">Following</p>
+			<h1>Followed creator links</h1>
+		</div>
+		<div class="creator_links_stats" aria-label="Creator link summary">
+			<div>
+				<strong>{{ followed_count }}</strong>
+				<span>followed profiles</span>
+			</div>
+			<div>
+				<strong>{{ rows.len() }}</strong>
+				<span>with creator URLs</span>
+			</div>
+			<div>
+				<strong>{{ self.total_link_count() }}</strong>
+				<span>profile links</span>
+			</div>
+			<div>
+				<strong>{{ self.archive_link_count() }}</strong>
+				<span>Coomer links</span>
+			</div>
+		</div>
+	</header>
+
+	{% if followed_count == 0 %}
+	<section class="creator_links_empty panel">
+		<h2>No followed profiles yet</h2>
+		<p>Follow one or more user profiles first.</p>
+	</section>
+	{% else if rows.is_empty() %}
+	<section class="creator_links_empty panel">
+		<h2>No creator URLs available</h2>
+		<p>No followed profile currently has cached or fetched OnlyFans, Fansly, RedGifs, or Coomer profile metadata.</p>
+	</section>
+	{% else %}
+	<section class="creator_links_grid" aria-label="Followed creator links">
+		{% for row in rows %}
+		<article class="creator_link_card">
+			<a class="creator_link_name" href="/user/{{ row.name }}">u/{{ row.name }}</a>
+			<div class="creator_link_icons" aria-label="Links for u/{{ row.name }}">
+				<a class="creator_link_icon creator_link_icon_redlib" href="/user/{{ row.name }}" title="Redlib profile for u/{{ row.name }}">
+					<img loading="lazy" src="/favicon.ico" alt="Redlib profile for u/{{ row.name }}" width="16" height="16">
+				</a>
+				{% for link in row.links.clone() %}
+				<a class="creator_link_icon{% if link.is_archive %} creator_link_icon_archive{% endif %}" href="{{ link.url }}" rel="nofollow noopener noreferrer" title="{{ link.label }}">
+					<img loading="lazy" src="{{ link.icon_path }}" alt="{{ link.label }}" width="16" height="16">
+				</a>
+				{% endfor %}
+			</div>
+		</article>
+		{% endfor %}
+	</section>
+	{% if self.skipped_profile_count() > 0 %}
+	<p class="creator_links_note">{{ self.skipped_profile_count() }} followed profiles had no creator URL metadata for this overview.</p>
+	{% endif %}
+	{% endif %}
+</main>
+{% endblock %}
