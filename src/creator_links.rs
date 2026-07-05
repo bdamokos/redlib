@@ -1,14 +1,17 @@
-use crate::utils::{self, template, ExternalLink, Preferences};
+use crate::utils::{self, param, template, ExternalLink, Preferences};
 use askama::Template;
 use hyper::{Body, Request, Response};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 use tokio::task::JoinSet;
 
-const CREATOR_LINK_AUTHOR_CONCURRENCY: usize = 12;
-const CREATOR_LINK_AUTHOR_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const CREATOR_LINK_BATCH_SIZE: usize = 8;
+const CREATOR_LINK_MAX_BATCH_SIZE: usize = 16;
+const CREATOR_LINK_AUTHOR_CONCURRENCY: usize = 8;
+const CREATOR_LINK_AUTHOR_TIMEOUT: StdDuration = StdDuration::from_secs(7);
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 struct CreatorOverviewLink {
 	label: String,
 	url: String,
@@ -16,10 +19,19 @@ struct CreatorOverviewLink {
 	is_archive: bool,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 struct CreatorOverviewRow {
 	name: String,
 	links: Vec<CreatorOverviewLink>,
+}
+
+#[derive(Serialize)]
+struct CreatorLinksBatch {
+	followed_count: usize,
+	offset: usize,
+	processed_count: usize,
+	next_offset: Option<usize>,
+	rows: Vec<CreatorOverviewRow>,
 }
 
 #[derive(Template)]
@@ -28,24 +40,10 @@ struct CreatorLinksTemplate {
 	prefs: Preferences,
 	url: String,
 	followed_count: usize,
-	rows: Vec<CreatorOverviewRow>,
+	batch_size: usize,
 }
 
 crate::impl_template_str_eq!(CreatorLinksTemplate);
-
-impl CreatorLinksTemplate {
-	fn total_link_count(&self) -> usize {
-		self.rows.iter().map(|row| row.links.len()).sum()
-	}
-
-	fn archive_link_count(&self) -> usize {
-		self.rows.iter().flat_map(|row| row.links.iter()).filter(|link| link.is_archive).count()
-	}
-
-	fn skipped_profile_count(&self) -> usize {
-		self.followed_count.saturating_sub(self.rows.len())
-	}
-}
 
 fn followed_profile_names(prefs: &Preferences) -> Vec<String> {
 	let mut seen = HashSet::new();
@@ -114,22 +112,64 @@ async fn creator_overview_rows(names: Vec<String>) -> Vec<CreatorOverviewRow> {
 	rows
 }
 
+fn requested_offset(req: &Request<Body>) -> usize {
+	let query = format!("?{}", req.uri().query().unwrap_or_default());
+	param(&query, "offset").and_then(|offset| offset.parse::<usize>().ok()).unwrap_or_default()
+}
+
+fn requested_limit(req: &Request<Body>) -> usize {
+	let query = format!("?{}", req.uri().query().unwrap_or_default());
+	param(&query, "limit")
+		.and_then(|limit| limit.parse::<usize>().ok())
+		.filter(|limit| *limit > 0)
+		.map(|limit| limit.min(CREATOR_LINK_MAX_BATCH_SIZE))
+		.unwrap_or(CREATOR_LINK_BATCH_SIZE)
+}
+
 pub async fn page(req: Request<Body>) -> Result<Response<Body>, String> {
 	let prefs = Preferences::new(&req);
 	let followed = followed_profile_names(&prefs);
-	let rows = creator_overview_rows(followed.clone()).await;
 
 	Ok(template(&CreatorLinksTemplate {
 		prefs,
 		url: "/creator-links".to_string(),
 		followed_count: followed.len(),
-		rows,
+		batch_size: CREATOR_LINK_BATCH_SIZE,
 	}))
+}
+
+pub async fn data(req: Request<Body>) -> Result<Response<Body>, String> {
+	let prefs = Preferences::new(&req);
+	let followed = followed_profile_names(&prefs);
+	let offset = requested_offset(&req).min(followed.len());
+	let limit = requested_limit(&req);
+	let end = (offset + limit).min(followed.len());
+	let batch_names = followed[offset..end].to_vec();
+	let rows = creator_overview_rows(batch_names).await;
+	let body = serde_json::to_string(&CreatorLinksBatch {
+		followed_count: followed.len(),
+		offset,
+		processed_count: end.saturating_sub(offset),
+		next_offset: (end < followed.len()).then_some(end),
+		rows,
+	})
+	.map_err(|err| err.to_string())?;
+
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "application/json")
+			.header("Cache-Control", "no-store")
+			.body(body.into())
+			.unwrap_or_default(),
+	)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use futures_lite::future::block_on;
+	use hyper::body::to_bytes;
 
 	fn external_link(label: &str, url: &str, host: &str) -> ExternalLink {
 		ExternalLink {
@@ -169,30 +209,30 @@ mod tests {
 			},
 			url: "/creator-links".to_string(),
 			followed_count: 1,
-			rows: vec![CreatorOverviewRow {
-				name: "demo".to_string(),
-				links: vec![
-					CreatorOverviewLink {
-						label: "OnlyFans".to_string(),
-						url: "https://onlyfans.com/demo".to_string(),
-						icon_path: "/site_icon/onlyfans.com".to_string(),
-						is_archive: false,
-					},
-					CreatorOverviewLink {
-						label: "Coomer".to_string(),
-						url: "https://coomer.st/onlyfans/user/demo".to_string(),
-						icon_path: "/site_icon/coomer.st".to_string(),
-						is_archive: true,
-					},
-				],
-			}],
+			batch_size: CREATOR_LINK_BATCH_SIZE,
 		};
 
 		let html = template.render().expect("template should render");
 
-		assert!(html.contains("href=\"/user/demo\""));
-		assert!(html.contains("src=\"/favicon.ico\""));
-		assert!(html.contains("src=\"/site_icon/onlyfans.com\""));
-		assert!(html.contains("creator_link_icon_archive"));
+		assert!(html.contains("data-creator-links-url=\"/creator-links.json\""));
+		assert!(html.contains("data-creator-links-followed-count=\"1\""));
+		assert!(html.contains("data-creator-links-grid"));
+		assert!(html.contains("creator_links.js"));
+	}
+
+	#[test]
+	fn empty_data_response_returns_json_without_profile_fetches() {
+		let response = block_on(data(Request::builder().uri("/creator-links.json?offset=10&limit=99").body(Body::empty()).unwrap())).expect("response");
+		assert_eq!(response.status(), 200);
+		assert_eq!(response.headers().get("content-type").and_then(|value| value.to_str().ok()), Some("application/json"));
+
+		let bytes = block_on(to_bytes(response.into_body())).expect("body");
+		let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+		assert_eq!(parsed["followed_count"], 0);
+		assert_eq!(parsed["offset"], 0);
+		assert_eq!(parsed["processed_count"], 0);
+		assert!(parsed["next_offset"].is_null());
+		assert_eq!(parsed["rows"].as_array().map(Vec::len), Some(0));
 	}
 }

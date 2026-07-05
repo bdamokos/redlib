@@ -243,6 +243,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"relative_time.js" => resource(include_str!("../static/relative_time.js"), "text/javascript", false).await,
 		"browser_session.js" => resource(include_str!("../static/browser_session.js"), "text/javascript", false).await,
 		"author_links.js" => resource(include_str!("../static/author_links.js"), "text/javascript", false).await,
+		"creator_links.js" => resource(include_str!("../static/creator_links.js"), "text/javascript", false).await,
 		"subscription.js" => resource(include_str!("../static/subscription.js"), "text/javascript", false).await,
 		"suggested_profiles.js" => resource(include_str!("../static/suggested_profiles.js"), "text/javascript", false).await,
 		"suggested_subreddits.js" => resource(include_str!("../static/suggested_subreddits.js"), "text/javascript", false).await,
@@ -445,6 +446,9 @@ async fn main() {
 		.at("/author_links.js")
 		.get(|_| resource(include_str!("../static/author_links.js"), "text/javascript", false).boxed());
 	app
+		.at("/creator_links.js")
+		.get(|_| resource(include_str!("../static/creator_links.js"), "text/javascript", false).boxed());
+	app
 		.at("/subscription.js")
 		.get(|_| resource(include_str!("../static/subscription.js"), "text/javascript", false).boxed());
 	app
@@ -567,6 +571,7 @@ async fn main() {
 	app.at("/bookmarks/add").post(|r| bookmarks::add(r).boxed());
 	app.at("/bookmarks/remove").post(|r| bookmarks::remove(r).boxed());
 	app.at("/creator-links").get(|r| creator_links::page(r).boxed());
+	app.at("/creator-links.json").get(|r| creator_links::data(r).boxed());
 	app.at("/suggested-profiles").get(|r| suggested_profiles::page(r).boxed());
 	app.at("/suggested-subreddits").get(|r| suggested_subreddits::page(r).boxed());
 	register_subreddit_fragment_routes(&mut app);
