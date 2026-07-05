@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(about = "Backfill bounded subreddit vibe samples into the Redlib content semantic sidecar using local Ollama.")]
+#[command(about = "Backfill cursor-based subreddit vibe aggregates into the Redlib content semantic sidecar using local Ollama.")]
 struct Args {
 	#[arg(long, env = "REDLIB_CACHE_DIR")]
 	cache_dir: Option<String>,
@@ -329,8 +329,8 @@ async fn run_backfill(args: &Args, options: &SubredditContentCorpusOptions, coun
 		if args.dry_run {
 			if !args.quiet {
 				println!(
-					"would embed sampled post r/{} chars={} post_hash={} text_hash={}",
-					candidate.subreddit, candidate.text_chars, candidate.post_key_hash, candidate.text_hash
+					"would embed aggregate post r/{} chars={} created={} post_hash={} text_hash={}",
+					candidate.subreddit, candidate.text_chars, candidate.created_ts, candidate.post_key_hash, candidate.text_hash
 				);
 			}
 			continue;
@@ -339,19 +339,19 @@ async fn run_backfill(args: &Args, options: &SubredditContentCorpusOptions, coun
 		let prompt = format!("r/{}\nCached post title and text:\n{}", candidate.subreddit, candidate.text);
 		match ollama_embedding(&client, &args.ollama_url, &args.model, &prompt).await {
 			Ok(embedding) => {
-				let stored = subreddit_content_semantics::store_post_sample_embedding(&candidate, &args.model, embedding, cache_persistence::unix_now())?;
+				let stored = subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &args.model, embedding, cache_persistence::unix_now())?;
 				if stored {
 					counters.embedded += 1;
 				} else {
 					counters.already_current += 1;
 				}
 				if !args.quiet {
-					println!("embedded sampled post r/{}", candidate.subreddit);
+					println!("embedded aggregate post r/{}", candidate.subreddit);
 				}
 			}
 			Err(error) => {
 				counters.failed += 1;
-				eprintln!("embedding failed sampled post r/{}: {error}", candidate.subreddit);
+				eprintln!("embedding failed aggregate post r/{}: {error}", candidate.subreddit);
 			}
 		}
 	}

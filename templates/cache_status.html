@@ -93,7 +93,7 @@
 				<p><strong>Sidecar rows:</strong> {{ content_semantic_database.sidecar_entry_count }}</p>
 				<p><strong>Embedding dimensions:</strong> {% match content_semantic_database.embedding_dimensions %}{% when Some with (dimensions) %}{{ dimensions }}{% when None %}-{% endmatch %}</p>
 			</div>
-			<p><strong>Quality gates:</strong> at least {{ content_semantic_database.min_posts_per_subreddit }} retained sampled posts and {{ content_semantic_database.min_corpus_text_chars }} sampled text characters; max top-5 mean similarity {{ content_semantic_database.max_top5_mean_similarity }}.</p>
+			<p><strong>Quality gates:</strong> at least {{ content_semantic_database.min_posts_per_subreddit }} processed posts and {{ content_semantic_database.min_corpus_text_chars }} processed text characters; max top-5 mean similarity {{ content_semantic_database.max_top5_mean_similarity }}.</p>
 			<p><strong>Top-5 mean similarity:</strong>
 				average {% match content_semantic_database.top5_mean_similarity_average %}{% when Some with (score) %}{{ score }}{% when None %}-{% endmatch %};
 				p95 {% match content_semantic_database.top5_mean_similarity_p95 %}{% when Some with (score) %}{{ score }}{% when None %}-{% endmatch %}
@@ -119,7 +119,7 @@
 				{% match run.finished_at_unix %}{% when Some with (timestamp) %}finished at Unix time {{ timestamp }}{% when None %}started at Unix time {{ run.started_at_unix }}{% endmatch %}
 				{% if run.dry_run %}(dry run){% endif %}{% if run.force %}(forced){% endif %}
 			</p>
-			<p><strong>Run totals:</strong> {{ run.counters.source_files }} source files, {{ run.counters.unique_posts }} unique candidate posts, {{ run.counters.candidate_subreddits }} candidate subreddits, {{ run.counters.embedded }} sampled posts embedded, {{ run.counters.already_current }} already current or outside the retained sample, {{ run.counters.too_small_subreddits }} too small, {{ run.counters.failed }} failed.</p>
+			<p><strong>Run totals:</strong> {{ run.counters.source_files }} source files, {{ run.counters.unique_posts }} unique candidate posts, {{ run.counters.candidate_subreddits }} candidate subreddits, {{ run.counters.embedded }} posts embedded into running aggregates, {{ run.counters.already_current }} already at or before the saved cursor, {{ run.counters.too_small_subreddits }} too small, {{ run.counters.failed }} failed.</p>
 			{% match run.error %}{% when Some with (error) %}
 			<p><strong>Run error:</strong> {{ error }}</p>
 			{% when None %}{% endmatch %}

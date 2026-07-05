@@ -12,9 +12,9 @@ use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_VERSION: u8 = 2;
-const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_FILE_NAME: &str = "subreddit-content-semantic-embeddings.v2.bin";
-const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_LOCK_FILE_NAME: &str = "subreddit-content-semantic-embeddings.v2.lock";
+const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_VERSION: u8 = 3;
+const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_FILE_NAME: &str = "subreddit-content-semantic-embeddings.v3.bin";
+const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_LOCK_FILE_NAME: &str = "subreddit-content-semantic-embeddings.v3.lock";
 const SUBREDDIT_CONTENT_SEMANTIC_BACKFILL_STATUS_FILE_NAME: &str = "subreddit-content-semantic-backfill-status.v1.json";
 const MATERIALIZED_CATALOG_FILE_NAME: &str = "materialized-catalog.v1.bin";
 const DEFAULT_CONTENT_SEMANTIC_MIX_PERCENT: u8 = 35;
@@ -42,6 +42,9 @@ pub struct PersistedSubredditContentSemanticEmbedding {
 	pub post_count: usize,
 	pub source_count: usize,
 	pub text_chars: usize,
+	pub vector_sum: Vec<f32>,
+	pub last_processed_created_ts: u64,
+	pub last_processed_post_key_hash: String,
 	pub top_neighbor_similarity: Option<f32>,
 	pub top5_mean_similarity: Option<f32>,
 	pub samples: Vec<PersistedSubredditContentSemanticSample>,
@@ -674,26 +677,13 @@ pub fn build_subreddit_content_post_embedding_candidates(options: &SubredditCont
 	}
 
 	stats.unique_posts = candidates_by_post.len();
-	let mut candidates_by_text = HashMap::<(String, String), SubredditContentPostEmbeddingCandidate>::new();
-	for candidate in candidates_by_post.into_values() {
-		let key = (candidate.subreddit.clone(), candidate.text_hash.clone());
-		candidates_by_text
-			.entry(key)
-			.and_modify(|existing| {
-				if candidate.sort_key < existing.sort_key || (candidate.sort_key == existing.sort_key && candidate.created_ts > existing.created_ts) {
-					*existing = candidate.clone();
-				}
-			})
-			.or_insert(candidate);
-	}
-
-	let mut candidates = candidates_by_text.into_values().collect::<Vec<_>>();
+	let mut candidates = candidates_by_post.into_values().collect::<Vec<_>>();
 	candidates.sort_by(|left, right| {
 		left
 			.subreddit
 			.cmp(&right.subreddit)
-			.then_with(|| left.sort_key.cmp(&right.sort_key))
-			.then_with(|| right.created_ts.cmp(&left.created_ts))
+			.then_with(|| left.created_ts.cmp(&right.created_ts))
+			.then_with(|| left.post_key_hash.cmp(&right.post_key_hash))
 	});
 	let mut candidates_per_subreddit = HashMap::<String, usize>::new();
 	for candidate in &candidates {
@@ -864,11 +854,14 @@ pub fn store_embedding(
 			subreddit,
 			model,
 			corpus_hash,
+			vector_sum: embedding.iter().map(|value| *value * post_count.max(1) as f32).collect(),
 			embedding,
 			embedded_at_unix,
 			post_count,
 			source_count,
 			text_chars,
+			last_processed_created_ts: 0,
+			last_processed_post_key_hash: String::new(),
 			top_neighbor_similarity: None,
 			top5_mean_similarity: None,
 			samples: Vec::new(),
@@ -877,7 +870,7 @@ pub fn store_embedding(
 	Ok(())
 }
 
-fn empty_sampled_entry(subreddit: String, model: String) -> PersistedSubredditContentSemanticEmbedding {
+fn empty_aggregate_entry(subreddit: String, model: String) -> PersistedSubredditContentSemanticEmbedding {
 	PersistedSubredditContentSemanticEmbedding {
 		subreddit,
 		model,
@@ -887,52 +880,38 @@ fn empty_sampled_entry(subreddit: String, model: String) -> PersistedSubredditCo
 		post_count: 0,
 		source_count: 0,
 		text_chars: 0,
+		vector_sum: Vec::new(),
+		last_processed_created_ts: 0,
+		last_processed_post_key_hash: String::new(),
 		top_neighbor_similarity: None,
 		top5_mean_similarity: None,
 		samples: Vec::new(),
 	}
 }
 
-fn recompute_sampled_entry(entry: &mut PersistedSubredditContentSemanticEmbedding, embedded_at_unix: u64) -> Result<(), String> {
-	entry
-		.samples
-		.sort_by(|left, right| left.sort_key.cmp(&right.sort_key).then_with(|| left.post_key_hash.cmp(&right.post_key_hash)));
-	let mut centroid = Vec::<f32>::new();
-	let mut source_keys = HashSet::new();
-	let mut text_chars = 0usize;
-	for sample in &entry.samples {
-		if sample.embedding.is_empty() || !sample.embedding.iter().all(|value| value.is_finite()) {
-			continue;
-		}
-		if centroid.is_empty() {
-			centroid.resize(sample.embedding.len(), 0.0);
-		}
-		if centroid.len() != sample.embedding.len() {
-			continue;
-		}
-		for (centroid_value, sample_value) in centroid.iter_mut().zip(&sample.embedding) {
-			*centroid_value += sample_value;
-		}
-		source_keys.insert(sample.source_key_hash.clone());
-		text_chars += sample.text_chars;
+fn candidate_is_after_cursor(candidate: &SubredditContentPostEmbeddingCandidate, entry: &PersistedSubredditContentSemanticEmbedding) -> bool {
+	candidate.created_ts > entry.last_processed_created_ts
+		|| (candidate.created_ts == entry.last_processed_created_ts && candidate.post_key_hash > entry.last_processed_post_key_hash)
+}
+
+fn aggregate_corpus_hash(entry: &PersistedSubredditContentSemanticEmbedding) -> String {
+	semantic_hash(&format!(
+		"cursor:{}:{}:{}:{}",
+		entry.last_processed_created_ts, entry.last_processed_post_key_hash, entry.post_count, entry.text_chars
+	))
+}
+
+fn recompute_aggregate_entry(entry: &mut PersistedSubredditContentSemanticEmbedding, embedded_at_unix: u64) -> Result<(), String> {
+	let mut embedding = entry.vector_sum.clone();
+	if embedding.is_empty() || !embedding.iter().all(|value| value.is_finite()) || !normalize_embedding(&mut embedding) {
+		return Err("content semantic aggregate vector is empty".to_string());
 	}
-	if centroid.is_empty() || !normalize_embedding(&mut centroid) {
-		return Err("content semantic sampled centroid is empty".to_string());
-	}
-	let sample_fingerprint = entry
-		.samples
-		.iter()
-		.map(|sample| format!("{}:{}", sample.post_key_hash, sample.text_hash))
-		.collect::<Vec<_>>()
-		.join("|");
-	entry.corpus_hash = semantic_hash(&sample_fingerprint);
-	entry.embedding = centroid;
+	entry.corpus_hash = aggregate_corpus_hash(entry);
+	entry.embedding = embedding;
 	entry.embedded_at_unix = embedded_at_unix;
-	entry.post_count = entry.samples.len();
-	entry.source_count = source_keys.len();
-	entry.text_chars = text_chars;
 	entry.top_neighbor_similarity = None;
 	entry.top5_mean_similarity = None;
+	entry.samples.clear();
 	Ok(())
 }
 
@@ -941,7 +920,6 @@ pub fn post_candidate_needs_embedding(candidate: &SubredditContentPostEmbeddingC
 	if candidate.subreddit.is_empty() || model.is_empty() {
 		return false;
 	}
-	let max_samples = corpus_options_from_env().max_posts_per_subreddit.max(1);
 	let Ok(cache) = CONTENT_SEMANTIC_CACHE.lock() else {
 		return true;
 	};
@@ -951,25 +929,10 @@ pub fn post_candidate_needs_embedding(candidate: &SubredditContentPostEmbeddingC
 	if entry.model != model {
 		return true;
 	}
-	if entry
-		.samples
-		.iter()
-		.any(|sample| sample.post_key_hash == candidate.post_key_hash && sample.text_hash == candidate.text_hash && !sample.embedding.is_empty())
-	{
-		return false;
-	}
-	if entry.samples.len() < max_samples {
-		return true;
-	}
-	entry
-		.samples
-		.iter()
-		.map(|sample| sample.sort_key)
-		.max()
-		.is_some_and(|max_sort_key| candidate.sort_key < max_sort_key)
+	candidate_is_after_cursor(candidate, entry)
 }
 
-pub fn store_post_sample_embedding(candidate: &SubredditContentPostEmbeddingCandidate, model: &str, embedding: Vec<f32>, embedded_at_unix: u64) -> Result<bool, String> {
+pub fn store_post_aggregate_embedding(candidate: &SubredditContentPostEmbeddingCandidate, model: &str, embedding: Vec<f32>, embedded_at_unix: u64) -> Result<bool, String> {
 	let subreddit = crate::subreddit_semantics::normalize_subreddit_name(&candidate.subreddit);
 	let model = model.trim().to_string();
 	if subreddit.is_empty() {
@@ -981,49 +944,33 @@ pub fn store_post_sample_embedding(candidate: &SubredditContentPostEmbeddingCand
 	let Some(embedding) = normalized_embedding(embedding) else {
 		return Err("embedding is empty, non-finite, or zero-length".to_string());
 	};
-	let max_samples = corpus_options_from_env().max_posts_per_subreddit.max(1);
-	let sample = PersistedSubredditContentSemanticSample {
-		post_key_hash: candidate.post_key_hash.clone(),
-		text_hash: candidate.text_hash.clone(),
-		sort_key: candidate.sort_key,
-		embedding,
-		text_chars: candidate.text_chars,
-		source_key_hash: candidate.source_key_hash.clone(),
-		observed_at_unix: embedded_at_unix,
-	};
 
 	let Ok(mut cache) = CONTENT_SEMANTIC_CACHE.lock() else {
 		return Err("content semantic embedding cache lock is poisoned".to_string());
 	};
-	let entry = cache.entry(subreddit.clone()).or_insert_with(|| empty_sampled_entry(subreddit.clone(), model.clone()));
+	let entry = cache.entry(subreddit.clone()).or_insert_with(|| empty_aggregate_entry(subreddit.clone(), model.clone()));
 	if entry.model != model {
-		*entry = empty_sampled_entry(subreddit.clone(), model.clone());
+		*entry = empty_aggregate_entry(subreddit.clone(), model.clone());
 	}
-	if let Some(existing) = entry.samples.iter_mut().find(|existing| existing.post_key_hash == sample.post_key_hash) {
-		if existing.text_hash == sample.text_hash && !existing.embedding.is_empty() {
-			return Ok(false);
-		}
-		*existing = sample;
-		recompute_sampled_entry(entry, embedded_at_unix)?;
-		return Ok(true);
+	if !candidate_is_after_cursor(candidate, entry) {
+		return Ok(false);
 	}
-	if entry.samples.len() >= max_samples {
-		let Some((replace_index, replace_sort_key)) = entry
-			.samples
-			.iter()
-			.enumerate()
-			.max_by_key(|(_, existing)| existing.sort_key)
-			.map(|(index, existing)| (index, existing.sort_key))
-		else {
-			return Ok(false);
-		};
-		if sample.sort_key >= replace_sort_key {
-			return Ok(false);
-		}
-		entry.samples.remove(replace_index);
+	if entry.vector_sum.is_empty() {
+		entry.vector_sum = vec![0.0; embedding.len()];
 	}
-	entry.samples.push(sample);
-	recompute_sampled_entry(entry, embedded_at_unix)?;
+	if entry.vector_sum.len() != embedding.len() {
+		*entry = empty_aggregate_entry(subreddit, model);
+		entry.vector_sum = vec![0.0; embedding.len()];
+	}
+	for (sum_value, embedding_value) in entry.vector_sum.iter_mut().zip(&embedding) {
+		*sum_value += *embedding_value;
+	}
+	entry.post_count = entry.post_count.saturating_add(1);
+	entry.source_count = entry.source_count.saturating_add(1);
+	entry.text_chars = entry.text_chars.saturating_add(candidate.text_chars);
+	entry.last_processed_created_ts = candidate.created_ts;
+	entry.last_processed_post_key_hash = candidate.post_key_hash.clone();
+	recompute_aggregate_entry(entry, embedded_at_unix)?;
 	Ok(true)
 }
 
@@ -1132,21 +1079,23 @@ fn normalized_entry(mut entry: PersistedSubredditContentSemanticEmbedding) -> Op
 	entry.subreddit = crate::subreddit_semantics::normalize_subreddit_name(&entry.subreddit);
 	entry.model = entry.model.trim().to_string();
 	entry.corpus_hash = entry.corpus_hash.trim().to_string();
+	entry.last_processed_post_key_hash = entry.last_processed_post_key_hash.trim().to_string();
 	entry.embedding = normalized_embedding(entry.embedding)?;
-	entry.samples = entry
-		.samples
-		.into_iter()
-		.filter_map(|mut sample| {
-			sample.post_key_hash = sample.post_key_hash.trim().to_string();
-			sample.text_hash = sample.text_hash.trim().to_string();
-			sample.source_key_hash = sample.source_key_hash.trim().to_string();
-			sample.embedding = normalized_embedding(sample.embedding)?;
-			(!sample.post_key_hash.is_empty() && !sample.text_hash.is_empty()).then_some(sample)
-		})
-		.collect();
-	entry
-		.samples
-		.sort_by(|left, right| left.sort_key.cmp(&right.sort_key).then_with(|| left.post_key_hash.cmp(&right.post_key_hash)));
+	if entry.vector_sum.is_empty() {
+		entry.vector_sum = entry.embedding.clone();
+	}
+	if entry.vector_sum.len() != entry.embedding.len() || !entry.vector_sum.iter().all(|value| value.is_finite()) {
+		return None;
+	}
+	let mut embedding = entry.vector_sum.clone();
+	if !normalize_embedding(&mut embedding) {
+		return None;
+	}
+	entry.embedding = embedding;
+	if entry.corpus_hash.is_empty() {
+		entry.corpus_hash = aggregate_corpus_hash(&entry);
+	}
+	entry.samples.clear();
 	(!entry.subreddit.is_empty() && !entry.model.is_empty() && !entry.corpus_hash.is_empty()).then_some((entry.subreddit.clone(), entry))
 }
 
@@ -1542,7 +1491,7 @@ mod tests {
 	}
 
 	#[test]
-	fn duplicate_post_sample_does_not_move_subreddit_vector() {
+	fn duplicate_or_older_post_does_not_move_running_vector() {
 		let _guard = TEST_CACHE_LOCK.lock().unwrap();
 		clear_test_cache();
 		let candidate = SubredditContentPostEmbeddingCandidate {
@@ -1556,15 +1505,49 @@ mod tests {
 			text_chars: 34,
 		};
 
-		assert!(store_post_sample_embedding(&candidate, "test-model", vec![1.0, 0.0], 100).unwrap());
+		assert!(store_post_aggregate_embedding(&candidate, "test-model", vec![1.0, 0.0], 100).unwrap());
 		let first = active_entries_for_model("test-model").into_iter().next().unwrap();
 		assert_eq!(first.post_count, 1);
-		assert!(!store_post_sample_embedding(&candidate, "test-model", vec![0.0, 1.0], 200).unwrap());
+		assert_eq!(first.last_processed_created_ts, 100);
+		assert!(!store_post_aggregate_embedding(&candidate, "test-model", vec![0.0, 1.0], 200).unwrap());
 		let second = active_entries_for_model("test-model").into_iter().next().unwrap();
 
 		assert_eq!(second.post_count, 1);
 		assert_eq!(first.corpus_hash, second.corpus_hash);
 		assert_eq!(first.embedding, second.embedding);
 		assert_eq!(first.embedded_at_unix, second.embedded_at_unix);
+	}
+
+	#[test]
+	fn newer_post_advances_running_vector() {
+		let _guard = TEST_CACHE_LOCK.lock().unwrap();
+		clear_test_cache();
+		let first = SubredditContentPostEmbeddingCandidate {
+			subreddit: "rust".to_string(),
+			text: "Async runtimes and task scheduling".to_string(),
+			post_key_hash: "post-a".to_string(),
+			text_hash: "text-a".to_string(),
+			sort_key: 10,
+			source_key_hash: "source-a".to_string(),
+			created_ts: 100,
+			text_chars: 34,
+		};
+		let mut second = first.clone();
+		second.post_key_hash = "post-b".to_string();
+		second.text_hash = "text-b".to_string();
+		second.created_ts = 101;
+		second.text_chars = 28;
+
+		assert!(store_post_aggregate_embedding(&first, "test-model", vec![1.0, 0.0], 100).unwrap());
+		assert!(store_post_aggregate_embedding(&second, "test-model", vec![0.0, 1.0], 200).unwrap());
+		let entry = active_entries_for_model("test-model").into_iter().next().unwrap();
+
+		assert_eq!(entry.post_count, 2);
+		assert_eq!(entry.text_chars, 62);
+		assert_eq!(entry.last_processed_created_ts, 101);
+		assert_eq!(entry.last_processed_post_key_hash, "post-b");
+		assert!((entry.embedding[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.001);
+		assert!((entry.embedding[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.001);
+		assert_eq!(entry.vector_sum, vec![1.0, 1.0]);
 	}
 }
