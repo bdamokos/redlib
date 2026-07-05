@@ -117,15 +117,35 @@
     }
 
     function browserAllowsPreviewSound() {
-        return browserAllowsPreviewPlayback();
+        return browserAllowsForegroundPreviewPlayback();
     }
 
-    function browserAllowsPreviewPlayback() {
+    function pageIsVisible() {
         if (document.visibilityState !== "visible") {
             return false;
         }
 
+        return true;
+    }
+
+    function mobilePreviewFocusIsUnreliable() {
+        if (!window.matchMedia) {
+            return false;
+        }
+
+        return window.matchMedia("(hover: none), (pointer: coarse)").matches;
+    }
+
+    function browserAllowsForegroundPreviewPlayback() {
+        if (!pageIsVisible()) {
+            return false;
+        }
+
         return typeof document.hasFocus !== "function" || document.hasFocus();
+    }
+
+    function browserAllowsPreviewPlayback() {
+        return pageIsVisible() && (mobilePreviewFocusIsUnreliable() || browserAllowsForegroundPreviewPlayback());
     }
 
     function syncPreviewSoundButton() {
@@ -805,12 +825,14 @@
         });
     }
 
-    function syncPreviewFallbackPlayback() {
+    function syncPreviewFallbackPlayback(forcePlaybackAllowed) {
+        var playbackAllowed = typeof forcePlaybackAllowed === "boolean" ? forcePlaybackAllowed : browserAllowsPreviewPlayback();
+
         activeHosts.forEach(function (state, host) {
             if (!state || (!state.previewFallbackActive && !state.previewFallbackLoading)) {
                 return;
             }
-            if (browserAllowsPreviewPlayback() && shouldRenderHost(host)) {
+            if (playbackAllowed && shouldRenderHost(host)) {
                 return;
             }
 
@@ -1108,7 +1130,7 @@
     }
 
     function pauseBackgroundPreviewWork() {
-        syncPreviewFallbackPlayback();
+        syncPreviewFallbackPlayback(false);
         syncPreviewSoundMode();
     }
 
