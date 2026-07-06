@@ -149,27 +149,6 @@ get_password() {
 	fi
 }
 
-# Keep REDLIB_DEPLOY_GIT_HASH in .env in sync with the commit being deployed (upsert one line).
-upsert_redlib_deploy_git_hash_in_env() {
-	local env_file="$1"
-	local hash="$2"
-	local tmp
-	tmp="$(mktemp)"
-	local found=false
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		if [[ "$line" == REDLIB_DEPLOY_GIT_HASH=* ]]; then
-			printf '%s\n' "REDLIB_DEPLOY_GIT_HASH=$hash" >> "$tmp"
-			found=true
-		else
-			printf '%s\n' "$line" >> "$tmp"
-		fi
-	done < "$env_file"
-	if [[ "$found" == false ]]; then
-		printf '%s\n' "REDLIB_DEPLOY_GIT_HASH=$hash" >> "$tmp"
-	fi
-	mv "$tmp" "$env_file"
-}
-
 cleanup_ssh_multiplexing() {
 	if [[ -n "$SSH_CONTROL_PATH" ]]; then
 		ssh "${SSH_COMMON_OPTS[@]}" \
@@ -384,6 +363,7 @@ cleanup_local_target() {
 deploy_remote() {
 	local remote_image_ref="$REGISTRY_HOST_PULL/$IMAGE_NAME:$IMAGE_TAG"
 	local deploy_git_hash
+	deploy_git_hash=$(current_git_hash)
 
 	echo "Resolving remote deploy directory..."
 	resolve_remote_dir
@@ -407,20 +387,10 @@ deploy_remote() {
 	run_scp compose.pi.yaml "$SERVER_USER@$SERVER_HOST:$REMOTE_DEPLOY_DIR/compose.pi.yaml"
 
 	if [[ -f .env ]]; then
-		deploy_git_hash="$(git rev-parse HEAD 2>/dev/null || true)"
-		if [[ -n "$deploy_git_hash" ]]; then
-			echo "Recording REDLIB_DEPLOY_GIT_HASH in .env ($deploy_git_hash)..."
-			upsert_redlib_deploy_git_hash_in_env .env "$deploy_git_hash"
-		else
-			echo "Warning: could not read git HEAD; .env left unchanged for REDLIB_DEPLOY_GIT_HASH." >&2
-		fi
-	fi
-
-	if [[ -f .env ]]; then
 		echo "Copying .env to server..."
 		run_scp .env "$SERVER_USER@$SERVER_HOST:$REMOTE_DEPLOY_DIR/.env"
 	else
-		echo "Local .env not found; leaving remote .env unchanged."
+		echo "Local .env not found; preserving remote .env except REDLIB_DEPLOY_GIT_HASH."
 	fi
 
 	echo "Updating Redlib on the Raspberry Pi..."
@@ -432,6 +402,24 @@ deploy_remote() {
 			touch .env
 		fi
 
+		echo \"Recording REDLIB_DEPLOY_GIT_HASH in remote .env ($deploy_git_hash)...\"
+		tmp_env=\$(mktemp)
+		awk -v hash=\"$deploy_git_hash\" '
+			BEGIN { found = 0 }
+			/^REDLIB_DEPLOY_GIT_HASH=/ {
+				print \"REDLIB_DEPLOY_GIT_HASH=\" hash
+				found = 1
+				next
+			}
+			{ print }
+			END {
+				if (!found) {
+					print \"REDLIB_DEPLOY_GIT_HASH=\" hash
+				}
+			}
+		' .env > \"\$tmp_env\"
+		mv \"\$tmp_env\" .env
+
 		compose_cmd() {
 			if docker compose version >/dev/null 2>&1; then
 				docker compose \"\$@\"
@@ -441,6 +429,7 @@ deploy_remote() {
 		}
 
 		export REDLIB_IMAGE=\"$remote_image_ref\"
+		export REDLIB_DEPLOY_GIT_HASH=\"$deploy_git_hash\"
 		export REDLIB_HOST_PORT=\"$HOST_PORT\"
 		export REDLIB_CONTAINER_NAME=\"$REDLIB_CONTAINER_NAME\"
 		export REDLIB_CACHE_VOLUME=\"$REDLIB_CACHE_VOLUME\"

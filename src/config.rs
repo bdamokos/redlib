@@ -175,7 +175,11 @@ impl Config {
 			// Return the first non-`None` value
 			// If all are `None`, return `None`
 			let legacy_key = key.replace("REDLIB_", "LIBREDDIT_");
-			var(key).ok().or_else(|| var(legacy_key).ok()).or_else(|| get_setting_from_config(key, &config))
+			var(key)
+				.ok()
+				.or_else(|| var(legacy_key).ok())
+				.or_else(|| get_setting_from_config(key, &config))
+				.filter(|value| !value.trim().is_empty())
 		};
 		Self {
 			sfw_only: parse("REDLIB_SFW_ONLY"),
@@ -285,6 +289,12 @@ fn test_deserialize() {
 #[sealed_test(env = [("REDLIB_SFW_ONLY", "on")])]
 fn test_env_var() {
 	assert!(crate::utils::sfw_only())
+}
+
+#[test]
+#[sealed_test(env = [("REDLIB_PEER_API_FALLBACK_SOURCES", "")])]
+fn test_empty_env_var_is_unset() {
+	assert_eq!(get_setting("REDLIB_PEER_API_FALLBACK_SOURCES"), None);
 }
 
 #[test]
