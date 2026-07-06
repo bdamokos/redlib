@@ -99,7 +99,6 @@ pub static LAST_REDDIT_RATELIMIT: LazyLock<std::sync::Mutex<Option<RedditRateLim
 static IMAGE_PRELOAD_CACHE: LazyLock<Mutex<ImagePreloadCache>> = LazyLock::new(|| Mutex::new(ImagePreloadCache::default()));
 static IMAGE_PRELOAD_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(IMAGE_PRELOAD_CONCURRENCY)));
 
-const BREAKER_FLOOR: u16 = 5;
 const BLOCK_COOLDOWN_SECS: u64 = 900;
 
 #[derive(Clone)]
@@ -1082,12 +1081,9 @@ fn now_unix() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-fn check_breaker_gate(blocked_until: u64, rate_remaining: u16, is_rolling_over: bool, now: u64) -> Option<String> {
+fn check_reddit_cooldown(blocked_until: u64, now: u64) -> Option<String> {
 	if blocked_until > now {
 		return Some(format!("Reddit unavailable; cooling down until unix {blocked_until}"));
-	}
-	if rate_remaining < BREAKER_FLOOR && !is_rolling_over {
-		return Some("Rate budget conservation; refusing request".to_string());
 	}
 	None
 }
@@ -1139,7 +1135,7 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	let now = now_unix();
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
-	if let Some(msg) = check_breaker_gate(OAUTH_BLOCKED_UNTIL.load(Ordering::SeqCst), current_rate_limit, is_rolling_over, now) {
+	if let Some(msg) = check_reddit_cooldown(OAUTH_BLOCKED_UNTIL.load(Ordering::SeqCst), now) {
 		return Err(format!("{msg} | {path}"));
 	}
 	if current_rate_limit < 10 && !is_rolling_over {
@@ -1371,23 +1367,14 @@ fn test_response_preview_truncates_and_escapes_newlines() {
 }
 
 #[test]
-fn test_breaker_gate_allows_normal_budget() {
-	assert_eq!(check_breaker_gate(0, BREAKER_FLOOR, false, 1_000), None);
+fn test_reddit_cooldown_allows_unblocked_requests() {
+	assert_eq!(check_reddit_cooldown(0, 1_000), None);
 }
 
 #[test]
-fn test_breaker_gate_blocks_active_cooldown() {
-	let msg = check_breaker_gate(1_900, 99, false, 1_000).expect("cooldown should block");
+fn test_reddit_cooldown_blocks_active_cooldown() {
+	let msg = check_reddit_cooldown(1_900, 1_000).expect("cooldown should block");
 	assert!(msg.contains("cooling down until unix 1900"));
-}
-
-#[test]
-fn test_breaker_gate_blocks_low_budget_unless_rolling_over() {
-	assert_eq!(
-		check_breaker_gate(0, BREAKER_FLOOR - 1, false, 1_000),
-		Some("Rate budget conservation; refusing request".to_string())
-	);
-	assert_eq!(check_breaker_gate(0, BREAKER_FLOOR - 1, true, 1_000), None);
 }
 
 #[test]
