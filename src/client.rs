@@ -15,9 +15,9 @@ use wreq_util::{Emulation, EmulationOS, EmulationOption};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{io, result::Result};
 
 use crate::config::get_setting;
@@ -94,9 +94,13 @@ pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| ArcSwap::ne
 pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
+pub static OAUTH_BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
 pub static LAST_REDDIT_RATELIMIT: LazyLock<std::sync::Mutex<Option<RedditRateLimitSnapshot>>> = LazyLock::new(|| std::sync::Mutex::new(None));
 static IMAGE_PRELOAD_CACHE: LazyLock<Mutex<ImagePreloadCache>> = LazyLock::new(|| Mutex::new(ImagePreloadCache::default()));
 static IMAGE_PRELOAD_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(IMAGE_PRELOAD_CONCURRENCY)));
+
+const BREAKER_FLOOR: u16 = 5;
+const BLOCK_COOLDOWN_SECS: u64 = 900;
 
 #[derive(Clone)]
 struct CachedImageResponse {
@@ -1074,6 +1078,30 @@ fn is_network_security_block(status: hyper::StatusCode, content_type: Option<&st
 	status == hyper::StatusCode::FORBIDDEN && content_type.is_some_and(|value| value.starts_with("text/html")) && text.contains("You've been blocked by network security")
 }
 
+fn now_unix() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn check_breaker_gate(blocked_until: u64, rate_remaining: u16, is_rolling_over: bool, now: u64) -> Option<String> {
+	if blocked_until > now {
+		return Some(format!("Reddit unavailable; cooling down until unix {blocked_until}"));
+	}
+	if rate_remaining < BREAKER_FLOOR && !is_rolling_over {
+		return Some("Rate budget conservation; refusing request".to_string());
+	}
+	None
+}
+
+fn should_record_403_cooldown(status: hyper::StatusCode, has_retry_after: bool) -> bool {
+	status == hyper::StatusCode::FORBIDDEN && has_retry_after
+}
+
+fn record_403_cooldown(now: u64) {
+	let until = now + BLOCK_COOLDOWN_SECS;
+	OAUTH_BLOCKED_UNTIL.store(until, Ordering::SeqCst);
+	warn!("Reddit returned 403; cooling down json() calls until unix {until}");
+}
+
 fn persist_debug_response(path: &str, status: hyper::StatusCode, headers: &[(String, String)], text: &str) {
 	use chrono::Utc;
 	use std::fs::{create_dir_all, OpenOptions};
@@ -1108,8 +1136,12 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	};
 
 	// First, handle rolling over the OAUTH_CLIENT if need be.
+	let now = now_unix();
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
+	if let Some(msg) = check_breaker_gate(OAUTH_BLOCKED_UNTIL.load(Ordering::SeqCst), current_rate_limit, is_rolling_over, now) {
+		return Err(format!("{msg} | {path}"));
+	}
 	if current_rate_limit < 10 && !is_rolling_over {
 		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
 		tokio::spawn(force_refresh_token());
@@ -1127,6 +1159,7 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 			if let Some(snapshot) = capture_ratelimit_snapshot(&response) {
 				store_ratelimit_snapshot(snapshot);
 			}
+			let response_had_retry_after = response.headers().get(header::RETRY_AFTER).is_some();
 			let content_type = response.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_owned);
 			let content_length = response
 				.headers()
@@ -1172,6 +1205,13 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					}
 
 					log_download_diagnostics("reddit_json", &path, status, content_type.as_deref(), content_length, Some(actual_bytes), None);
+
+					if should_record_403_cooldown(status, response_had_retry_after) {
+						record_403_cooldown(now);
+						return Err(format!(
+							"Too many requests. Reddit returned 403 with Retry-After; cooling down for {BLOCK_COOLDOWN_SECS}s | {path}"
+						));
+					}
 
 					if status == hyper::StatusCode::TOO_MANY_REQUESTS {
 						return Err("Too many requests.".to_string());
@@ -1328,6 +1368,42 @@ fn test_detects_network_security_block_page() {
 #[test]
 fn test_response_preview_truncates_and_escapes_newlines() {
 	assert_eq!(response_preview("line1\nline2", 8), "line1\\nli...");
+}
+
+#[test]
+fn test_breaker_gate_allows_normal_budget() {
+	assert_eq!(check_breaker_gate(0, BREAKER_FLOOR, false, 1_000), None);
+}
+
+#[test]
+fn test_breaker_gate_blocks_active_cooldown() {
+	let msg = check_breaker_gate(1_900, 99, false, 1_000).expect("cooldown should block");
+	assert!(msg.contains("cooling down until unix 1900"));
+}
+
+#[test]
+fn test_breaker_gate_blocks_low_budget_unless_rolling_over() {
+	assert_eq!(
+		check_breaker_gate(0, BREAKER_FLOOR - 1, false, 1_000),
+		Some("Rate budget conservation; refusing request".to_string())
+	);
+	assert_eq!(check_breaker_gate(0, BREAKER_FLOOR - 1, true, 1_000), None);
+}
+
+#[test]
+fn test_403_cooldown_requires_retry_after() {
+	assert!(should_record_403_cooldown(hyper::StatusCode::FORBIDDEN, true));
+	assert!(!should_record_403_cooldown(hyper::StatusCode::FORBIDDEN, false));
+	assert!(!should_record_403_cooldown(hyper::StatusCode::TOO_MANY_REQUESTS, true));
+}
+
+#[test]
+#[sealed_test]
+fn test_record_403_cooldown_sets_blocked_until() {
+	OAUTH_BLOCKED_UNTIL.store(0, Ordering::SeqCst);
+	record_403_cooldown(1_000);
+	assert_eq!(OAUTH_BLOCKED_UNTIL.load(Ordering::SeqCst), 1_000 + BLOCK_COOLDOWN_SECS);
+	OAUTH_BLOCKED_UNTIL.store(0, Ordering::SeqCst);
 }
 
 #[test]

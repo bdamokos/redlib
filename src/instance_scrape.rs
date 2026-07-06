@@ -1347,6 +1347,9 @@ mod tests {
 	#[test]
 	fn fallback_detection_matches_rate_limit_messages() {
 		assert!(should_attempt_scrape_fallback("Too many requests."));
+		assert!(should_attempt_scrape_fallback(
+			"Too many requests. Reddit returned 403 with Retry-After; cooling down for 900s"
+		));
 		assert!(should_attempt_scrape_fallback("Reddit rate limit hit"));
 		assert!(should_attempt_scrape_fallback("ratelimit exhausted"));
 	}

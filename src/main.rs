@@ -12,6 +12,7 @@ use hyper::Uri;
 use hyper::{header::HeaderValue, Body, Request, Response};
 use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
+use redlib::json_api;
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
@@ -150,13 +151,42 @@ fn register_subreddit_fragment_routes(app: &mut server::Server) {
 	app.at("/subreddit-fragment/:sort").get(|r| subreddit::community_fragment(r).boxed());
 }
 
+fn register_json_api_routes(app: &mut server::Server) {
+	app.at("/api/search").get(|r| json_api::search(r).boxed());
+	app.at("/api/r/:sub/search").get(|r| json_api::search(r).boxed());
+	app.at("/api/comments/:id").get(|r| json_api::post(r).boxed());
+	app.at("/api/comments/:id/:title").get(|r| json_api::post(r).boxed());
+	app.at("/api/comments/:id/:title/:comment_id").get(|r| json_api::post(r).boxed());
+	app.at("/api/r/:sub/comments/:id").get(|r| json_api::post(r).boxed());
+	app.at("/api/r/:sub/comments/:id/:title").get(|r| json_api::post(r).boxed());
+	app.at("/api/r/:sub/comments/:id/:title/:comment_id").get(|r| json_api::post(r).boxed());
+	app.at("/api/user/:name").get(|r| json_api::user_listing(r).boxed());
+	app.at("/api/user/:name/:listing").get(|r| json_api::user_listing(r).boxed());
+	app.at("/api/r/:sub").get(|r| json_api::subreddit_listing(r).boxed());
+	app.at("/api/r/:sub/:sort").get(|r| json_api::subreddit_listing(r).boxed());
+
+	app.at("/search.js").get(|r| json_api::search(r).boxed());
+	app.at("/r/:sub/search.js").get(|r| json_api::search(r).boxed());
+	app.at("/comments/:id.js").get(|r| json_api::post(r).boxed());
+	app.at("/comments/:id/:title.js").get(|r| json_api::post(r).boxed());
+	app.at("/comments/:id/:title/:comment_id.js").get(|r| json_api::post(r).boxed());
+	app.at("/r/:sub/comments/:id.js").get(|r| json_api::post(r).boxed());
+	app.at("/r/:sub/comments/:id/:title.js").get(|r| json_api::post(r).boxed());
+	app.at("/r/:sub/comments/:id/:title/:comment_id.js").get(|r| json_api::post(r).boxed());
+	app.at("/user/:name.js").get(|r| json_api::user_listing(r).boxed());
+	app.at("/user/:name/:listing.js").get(|r| json_api::user_listing(r).boxed());
+	app.at("/u/:name.js").get(|r| json_api::user_listing(r).boxed());
+	app.at("/r/:sub.js").get(|r| json_api::subreddit_listing(r).boxed());
+	app.at("/r/:sub/:sort.js").get(|r| json_api::subreddit_listing(r).boxed());
+}
+
 fn is_front_page_sort_route(id: &str) -> bool {
 	matches!(id, "best" | "hot" | "new" | "random" | "top" | "rising" | "controversial" | "video-length")
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{configured_origin, is_front_page_sort_route};
+	use super::{configured_origin, is_front_page_sort_route, register_json_api_routes};
 	use hyper::Method;
 	use redlib::server::Server;
 
@@ -196,6 +226,35 @@ mod tests {
 		assert!(is_front_page_sort_route("random"));
 		assert!(is_front_page_sort_route("new"));
 		assert!(!is_front_page_sort_route("comments"));
+	}
+
+	#[test]
+	fn json_api_routes_preserve_listing_params() {
+		let mut app = Server::new();
+		register_json_api_routes(&mut app);
+
+		let params = app.recognize_params_for_test(&Method::GET, "/r/rust/top.js").expect("subreddit json route");
+		assert_eq!(params.find("sub"), Some("rust"));
+		assert_eq!(params.find("sort"), Some("top"));
+
+		let params = app.recognize_params_for_test(&Method::GET, "/api/user/spez/submitted").expect("user api route");
+		assert_eq!(params.find("name"), Some("spez"));
+		assert_eq!(params.find("listing"), Some("submitted"));
+	}
+
+	#[test]
+	fn json_api_routes_preserve_post_params() {
+		let mut app = Server::new();
+		register_json_api_routes(&mut app);
+
+		let params = app.recognize_params_for_test(&Method::GET, "/r/rust/comments/abc/title/c42.js").expect("post json route");
+		assert_eq!(params.find("sub"), Some("rust"));
+		assert_eq!(params.find("id"), Some("abc"));
+		assert_eq!(params.find("title"), Some("title"));
+		assert_eq!(params.find("comment_id"), Some("c42"));
+
+		let params = app.recognize_params_for_test(&Method::GET, "/api/comments/abc").expect("short post api route");
+		assert_eq!(params.find("id"), Some("abc"));
 	}
 }
 
@@ -492,6 +551,7 @@ async fn main() {
 	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());
 	app.at("/api/video-previews/:job_id/animation").get(|r| video_preview::animation(r).boxed());
 	app.at("/api/video-previews/:job_id/frame/:index").get(|r| video_preview::frame(r).boxed());
+	register_json_api_routes(&mut app);
 
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());

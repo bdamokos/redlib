@@ -447,6 +447,23 @@ fn query_comments(
 
 	results
 }
+
+pub(crate) fn parse_comments_for_api(
+	json: &serde_json::Value,
+	post_link: &str,
+	post_author: &str,
+	highlighted_comment: &str,
+	filters: &HashSet<String>,
+	query: &str,
+	req: &Request<Body>,
+) -> Vec<Comment> {
+	if query.is_empty() {
+		parse_comments(json, post_link, post_author, highlighted_comment, filters, req)
+	} else {
+		query_comments(json, post_link, post_author, highlighted_comment, filters, query, req)
+	}
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_comment(
 	comment: &serde_json::Value,

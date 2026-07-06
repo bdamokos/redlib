@@ -1168,7 +1168,7 @@ impl Post {
 	}
 }
 
-#[derive(Template)]
+#[derive(Template, Serialize)]
 #[template(path = "comment.html")]
 /// Comment with content, post, score and data/time that it was posted
 pub struct Comment {
@@ -1190,6 +1190,7 @@ pub struct Comment {
 	pub collapsed: bool,
 	pub is_filtered: bool,
 	pub more_count: i64,
+	#[serde(skip_serializing)]
 	pub prefs: Preferences,
 }
 
@@ -1338,7 +1339,7 @@ pub struct NSFWLandingTemplate {
 	pub url: String,
 }
 
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone, Serialize, PartialEq)]
 /// User struct containing metadata about user
 pub struct User {
 	pub name: String,
@@ -1797,7 +1798,7 @@ pub(crate) fn clear_test_caches() {
 	}
 }
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, Serialize, PartialEq)]
 /// Subreddit struct containing metadata about community
 pub struct Subreddit {
 	pub name: String,

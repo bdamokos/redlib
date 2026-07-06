@@ -6,6 +6,7 @@ pub mod creator_links;
 pub mod duplicates;
 pub mod instance_info;
 pub mod instance_scrape;
+pub mod json_api;
 pub mod materialized_catalog;
 pub mod oauth;
 pub mod oauth_resources;

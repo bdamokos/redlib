@@ -3674,7 +3674,7 @@ async fn fetch_user_metadata_fresh(name: &str) -> Result<User, String> {
 	fetch_user_metadata_with_mode(name, true).await
 }
 
-async fn fetch_user_metadata_status(name: &str) -> Result<User, String> {
+pub(crate) async fn fetch_user_metadata_status(name: &str) -> Result<User, String> {
 	fetch_user_metadata_with_mode(name, false).await
 }
 
