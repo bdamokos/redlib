@@ -1,4 +1,4 @@
-use crate::client::CLIENT;
+use crate::client::{self, CLIENT};
 use crate::config::get_setting;
 use crate::utils::{Post, Subreddit};
 use hyper::body::to_bytes;
@@ -78,6 +78,9 @@ pub(crate) async fn fetch_subreddit_listing(subreddit: &str, sort: &str, query: 
 			Ok((status, body)) => match parse_subreddit_listing_response(status, &body) {
 				Ok(mut listing) => {
 					normalize_peer_posts(&mut listing.posts);
+					if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+						client::record_peer_ratelimit_from_api_value(&origin, &value);
+					}
 					note_peer_success(&origin);
 					info!("peer_api_fallback: fetched {} from {}", path, origin);
 					return Ok(PeerSubredditListing {

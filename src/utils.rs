@@ -7,7 +7,9 @@ use crate::config::{self, get_setting};
 //
 use crate::{
 	cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditFlairsEntry, PersistedSubredditUsersEntry},
-	client::{json, latest_ratelimit_snapshot, CLIENT, OAUTH_CLIENT},
+	client::{
+		current_ratelimit_status, json, latest_ratelimit_snapshot, peer_ratelimit_statuses, PeerRateLimitStatus, RedditRateLimitState, RedditRateLimitStatus, CLIENT, OAUTH_CLIENT,
+	},
 	redgifs,
 	server::{RequestExt, ResponseExt},
 };
@@ -2330,6 +2332,123 @@ pub fn footer_deploy_revision_short() -> &'static str {
 /// Tooltip for [`footer_deploy_revision_short`]; empty when unset.
 pub fn footer_deploy_revision_title() -> &'static str {
 	DEPLOY_GIT_FOOTER.title.as_str()
+}
+
+struct FooterRateLimitDisplay {
+	label: String,
+	title: String,
+	class_name: &'static str,
+}
+
+fn format_status_seconds(seconds: u64) -> String {
+	if seconds >= 3600 {
+		format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+	} else if seconds >= 60 {
+		format!("{}m {}s", seconds / 60, seconds % 60)
+	} else {
+		format!("{seconds}s")
+	}
+}
+
+fn format_status_float(value: f32) -> String {
+	if value >= 10.0 {
+		format!("{value:.0}")
+	} else {
+		format!("{value:.1}")
+	}
+}
+
+fn footer_ratelimit_parts_for_status(status: &RedditRateLimitStatus) -> FooterRateLimitDisplay {
+	footer_ratelimit_parts_for_status_and_peers(status, &[])
+}
+
+fn footer_ratelimit_parts_for_status_and_peers(status: &RedditRateLimitStatus, peers: &[PeerRateLimitStatus]) -> FooterRateLimitDisplay {
+	let peer_limited_count = peers
+		.iter()
+		.filter(|peer| matches!(peer.rate_limit.state, RedditRateLimitState::Limited | RedditRateLimitState::Cooldown))
+		.count();
+	let class_name = match status.state {
+		RedditRateLimitState::Limited | RedditRateLimitState::Cooldown => "rate-limit-bad",
+		_ if peer_limited_count > 0 => "rate-limit-bad",
+		RedditRateLimitState::Ok => "rate-limit-ok",
+		RedditRateLimitState::Unknown => "rate-limit-idle",
+	};
+	let mut label = match status.state {
+		RedditRateLimitState::Cooldown => status
+			.cooldown_seconds
+			.map(|seconds| format!("RL wait {}", format_status_seconds(seconds)))
+			.unwrap_or_else(|| "RL wait".to_string()),
+		RedditRateLimitState::Limited => status
+			.retry_after_seconds
+			.or(status.reset_seconds)
+			.map(|seconds| format!("RL wait {}", format_status_seconds(seconds)))
+			.or_else(|| status.remaining.map(|remaining| format!("RL {}", format_status_float(remaining))))
+			.unwrap_or_else(|| "RL limited".to_string()),
+		RedditRateLimitState::Ok => status
+			.remaining
+			.map(|remaining| format!("RL {}", format_status_float(remaining)))
+			.unwrap_or_else(|| "RL ok".to_string()),
+		RedditRateLimitState::Unknown => "RL idle".to_string(),
+	};
+	if !peers.is_empty() {
+		label.push_str(&format!(" P{peer_limited_count}/{}", peers.len()));
+	}
+
+	let mut details = Vec::new();
+	details.push(match status.state {
+		RedditRateLimitState::Cooldown => "Reddit API cooling down".to_string(),
+		RedditRateLimitState::Limited => "Reddit API rate limited".to_string(),
+		RedditRateLimitState::Ok => "Reddit API budget available".to_string(),
+		RedditRateLimitState::Unknown => "Reddit API budget idle or unknown".to_string(),
+	});
+	if let Some(http_status) = status.http_status {
+		details.push(format!("HTTP {http_status}"));
+	}
+	if let Some(remaining) = status.remaining {
+		details.push(format!("remaining {}", format_status_float(remaining)));
+	}
+	if let Some(used) = status.used {
+		details.push(format!("used {}", format_status_float(used)));
+	}
+	if let Some(reset_seconds) = status.reset_seconds {
+		details.push(format!("reset in {}", format_status_seconds(reset_seconds)));
+	}
+	if let Some(retry_after_seconds) = status.retry_after_seconds {
+		details.push(format!("retry after {}", format_status_seconds(retry_after_seconds)));
+	}
+	if let Some(cooldown_seconds) = status.cooldown_seconds {
+		details.push(format!("cooldown {}", format_status_seconds(cooldown_seconds)));
+	}
+	if let Some(budget_per_second) = status.budget_per_second {
+		details.push(format!("{budget_per_second:.2} req/s"));
+	}
+	if let Some(observed_age_seconds) = status.observed_age_seconds {
+		details.push(format!("observed {} ago", format_status_seconds(observed_age_seconds)));
+	}
+	if status.stale {
+		details.push("stale".to_string());
+	}
+	if !peers.is_empty() {
+		details.push(format!("{peer_limited_count}/{} learned peers limited", peers.len()));
+	}
+
+	FooterRateLimitDisplay {
+		label,
+		title: details.join("; "),
+		class_name,
+	}
+}
+
+pub fn footer_ratelimit_label() -> String {
+	footer_ratelimit_parts_for_status_and_peers(&current_ratelimit_status(), &peer_ratelimit_statuses()).label
+}
+
+pub fn footer_ratelimit_title() -> String {
+	footer_ratelimit_parts_for_status_and_peers(&current_ratelimit_status(), &peer_ratelimit_statuses()).title
+}
+
+pub fn footer_ratelimit_class() -> &'static str {
+	footer_ratelimit_parts_for_status_and_peers(&current_ratelimit_status(), &peer_ratelimit_statuses()).class_name
 }
 
 fn static_asset_revision_token_ok(s: &str) -> bool {
@@ -5666,13 +5785,14 @@ mod tests {
 	use super::{
 		cache_author_watched_links_from_posts, cached_subreddit_users, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links,
 		coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links,
-		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, format_num, format_url, format_video_duration,
-		hydrate_post_author_links_from_cache, is_creator_archive_link, is_creator_profile_overview_link, post_feedback_score_adjustment, post_feedback_summary_affinity,
-		read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links, store_subreddit_users, time,
-		user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media,
-		Post, PostFeedbackEntry, PostFeedbackSummary, Preferences,
+		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, footer_ratelimit_parts_for_status,
+		footer_ratelimit_parts_for_status_and_peers, format_num, format_url, format_video_duration, hydrate_post_author_links_from_cache, is_creator_archive_link,
+		is_creator_profile_overview_link, post_feedback_score_adjustment, post_feedback_summary_affinity, read_sharded_cookie, redgifs_uploader_matches_author,
+		refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links, store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards,
+		CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media, Post, PostFeedbackEntry, PostFeedbackSummary, Preferences,
 	};
 	use crate::cache_persistence::PersistedSubredditUsersEntry;
+	use crate::client::{PeerRateLimitStatus, RedditRateLimitState, RedditRateLimitStatus};
 	use crate::utils::ParentComment;
 	use futures_lite::future::block_on;
 	use hyper::{Body, Request, Response};
@@ -5690,6 +5810,72 @@ mod tests {
 	fn redgifs_uploader_matches_reddit_ignoring_punctuation_and_case() {
 		assert!(redgifs_uploader_matches_author("Foo_Bar", "foo-bar", &[]));
 		assert!(redgifs_uploader_matches_author("  Alice  ", "@alice", &[]));
+	}
+
+	#[test]
+	fn footer_ratelimit_display_compacts_limited_state() {
+		let status = RedditRateLimitStatus {
+			state: RedditRateLimitState::Limited,
+			http_status: Some(429),
+			remaining: Some(0.0),
+			reset_seconds: Some(125),
+			used: Some(100.0),
+			retry_after_seconds: None,
+			cooldown_seconds: None,
+			budget_per_second: None,
+			observed_age_seconds: Some(3),
+			stale: false,
+		};
+
+		let display = footer_ratelimit_parts_for_status(&status);
+		assert_eq!(display.label, "RL wait 2m 5s");
+		assert_eq!(display.class_name, "rate-limit-bad");
+		assert!(display.title.contains("HTTP 429"));
+		assert!(display.title.contains("reset in 2m 5s"));
+	}
+
+	#[test]
+	fn footer_ratelimit_display_adds_peer_aggregate() {
+		let local = RedditRateLimitStatus {
+			state: RedditRateLimitState::Ok,
+			http_status: Some(200),
+			remaining: Some(72.0),
+			reset_seconds: Some(180),
+			used: Some(28.0),
+			retry_after_seconds: None,
+			cooldown_seconds: None,
+			budget_per_second: Some(0.4),
+			observed_age_seconds: Some(1),
+			stale: false,
+		};
+		let peers = vec![
+			PeerRateLimitStatus {
+				peer: "peer-a".to_string(),
+				rate_limit: RedditRateLimitStatus {
+					state: RedditRateLimitState::Limited,
+					http_status: Some(429),
+					remaining: Some(0.0),
+					reset_seconds: Some(60),
+					used: None,
+					retry_after_seconds: None,
+					cooldown_seconds: None,
+					budget_per_second: None,
+					observed_age_seconds: Some(2),
+					stale: false,
+				},
+				learned_age_seconds: 2,
+			},
+			PeerRateLimitStatus {
+				peer: "peer-b".to_string(),
+				rate_limit: RedditRateLimitStatus::unknown(),
+				learned_age_seconds: 2,
+			},
+		];
+
+		let display = footer_ratelimit_parts_for_status_and_peers(&local, &peers);
+		assert_eq!(display.label, "RL 72 P1/2");
+		assert_eq!(display.class_name, "rate-limit-bad");
+		assert!(display.title.contains("1/2 learned peers limited"));
 	}
 
 	#[test]

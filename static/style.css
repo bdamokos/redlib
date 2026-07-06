@@ -574,6 +574,32 @@ body > footer {
     opacity: 0.65;
 }
 
+.rate-limit-status {
+    border: 1px solid color-mix(in srgb, currentColor 38%, transparent);
+    border-radius: 4px;
+    cursor: default;
+    display: inline-block;
+    font-size: 0.82em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.25;
+    min-width: 3.9em;
+    padding: 1px 5px;
+    text-align: center;
+    white-space: nowrap;
+}
+
+.rate-limit-ok {
+    color: var(--green);
+}
+
+.rate-limit-bad {
+    color: var(--nsfw);
+}
+
+.rate-limit-idle {
+    color: var(--fg-2);
+}
+
 /* / Body footer. */
 
 /* Footer in content block. */

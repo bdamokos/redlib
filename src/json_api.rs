@@ -1,4 +1,5 @@
 use crate::client;
+use crate::client::{PeerRateLimitStatus, RedditRateLimitStatus};
 use crate::peer_api_fallback;
 use crate::post as post_page;
 use crate::server::RequestExt;
@@ -14,6 +15,21 @@ use url::form_urlencoded;
 struct ApiEnvelope<T> {
 	data: Option<T>,
 	error: Option<String>,
+	meta: ApiMetadata,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApiMetadata {
+	rate_limit: RedditRateLimitStatus,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	peer_rate_limits: Vec<PeerRateLimitStatus>,
+}
+
+fn api_metadata() -> ApiMetadata {
+	ApiMetadata {
+		rate_limit: client::current_ratelimit_status(),
+		peer_rate_limits: client::peer_ratelimit_statuses(),
+	}
 }
 
 #[derive(Serialize, Deserialize)]
@@ -49,7 +65,12 @@ struct PostResponse {
 }
 
 fn json_response<T: Serialize>(data: T) -> Result<Response<Body>, String> {
-	let body = serde_json::to_string(&ApiEnvelope { data: Some(data), error: None }).map_err(|error| error.to_string())?;
+	let body = serde_json::to_string(&ApiEnvelope {
+		data: Some(data),
+		error: None,
+		meta: api_metadata(),
+	})
+	.map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)
 		.header("content-type", "application/json; charset=utf-8")
@@ -62,6 +83,7 @@ fn json_error(msg: impl Into<String>, status: u16) -> Result<Response<Body>, Str
 	let body = serde_json::to_string(&ApiEnvelope::<()> {
 		data: None,
 		error: Some(msg.into()),
+		meta: api_metadata(),
 	})
 	.map_err(|error| error.to_string())?;
 	Response::builder()
@@ -359,4 +381,24 @@ pub async fn post(req: Request<Body>) -> Result<Response<Body>, String> {
 	crate::instance_scrape::apply_comment_prefs(&mut comments, &prefs);
 
 	json_response(PostResponse { post, comments })
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{api_metadata, ApiEnvelope};
+
+	#[test]
+	fn api_envelope_serializes_rate_limit_metadata() {
+		let envelope = ApiEnvelope {
+			data: Some("ok"),
+			error: None,
+			meta: api_metadata(),
+		};
+
+		let value = serde_json::to_value(envelope).expect("envelope should serialize");
+
+		assert_eq!(value["data"], "ok");
+		assert!(value["meta"]["rate_limit"]["state"].is_string());
+		assert!(value["meta"]["rate_limit"]["stale"].is_boolean());
+	}
 }

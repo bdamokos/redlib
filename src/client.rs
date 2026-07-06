@@ -8,6 +8,7 @@ use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use libflate::gzip;
 use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wreq::redirect::Policy;
 use wreq::{Client as WreqClient, EmulationFactory, Method as WreqMethod, Response as WreqResponse};
@@ -43,6 +44,8 @@ const IMAGE_PRELOAD_MAX_URLS: usize = 12;
 const IMAGE_PRELOAD_CONCURRENCY: usize = 3;
 const IMAGE_PRELOAD_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_REDDIT_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(3);
+const RATE_LIMIT_STATUS_TTL: Duration = Duration::from_secs(15 * 60);
+const PEER_RATE_LIMIT_STATUS_TTL: Duration = Duration::from_secs(5 * 60);
 
 pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::new(|| {
 	hyper_rustls::HttpsConnectorBuilder::new()
@@ -97,6 +100,7 @@ pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 pub static OAUTH_BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
 pub static LAST_REDDIT_RATELIMIT: LazyLock<std::sync::Mutex<Option<RedditRateLimitSnapshot>>> = LazyLock::new(|| std::sync::Mutex::new(None));
+static PEER_REDDIT_RATELIMITS: LazyLock<std::sync::Mutex<HashMap<String, PeerRateLimitEntry>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 static IMAGE_PRELOAD_CACHE: LazyLock<Mutex<ImagePreloadCache>> = LazyLock::new(|| Mutex::new(ImagePreloadCache::default()));
 static IMAGE_PRELOAD_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(IMAGE_PRELOAD_CONCURRENCY)));
 
@@ -241,6 +245,50 @@ pub struct RedditRateLimitSnapshot {
 	pub observed_at: Instant,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedditRateLimitState {
+	Unknown,
+	Ok,
+	Limited,
+	Cooldown,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RedditRateLimitStatus {
+	pub state: RedditRateLimitState,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub http_status: Option<u16>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub remaining: Option<f32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub reset_seconds: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub used: Option<f32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub retry_after_seconds: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cooldown_seconds: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub budget_per_second: Option<f32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub observed_age_seconds: Option<u64>,
+	pub stale: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PeerRateLimitStatus {
+	pub peer: String,
+	pub rate_limit: RedditRateLimitStatus,
+	pub learned_age_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PeerRateLimitEntry {
+	rate_limit: RedditRateLimitStatus,
+	observed_at: Instant,
+}
+
 impl RedditRateLimitSnapshot {
 	pub fn is_rate_limited(&self) -> bool {
 		self.status == 429 || self.retry_after_seconds.is_some()
@@ -285,6 +333,132 @@ impl RedditRateLimitSnapshot {
 			_ => None,
 		}
 	}
+}
+
+fn remaining_cooldown_seconds(now: u64) -> Option<u64> {
+	let blocked_until = OAUTH_BLOCKED_UNTIL.load(Ordering::SeqCst);
+	(blocked_until > now).then(|| blocked_until - now)
+}
+
+fn duration_secs_ceil(duration: Duration) -> u64 {
+	let seconds = duration.as_secs();
+	if duration.subsec_nanos() > 0 {
+		seconds + 1
+	} else {
+		seconds
+	}
+}
+
+fn positive_seconds_ceil(value: Option<f32>) -> Option<u64> {
+	value.and_then(|seconds| (seconds > 0.0).then(|| seconds.ceil() as u64))
+}
+
+impl RedditRateLimitStatus {
+	pub fn unknown() -> Self {
+		Self {
+			state: RedditRateLimitState::Unknown,
+			http_status: None,
+			remaining: None,
+			reset_seconds: None,
+			used: None,
+			retry_after_seconds: None,
+			cooldown_seconds: None,
+			budget_per_second: None,
+			observed_age_seconds: None,
+			stale: false,
+		}
+	}
+
+	fn from_snapshot(snapshot: &RedditRateLimitSnapshot, now_unix: u64) -> Self {
+		let observed_age = snapshot.observed_at.elapsed();
+		let stale = observed_age > RATE_LIMIT_STATUS_TTL;
+		let cooldown_seconds = remaining_cooldown_seconds(now_unix);
+		let reset_seconds = positive_seconds_ceil(snapshot.effective_reset_seconds());
+		let retry_after_seconds = positive_seconds_ceil(snapshot.effective_retry_after_seconds());
+		let depleted_until_reset = snapshot.remaining.is_some_and(|remaining| remaining <= 0.0) && reset_seconds.is_some();
+		let state = if cooldown_seconds.is_some() {
+			RedditRateLimitState::Cooldown
+		} else if stale {
+			RedditRateLimitState::Unknown
+		} else if snapshot.is_rate_limited() || retry_after_seconds.is_some() || depleted_until_reset {
+			RedditRateLimitState::Limited
+		} else {
+			RedditRateLimitState::Ok
+		};
+
+		Self {
+			state,
+			http_status: Some(snapshot.status),
+			remaining: snapshot.remaining,
+			reset_seconds,
+			used: snapshot.used,
+			retry_after_seconds,
+			cooldown_seconds,
+			budget_per_second: snapshot.remaining_requests_per_second(),
+			observed_age_seconds: Some(duration_secs_ceil(observed_age)),
+			stale,
+		}
+	}
+}
+
+pub fn current_ratelimit_status() -> RedditRateLimitStatus {
+	let now = now_unix();
+	if let Some(snapshot) = latest_ratelimit_snapshot() {
+		RedditRateLimitStatus::from_snapshot(&snapshot, now)
+	} else if let Some(cooldown_seconds) = remaining_cooldown_seconds(now) {
+		RedditRateLimitStatus {
+			state: RedditRateLimitState::Cooldown,
+			cooldown_seconds: Some(cooldown_seconds),
+			..RedditRateLimitStatus::unknown()
+		}
+	} else {
+		RedditRateLimitStatus::unknown()
+	}
+}
+
+pub fn record_peer_ratelimit_status(peer: impl Into<String>, rate_limit: RedditRateLimitStatus) {
+	let peer = peer.into();
+	if peer.trim().is_empty() {
+		return;
+	}
+	if let Ok(mut peers) = PEER_REDDIT_RATELIMITS.lock() {
+		peers.insert(
+			peer,
+			PeerRateLimitEntry {
+				rate_limit,
+				observed_at: Instant::now(),
+			},
+		);
+	}
+}
+
+pub fn record_peer_ratelimit_from_api_value(peer: impl Into<String>, value: &Value) -> bool {
+	let peer = peer.into();
+	let Some(rate_limit_value) = value.get("meta").or_else(|| value.get("metadata")).and_then(|metadata| metadata.get("rate_limit")) else {
+		return false;
+	};
+	let Ok(rate_limit) = serde_json::from_value::<RedditRateLimitStatus>(rate_limit_value.clone()) else {
+		return false;
+	};
+	record_peer_ratelimit_status(peer, rate_limit);
+	true
+}
+
+pub fn peer_ratelimit_statuses() -> Vec<PeerRateLimitStatus> {
+	let Ok(mut peers) = PEER_REDDIT_RATELIMITS.lock() else {
+		return Vec::new();
+	};
+	peers.retain(|_, entry| entry.observed_at.elapsed() <= PEER_RATE_LIMIT_STATUS_TTL);
+	let mut statuses = peers
+		.iter()
+		.map(|(peer, entry)| PeerRateLimitStatus {
+			peer: peer.clone(),
+			rate_limit: entry.rate_limit.clone(),
+			learned_age_seconds: duration_secs_ceil(entry.observed_at.elapsed()),
+		})
+		.collect::<Vec<_>>();
+	statuses.sort_by(|a, b| a.peer.cmp(&b.peer));
+	statuses
 }
 
 fn parse_header_f32(headers: &hyper::HeaderMap<HeaderValue>, key: &str) -> Option<f32> {
@@ -1516,6 +1690,58 @@ fn test_rate_limit_wait_error_allows_short_wait() {
 	};
 
 	assert_eq!(rate_limit_wait_error(&snapshot, Duration::from_secs(2)), None);
+}
+
+#[test]
+fn test_ratelimit_status_serializes_budget_snapshot() {
+	let snapshot = RedditRateLimitSnapshot {
+		remaining: Some(0.0),
+		reset_seconds: Some(60.0),
+		used: Some(100.0),
+		retry_after_seconds: Some(12.0),
+		status: 429,
+		observed_at: Instant::now(),
+	};
+
+	let value = serde_json::to_value(RedditRateLimitStatus::from_snapshot(&snapshot, now_unix())).expect("status should serialize");
+
+	assert_eq!(value["state"], "limited");
+	assert_eq!(value["http_status"], 429);
+	assert_eq!(value["remaining"], 0.0);
+	assert_eq!(value["used"], 100.0);
+	assert!(value["retry_after_seconds"].as_u64().is_some_and(|seconds| seconds > 0 && seconds <= 12));
+	assert_eq!(value["stale"], false);
+}
+
+#[test]
+fn test_records_peer_ratelimit_from_api_metadata() {
+	if let Ok(mut peers) = PEER_REDDIT_RATELIMITS.lock() {
+		peers.clear();
+	}
+	let value = serde_json::json!({
+		"data": {},
+		"error": null,
+		"meta": {
+			"rate_limit": {
+				"state": "ok",
+				"http_status": 200,
+				"remaining": 87.0,
+				"reset_seconds": 300,
+				"stale": false
+			}
+		}
+	});
+
+	assert!(record_peer_ratelimit_from_api_value("http://peer.example", &value));
+	let peers = peer_ratelimit_statuses();
+	assert_eq!(peers.len(), 1);
+	assert_eq!(peers[0].peer, "http://peer.example");
+	assert_eq!(peers[0].rate_limit.state, RedditRateLimitState::Ok);
+	assert_eq!(peers[0].rate_limit.remaining, Some(87.0));
+
+	if let Ok(mut peers) = PEER_REDDIT_RATELIMITS.lock() {
+		peers.clear();
+	}
 }
 
 #[test]

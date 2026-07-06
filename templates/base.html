@@ -98,7 +98,7 @@
 		{% block footer %}
 			<footer>
 				<div class="footer-buttons">
-					<p><span id="version">v{{ env!("CARGO_PKG_VERSION") }}{% if !crate::utils::footer_deploy_revision_short().is_empty() %}<span class="deploy-rev" title="{{ crate::utils::footer_deploy_revision_title() }}">{{ crate::utils::footer_deploy_revision_short() }}</span>{% endif %}&emsp;</span><a href="/info" title="View instance information">ⓘ View instance info</a>&emsp;<a href="/cache-status" title="View visible cache status">Cache status</a>&emsp;<a href="https://github.com/redlib-org/redlib" title="View code on GitHub">&lt;&gt; Code</a></p>
+					<p><span id="version">v{{ env!("CARGO_PKG_VERSION") }}{% if !crate::utils::footer_deploy_revision_short().is_empty() %}<span class="deploy-rev" title="{{ crate::utils::footer_deploy_revision_title() }}">{{ crate::utils::footer_deploy_revision_short() }}</span>{% endif %}&emsp;</span><span class="rate-limit-status {{ crate::utils::footer_ratelimit_class() }}" title="{{ crate::utils::footer_ratelimit_title() }}" aria-label="{{ crate::utils::footer_ratelimit_title() }}">{{ crate::utils::footer_ratelimit_label() }}</span>&emsp;<a href="/info" title="View instance information">ⓘ View instance info</a>&emsp;<a href="/cache-status" title="View visible cache status">Cache status</a>&emsp;<a href="https://github.com/redlib-org/redlib" title="View code on GitHub">&lt;&gt; Code</a></p>
 				</div>
 			</footer>
 		{% endblock %}
