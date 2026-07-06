@@ -235,6 +235,24 @@ pub async fn subreddit_listing(req: Request<Body>) -> Result<Response<Body>, Str
 	}
 
 	let sort = subreddit_sort(&req);
+	if peer_api_fallback::request_should_force_peer_api_fallback(&req) {
+		info!("json_api: forcing subreddit listing r/{sub}/{sort} through configured Redlib peer API");
+		match peer_api_fallback::fetch_subreddit_listing(&sub, &sort, req.uri().query()).await {
+			Ok(peer) => {
+				let mut posts = peer.posts;
+				let (all_posts_filtered, all_posts_hidden_nsfw) = finalize_posts(&req, &mut posts, true);
+				return json_response(ListingResponse {
+					subreddit: peer.subreddit,
+					posts,
+					after: after_value(peer.after),
+					peer_origin: Some(peer.origin),
+					all_posts_filtered,
+					all_posts_hidden_nsfw,
+				});
+			}
+			Err(error) => warn!("json_api: forced Redlib peer API fallback failed for r/{sub}/{sort}: {error}"),
+		}
+	}
 	let quarantined = subreddit::can_access_quarantine(&req, &sub);
 	let query = query_with_raw_json(&req, &[]);
 	let path = format!("/r/{}/{}.json?{}", sub.replace('+', "%2B"), sort, query);

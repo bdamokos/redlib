@@ -104,6 +104,9 @@
     "REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS": {
       "required": false
     },
+    "REDLIB_PEER_API_FALLBACK_FORCE_TESTING": {
+      "required": false
+    },
     "REDLIB_REMEMBERED_FEED_DAEMON_ENABLED": {
       "required": false
     },

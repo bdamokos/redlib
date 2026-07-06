@@ -3,7 +3,7 @@ use crate::config::get_setting;
 use crate::utils::{Post, Subreddit};
 use hyper::body::to_bytes;
 use hyper::client::HttpConnector;
-use hyper::header::{ACCEPT, USER_AGENT};
+use hyper::header::{HeaderValue, ACCEPT, USER_AGENT};
 use hyper::{Body, Client as HyperClient, Method, Request, StatusCode};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use log::{info, warn};
@@ -18,6 +18,8 @@ const PEER_FAILURE_BACKOFF_SECS: u64 = 60;
 const PEER_API_NOTICE: &str = "Showing content fetched from a configured Redlib API peer because Reddit rate limited this request.";
 const PEER_API_UA: &str = "Redlib peer API fallback";
 pub(crate) const PEER_API_FALLBACK_HEADER: &str = "x-redlib-peer-api-fallback";
+pub(crate) const PEER_API_FORCE_HEADER: &str = "x-redlib-force-peer";
+const PEER_API_FORCE_QUERY_PARAM: &str = "force_peer";
 
 static PEER_FAILURE_BACKOFF: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static LAST_SUCCESSFUL_PEER: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
@@ -65,6 +67,34 @@ pub(crate) fn request_is_peer_api_fallback(req: &Request<Body>) -> bool {
 
 pub(crate) fn peer_api_fallback_enabled() -> bool {
 	!configured_peer_origins().is_empty()
+}
+
+pub(crate) fn request_should_force_peer_api_fallback(req: &Request<Body>) -> bool {
+	request_should_force_peer_api_fallback_with_setting(req, get_setting("REDLIB_PEER_API_FALLBACK_FORCE_TESTING").as_deref())
+}
+
+fn request_should_force_peer_api_fallback_with_setting(req: &Request<Body>, force_testing: Option<&str>) -> bool {
+	config_value_enabled(force_testing) && !request_is_peer_api_fallback(req) && request_requests_force_peer(req)
+}
+
+fn request_requests_force_peer(req: &Request<Body>) -> bool {
+	req
+		.uri()
+		.query()
+		.is_some_and(|query| form_urlencoded::parse(query.as_bytes()).any(|(key, value)| key == PEER_API_FORCE_QUERY_PARAM && request_value_enabled(&value)))
+		|| req.headers().get(PEER_API_FORCE_HEADER).is_some_and(header_value_enabled)
+}
+
+fn config_value_enabled(value: Option<&str>) -> bool {
+	value.is_some_and(|value| request_value_enabled(value.trim()))
+}
+
+fn request_value_enabled(value: &str) -> bool {
+	matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+fn header_value_enabled(value: &HeaderValue) -> bool {
+	value.to_str().ok().is_some_and(request_value_enabled)
 }
 
 pub(crate) async fn fetch_subreddit_listing(subreddit: &str, sort: &str, query: Option<&str>) -> Result<PeerSubredditListing, String> {
@@ -175,7 +205,7 @@ fn filtered_peer_query(query: &str) -> String {
 		.extend_pairs(
 			form_urlencoded::parse(query.as_bytes())
 				.into_owned()
-				.filter(|(key, _)| !matches!(key.as_str(), "cache_page" | "feed_session" | "front_cursor" | "raw_json")),
+				.filter(|(key, _)| !matches!(key.as_str(), "cache_page" | "feed_session" | "front_cursor" | "raw_json" | PEER_API_FORCE_QUERY_PARAM)),
 		)
 		.finish()
 }
@@ -274,9 +304,35 @@ mod tests {
 	#[test]
 	fn builds_subreddit_api_path_without_internal_cursor_params() {
 		assert_eq!(
-			build_subreddit_api_path("rust+programming", "new", Some("after=t3_next&cache_page=2&flair=Help&raw_json=1")),
+			build_subreddit_api_path("rust+programming", "new", Some("after=t3_next&cache_page=2&flair=Help&raw_json=1&force_peer=1")),
 			"/api/r/rust%2Bprogramming/new?after=t3_next&flair=Help"
 		);
+	}
+
+	#[test]
+	fn force_peer_override_requires_enabled_gate() {
+		let request = Request::builder().uri("/api/r/rust?force_peer=1").body(Body::empty()).unwrap();
+		assert!(request_should_force_peer_api_fallback_with_setting(&request, Some("on")));
+		assert!(!request_should_force_peer_api_fallback_with_setting(&request, Some("off")));
+		assert!(!request_should_force_peer_api_fallback_with_setting(&request, None));
+	}
+
+	#[test]
+	fn force_peer_override_accepts_header_when_enabled() {
+		let request = Request::builder().uri("/api/r/rust").header(PEER_API_FORCE_HEADER, "true").body(Body::empty()).unwrap();
+
+		assert!(request_should_force_peer_api_fallback_with_setting(&request, Some("yes")));
+	}
+
+	#[test]
+	fn force_peer_override_ignores_peer_fallback_requests() {
+		let request = Request::builder()
+			.uri("/api/r/rust?force_peer=1")
+			.header(PEER_API_FALLBACK_HEADER, "1")
+			.body(Body::empty())
+			.unwrap();
+
+		assert!(!request_should_force_peer_api_fallback_with_setting(&request, Some("on")));
 	}
 
 	#[tokio::test]

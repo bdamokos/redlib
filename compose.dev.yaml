@@ -27,6 +27,7 @@ services:
       REDLIB_CACHE_DIR: "${REDLIB_CACHE_DIR:-/var/lib/redlib/cache}"
       REDLIB_PREFS_DB: "${REDLIB_PREFS_DB:-/var/lib/redlib/state/preferences.sqlite3}"
       REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS: "${REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS:-5}"
+      REDLIB_PEER_API_FALLBACK_FORCE_TESTING: "${REDLIB_PEER_API_FALLBACK_FORCE_TESTING:-off}"
       REDLIB_REMEMBERED_FEED_DAEMON_ENABLED: "${REDLIB_REMEMBERED_FEED_DAEMON_ENABLED:-on}"
     volumes:
       - redlib-cache:/var/lib/redlib/cache

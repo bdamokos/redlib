@@ -460,12 +460,14 @@ Assign a default value for each instance-specific setting by passing environment
 | `INSTANCE_SCRAPE_TIMEOUT_SECS` | Integer     | `6`                    | Per-request timeout for external Redlib scrape fallback and instance-health probes.                        |
 | `PEER_API_FALLBACK_SOURCES` | CSV of origins | (empty)                | Explicit Redlib peer origins used for subreddit listing fallback through `/api/r/...` when Reddit rate limits apply. Public catalog probing is not used. |
 | `PEER_API_FALLBACK_TIMEOUT_SECS` | Integer  | `5`                    | Per-request timeout for configured Redlib peer API fallback requests.                                      |
+| `PEER_API_FALLBACK_FORCE_TESTING` | `["on", "off"]` | `off`          | Enables the guarded `?force_peer=1` URL test override for subreddit listing API and fragment requests. |
 | `REMEMBERED_FEED_DAEMON_ENABLED` | `["on", "off"]` | `on`            | Enables the remembered-feed background refresh daemon. Set to `off` on passive hot-spare instances.        |
 
 > [!WARNING]
 > When `REDLIB_INSTANCE_SCRAPE_ENABLED=on`, direct subreddit, user, and post page requests that hit a Reddit rate limit may be fetched from a public Redlib instance instead. That leaks the requested path to the selected external instance. Front-page warming, remembered-subreddit background refreshes, and other background cache traffic do not use this fallback.
 
 > `REDLIB_PEER_API_FALLBACK_SOURCES` is separate from `REDLIB_INSTANCE_SCRAPE_SOURCES`: peer API fallback is intended for controlled Redlib instances you operate, and currently covers subreddit listing API/page fallback only.
+> Set `REDLIB_PEER_API_FALLBACK_FORCE_TESTING=on` only on instances where operators should be able to force the peer path for validation. When enabled, `?force_peer=1` makes subreddit listing API and fragment requests try the configured peer before local Reddit/cache paths; peer requests carry Redlib's loop-guard header so hot spares do not need their own peer sources. `X-Redlib-Force-Peer: 1` is also accepted for non-browser tooling, but the URL parameter is the primary deterministic test interface.
 ## Default user settings
 
 Assign a default value for each user-modifiable setting by passing environment variables to Redlib in the format `REDLIB_DEFAULT_{Y}`. Replace `{Y}` with the setting name (see list below) in capital letters.

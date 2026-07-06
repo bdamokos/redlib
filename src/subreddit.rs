@@ -2395,6 +2395,49 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	} else {
 		build_listing_path(&sub_name, &sort, &reddit_query, &request_after, &request_before)
 	};
+	let force_peer_api_fallback = is_subreddit_route && is_single_sub && peer_api_fallback::request_should_force_peer_api_fallback(&req);
+	if force_peer_api_fallback {
+		info!("subreddit: forcing configured Redlib peer API fallback for {}", req_url);
+		let sort_base_path = if is_following_route(&url) {
+			FOLLOWING_ROUTE.to_string()
+		} else if aggregate_saved_feeds {
+			String::new()
+		} else if sub_name.is_empty() {
+			String::new()
+		} else {
+			format!("/r/{sub_name}")
+		};
+		let sort_options = build_sort_options(&sort_base_path, &url, &sort, &active_flair_filter);
+		let filters = get_filters(&req);
+		let timeframe = param(&path, "t").unwrap_or_default();
+		let is_flair_subscribed = !active_flair_filter.is_empty()
+			&& sub_name != "all"
+			&& sub_name != "popular"
+			&& prefs
+				.flair_subscriptions
+				.iter()
+				.any(|subscription| subscription.subreddit == sub_name && subscription.flair == active_flair_filter);
+		let scrape_cacheable_first_page = uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty();
+		if let Some(response) = render_peer_api_subreddit_fragment(
+			&req,
+			&sub_name,
+			&sort,
+			sort_options,
+			&active_flair_filter,
+			&url,
+			&redirect_url,
+			&filters,
+			&request_before,
+			is_flair_subscribed,
+			scrape_cacheable_first_page,
+			req.uri().query(),
+			&timeframe,
+		)
+		.await
+		{
+			return response;
+		}
+	}
 
 	if is_subreddit_route
 		&& is_single_sub
@@ -3613,6 +3656,13 @@ mod tests {
 		assert!(html.contains("data-error-message=\"Loading posts is taking longer than expected.\""));
 		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading posts..."));
+	}
+
+	#[test]
+	fn subreddit_fragment_path_preserves_force_peer_query() {
+		let request = Request::builder().uri("/r/rust/new?force_peer=1&limit=1").body(Body::empty()).unwrap();
+
+		assert_eq!(super::subreddit_fragment_path(&request), "/subreddit-fragment/r/rust/new?force_peer=1&limit=1");
 	}
 
 	#[test]

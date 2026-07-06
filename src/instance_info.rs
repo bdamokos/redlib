@@ -150,6 +150,7 @@ impl InstanceInfo {
 					},
 				],
 				["Peer API fallback timeout", &convert(&self.config.peer_api_fallback_timeout_secs)],
+				["Peer API fallback force testing", &convert(&self.config.peer_api_fallback_force_testing)],
 				["Remembered feed daemon enabled", &convert(&self.config.remembered_feed_daemon_enabled)],
 				//TODO: fallback to crate::config::DEFAULT_PUSHSHIFT_FRONTEND
 			])
@@ -200,6 +201,7 @@ impl InstanceInfo {
 				Instance scrape timeout: {:?}\n
 				Peer API fallback sources: {}\n
 				Peer API fallback timeout: {:?}\n
+				Peer API fallback force testing: {:?}\n
 				Remembered feed daemon enabled: {:?}\n
                 Config:\n
                     Banner: {:?}\n
@@ -236,6 +238,7 @@ impl InstanceInfo {
 					self.config.instance_scrape_timeout_secs,
 					if self.config.peer_api_fallback_sources.is_some() { "Configured" } else { "Unset" },
 					self.config.peer_api_fallback_timeout_secs,
+					self.config.peer_api_fallback_force_testing,
 					self.config.remembered_feed_daemon_enabled,
 					self.config.banner,
 					self.config.default_hide_awards,
