@@ -39,7 +39,7 @@ const AFTER_PATH_HEADROOM: usize = 128;
 const MAX_SUBREDDITS_PER_LISTING_CHUNK: usize = 100;
 const AGGREGATE_FETCH_CONCURRENCY: usize = 4;
 const SUBREDDIT_METADATA_CACHE_TTL_SECS: u64 = 10_800;
-const OAUTH_CACHE_NOTICE: &str = "Showing cached posts because live Reddit authentication is temporarily unavailable. Content may be stale.";
+const OAUTH_CACHE_NOTICE: &str = "Showing cached posts because live Reddit requests are temporarily unavailable. Content may be stale.";
 const CONTEXTUAL_PAGINATION_MAX_LINKS: usize = 6;
 static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").unwrap());
 static SUBREDDIT_METADATA_CACHE: LazyLock<Mutex<HashMap<String, CachedSubredditMetadata>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -3030,7 +3030,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			Err(msg) => {
 				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
 					crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
-					if msg.contains("oauth_unavailable") {
+					if msg.contains("oauth_unavailable") || instance_scrape::should_attempt_scrape_fallback(&msg) {
 						if let Some((mut posts, mut after, mut has_prev, mut has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(
 							&sub_name,
 							cache_page,

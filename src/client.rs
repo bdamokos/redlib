@@ -42,6 +42,7 @@ const IMAGE_PRELOAD_MAX_POSTS: usize = 8;
 const IMAGE_PRELOAD_MAX_URLS: usize = 12;
 const IMAGE_PRELOAD_CONCURRENCY: usize = 3;
 const IMAGE_PRELOAD_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_REDDIT_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(3);
 
 pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::new(|| {
 	hyper_rustls::HttpsConnectorBuilder::new()
@@ -325,27 +326,42 @@ pub fn latest_ratelimit_snapshot() -> Option<RedditRateLimitSnapshot> {
 	LAST_REDDIT_RATELIMIT.lock().ok().and_then(|state| state.clone())
 }
 
-async fn pace_reddit_request_if_needed() {
+fn rate_limit_wait_error(snapshot: &RedditRateLimitSnapshot, wait_duration: Duration) -> Option<String> {
+	if snapshot.is_rate_limited() && wait_duration > MAX_REDDIT_RATE_LIMIT_SLEEP {
+		let wait_secs = wait_duration.as_secs().max(1);
+		return Some(format!("Too many requests. Reddit rate limited; retry after about {wait_secs}s"));
+	}
+	None
+}
+
+async fn pace_reddit_request_if_needed() -> Result<(), String> {
 	let snapshot = latest_ratelimit_snapshot();
 	let Some(snapshot) = snapshot else {
-		return;
+		return Ok(());
 	};
 
 	let Some(wait_duration) = snapshot.suggested_wait_duration() else {
-		return;
+		return Ok(());
 	};
 
 	if wait_duration.is_zero() {
-		return;
+		return Ok(());
 	}
 
 	if snapshot.is_rate_limited() {
+		if let Some(error) = rate_limit_wait_error(&snapshot, wait_duration) {
+			warn!(
+				"Reddit rate limit hit. Failing fast instead of waiting {:?}. Remaining: {:?}, reset: {:?}, retry-after: {:?}",
+				wait_duration, snapshot.remaining, snapshot.reset_seconds, snapshot.retry_after_seconds
+			);
+			return Err(error);
+		}
 		warn!(
 			"Reddit rate limit hit. Waiting {:?} before next API request. Remaining: {:?}, reset: {:?}, retry-after: {:?}",
 			wait_duration, snapshot.remaining, snapshot.reset_seconds, snapshot.retry_after_seconds
 		);
 		tokio::time::sleep(wait_duration).await;
-		return;
+		return Ok(());
 	}
 
 	if let Some(requests_per_second) = snapshot.remaining_requests_per_second() {
@@ -358,6 +374,7 @@ async fn pace_reddit_request_if_needed() {
 			tokio::time::sleep(wait_duration).await;
 		}
 	}
+	Ok(())
 }
 
 trait IntoHyperResponse {
@@ -941,7 +958,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	fastrand::shuffle(&mut headers);
 
 	async move {
-		pace_reddit_request_if_needed().await;
+		pace_reddit_request_if_needed().await?;
 
 		match send_reddit_transport_request(method, &url, &headers, Vec::new()).await {
 			Ok((mut response, transport)) => {
@@ -1469,6 +1486,36 @@ fn test_retry_after_counts_down_with_elapsed_time() {
 	let wait = snapshot.suggested_wait_duration().expect("expected retry-after wait");
 	assert!(wait > Duration::from_secs_f32(2.0));
 	assert!(wait <= Duration::from_secs(3));
+}
+
+#[test]
+fn test_rate_limit_wait_error_fails_fast_for_long_reset() {
+	let snapshot = RedditRateLimitSnapshot {
+		remaining: Some(0.0),
+		reset_seconds: Some(600.0),
+		used: None,
+		retry_after_seconds: None,
+		status: 429,
+		observed_at: Instant::now(),
+	};
+
+	let err = rate_limit_wait_error(&snapshot, Duration::from_secs(600)).expect("long rate-limit waits should fail fast");
+	assert!(err.contains("Too many requests"));
+	assert!(err.contains("600s"));
+}
+
+#[test]
+fn test_rate_limit_wait_error_allows_short_wait() {
+	let snapshot = RedditRateLimitSnapshot {
+		remaining: Some(0.0),
+		reset_seconds: Some(2.0),
+		used: None,
+		retry_after_seconds: None,
+		status: 429,
+		observed_at: Instant::now(),
+	};
+
+	assert_eq!(rate_limit_wait_error(&snapshot, Duration::from_secs(2)), None);
 }
 
 #[test]
