@@ -33,6 +33,7 @@ KEYCHAIN_ACCOUNT="$SERVER_USER@$SERVER_HOST"
 SSH_PROXY_JUMP=${SSH_PROXY_JUMP:-}
 SSH_CONTROL_PERSIST=${SSH_CONTROL_PERSIST:-600}
 SSH_CONTROL_DIR_BASE=${SSH_CONTROL_DIR_BASE:-/tmp/redlib-ssh}
+REMOTE_DOCKER_CMD=${REMOTE_DOCKER_CMD:-docker}
 
 FOLLOW_LOGS=false
 DEPLOY_ONLY=false
@@ -100,6 +101,7 @@ Environment overrides:
   SSH_PROXY_JUMP       Default: ${SSH_PROXY_JUMP:-none}
   SSH_CONTROL_PERSIST  Default: $SSH_CONTROL_PERSIST
   SSH_CONTROL_DIR_BASE Default: $SSH_CONTROL_DIR_BASE
+  REMOTE_DOCKER_CMD    Default: $REMOTE_DOCKER_CMD
 EOF
 				exit 0
 				;;
@@ -422,13 +424,79 @@ deploy_remote() {
 		' .env > \"\$tmp_env\"
 		mv \"\$tmp_env\" .env
 
-		compose_cmd() {
-			if docker compose version >/dev/null 2>&1; then
-				docker compose \"\$@\"
-			else
-				docker-compose \"\$@\"
-			fi
-		}
+			REMOTE_DOCKER_CMD=\"$REMOTE_DOCKER_CMD\"
+
+			docker_cmd() {
+				\$REMOTE_DOCKER_CMD \"\$@\"
+			}
+
+			compose_backend() {
+				if docker_cmd compose version >/dev/null 2>&1; then
+					echo docker-plugin
+				elif command -v docker-compose >/dev/null 2>&1; then
+					echo docker-compose
+				else
+					echo plain-docker
+				fi
+			}
+
+			compose_cmd() {
+				case \"\$COMPOSE_BACKEND\" in
+					docker-plugin)
+						docker_cmd compose \"\$@\"
+						;;
+					docker-compose)
+						docker-compose \"\$@\"
+						;;
+					*)
+						echo \"docker compose is unavailable on this host.\" >&2
+						return 127
+						;;
+				esac
+			}
+
+			plain_docker_recreate() {
+				echo \"Pulling \$REDLIB_IMAGE with \$REMOTE_DOCKER_CMD...\"
+				docker_cmd pull \"\$REDLIB_IMAGE\"
+
+				echo \"Recreating \$REDLIB_CONTAINER_NAME on port \$REDLIB_HOST_PORT with plain Docker...\"
+				docker_cmd rm -f \"\$REDLIB_CONTAINER_NAME\" >/dev/null 2>&1 || true
+				docker_cmd volume create \"\$REDLIB_CACHE_VOLUME\" >/dev/null
+				docker_cmd volume create \"\$REDLIB_STATE_VOLUME\" >/dev/null
+				docker_cmd run -d \\
+					--name \"\$REDLIB_CONTAINER_NAME\" \\
+					--restart always \\
+					--user nobody \\
+					--read-only \\
+					--security-opt no-new-privileges:true \\
+					--cap-drop ALL \\
+					--add-host host.docker.internal:host-gateway \\
+					-p \"\$REDLIB_HOST_PORT:8080\" \\
+					--env-file .env \\
+					-e REDLIB_DEPLOY_GIT_HASH=\"\$REDLIB_DEPLOY_GIT_HASH\" \\
+					-e REDLIB_VIDEO_PREVIEW_ENABLED=off \\
+					-e REDLIB_VIDEO_PREVIEW_MAX_CONCURRENT=1 \\
+					-e REDLIB_VIDEO_PREVIEW_ANIMATION_FPS=\"\${REDLIB_VIDEO_PREVIEW_ANIMATION_FPS:-15}\" \\
+					-e REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_QUALITY=\"\${REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_QUALITY:-75}\" \\
+					-e REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL=\"\${REDLIB_VIDEO_PREVIEW_ANIMATION_WEBP_COMPRESSION_LEVEL:-0}\" \\
+					-e REDLIB_VIDEO_PREVIEW_ANIMATION_MAX_WIDTH=\"\${REDLIB_VIDEO_PREVIEW_ANIMATION_MAX_WIDTH:-360}\" \\
+					-e REDLIB_CACHE_DIR=\"\${REDLIB_CACHE_DIR:-/var/lib/redlib/cache}\" \\
+					-e REDLIB_PREFS_DB=\"\${REDLIB_PREFS_DB:-/var/lib/redlib/state/preferences.sqlite3}\" \\
+					-e REDLIB_PEER_API_FALLBACK_SOURCES=\"\$REDLIB_PEER_API_FALLBACK_SOURCES\" \\
+					-e REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS=\"\$REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS\" \\
+					-e REDLIB_PEER_API_FALLBACK_FORCE_TESTING=\"\$REDLIB_PEER_API_FALLBACK_FORCE_TESTING\" \\
+					-e REDLIB_REMEMBERED_FEED_DAEMON_ENABLED=\"\$REDLIB_REMEMBERED_FEED_DAEMON_ENABLED\" \\
+					-e REDLIB_CONTENT_SEMANTIC_OBSERVED_BACKFILL=\"\$REDLIB_CONTENT_SEMANTIC_OBSERVED_BACKFILL\" \\
+					-e REDLIB_INSTANCE_SCRAPE_ENABLED=\"\$REDLIB_INSTANCE_SCRAPE_ENABLED\" \\
+					-e OLLAMA_BASE_URL=\"\${OLLAMA_BASE_URL:-http://host.docker.internal:11434}\" \\
+					-e REDLIB_SUBREDDIT_SEMANTIC_MODEL=\"\${REDLIB_SUBREDDIT_SEMANTIC_MODEL:-nomic-embed-text}\" \\
+					-v \"\$REDLIB_CACHE_VOLUME:/var/lib/redlib/cache\" \\
+					-v \"\$REDLIB_STATE_VOLUME:/var/lib/redlib/state\" \\
+					--health-cmd 'wget --spider -q --tries=1 http://localhost:8080/settings' \\
+					--health-interval 5m \\
+					--health-timeout 3s \\
+					\"\$REDLIB_IMAGE\"
+			}
 
 		export REDLIB_IMAGE=\"$remote_image_ref\"
 		export REDLIB_DEPLOY_GIT_HASH=\"$deploy_git_hash\"
@@ -441,33 +509,53 @@ deploy_remote() {
 		export REDLIB_PEER_API_FALLBACK_FORCE_TESTING=\"$REDLIB_PEER_API_FALLBACK_FORCE_TESTING\"
 		export REDLIB_REMEMBERED_FEED_DAEMON_ENABLED=\"$REDLIB_REMEMBERED_FEED_DAEMON_ENABLED\"
 		export REDLIB_CONTENT_SEMANTIC_OBSERVED_BACKFILL=\"$REDLIB_CONTENT_SEMANTIC_OBSERVED_BACKFILL\"
-		export REDLIB_INSTANCE_SCRAPE_ENABLED=\"$REDLIB_INSTANCE_SCRAPE_ENABLED\"
+			export REDLIB_INSTANCE_SCRAPE_ENABLED=\"$REDLIB_INSTANCE_SCRAPE_ENABLED\"
+			COMPOSE_BACKEND=\$(compose_backend)
+			echo \"Remote container backend: \$COMPOSE_BACKEND\"
 
-		echo \"Pulling \$REDLIB_IMAGE...\"
-		compose_cmd -f compose.pi.yaml -p \"$COMPOSE_PROJECT_NAME\" pull redlib
+			if [ \"\$COMPOSE_BACKEND\" = plain-docker ]; then
+				plain_docker_recreate
+			else
+				echo \"Pulling \$REDLIB_IMAGE...\"
+				compose_cmd -f compose.pi.yaml -p \"$COMPOSE_PROJECT_NAME\" pull redlib
 
-		echo \"Recreating redlib on port \$REDLIB_HOST_PORT...\"
-		compose_cmd -f compose.pi.yaml -p \"$COMPOSE_PROJECT_NAME\" up -d --force-recreate --remove-orphans redlib
+				echo \"Recreating redlib on port \$REDLIB_HOST_PORT...\"
+				compose_cmd -f compose.pi.yaml -p \"$COMPOSE_PROJECT_NAME\" up -d --force-recreate --remove-orphans redlib
+			fi
 
-		echo \"Container status:\"
-		compose_cmd -f compose.pi.yaml -p \"$COMPOSE_PROJECT_NAME\" ps
+			echo \"Container status:\"
+			if [ \"\$COMPOSE_BACKEND\" = plain-docker ]; then
+				docker_cmd ps --filter \"name=^\${REDLIB_CONTAINER_NAME}\$\" --format \"table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}\"
+			else
+				compose_cmd -f compose.pi.yaml -p \"$COMPOSE_PROJECT_NAME\" ps
+			fi
 
-		echo \"Recent image list:\"
-		docker images --format \"table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}\" | grep -i \"^.*redlib\" || true
-	"
-}
+			echo \"Recent image list:\"
+			docker_cmd images --format \"table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}\" | grep -i \"^.*redlib\" || true
+		"
+	}
 
 follow_logs() {
 	run_ssh "
 		set -e
 		cd \"$REMOTE_DEPLOY_DIR\"
 
-		compose_cmd() {
-			if docker compose version >/dev/null 2>&1; then
-				docker compose \"\$@\"
-			else
-				docker-compose \"\$@\"
-			fi
+			REMOTE_DOCKER_CMD=\"$REMOTE_DOCKER_CMD\"
+
+			docker_cmd() {
+				\$REMOTE_DOCKER_CMD \"\$@\"
+			}
+
+			compose_cmd() {
+				if docker_cmd compose version >/dev/null 2>&1; then
+					docker_cmd compose \"\$@\"
+				elif command -v docker-compose >/dev/null 2>&1; then
+					docker-compose \"\$@\"
+				else
+					docker_cmd logs -f \"$REDLIB_CONTAINER_NAME\"
+					return
+				fi
+			}
 		}
 
 		export REDLIB_IMAGE=\"$REGISTRY_HOST_PULL/$IMAGE_NAME:$IMAGE_TAG\"
@@ -493,6 +581,7 @@ echo "Local image reuse mode: $REUSE_LOCAL_IMAGE"
 echo "Host port: $HOST_PORT"
 echo "Compose project: $COMPOSE_PROJECT_NAME"
 echo "Container name: $REDLIB_CONTAINER_NAME"
+echo "Remote Docker command: $REMOTE_DOCKER_CMD"
 if [[ -n "$SSH_PROXY_JUMP" ]]; then
 	echo "SSH proxy jump: $SSH_PROXY_JUMP"
 fi
