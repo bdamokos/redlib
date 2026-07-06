@@ -21,11 +21,16 @@
   If deployment fails because of an implementation or build error, the coordinator reports the failure back to the originating thread with the relevant command output so that thread can fix it without staying in a polling loop.
 - Raspberry Pi deploy:
   Run `./deploy.sh` from the repo root.
-  That script builds a `linux/arm64` image locally, pushes it to the Pi registry at `100.119.233.126:5010`, copies `compose.pi.yaml` to `~/redlib` on the Pi, and recreates the `redlib` container there.
-  The Pi deploy serves Redlib on port `8081`.
+  That script builds a `linux/arm64` image locally, pushes it to the main Server 1 registry at `192.168.50.25:5010`, copies `compose.pi.yaml` to `~/redlib`, and recreates the `redlib` container there.
+  The main Server 1 deploy target is `192.168.50.25` and serves Redlib on port `8081`.
   `./deploy.sh --deploy-only` skips the local build and push.
   `./deploy.sh --follow-logs` tails the remote Redlib logs after deployment.
   Before rebuilding, `deploy.sh` tries to reuse `redlib:local` when its `org.opencontainers.image.revision` label exactly matches `HEAD`, the worktree is clean, and the image platform matches `TARGET_PLATFORM`. Use `REUSE_LOCAL_IMAGE=never ./deploy.sh` to force a rebuild, or `REUSE_LOCAL_IMAGE=required ./deploy.sh` to fail instead of rebuilding when the local validation image is not reusable.
+- Two-server deploy:
+  Use `./scripts/deploy-two-server.sh --target main`, `--target spare`, or `--target both` to apply the confirmed two-server defaults without ad hoc env setup.
+  Main Server 1 uses `REDLIB_PEER_API_FALLBACK_SOURCES=http://192.168.50.251:18081` and `REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS=5`.
+  Raspberry Server 2 is reached with `ssh -J raspberryserver bence@192.168.50.251`, pulls `192.168.50.25:5010/redlib:latest`, runs as Compose project/container `redlib-rate-test`, and binds host port `18081`.
+  Server 2 is a hot spare for Reddit API/API-layer fallback, not a second daemon/cache worker: keep `REDLIB_REMEMBERED_FEED_DAEMON_ENABLED=off`, `REDLIB_CONTENT_SEMANTIC_OBSERVED_BACKFILL=off`, `REDLIB_INSTANCE_SCRAPE_ENABLED=off`, and no peer fallback sources there.
 - Pi runtime details:
   The active Pi deploy directory is `~/redlib`.
   The Pi compose file is `compose.pi.yaml`, not `compose.yaml`.
