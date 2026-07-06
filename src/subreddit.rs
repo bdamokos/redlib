@@ -852,6 +852,75 @@ fn render_subreddit_fragment(
 	Ok(response)
 }
 
+fn subreddit_source_unavailable_notice(sub_name: &str, reason: crate::client::SourceUnavailable) -> String {
+	match reason {
+		crate::client::SourceUnavailable::Banned => format!("r/{sub_name} has been banned from Reddit."),
+		crate::client::SourceUnavailable::Private => format!("r/{sub_name} is a private community on Reddit."),
+		crate::client::SourceUnavailable::Suspended => format!("r/{sub_name} is unavailable from Reddit."),
+		crate::client::SourceUnavailable::NotFound => format!("r/{sub_name} was not found on Reddit."),
+		crate::client::SourceUnavailable::Forbidden => format!("r/{sub_name} is unavailable from Reddit."),
+	}
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_subreddit_source_unavailable_fragment(
+	req: &Request<Body>,
+	sub: Subreddit,
+	sub_name: &str,
+	reason: crate::client::SourceUnavailable,
+	sort: (String, String),
+	sort_options: Vec<SortOption>,
+	flair_filters: Vec<FlairFilterOption>,
+	active_flair_filter: &str,
+	url: String,
+	redirect_url: String,
+	is_flair_subscribed: bool,
+	filters: &HashSet<String>,
+	top_users: Vec<SubredditUserEntry>,
+	feed_seen: Option<seen_posts::FeedSeenCookieCtx>,
+) -> Result<Response<Body>, String> {
+	let prefs = Preferences::new(req);
+	let related_subreddits = related_subreddit_sidebar(&sub, &prefs, filters);
+	render_subreddit_fragment(
+		req,
+		SubredditFragmentTemplate {
+			sub,
+			posts: Vec::new(),
+			top_users,
+			related_subreddits,
+			sort,
+			sort_options,
+			flair_filters,
+			active_flair_filter: active_flair_filter.to_string(),
+			active_flair_filter_encoded: encode_query_value(active_flair_filter),
+			clear_flair_filter_url: update_url_query(&url, &[("flair", None), ("before", None), ("after", None), (FRONT_CURSOR_PARAM, None)]),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs,
+			url,
+			redirect_url,
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			cache_notice: subreddit_source_unavailable_notice(sub_name, reason),
+			peer_origin: String::new(),
+			is_flair_subscribed,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
+		},
+		feed_seen,
+	)
+}
+
 fn render_scraped_subreddit_fragment(
 	req: &Request<Body>,
 	scraped: instance_scrape::ScrapedSubredditPage,
@@ -2590,6 +2659,28 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			.any(|subscription| subscription.subreddit == sub.name && subscription.flair == active_flair_filter);
 	let scrape_cacheable_first_page = is_subreddit_route && is_single_sub && uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty();
 
+	if let Some(reason) = (is_subreddit_route && is_single_sub)
+		.then(|| metadata_error.as_deref().and_then(crate::client::source_unavailable_from_error))
+		.flatten()
+	{
+		return render_subreddit_source_unavailable_fragment(
+			&req,
+			sub,
+			&sub_name,
+			reason,
+			(sort.clone(), timeframe.clone()),
+			sort_options,
+			flair_filters,
+			&active_flair_filter,
+			url,
+			redirect_url,
+			is_flair_subscribed,
+			&filters,
+			top_users,
+			feed_seen_ctx.clone(),
+		);
+	}
+
 	if is_subreddit_route
 		&& is_single_sub
 		&& (peer_api_fallback::peer_api_fallback_enabled() || instance_scrape::instance_scrape_enabled())
@@ -2687,7 +2778,30 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		)
 	} else if is_video_length_sort(&sort) {
 		let source_posts = if is_subreddit_route && is_single_sub {
-			let mut posts = cached_or_live_new_subreddit_posts(&sub_name, quarantined).await?;
+			let mut posts = match cached_or_live_new_subreddit_posts(&sub_name, quarantined).await {
+				Ok(posts) => posts,
+				Err(msg) => {
+					if let Some(reason) = crate::client::source_unavailable_from_error(&msg) {
+						return render_subreddit_source_unavailable_fragment(
+							&req,
+							sub,
+							&sub_name,
+							reason,
+							(sort.clone(), timeframe.clone()),
+							sort_options,
+							flair_filters,
+							&active_flair_filter,
+							url,
+							redirect_url,
+							is_flair_subscribed,
+							&filters,
+							top_users,
+							feed_seen_ctx.clone(),
+						);
+					}
+					return Err(msg);
+				}
+			};
 			filter_posts_by_flair(&mut posts, &active_flair_filter);
 			posts
 		} else if !is_subreddit_route {
@@ -3184,6 +3298,27 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				)
 			}
 			Err(msg) => {
+				if let Some(reason) = (is_subreddit_route && is_single_sub).then(|| crate::client::source_unavailable_from_error(&msg)).flatten() {
+					if uses_remembered_subreddit_cache {
+						crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					}
+					return render_subreddit_source_unavailable_fragment(
+						&req,
+						sub,
+						&sub_name,
+						reason,
+						(sort.clone(), timeframe.clone()),
+						sort_options,
+						flair_filters,
+						&active_flair_filter,
+						url,
+						redirect_url,
+						is_flair_subscribed,
+						&filters,
+						top_users,
+						None,
+					);
+				}
 				let can_serve_stale_single_subreddit_cache = is_single_sub && request_after.is_empty() && request_before.is_empty();
 				if can_serve_stale_single_subreddit_cache {
 					if uses_remembered_subreddit_cache {
@@ -3356,7 +3491,7 @@ mod tests {
 		update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, FeedFragmentTemplate, SubredditTemplate, FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
-	use hyper::{Body, Request};
+	use hyper::{body, Body, Request};
 	use std::collections::{HashSet, VecDeque};
 	use std::time::{Duration, Instant};
 
@@ -4102,6 +4237,40 @@ mod tests {
 		.unwrap();
 
 		assert!(!html.contains("id=\"sidebar\""));
+	}
+
+	#[tokio::test]
+	async fn source_unavailable_subreddit_fragment_renders_deterministic_notice() {
+		let req = Request::builder()
+			.uri("/subreddit-fragment/r/missing_sub/new")
+			.body(Body::empty())
+			.expect("request should build");
+		let response = super::render_subreddit_source_unavailable_fragment(
+			&req,
+			Subreddit {
+				name: "missing_sub".to_string(),
+				..Default::default()
+			},
+			"missing_sub",
+			crate::client::SourceUnavailable::Banned,
+			("new".to_string(), String::new()),
+			Vec::new(),
+			Vec::new(),
+			"",
+			"/r/missing_sub/new".to_string(),
+			"r/missing_sub/new".to_string(),
+			false,
+			&HashSet::new(),
+			Vec::new(),
+			None,
+		)
+		.expect("fragment should render");
+
+		assert_eq!(response.status(), 200);
+		let body = body::to_bytes(response.into_body()).await.expect("body should read");
+		let html = String::from_utf8(body.to_vec()).expect("fragment should be utf8");
+		assert!(html.contains("r/missing_sub has been banned from Reddit."));
+		assert!(!html.contains("Loading posts"));
 	}
 
 	#[test]

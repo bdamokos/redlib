@@ -104,8 +104,8 @@ fn upstream_error(msg: String) -> Result<Response<Body>, String> {
 		503
 	} else if matches!(msg.as_str(), "quarantined" | "gated") {
 		403
-	} else if matches!(msg.as_str(), "private" | "banned" | "suspended") {
-		404
+	} else if let Some(reason) = client::source_unavailable_from_error(&msg) {
+		return json_error(format!("source_unavailable: {}", reason.as_str()), reason.http_status());
 	} else {
 		502
 	};
@@ -407,7 +407,8 @@ pub async fn post(req: Request<Body>) -> Result<Response<Body>, String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{api_metadata, ApiEnvelope, ListingResponse};
+	use super::{api_metadata, upstream_error, ApiEnvelope, ListingResponse};
+	use hyper::body;
 
 	#[test]
 	fn api_envelope_serializes_rate_limit_metadata() {
@@ -447,5 +448,20 @@ mod tests {
 		})
 		.expect("listing response should serialize");
 		assert_eq!(peer["peer_origin"], "http://192.168.50.251:18081");
+	}
+
+	#[tokio::test]
+	async fn upstream_error_returns_source_unavailable_json_without_rate_limit_fallback() {
+		let response = upstream_error("banned".to_string()).expect("response should build");
+		assert_eq!(response.status(), 404);
+		let body = body::to_bytes(response.into_body()).await.expect("body should read");
+		let value: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
+		assert_eq!(value["error"], "source_unavailable: banned");
+
+		let response = upstream_error("Too many requests.".to_string()).expect("response should build");
+		assert_eq!(response.status(), 429);
+		let body = body::to_bytes(response.into_body()).await.expect("body should read");
+		let value: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
+		assert_eq!(value["error"], "Too many requests.");
 	}
 }

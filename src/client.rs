@@ -283,6 +283,70 @@ pub struct PeerRateLimitStatus {
 	pub learned_age_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceUnavailable {
+	Banned,
+	Private,
+	Suspended,
+	NotFound,
+	Forbidden,
+}
+
+impl SourceUnavailable {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Banned => "banned",
+			Self::Private => "private",
+			Self::Suspended => "suspended",
+			Self::NotFound => "not_found",
+			Self::Forbidden => "forbidden",
+		}
+	}
+
+	pub fn http_status(self) -> u16 {
+		match self {
+			Self::Private | Self::Forbidden => 403,
+			Self::Banned | Self::Suspended | Self::NotFound => 404,
+		}
+	}
+}
+
+pub fn source_unavailable_from_error(msg: &str) -> Option<SourceUnavailable> {
+	let trimmed = msg.trim();
+	let lower = trimmed.to_ascii_lowercase();
+
+	if lower.contains("too many requests")
+		|| lower.contains("rate limit")
+		|| lower.contains("ratelimit")
+		|| lower.contains("oauth_unavailable")
+		|| lower.contains("quarantined")
+		|| lower.contains("gated")
+		|| lower.contains("network security")
+	{
+		return None;
+	}
+
+	if trimmed == "banned" || lower.contains("\"banned\"") || lower.contains("reason banned") {
+		Some(SourceUnavailable::Banned)
+	} else if trimmed == "private" || lower.contains("\"private\"") || lower.contains("private community") {
+		Some(SourceUnavailable::Private)
+	} else if trimmed == "suspended" || lower.contains("suspended") {
+		Some(SourceUnavailable::Suspended)
+	} else if trimmed == "not_found"
+		|| lower.contains("reddit error 404")
+		|| lower.contains("status code: 404")
+		|| lower.contains("404 not found")
+		|| lower.contains("status code: 410")
+		|| lower.contains("reddit error 410")
+	{
+		Some(SourceUnavailable::NotFound)
+	} else if lower.contains("reddit error 403") && lower.contains("forbidden") {
+		Some(SourceUnavailable::Forbidden)
+	} else {
+		None
+	}
+}
+
 #[derive(Clone, Debug)]
 struct PeerRateLimitEntry {
 	rate_limit: RedditRateLimitStatus,
@@ -1403,6 +1467,9 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					if status == hyper::StatusCode::TOO_MANY_REQUESTS {
 						return Err("Too many requests.".to_string());
 					}
+					if matches!(status, hyper::StatusCode::NOT_FOUND | hyper::StatusCode::GONE) {
+						return Err("not_found".to_string());
+					}
 
 					// Parse the response as JSON
 					match serde_json::from_str(&text) {
@@ -1442,6 +1509,9 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 								// Handle banned subs
 								if json["reason"] == "banned" {
 									return Err("banned".into());
+								}
+								if matches!(json["error"].as_i64(), Some(404 | 410)) {
+									return Err("not_found".into());
 								}
 
 								Err(format!("Reddit error {} \"{}\": {} | {path}", json["error"], json["reason"], json["message"]))
@@ -1573,6 +1643,23 @@ fn test_403_cooldown_requires_retry_after() {
 	assert!(should_record_403_cooldown(hyper::StatusCode::FORBIDDEN, true));
 	assert!(!should_record_403_cooldown(hyper::StatusCode::FORBIDDEN, false));
 	assert!(!should_record_403_cooldown(hyper::StatusCode::TOO_MANY_REQUESTS, true));
+}
+
+#[test]
+fn test_source_unavailable_classifier_keeps_rate_limit_separate() {
+	assert_eq!(source_unavailable_from_error("banned"), Some(SourceUnavailable::Banned));
+	assert_eq!(source_unavailable_from_error("private"), Some(SourceUnavailable::Private));
+	assert_eq!(source_unavailable_from_error("suspended"), Some(SourceUnavailable::Suspended));
+	assert_eq!(
+		source_unavailable_from_error(r#"Reddit error 404 "null": Not Found | /r/missing/new.json"#),
+		Some(SourceUnavailable::NotFound)
+	);
+	assert_eq!(
+		source_unavailable_from_error(r#"Reddit error 403 "null": Forbidden | /user/missing/about.json"#),
+		Some(SourceUnavailable::Forbidden)
+	);
+	assert_eq!(source_unavailable_from_error("Too many requests. Reddit rate limited"), None);
+	assert_eq!(source_unavailable_from_error("oauth_unavailable | /r/rust/new.json"), None);
 }
 
 #[test]

@@ -1192,10 +1192,12 @@ fn cached_or_placeholder_user(username: &str) -> User {
 }
 
 fn user_upstream_unavailable_notice(username: &str, msg: &str) -> Option<String> {
-	match msg.trim() {
-		"suspended" => Some(format!("u/{username} is suspended on Reddit. Showing cached posts when available.")),
-		"banned" => Some(format!("u/{username} is banned upstream. Showing cached posts when available.")),
-		_ => None,
+	match crate::client::source_unavailable_from_error(msg)? {
+		crate::client::SourceUnavailable::Suspended => Some(format!("u/{username} is suspended on Reddit. Showing cached posts when available.")),
+		crate::client::SourceUnavailable::Banned => Some(format!("u/{username} is banned upstream. Showing cached posts when available.")),
+		crate::client::SourceUnavailable::Private => Some(format!("u/{username} is private on Reddit. Showing cached posts when available.")),
+		crate::client::SourceUnavailable::NotFound => Some(format!("u/{username} was not found on Reddit. Showing cached posts when available.")),
+		crate::client::SourceUnavailable::Forbidden => Some(format!("u/{username} is unavailable from Reddit. Showing cached posts when available.")),
 	}
 }
 
@@ -1926,6 +1928,19 @@ mod tests {
 		assert!(html.contains("from cache"));
 		assert!(html.contains("u/demo_user is suspended on Reddit"));
 		assert!(html.find("Live title").unwrap() < html.find("from cache").unwrap());
+	}
+
+	#[test]
+	fn user_unavailable_notice_covers_private_not_found_and_rate_limit_separately() {
+		assert_eq!(
+			super::user_upstream_unavailable_notice("demo_user", "private").as_deref(),
+			Some("u/demo_user is private on Reddit. Showing cached posts when available.")
+		);
+		assert_eq!(
+			super::user_upstream_unavailable_notice("demo_user", r#"Reddit error 404 "null": Not Found | /user/demo_user/about.json"#).as_deref(),
+			Some("u/demo_user was not found on Reddit. Showing cached posts when available.")
+		);
+		assert_eq!(super::user_upstream_unavailable_notice("demo_user", "Too many requests."), None);
 	}
 
 	#[test]
