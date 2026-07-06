@@ -8,6 +8,7 @@
   If you use raw Compose after a deployable commit exists, run `GIT_HASH=$(git rev-parse HEAD) REDLIB_DEPLOY_GIT_HASH=$(git rev-parse HEAD) docker compose -f compose.dev.yaml up -d --build` so the resulting `redlib:local` image can be reused by `deploy.sh`.
 - Default change workflow:
   When the user asks to fix or change something in this repo, assume they expect the change to be committed and deployed after validation unless they explicitly say otherwise.
+  The active integration branch for parallel Redlib work is `feature/video-audio`. Feature and fix threads should work there by default; if they use a temporary `codex/...` branch or separate worktree, merge or rebase the finished work into `feature/video-audio` before deployment handoff unless the user explicitly asks for a different target.
   If there are parallel active threads or workstreams that could also affect deployment, spawn or defer to an orchestrator thread that can coordinate those parallel changes and manage the final deploy ordering.
 - Persistent deployment thread:
   The designated Redlib deployment coordinator thread is `019f0411-87a6-7112-a4a8-a005a28d3ee6`.
