@@ -286,6 +286,10 @@ async fn discover_nsfwdog_similar_candidates(
 	discovered
 }
 
+fn allow_name_only_metadata_for_candidate(args: &Args, nsfwdog_discovered_names: &HashSet<String>, name: &str) -> bool {
+	args.name_only_if_missing_metadata && !nsfwdog_discovered_names.contains(name)
+}
+
 async fn ollama_embedding(client: &Client<hyper::client::HttpConnector>, base_url: &str, model: &str, prompt: &str) -> Result<Vec<f32>, String> {
 	let uri = format!("{}/api/embeddings", normalize_ollama_url(base_url))
 		.parse::<Uri>()
@@ -502,6 +506,7 @@ async fn run_backfill(args: &Args, counters: &mut SubredditSemanticBackfillCount
 		}
 	}
 	let discovered_names = discover_nsfwdog_similar_candidates(args, &known_names, &cached_metadata, counters).await;
+	let nsfwdog_discovered_names = discovered_names.iter().cloned().collect::<HashSet<_>>();
 	let mut names = known_names.into_iter().collect::<Vec<_>>();
 	names.extend(discovered_names);
 	let metadata_by_name = cached_metadata
@@ -513,6 +518,7 @@ async fn run_backfill(args: &Args, counters: &mut SubredditSemanticBackfillCount
 	let client = Client::new();
 
 	for name in names.into_iter().take(args.limit.unwrap_or(usize::MAX)) {
+		let allow_name_only_metadata = allow_name_only_metadata_for_candidate(args, &nsfwdog_discovered_names, &name);
 		let metadata = match metadata_by_name.get(&name).cloned().or_else(|| subreddit::cached_subreddit_metadata_for_name(&name)) {
 			Some(metadata) => metadata,
 			None if args.refresh_missing_metadata && args.metadata_refresh_limit.map(|limit| counters.metadata_refresh_attempted < limit).unwrap_or(true) => {
@@ -528,7 +534,7 @@ async fn run_backfill(args: &Args, counters: &mut SubredditSemanticBackfillCount
 					Err(error) => {
 						counters.missing_metadata += 1;
 						eprintln!("metadata failed r/{name}: {error}");
-						if args.name_only_if_missing_metadata {
+						if allow_name_only_metadata {
 							counters.name_only_metadata += 1;
 							utils::Subreddit {
 								name: name.clone(),
@@ -542,7 +548,7 @@ async fn run_backfill(args: &Args, counters: &mut SubredditSemanticBackfillCount
 			}
 			None if args.refresh_missing_metadata => {
 				counters.metadata_refresh_skipped += 1;
-				if args.name_only_if_missing_metadata {
+				if allow_name_only_metadata {
 					counters.name_only_metadata += 1;
 					utils::Subreddit {
 						name: name.clone(),
@@ -554,7 +560,7 @@ async fn run_backfill(args: &Args, counters: &mut SubredditSemanticBackfillCount
 				}
 			}
 			None => {
-				if args.name_only_if_missing_metadata {
+				if allow_name_only_metadata {
 					counters.name_only_metadata += 1;
 					utils::Subreddit {
 						name: name.clone(),
@@ -611,6 +617,26 @@ async fn run_backfill(args: &Args, counters: &mut SubredditSemanticBackfillCount
 mod tests {
 	use super::*;
 
+	fn test_args() -> Args {
+		Args {
+			cache_dir: None,
+			model: subreddit_semantics::DEFAULT_SUBREDDIT_SEMANTIC_MODEL.to_string(),
+			ollama_url: "http://127.0.0.1:11434".to_string(),
+			limit: None,
+			subreddits: Vec::new(),
+			refresh_missing_metadata: true,
+			metadata_refresh_limit: Some(200),
+			name_only_if_missing_metadata: true,
+			nsfwdog_similar_limit: DEFAULT_NSFWDOG_SIMILAR_LIMIT,
+			nsfwdog_seed_limit: DEFAULT_NSFWDOG_SEED_LIMIT,
+			nsfwdog_per_seed_limit: DEFAULT_NSFWDOG_PER_SEED_LIMIT,
+			nsfwdog_api_base: DEFAULT_NSFWDOG_API_BASE.to_string(),
+			force: false,
+			dry_run: true,
+			quiet: true,
+		}
+	}
+
 	#[test]
 	fn nsfwdog_subreddit_names_are_normalized_and_validated() {
 		assert_eq!(normalize_nsfwdog_subreddit_name("r/IndianCelebScenes"), Some("indiancelebscenes".to_string()));
@@ -635,5 +661,13 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(uri.to_string(), "https://api2.nsfwdog.com/api/v1/similar?subreddit=r%2FIndianCelebScenes&offset=0&limit=10");
+	}
+
+	#[test]
+	fn nsfwdog_discovered_candidates_require_verified_metadata() {
+		let args = test_args();
+		let discovered = HashSet::from(["newcandidate".to_string()]);
+		assert!(!allow_name_only_metadata_for_candidate(&args, &discovered, "newcandidate"));
+		assert!(allow_name_only_metadata_for_candidate(&args, &discovered, "cachedcandidate"));
 	}
 }
