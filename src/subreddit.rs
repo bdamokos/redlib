@@ -92,6 +92,7 @@ pub struct SubredditTemplate {
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
 	cache_notice: String,
+	peer_origin: String,
 	is_flair_subscribed: bool,
 	feed_session_id: String,
 	feed_status_url: String,
@@ -157,6 +158,7 @@ struct SubredditFragmentTemplate {
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
 	cache_notice: String,
+	peer_origin: String,
 	is_flair_subscribed: bool,
 	feed_session_id: String,
 	feed_status_url: String,
@@ -865,6 +867,7 @@ fn render_scraped_subreddit_fragment(
 	is_flair_subscribed: bool,
 	cacheable_first_page: bool,
 	cache_notice: &str,
+	peer_origin: &str,
 ) -> Result<Response<Body>, String> {
 	cache_subreddit_metadata(&scraped.subreddit);
 	if cacheable_first_page {
@@ -927,6 +930,7 @@ fn render_scraped_subreddit_fragment(
 			all_posts_hidden_nsfw,
 			no_posts,
 			cache_notice: cache_notice.to_string(),
+			peer_origin: peer_origin.to_string(),
 			is_flair_subscribed,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -984,6 +988,7 @@ async fn render_peer_api_subreddit_fragment(
 				is_flair_subscribed,
 				cacheable_first_page,
 				peer_api_fallback::peer_api_notice(),
+				&peer.origin,
 			))
 		}
 		Err(error) => {
@@ -1177,6 +1182,7 @@ fn render_video_mode_subreddit_fragment(
 			all_posts_hidden_nsfw,
 			no_posts,
 			cache_notice,
+			peer_origin: String::new(),
 			is_flair_subscribed,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -2187,6 +2193,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				all_posts_hidden_nsfw,
 				no_posts,
 				cache_notice: String::new(),
+				peer_origin: String::new(),
 				is_flair_subscribed,
 				feed_session_id: feed_session_id.clone(),
 				feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
@@ -2451,6 +2458,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					is_flair_subscribed,
 					scrape_cacheable_first_page,
 					instance_scrape::scrape_notice(),
+					"",
 				);
 			}
 		}
@@ -2585,6 +2593,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					is_flair_subscribed,
 					scrape_cacheable_first_page,
 					instance_scrape::scrape_notice(),
+					"",
 				);
 			}
 		}
@@ -2618,6 +2627,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				all_posts_hidden_nsfw: false,
 				no_posts: false,
 				cache_notice: String::new(),
+				peer_origin: String::new(),
 				is_flair_subscribed,
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
@@ -2768,6 +2778,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					all_posts_hidden_nsfw,
 					no_posts,
 					cache_notice: String::new(),
+					peer_origin: String::new(),
 					is_flair_subscribed,
 					feed_session_id: feed_session_id.clone(),
 					feed_status_url: feed_status_url(&url, &feed_session_id, cache_page),
@@ -2909,6 +2920,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				all_posts_hidden_nsfw,
 				no_posts,
 				cache_notice: String::new(),
+				peer_origin: String::new(),
 				is_flair_subscribed,
 				feed_session_id: String::new(),
 				feed_status_url: String::new(),
@@ -3001,6 +3013,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					all_posts_hidden_nsfw,
 					no_posts,
 					cache_notice: String::new(),
+					peer_origin: String::new(),
 					is_flair_subscribed,
 					feed_session_id: String::new(),
 					feed_status_url: String::new(),
@@ -3111,6 +3124,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						all_posts_hidden_nsfw,
 						no_posts,
 						cache_notice: String::new(),
+						peer_origin: String::new(),
 						is_flair_subscribed,
 						feed_session_id: String::new(),
 						feed_status_url: String::new(),
@@ -3215,6 +3229,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 									all_posts_hidden_nsfw,
 									no_posts,
 									cache_notice: OAUTH_CACHE_NOTICE.to_string(),
+									peer_origin: String::new(),
 									is_flair_subscribed,
 									feed_session_id: String::new(),
 									feed_status_url: String::new(),
@@ -3274,6 +3289,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								is_flair_subscribed,
 								scrape_cacheable_first_page,
 								instance_scrape::scrape_notice(),
+								"",
 							);
 						}
 					}
@@ -3476,6 +3492,7 @@ mod tests {
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
 			cache_notice: String::new(),
+			peer_origin: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -3535,6 +3552,7 @@ mod tests {
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
 			cache_notice: String::new(),
+			peer_origin: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -3867,6 +3885,7 @@ mod tests {
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
 			cache_notice: String::new(),
+			peer_origin: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: "demo".to_string(),
 			feed_status_url: "/feed-status?feed_session=demo".to_string(),
@@ -3942,6 +3961,51 @@ mod tests {
 	}
 
 	#[test]
+	fn subreddit_fragment_renders_peer_origin_marker() {
+		let html = super::SubredditFragmentTemplate {
+			sub: Subreddit::default(),
+			posts: vec![test_post()],
+			top_users: Vec::new(),
+			related_subreddits: Default::default(),
+			sort: ("hot".to_string(), String::new()),
+			sort_options: Vec::new(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: "/r/rust".to_string(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			cache_notice: String::new(),
+			peer_origin: "http://192.168.50.251:18081".to_string(),
+			is_flair_subscribed: false,
+			feed_session_id: String::new(),
+			feed_status_url: String::new(),
+			feed_fragment_url: String::new(),
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+			show_hide_seen_toggle: false,
+			hide_seen_on: false,
+			hide_seen_toggle_url: String::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("post_origin_marker peer_origin_marker"));
+		assert!(html.contains("from spare"));
+		assert!(html.contains("Fetched from Redlib peer http://192.168.50.251:18081"));
+		assert!(html.find("from spare").unwrap() < html.find("Primary post title").unwrap());
+	}
+
+	#[test]
 	fn does_not_render_sidebar_panel_when_subreddit_sidebar_is_empty() {
 		let html = SubredditTemplate {
 			sub: Subreddit {
@@ -3969,6 +4033,7 @@ mod tests {
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
 			cache_notice: String::new(),
+			peer_origin: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -4012,6 +4077,7 @@ mod tests {
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
 			cache_notice: String::new(),
+			peer_origin: String::new(),
 			is_flair_subscribed: false,
 			feed_session_id: "demo".to_string(),
 			feed_status_url: String::new(),

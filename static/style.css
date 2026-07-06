@@ -43,6 +43,7 @@
     /* Default & fallback theme (dark) */
     --accent: #d54455;
     --green: #5cff85;
+    --peer-origin: #6fae98;
     --text: white;
     --foreground: #222;
     --background: #0f0f0f;
@@ -64,6 +65,7 @@
     :root {
         --accent: #bb2b3b;
         --green: #00a229;
+        --peer-origin: #357c65;
         --text: black;
         --foreground: #f5f5f5;
         --background: #ddd;
@@ -86,6 +88,7 @@
 .tokyoNight {
     --accent: #565f89;
     --green: #73daca;
+    --peer-origin: #73daca;
     --text: #a9b1d6;
     --foreground: #24283b;
     --background: #1a1b26;
@@ -505,7 +508,7 @@ main.post_page_main #page_fragment {
     margin: 8px 0;
 }
 
-.user_cached_post_marker {
+.post_origin_marker {
     display: inline-flex;
     align-items: center;
     position: relative;
@@ -519,6 +522,14 @@ main.post_page_main #page_fragment {
     background: var(--post);
     font-size: 11px;
     line-height: 1.4;
+}
+
+.user_cached_post_marker {
+    color: var(--accent);
+}
+
+.peer_origin_marker {
+    color: var(--peer-origin);
 }
 
 #column_one {

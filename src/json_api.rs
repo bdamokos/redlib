@@ -37,6 +37,8 @@ pub(crate) struct ListingResponse {
 	pub(crate) subreddit: Option<Subreddit>,
 	pub(crate) posts: Vec<Post>,
 	pub(crate) after: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) peer_origin: Option<String>,
 	pub(crate) all_posts_filtered: bool,
 	pub(crate) all_posts_hidden_nsfw: bool,
 }
@@ -249,6 +251,7 @@ pub async fn subreddit_listing(req: Request<Body>) -> Result<Response<Body>, Str
 							subreddit: peer.subreddit,
 							posts,
 							after: after_value(peer.after),
+							peer_origin: Some(peer.origin),
 							all_posts_filtered,
 							all_posts_hidden_nsfw,
 						});
@@ -266,6 +269,7 @@ pub async fn subreddit_listing(req: Request<Body>) -> Result<Response<Body>, Str
 		subreddit,
 		posts,
 		after: after_value(after),
+		peer_origin: None,
 		all_posts_filtered,
 		all_posts_hidden_nsfw,
 	})
@@ -385,7 +389,7 @@ pub async fn post(req: Request<Body>) -> Result<Response<Body>, String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{api_metadata, ApiEnvelope};
+	use super::{api_metadata, ApiEnvelope, ListingResponse};
 
 	#[test]
 	fn api_envelope_serializes_rate_limit_metadata() {
@@ -400,5 +404,30 @@ mod tests {
 		assert_eq!(value["data"], "ok");
 		assert!(value["meta"]["rate_limit"]["state"].is_string());
 		assert!(value["meta"]["rate_limit"]["stale"].is_boolean());
+	}
+
+	#[test]
+	fn listing_response_serializes_peer_origin_only_when_present() {
+		let normal = serde_json::to_value(ListingResponse {
+			subreddit: None,
+			posts: Vec::new(),
+			after: None,
+			peer_origin: None,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+		})
+		.expect("listing response should serialize");
+		assert!(normal.get("peer_origin").is_none());
+
+		let peer = serde_json::to_value(ListingResponse {
+			subreddit: None,
+			posts: Vec::new(),
+			after: None,
+			peer_origin: Some("http://192.168.50.251:18081".to_string()),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+		})
+		.expect("listing response should serialize");
+		assert_eq!(peer["peer_origin"], "http://192.168.50.251:18081");
 	}
 }

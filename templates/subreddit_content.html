@@ -76,6 +76,9 @@
 				{% for post in posts %}
 				{% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
 				<hr class="sep" />
+				{% if !peer_origin.is_empty() %}
+				<div class="post_origin_marker peer_origin_marker" title="Fetched from Redlib peer {{ peer_origin }}">from spare</div>
+				{% endif %}
 				{% call utils::post_in_list(post, false, "", true) %}
 				{% endif %}
 				{% endfor %}

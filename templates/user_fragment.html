@@ -43,7 +43,7 @@
         {% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}
         <hr class="sep" />
         {% if self.post_from_cache(post) %}
-        <div class="user_cached_post_marker">from cache</div>
+        <div class="post_origin_marker user_cached_post_marker">from cache</div>
         {% endif %}
         {% call utils::post_in_list(post, true, redirect_url.as_str(), false) %}
         {% endif %}
