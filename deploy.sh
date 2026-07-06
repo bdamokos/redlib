@@ -34,6 +34,7 @@ SSH_PROXY_JUMP=${SSH_PROXY_JUMP:-}
 SSH_CONTROL_PERSIST=${SSH_CONTROL_PERSIST:-600}
 SSH_CONTROL_DIR_BASE=${SSH_CONTROL_DIR_BASE:-/tmp/redlib-ssh}
 REMOTE_DOCKER_CMD=${REMOTE_DOCKER_CMD:-docker}
+SSH_PASSWORD_AUTH=true
 
 FOLLOW_LOGS=false
 DEPLOY_ONLY=false
@@ -120,6 +121,14 @@ test_ssh_connection() {
 		"echo ok" >/dev/null 2>&1
 }
 
+test_key_ssh_connection() {
+	ssh \
+		"${SSH_COMMON_OPTS[@]}" \
+		-o BatchMode=yes \
+		"$SERVER_USER@$SERVER_HOST" \
+		"echo ok" >/dev/null 2>&1
+}
+
 prompt_for_password() {
 	printf "Enter SSH password for %s: " "$KEYCHAIN_ACCOUNT"
 	read -rs PASSWORD
@@ -132,6 +141,14 @@ prompt_for_password() {
 }
 
 get_password() {
+	if test_key_ssh_connection; then
+		SSH_PASSWORD_AUTH=false
+		PASSWORD=""
+		return
+	fi
+
+	require_command sshpass
+
 	if command -v security >/dev/null 2>&1; then
 		PASSWORD=$(security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)
 	else
@@ -174,32 +191,61 @@ start_ssh_multiplexing() {
 	trap cleanup_ssh_multiplexing EXIT
 
 	echo "Opening SSH control connection..."
-	sshpass -p "$PASSWORD" ssh \
-		"${SSH_COMMON_OPTS[@]}" \
-		-o ControlMaster=yes \
-		-o ControlPersist="$SSH_CONTROL_PERSIST" \
-		-o ControlPath="$SSH_CONTROL_PATH" \
-		-fN \
-		"$SERVER_USER@$SERVER_HOST"
+	if [[ "$SSH_PASSWORD_AUTH" == true ]]; then
+		sshpass -p "$PASSWORD" ssh \
+			"${SSH_COMMON_OPTS[@]}" \
+			-o ControlMaster=yes \
+			-o ControlPersist="$SSH_CONTROL_PERSIST" \
+			-o ControlPath="$SSH_CONTROL_PATH" \
+			-fN \
+			"$SERVER_USER@$SERVER_HOST"
+	else
+		ssh \
+			"${SSH_COMMON_OPTS[@]}" \
+			-o ControlMaster=yes \
+			-o ControlPersist="$SSH_CONTROL_PERSIST" \
+			-o ControlPath="$SSH_CONTROL_PATH" \
+			-fN \
+			"$SERVER_USER@$SERVER_HOST"
+	fi
 }
 
 run_ssh() {
-	sshpass -p "$PASSWORD" ssh \
-		"${SSH_COMMON_OPTS[@]}" \
-		-o ControlMaster=auto \
-		-o ControlPersist="$SSH_CONTROL_PERSIST" \
-		-o ControlPath="$SSH_CONTROL_PATH" \
-		"$SERVER_USER@$SERVER_HOST" \
-		"$1"
+	if [[ "$SSH_PASSWORD_AUTH" == true ]]; then
+		sshpass -p "$PASSWORD" ssh \
+			"${SSH_COMMON_OPTS[@]}" \
+			-o ControlMaster=auto \
+			-o ControlPersist="$SSH_CONTROL_PERSIST" \
+			-o ControlPath="$SSH_CONTROL_PATH" \
+			"$SERVER_USER@$SERVER_HOST" \
+			"$1"
+	else
+		ssh \
+			"${SSH_COMMON_OPTS[@]}" \
+			-o ControlMaster=auto \
+			-o ControlPersist="$SSH_CONTROL_PERSIST" \
+			-o ControlPath="$SSH_CONTROL_PATH" \
+			"$SERVER_USER@$SERVER_HOST" \
+			"$1"
+	fi
 }
 
 run_scp() {
-	sshpass -p "$PASSWORD" scp \
-		"${SSH_COMMON_OPTS[@]}" \
-		-o ControlMaster=auto \
-		-o ControlPersist="$SSH_CONTROL_PERSIST" \
-		-o ControlPath="$SSH_CONTROL_PATH" \
-		"$@"
+	if [[ "$SSH_PASSWORD_AUTH" == true ]]; then
+		sshpass -p "$PASSWORD" scp \
+			"${SSH_COMMON_OPTS[@]}" \
+			-o ControlMaster=auto \
+			-o ControlPersist="$SSH_CONTROL_PERSIST" \
+			-o ControlPath="$SSH_CONTROL_PATH" \
+			"$@"
+	else
+		scp \
+			"${SSH_COMMON_OPTS[@]}" \
+			-o ControlMaster=auto \
+			-o ControlPersist="$SSH_CONTROL_PERSIST" \
+			-o ControlPath="$SSH_CONTROL_PATH" \
+			"$@"
+	fi
 }
 
 resolve_remote_dir() {
@@ -569,7 +615,6 @@ follow_logs() {
 parse_args "$@"
 
 require_command docker
-require_command sshpass
 
 echo "Server: $SERVER_USER@$SERVER_HOST"
 echo "Remote path: $DEPLOY_PATH"
