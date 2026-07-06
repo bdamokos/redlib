@@ -46,6 +46,18 @@ pub struct SubredditSemanticBackfillCounters {
 	pub total_candidates: usize,
 	pub embedded: usize,
 	pub already_current: usize,
+	#[serde(default)]
+	pub nsfwdog_seed_count: usize,
+	#[serde(default)]
+	pub nsfwdog_queries: usize,
+	#[serde(default)]
+	pub nsfwdog_results: usize,
+	#[serde(default)]
+	pub nsfwdog_resolved: usize,
+	#[serde(default)]
+	pub nsfwdog_added: usize,
+	#[serde(default)]
+	pub nsfwdog_failed: usize,
 	pub metadata_refresh_attempted: usize,
 	pub metadata_refresh_skipped: usize,
 	pub refreshed_metadata: usize,

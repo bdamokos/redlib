@@ -64,6 +64,7 @@
 			{% if run.dry_run %}(dry run){% endif %}{% if run.force %}(forced){% endif %}
 		</p>
 		<p><strong>Run totals:</strong> {{ run.counters.total_candidates }} candidates, {{ run.counters.embedded }} embedded, {{ run.counters.already_current }} already current, {{ run.counters.failed }} failed, {{ run.counters.missing_metadata }} missing metadata.</p>
+		<p><strong>NSFWDOG discovery:</strong> {{ run.counters.nsfwdog_seed_count }} seeds, {{ run.counters.nsfwdog_queries }} queries, {{ run.counters.nsfwdog_results }} results, {{ run.counters.nsfwdog_resolved }} resolved, {{ run.counters.nsfwdog_added }} added, {{ run.counters.nsfwdog_failed }} failed.</p>
 		<p><strong>Metadata refresh:</strong> {{ run.counters.metadata_refresh_attempted }} attempted, {{ run.counters.refreshed_metadata }} refreshed, {{ run.counters.public_fallback_metadata }} via public fallback, {{ run.counters.metadata_refresh_skipped }} skipped, {{ run.counters.name_only_metadata }} name-only records.</p>
 		{% match run.error %}{% when Some with (error) %}
 		<p><strong>Run error:</strong> {{ error }}</p>

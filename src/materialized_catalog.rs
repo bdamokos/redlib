@@ -1550,6 +1550,45 @@ pub fn cached_catalog_subreddit_names() -> Vec<String> {
 	names
 }
 
+pub fn cached_catalog_subreddit_names_by_activity() -> Vec<String> {
+	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let mut stats = HashMap::<String, (usize, usize)>::new();
+	for counts in catalog.author_community_counts.values() {
+		for (subreddit, count) in counts {
+			let subreddit = subreddit_semantics::normalize_subreddit_name(subreddit);
+			if subreddit.is_empty() || subreddit.starts_with("u_") || *count == 0 {
+				continue;
+			}
+			let entry = stats.entry(subreddit).or_default();
+			entry.0 += 1;
+			entry.1 += *count;
+		}
+	}
+	for (source_key, post_ids) in &catalog.source_to_post_ids {
+		let subreddit = match source_key {
+			CatalogSourceKey::Subreddit(subreddit) => subreddit,
+			CatalogSourceKey::Flair { subreddit, .. } => subreddit,
+			CatalogSourceKey::UserComments(_) => continue,
+		};
+		let subreddit = subreddit_semantics::normalize_subreddit_name(subreddit);
+		if subreddit.is_empty() || subreddit.starts_with("u_") || post_ids.is_empty() {
+			continue;
+		}
+		let entry = stats.entry(subreddit).or_default();
+		entry.1 += post_ids.len();
+	}
+	let mut names = stats.into_iter().collect::<Vec<_>>();
+	names.sort_by(|left, right| {
+		let (left_profile_count, left_post_count) = left.1;
+		let (right_profile_count, right_post_count) = right.1;
+		right_profile_count
+			.cmp(&left_profile_count)
+			.then_with(|| right_post_count.cmp(&left_post_count))
+			.then_with(|| left.0.cmp(&right.0))
+	});
+	names.into_iter().map(|(name, _)| name).collect()
+}
+
 fn related_score_percent(score: f64) -> u32 {
 	(score * 100.0).round().clamp(1.0, 100.0) as u32
 }
