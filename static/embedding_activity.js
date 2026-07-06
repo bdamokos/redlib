@@ -14,6 +14,7 @@
     const activePollMs = 500;
     const idlePollMs = 2500;
     const requestTimeoutMs = 12000;
+    const placeholderModes = new Set(["queued", "active", "errored"]);
 
     const stateLabels = {
         active: "active",
@@ -63,6 +64,7 @@
             const cell = document.createElement("span");
             cell.className = "embedding_vector_cell";
             cell.setAttribute("aria-label", `vector value ${index + 1}`);
+            cell.style.setProperty("--embedding-cell-index", index);
             grid.appendChild(cell);
         }
     };
@@ -83,6 +85,12 @@
         setText(container, stateSelector, stateLabels[state] || state);
     };
 
+    const setGridMode = (grid, mode) => {
+        if (grid) {
+            grid.dataset.embeddingGridMode = mode;
+        }
+    };
+
     const maxAbsValue = (values) => values.reduce((max, value) => {
         const abs = Math.abs(Number(value));
         return Number.isFinite(abs) ? Math.max(max, abs) : max;
@@ -99,6 +107,7 @@
         if (!grid) {
             return;
         }
+        setGridMode(grid, values.length > 0 ? "values" : "empty");
 
         const maxAbs = maxAbsValue(values);
         const cells = Array.from(grid.children);
@@ -125,6 +134,7 @@
             cell.classList.toggle("is-positive", hasValue && value >= 0);
             cell.classList.toggle("is-negative", hasValue && value < 0);
             cell.classList.toggle("is-empty", !hasValue);
+            cell.classList.remove("is-placeholder", "is-placeholder-error");
 
             if (changeKey && nextText !== previousText) {
                 flipCell(cell);
@@ -132,10 +142,61 @@
         }
     };
 
+    const renderPlaceholder = (grid, mode) => {
+        ensureGridCells(grid);
+        if (!grid) {
+            return;
+        }
+        setGridMode(grid, mode);
+        const cells = Array.from(grid.children);
+        for (let index = 0; index < cells.length; index += 1) {
+            const cell = cells[index];
+            cell.textContent = "";
+            cell.removeAttribute("style");
+            cell.style.setProperty("--embedding-cell-index", index);
+            cell.classList.remove("is-positive", "is-negative", "is-empty", "is-flipping");
+            cell.classList.add("is-placeholder");
+            cell.classList.toggle("is-placeholder-error", mode === "errored");
+        }
+    };
+
+    const noVectorMode = (status) => {
+        const state = status?.state || "idle";
+        if (placeholderModes.has(state)) {
+            return state;
+        }
+        if ((status?.queued_candidates || 0) > 0) {
+            return "queued";
+        }
+        if ((status?.active_candidates || 0) > 0 || (status?.active_remaining || 0) > 0) {
+            return "active";
+        }
+        return "empty";
+    };
+
+    const noVectorMessage = (status) => {
+        if (!status.enabled) {
+            return "Embedding stream off";
+        }
+        if (status.state === "errored" || status.failed > 0) {
+            return "Embedding stream failed before a vector arrived";
+        }
+        if (status.timed_out) {
+            return "Embedding stream paused before a vector arrived";
+        }
+        if (status.state === "queued" || (status.queued_candidates || 0) > 0) {
+            return "Queued posts are waiting for vectors";
+        }
+        if (status.state === "active" || (status.active_remaining || 0) > 0) {
+            return "Embedding vectors are being generated";
+        }
+        return "Waiting for vectors";
+    };
+
     const updateMeta = (container, status) => {
         const embedding = status.latest_embedding;
         if (!embedding) {
-            setText(container, metaSelector, status.enabled ? "Waiting for vectors" : "Embedding stream off");
+            setText(container, metaSelector, noVectorMessage(status));
             return;
         }
         const shown = embedding.displayed_dimensions || embedding.values?.length || 0;
@@ -151,7 +212,15 @@
                 panel.dataset.embeddingAverageReady = "false";
             }
             setText(container, averageStateSelector, "waiting");
-            setText(container, averageMetaSelector, status.enabled ? "Waiting for average" : "Embedding stream off");
+            setText(
+                container,
+                averageMetaSelector,
+                status.state === "errored" || status.failed > 0
+                    ? "Average unavailable until a vector lands"
+                    : status.enabled
+                        ? "Waiting for average"
+                        : "Embedding stream off"
+            );
             return;
         }
         if (panel) {
@@ -165,7 +234,16 @@
     };
 
     const shouldShow = (status) =>
-        Boolean(status?.latest_embedding || status?.aggregate_embedding || status?.queued_candidates || status?.active_candidates || status?.active_remaining);
+        Boolean(
+            status?.latest_embedding ||
+                status?.aggregate_embedding ||
+                status?.queued_candidates ||
+                status?.active_candidates ||
+                status?.active_remaining ||
+                status?.state === "errored" ||
+                status?.failed > 0 ||
+                status?.timed_out
+        );
 
     const shouldContinuePolling = (status) =>
         Boolean(status?.enabled && (status.state === "active" || status.state === "queued" || status.queued_candidates > 0 || status.active_remaining > 0));
@@ -182,7 +260,7 @@
         const embedding = status.latest_embedding;
         const latestGrid = container.querySelector(gridSelector);
         if (!embedding || !Array.isArray(embedding.values)) {
-            renderValues(latestGrid, [], "");
+            renderPlaceholder(latestGrid, noVectorMode(status));
         } else {
             const changeKey = `${status.activity_seq || 0}:${embedding.post_key_hash || ""}:${embedding.embedded_at_unix || 0}`;
             const hasChanged = container.dataset.embeddingLastKey !== changeKey;
@@ -193,7 +271,7 @@
         const average = status.aggregate_embedding;
         const averageGrid = container.querySelector(averageGridSelector);
         if (!average || !Array.isArray(average.values)) {
-            renderValues(averageGrid, [], "");
+            renderPlaceholder(averageGrid, noVectorMode(status));
             return;
         }
         const averageChangeKey = `${status.activity_seq || 0}:${average.post_count || 0}:${average.embedded_at_unix || 0}`;
@@ -232,9 +310,13 @@
                 const response = await fetchWithTimeout(url).catch(() => null);
                 if (!response || !response.ok) {
                     container.dataset.embeddingReady = "true";
-                    container.classList.add("is-error");
+                    setContainerState(container, { state: "errored" });
                     setText(container, stateSelector, "error");
                     setText(container, metaSelector, "Embedding status unavailable");
+                    setText(container, averageStateSelector, "waiting");
+                    setText(container, averageMetaSelector, "Average unavailable until the stream recovers");
+                    renderPlaceholder(container.querySelector(gridSelector), "errored");
+                    renderPlaceholder(container.querySelector(averageGridSelector), "errored");
                     schedule(idlePollMs);
                     return;
                 }

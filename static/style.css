@@ -1028,13 +1028,39 @@ aside {
     background-size: 18px 18px;
 }
 
-.sub_embedding_activity.is-active .embedding_vector_grid::before {
+.sub_embedding_activity.is-active .embedding_vector_grid::before,
+.embedding_vector_grid[data-embedding-grid-mode="queued"]::before,
+.embedding_vector_grid[data-embedding-grid-mode="active"]::before {
     content: "";
     position: absolute;
     inset: -35% 0;
     z-index: 0;
     background: linear-gradient(180deg, transparent 12%, color-mix(in srgb, var(--green) 24%, transparent) 50%, transparent 88%);
     animation: embedding-grid-scan 1100ms linear infinite;
+    pointer-events: none;
+}
+
+.sub_embedding_activity.is-error .embedding_vector_grid {
+    border-color: color-mix(in srgb, var(--nsfw) 62%, var(--highlighted));
+    background:
+        linear-gradient(90deg, color-mix(in srgb, var(--nsfw) 7%, transparent) 1px, transparent 1px),
+        linear-gradient(0deg, color-mix(in srgb, var(--nsfw) 5%, transparent) 1px, transparent 1px),
+        color-mix(in srgb, var(--background) 86%, black 14%);
+    background-size: 18px 18px;
+}
+
+.embedding_vector_grid[data-embedding-grid-mode="errored"]::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    background:
+        repeating-linear-gradient(
+            135deg,
+            transparent 0 9px,
+            color-mix(in srgb, var(--nsfw) 13%, transparent) 9px 15px
+        );
+    animation: embedding-error-scan 1600ms linear infinite;
     pointer-events: none;
 }
 
@@ -1076,6 +1102,26 @@ aside {
     border-color: color-mix(in srgb, var(--highlighted) 72%, transparent);
     background: color-mix(in srgb, var(--foreground) 58%, transparent);
     box-shadow: none;
+}
+
+.embedding_vector_cell.is-placeholder {
+    border-color: color-mix(in srgb, var(--highlighted) 76%, transparent);
+    background:
+        linear-gradient(110deg, transparent 0 32%, color-mix(in srgb, white 16%, transparent) 48%, transparent 64%),
+        color-mix(in srgb, var(--foreground) 66%, transparent);
+    background-size: 260% 100%, auto;
+    box-shadow: inset 0 1px 0 color-mix(in srgb, white 7%, transparent);
+    animation: embedding-placeholder-pulse 1400ms ease-in-out infinite;
+    animation-delay: calc(var(--embedding-cell-index, 0) * 34ms);
+}
+
+.embedding_vector_cell.is-placeholder-error {
+    border-color: color-mix(in srgb, var(--nsfw) 42%, var(--highlighted));
+    background:
+        linear-gradient(110deg, transparent 0 32%, color-mix(in srgb, var(--nsfw) 30%, transparent) 48%, transparent 64%),
+        color-mix(in srgb, var(--foreground) 72%, transparent);
+    background-size: 260% 100%, auto;
+    animation-name: embedding-placeholder-error-pulse;
 }
 
 .embedding_vector_cell.is-flipping {
@@ -1183,9 +1229,48 @@ aside {
     }
 }
 
+@keyframes embedding-error-scan {
+    from {
+        background-position: 0 0;
+    }
+    to {
+        background-position: 28px 28px;
+    }
+}
+
+@keyframes embedding-placeholder-pulse {
+    0%,
+    100% {
+        background-position: 160% 0, 0 0;
+        opacity: 0.56;
+        transform: scale(1);
+    }
+    45% {
+        background-position: 30% 0, 0 0;
+        opacity: 0.95;
+        transform: scale(0.985);
+    }
+}
+
+@keyframes embedding-placeholder-error-pulse {
+    0%,
+    100% {
+        background-position: 150% 0, 0 0;
+        opacity: 0.6;
+    }
+    50% {
+        background-position: 24% 0, 0 0;
+        opacity: 1;
+    }
+}
+
 @media (prefers-reduced-motion: reduce) {
     .embedding_vector_cell.is-flipping,
-    .sub_embedding_activity.is-active .embedding_vector_grid::before {
+    .embedding_vector_cell.is-placeholder,
+    .sub_embedding_activity.is-active .embedding_vector_grid::before,
+    .embedding_vector_grid[data-embedding-grid-mode="queued"]::before,
+    .embedding_vector_grid[data-embedding-grid-mode="active"]::before,
+    .embedding_vector_grid[data-embedding-grid-mode="errored"]::before {
         animation: none;
     }
 }
