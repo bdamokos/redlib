@@ -962,6 +962,234 @@ aside {
     margin-top: 20px;
 }
 
+.sub_embedding_activity {
+    box-sizing: border-box;
+    width: 100%;
+    margin-top: 20px;
+    padding: 10px;
+    border: var(--panel-border);
+    border-radius: 5px;
+    background:
+        linear-gradient(180deg, color-mix(in srgb, var(--foreground) 88%, transparent), color-mix(in srgb, var(--post) 92%, transparent)),
+        var(--post);
+    box-shadow: inset 0 1px 0 color-mix(in srgb, white 7%, transparent);
+}
+
+.sub_embedding_activity[data-embedding-ready="false"] {
+    display: none;
+}
+
+#subreddit .sub_embedding_activity,
+#subreddit .sub_embedding_activity * {
+    text-align: left;
+}
+
+.embedding_activity_stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+    margin-bottom: 8px;
+}
+
+.embedding_activity_stats span {
+    min-width: 0;
+    padding: 4px 5px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--outside) 70%, transparent);
+    color: var(--visited);
+    font-size: 10px;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.embedding_activity_stats strong {
+    display: block;
+    color: var(--text);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+}
+
+.embedding_vector_grid {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 4px;
+    overflow: hidden;
+    padding: 5px;
+    border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--highlighted));
+    border-radius: 5px;
+    background:
+        linear-gradient(90deg, color-mix(in srgb, var(--green) 7%, transparent) 1px, transparent 1px),
+        linear-gradient(0deg, color-mix(in srgb, var(--green) 6%, transparent) 1px, transparent 1px),
+        color-mix(in srgb, var(--background) 84%, black 16%);
+    background-size: 18px 18px;
+}
+
+.sub_embedding_activity.is-active .embedding_vector_grid::before {
+    content: "";
+    position: absolute;
+    inset: -35% 0;
+    z-index: 0;
+    background: linear-gradient(180deg, transparent 12%, color-mix(in srgb, var(--green) 24%, transparent) 50%, transparent 88%);
+    animation: embedding-grid-scan 1100ms linear infinite;
+    pointer-events: none;
+}
+
+.embedding_vector_cell {
+    --embedding-hue: 156;
+    --embedding-intensity: 0;
+    --embedding-lightness: 16%;
+    --embedding-alpha: 0.18;
+    --embedding-border-alpha: 0.18;
+    --embedding-glow: 0px;
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    height: 24px;
+    border: 1px solid hsl(var(--embedding-hue) 80% 54% / var(--embedding-border-alpha));
+    border-radius: 3px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.08)),
+        hsl(var(--embedding-hue) 72% var(--embedding-lightness) / var(--embedding-alpha));
+    box-shadow: 0 0 var(--embedding-glow) hsl(var(--embedding-hue) 80% 54% / 0.42);
+    color: color-mix(in srgb, var(--text) 92%, white 8%);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    overflow: hidden;
+    transform-origin: 50% 50%;
+    white-space: nowrap;
+}
+
+#subreddit .embedding_vector_cell {
+    text-align: center;
+}
+
+.embedding_vector_cell.is-empty {
+    border-color: color-mix(in srgb, var(--highlighted) 72%, transparent);
+    background: color-mix(in srgb, var(--foreground) 58%, transparent);
+    box-shadow: none;
+}
+
+.embedding_vector_cell.is-flipping {
+    animation: embedding-cell-flip 420ms cubic-bezier(0.2, 0.8, 0.22, 1);
+}
+
+.embedding_activity_meta {
+    margin-top: 7px;
+    color: var(--visited);
+    font-size: 11px;
+    line-height: 1.3;
+}
+
+.embedding_average_panel {
+    margin-top: 8px;
+    border-top: 1px solid color-mix(in srgb, var(--highlighted) 64%, transparent);
+}
+
+.embedding_average_panel summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 28px;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 700;
+    list-style: none;
+}
+
+.embedding_average_panel summary::-webkit-details-marker {
+    display: none;
+}
+
+.embedding_average_panel summary::before {
+    content: ">";
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-size: 10px;
+    transform-origin: 50% 50%;
+    transition: transform 160ms ease;
+}
+
+.embedding_average_panel[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.embedding_average_panel summary span {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.embedding_average_panel summary small {
+    flex: 0 0 auto;
+    color: var(--visited);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+}
+
+.embedding_average_panel[data-embedding-average-ready="false"] summary small {
+    opacity: 0.72;
+}
+
+.embedding_vector_grid--average {
+    margin-top: 2px;
+    border-color: color-mix(in srgb, var(--accent) 20%, var(--highlighted));
+    background:
+        linear-gradient(90deg, color-mix(in srgb, var(--accent) 5%, transparent) 1px, transparent 1px),
+        linear-gradient(0deg, color-mix(in srgb, var(--accent) 4%, transparent) 1px, transparent 1px),
+        color-mix(in srgb, var(--background) 88%, black 12%);
+    background-size: 18px 18px;
+}
+
+.sub_embedding_activity.is-error .embedding_activity_meta,
+.sub_embedding_activity.is-error [data-embedding-activity-state] {
+    color: var(--nsfw);
+}
+
+@keyframes embedding-cell-flip {
+    0% {
+        transform: perspective(180px) rotateX(0deg);
+        filter: brightness(0.92);
+    }
+    42% {
+        transform: perspective(180px) rotateX(78deg);
+        filter: brightness(1.55);
+    }
+    100% {
+        transform: perspective(180px) rotateX(0deg);
+        filter: brightness(1);
+    }
+}
+
+@keyframes embedding-grid-scan {
+    from {
+        transform: translateY(-30%);
+    }
+    to {
+        transform: translateY(30%);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .embedding_vector_cell.is-flipping,
+    .sub_embedding_activity.is-active .embedding_vector_grid::before {
+        animation: none;
+    }
+}
+
 .sub_related_group {
     margin-top: 12px;
 }

@@ -1084,6 +1084,37 @@ pub fn active_usable_embedding_count() -> usize {
 	usable_embedding_count_for_model(&crate::subreddit_semantics::embedding_model())
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubredditContentAggregatePreview {
+	pub embedded_at_unix: u64,
+	pub dimensions: usize,
+	pub displayed_dimensions: usize,
+	pub post_count: usize,
+	pub values: Vec<f32>,
+}
+
+pub fn aggregate_preview_for_subreddit_model(subreddit: &str, model: &str, displayed_dimensions: usize) -> Option<SubredditContentAggregatePreview> {
+	let subreddit = crate::subreddit_semantics::normalize_subreddit_name(subreddit);
+	let model = model.trim();
+	if subreddit.is_empty() || model.is_empty() {
+		return None;
+	}
+	let cache = CONTENT_SEMANTIC_CACHE.lock().ok()?;
+	let entry = cache.get(&subreddit)?;
+	if entry.model != model || entry.vector_sum.is_empty() || entry.post_count == 0 || !entry.vector_sum.iter().all(|value| value.is_finite()) {
+		return None;
+	}
+	let displayed_dimensions = entry.vector_sum.len().min(displayed_dimensions);
+	let divisor = entry.post_count as f32;
+	Some(SubredditContentAggregatePreview {
+		embedded_at_unix: entry.embedded_at_unix,
+		dimensions: entry.vector_sum.len(),
+		displayed_dimensions,
+		post_count: entry.post_count,
+		values: entry.vector_sum.iter().take(displayed_dimensions).map(|value| *value / divisor).collect(),
+	})
+}
+
 pub fn active_entries_for_model(model: &str) -> Vec<PersistedSubredditContentSemanticEmbedding> {
 	let model = model.trim();
 	let Ok(cache) = CONTENT_SEMANTIC_CACHE.lock() else {
@@ -1597,5 +1628,34 @@ mod tests {
 		assert!((entry.embedding[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.001);
 		assert!((entry.embedding[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.001);
 		assert_eq!(entry.vector_sum, vec![1.0, 1.0]);
+	}
+
+	#[test]
+	fn aggregate_preview_exposes_running_average() {
+		let _guard = TEST_CACHE_LOCK.lock().unwrap();
+		clear_test_cache();
+		let first = SubredditContentPostEmbeddingCandidate {
+			subreddit: "rust".to_string(),
+			text: "Async runtimes and task scheduling".to_string(),
+			post_key_hash: "post-a".to_string(),
+			text_hash: "text-a".to_string(),
+			sort_key: 10,
+			source_key_hash: "source-a".to_string(),
+			created_ts: 100,
+			text_chars: 34,
+		};
+		let mut second = first.clone();
+		second.post_key_hash = "post-b".to_string();
+		second.text_hash = "text-b".to_string();
+		second.created_ts = 101;
+
+		assert!(store_post_aggregate_embedding(&first, "test-model", vec![1.0, 0.0], 100).unwrap());
+		assert!(store_post_aggregate_embedding(&second, "test-model", vec![0.0, 1.0], 200).unwrap());
+
+		let preview = aggregate_preview_for_subreddit_model("rust", "test-model", 1).unwrap();
+		assert_eq!(preview.post_count, 2);
+		assert_eq!(preview.dimensions, 2);
+		assert_eq!(preview.displayed_dimensions, 1);
+		assert_eq!(preview.values, vec![0.5]);
 	}
 }

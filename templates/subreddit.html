@@ -24,6 +24,11 @@
 	{% endif %}
 {% endblock %}
 
+{% block head %}
+	{% call super() %}
+	<script src="{{ crate::utils::static_asset_href("embedding_activity.js") }}" defer></script>
+{% endblock %}
+
 {% block body %}
 	{% if !feed_status_message.is_empty() %}
 	<div class="feed_status_banner{% if feed_status_warming %} warming{% endif %}">{{ feed_status_message }}</div>

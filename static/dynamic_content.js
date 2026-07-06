@@ -11,6 +11,7 @@
         window.initializeHlsVideos?.(root);
         window.initializeDashVideos?.(root);
         window.initializeNetworkImages?.(root);
+        window.initializeEmbeddingActivity?.(root);
         window.observeVideoPreviewHosts?.(root);
         window.observeVideoVisibility?.(root);
         window.resizeSinglePostMediaToViewport?.(root);

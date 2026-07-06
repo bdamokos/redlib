@@ -23,6 +23,11 @@
 	{% endif %}
 {% endblock %}
 
+{% block head %}
+	{% call super() %}
+	<script src="{{ crate::utils::static_asset_href("embedding_activity.js") }}" defer></script>
+{% endblock %}
+
 {% block body %}
 	<div class="feed_status_banner warming">{{ loading_message }}</div>
 	<div

@@ -1,8 +1,10 @@
+use crate::server::RequestExt;
 use crate::subreddit_content_semantics::{self, SubredditContentPostEmbeddingCandidate};
 use crate::utils::Post;
-use hyper::{body::to_bytes, Body, Client, Method, Request, Uri};
+use hyper::header::CONTENT_TYPE;
+use hyper::{body::to_bytes, Body, Client, Method, Request, Response, Uri};
 use log::{info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -15,8 +17,10 @@ const DEFAULT_OPPORTUNISTIC_DELAY_MS: u64 = 150;
 const DEFAULT_PRIORITY_DELAY_MS: u64 = 25;
 const MAX_QUEUE_SUBREDDITS: usize = 512;
 const MAX_PENDING_CANDIDATES_PER_SUBREDDIT: usize = 512;
+const VECTOR_PREVIEW_VALUES: usize = 30;
 
 static OBSERVED_BACKFILL_QUEUE: LazyLock<Mutex<ObservedBackfillQueue>> = LazyLock::new(|| Mutex::new(ObservedBackfillQueue::default()));
+static OBSERVED_BACKFILL_ACTIVITY: LazyLock<Mutex<HashMap<String, ObservedBackfillActivity>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static OBSERVED_BACKFILL_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static OBSERVED_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -46,6 +50,69 @@ struct ObservedBackfillOutcome {
 	already_current: usize,
 	failed: usize,
 	timed_out: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObservedBackfillActivity {
+	active_candidates: usize,
+	active_remaining: usize,
+	embedded: usize,
+	already_current: usize,
+	failed: usize,
+	timed_out: bool,
+	activity_seq: u64,
+	last_update_unix: u64,
+	latest_embedding: Option<ObservedEmbeddingVectorPreview>,
+	aggregate_embedding: Option<ObservedAggregateVectorPreview>,
+	state: ObservedBackfillState,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ObservedBackfillState {
+	#[default]
+	Idle,
+	Queued,
+	Active,
+	Finished,
+	Errored,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ObservedEmbeddingVectorPreview {
+	embedded_at_unix: u64,
+	dimensions: usize,
+	displayed_dimensions: usize,
+	post_key_hash: String,
+	values: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ObservedAggregateVectorPreview {
+	embedded_at_unix: u64,
+	dimensions: usize,
+	displayed_dimensions: usize,
+	post_count: usize,
+	values: Vec<f32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObservedBackfillActivitySnapshot {
+	subreddit: String,
+	enabled: bool,
+	state: ObservedBackfillState,
+	queued_candidates: usize,
+	queued_jobs: usize,
+	active_candidates: usize,
+	active_remaining: usize,
+	embedded: usize,
+	already_current: usize,
+	failed: usize,
+	timed_out: bool,
+	activity_seq: u64,
+	last_update_unix: u64,
+	latest_embedding: Option<ObservedEmbeddingVectorPreview>,
+	aggregate_embedding: Option<ObservedAggregateVectorPreview>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +190,158 @@ fn group_candidates_by_subreddit(candidates: Vec<SubredditContentPostEmbeddingCa
 	grouped
 }
 
+fn now_unix() -> u64 {
+	crate::cache_persistence::unix_now()
+}
+
+fn update_activity<F>(subreddit: &str, update: F)
+where
+	F: FnOnce(&mut ObservedBackfillActivity),
+{
+	let subreddit = crate::subreddit_semantics::normalize_subreddit_name(subreddit);
+	if subreddit.is_empty() {
+		return;
+	}
+	let Ok(mut activity) = OBSERVED_BACKFILL_ACTIVITY.lock() else {
+		return;
+	};
+	let entry = activity.entry(subreddit).or_default();
+	update(entry);
+	entry.activity_seq = entry.activity_seq.saturating_add(1);
+	entry.last_update_unix = now_unix();
+}
+
+fn mark_queued_activity(subreddit: &str) {
+	update_activity(subreddit, |activity| {
+		if !matches!(activity.state, ObservedBackfillState::Active) {
+			activity.state = ObservedBackfillState::Queued;
+		}
+		activity.timed_out = false;
+	});
+}
+
+fn mark_active_activity(job: &ObservedBackfillJob) {
+	update_activity(&job.subreddit, |activity| {
+		activity.active_candidates = job.candidates.len();
+		activity.active_remaining = job.candidates.len();
+		activity.embedded = 0;
+		activity.already_current = 0;
+		activity.failed = 0;
+		activity.timed_out = false;
+		activity.state = ObservedBackfillState::Active;
+	});
+}
+
+fn mark_skipped_current_activity(subreddit: &str) {
+	update_activity(subreddit, |activity| {
+		activity.already_current = activity.already_current.saturating_add(1);
+		activity.active_remaining = activity.active_remaining.saturating_sub(1);
+	});
+}
+
+fn mark_failed_activity(subreddit: &str) {
+	update_activity(subreddit, |activity| {
+		activity.failed = activity.failed.saturating_add(1);
+		activity.active_remaining = activity.active_remaining.saturating_sub(1);
+	});
+}
+
+fn vector_preview(candidate: &SubredditContentPostEmbeddingCandidate, embedding: &[f32], embedded_at_unix: u64) -> ObservedEmbeddingVectorPreview {
+	ObservedEmbeddingVectorPreview {
+		embedded_at_unix,
+		dimensions: embedding.len(),
+		displayed_dimensions: embedding.len().min(VECTOR_PREVIEW_VALUES),
+		post_key_hash: candidate.post_key_hash.clone(),
+		values: embedding.iter().take(VECTOR_PREVIEW_VALUES).copied().collect(),
+	}
+}
+
+fn aggregate_preview(subreddit: &str, model: &str) -> Option<ObservedAggregateVectorPreview> {
+	let preview = subreddit_content_semantics::aggregate_preview_for_subreddit_model(subreddit, model, VECTOR_PREVIEW_VALUES)?;
+	Some(ObservedAggregateVectorPreview {
+		embedded_at_unix: preview.embedded_at_unix,
+		dimensions: preview.dimensions,
+		displayed_dimensions: preview.displayed_dimensions,
+		post_count: preview.post_count,
+		values: preview.values,
+	})
+}
+
+fn mark_embedded_activity(candidate: &SubredditContentPostEmbeddingCandidate, model: &str, embedding: &[f32], embedded_at_unix: u64) {
+	let aggregate_embedding = aggregate_preview(&candidate.subreddit, model);
+	update_activity(&candidate.subreddit, |activity| {
+		activity.embedded = activity.embedded.saturating_add(1);
+		activity.active_remaining = activity.active_remaining.saturating_sub(1);
+		activity.latest_embedding = Some(vector_preview(candidate, embedding, embedded_at_unix));
+		activity.aggregate_embedding = aggregate_embedding;
+	});
+}
+
+fn mark_finished_activity(subreddit: &str, outcome: &ObservedBackfillOutcome) {
+	update_activity(subreddit, |activity| {
+		activity.active_remaining = 0;
+		activity.timed_out = outcome.timed_out;
+		activity.state = if outcome.failed > 0 {
+			ObservedBackfillState::Errored
+		} else {
+			ObservedBackfillState::Finished
+		};
+	});
+}
+
+fn queued_counts_for_subreddit(subreddit: &str) -> (usize, usize) {
+	let subreddit = crate::subreddit_semantics::normalize_subreddit_name(subreddit);
+	let Ok(queue) = OBSERVED_BACKFILL_QUEUE.lock() else {
+		return (0, 0);
+	};
+	queue.jobs.get(&subreddit).map(|job| (job.candidates.len(), 1)).unwrap_or((0, 0))
+}
+
+pub fn activity_snapshot(subreddit: &str) -> ObservedBackfillActivitySnapshot {
+	let subreddit = crate::subreddit_semantics::normalize_subreddit_name(subreddit);
+	let (queued_candidates, queued_jobs) = queued_counts_for_subreddit(&subreddit);
+	let activity = OBSERVED_BACKFILL_ACTIVITY
+		.lock()
+		.ok()
+		.and_then(|activity| activity.get(&subreddit).cloned())
+		.unwrap_or_default();
+	let state = if matches!(activity.state, ObservedBackfillState::Idle) && queued_jobs > 0 {
+		ObservedBackfillState::Queued
+	} else {
+		activity.state.clone()
+	};
+	ObservedBackfillActivitySnapshot {
+		subreddit,
+		enabled: observed_backfill_enabled(),
+		state,
+		queued_candidates,
+		queued_jobs,
+		active_candidates: activity.active_candidates,
+		active_remaining: activity.active_remaining,
+		embedded: activity.embedded,
+		already_current: activity.already_current,
+		failed: activity.failed,
+		timed_out: activity.timed_out,
+		activity_seq: activity.activity_seq,
+		last_update_unix: activity.last_update_unix,
+		latest_embedding: activity.latest_embedding,
+		aggregate_embedding: activity.aggregate_embedding,
+	}
+}
+
+pub async fn activity_api(req: Request<Body>) -> Result<Response<Body>, String> {
+	let subreddit = req.param("sub").unwrap_or_default();
+	let body = serde_json::to_string(&activity_snapshot(&subreddit)).map_err(|error| error.to_string())?;
+	Ok(
+		Response::builder()
+			.status(200)
+			.header(CONTENT_TYPE, "application/json; charset=utf-8")
+			.header("Cache-Control", "no-store")
+			.body(body.into())
+			.unwrap_or_default(),
+	)
+}
+
 fn enqueue_candidates(candidates: Vec<SubredditContentPostEmbeddingCandidate>, priority: ObservedBackfillPriority) -> usize {
 	let mut queued = 0usize;
 	let grouped = group_candidates_by_subreddit(candidates);
@@ -146,7 +365,7 @@ fn enqueue_candidates(candidates: Vec<SubredditContentPostEmbeddingCandidate>, p
 			queue.order.push_back(subreddit.clone());
 		}
 		let job = queue.jobs.entry(subreddit.clone()).or_insert_with(|| ObservedBackfillJob {
-			subreddit,
+			subreddit: subreddit.clone(),
 			candidates: Vec::new(),
 			priority,
 			updated_at: Instant::now(),
@@ -154,6 +373,7 @@ fn enqueue_candidates(candidates: Vec<SubredditContentPostEmbeddingCandidate>, p
 		job.priority = job.priority.max(priority);
 		job.updated_at = Instant::now();
 		merge_candidates(&mut job.candidates, candidates);
+		mark_queued_activity(&subreddit);
 		queued += 1;
 	}
 	queued
@@ -236,6 +456,7 @@ async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome
 	let started = Instant::now();
 	let client = Client::new();
 	let mut outcome = ObservedBackfillOutcome::default();
+	mark_active_activity(&job);
 
 	for candidate in job.candidates {
 		if budget.is_some_and(|budget| started.elapsed() >= budget) {
@@ -244,20 +465,32 @@ async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome
 		}
 		if !subreddit_content_semantics::post_candidate_needs_embedding(&candidate, &model) {
 			outcome.already_current += 1;
+			mark_skipped_current_activity(&candidate.subreddit);
 			continue;
 		}
 
 		let prompt = format!("r/{}\nCached post title and text:\n{}", candidate.subreddit, candidate.text);
 		match ollama_embedding(&client, &base_url, &model, &prompt).await {
-			Ok(embedding) => match subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &model, embedding, crate::cache_persistence::unix_now()) {
-				Ok(true) => outcome.embedded += 1,
-				Ok(false) => outcome.already_current += 1,
-				Err(error) => {
-					outcome.failed += 1;
-					warn!("observed_semantic_backfill: failed to store r/{} embedding: {}", candidate.subreddit, error);
+			Ok(embedding) => {
+				let embedded_at_unix = now_unix();
+				match subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &model, embedding.clone(), embedded_at_unix) {
+					Ok(true) => {
+						outcome.embedded += 1;
+						mark_embedded_activity(&candidate, &model, &embedding, embedded_at_unix);
+					}
+					Ok(false) => {
+						outcome.already_current += 1;
+						mark_skipped_current_activity(&candidate.subreddit);
+					}
+					Err(error) => {
+						outcome.failed += 1;
+						mark_failed_activity(&candidate.subreddit);
+						warn!("observed_semantic_backfill: failed to store r/{} embedding: {}", candidate.subreddit, error);
+					}
 				}
-			},
+			}
 			Err(error) => {
+				mark_failed_activity(&candidate.subreddit);
 				return Err(format!("embedding failed for r/{}: {error}", candidate.subreddit));
 			}
 		}
@@ -290,12 +523,17 @@ async fn worker_loop() {
 		);
 		match process_job(job).await {
 			Ok(outcome) => {
+				mark_finished_activity(&subreddit, &outcome);
 				info!(
 					"observed_semantic_backfill: finished r/{} ({:?}): embedded={}, already_current={}, failed={}, timed_out={}",
 					subreddit, priority, outcome.embedded, outcome.already_current, outcome.failed, outcome.timed_out
 				);
 			}
 			Err(error) => {
+				update_activity(&subreddit, |activity| {
+					activity.active_remaining = 0;
+					activity.state = ObservedBackfillState::Errored;
+				});
 				warn!("observed_semantic_backfill: failed r/{} ({:?}): {}", subreddit, priority, error);
 			}
 		}

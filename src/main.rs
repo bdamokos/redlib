@@ -306,6 +306,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"subscription.js" => resource(include_str!("../static/subscription.js"), "text/javascript", false).await,
 		"suggested_profiles.js" => resource(include_str!("../static/suggested_profiles.js"), "text/javascript", false).await,
 		"suggested_subreddits.js" => resource(include_str!("../static/suggested_subreddits.js"), "text/javascript", false).await,
+		"embedding_activity.js" => resource(include_str!("../static/embedding_activity.js"), "text/javascript", false).await,
 		"feed_status.js" => resource(include_str!("../static/feed_status.js"), "text/javascript", false).await,
 		"page_fragment.js" => resource(include_str!("../static/page_fragment.js"), "text/javascript", false).await,
 		"dynamic_content.js" => resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).await,
@@ -518,6 +519,9 @@ async fn main() {
 		.at("/suggested_subreddits.js")
 		.get(|_| resource(include_str!("../static/suggested_subreddits.js"), "text/javascript", false).boxed());
 	app
+		.at("/embedding_activity.js")
+		.get(|_| resource(include_str!("../static/embedding_activity.js"), "text/javascript", false).boxed());
+	app
 		.at("/feed_status.js")
 		.get(|_| resource(include_str!("../static/feed_status.js"), "text/javascript", false).boxed());
 	app
@@ -548,6 +552,9 @@ async fn main() {
 	app.at("/api/browser-sessions/heartbeat").post(|r| post_cache::browser_session_heartbeat(r).boxed());
 	app.at("/api/browser-sessions/release").post(|r| post_cache::browser_session_release(r).boxed());
 	app.at("/post-feedback").post(|r| post_feedback::update(r).boxed());
+	app
+		.at("/api/subreddit-embedding-activity/:sub")
+		.get(|r| observed_semantic_backfill::activity_api(r).boxed());
 	app.at("/api/video-previews/:job_id").get(|r| video_preview::status(r).boxed());
 	app.at("/api/video-previews/:job_id/animation").get(|r| video_preview::animation(r).boxed());
 	app.at("/api/video-previews/:job_id/frame/:index").get(|r| video_preview::frame(r).boxed());

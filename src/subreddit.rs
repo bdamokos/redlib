@@ -212,6 +212,14 @@ fn related_subreddit_sidebar(sub: &Subreddit, prefs: &Preferences, filters: &Has
 	crate::materialized_catalog::related_subreddit_report(&sub.name, &prefs.subscriptions, filters, 5)
 }
 
+fn enqueue_direct_subreddit_embedding_activity(sub_name: &str, posts: &[Post]) {
+	if sub_name.is_empty() || sub_name == "all" || sub_name == "popular" || sub_name.contains('+') || posts.is_empty() {
+		return;
+	}
+	let source_key = format!("subreddit:{sub_name}:direct-page");
+	crate::observed_semantic_backfill::enqueue_observed_posts(&source_key, posts, crate::observed_semantic_backfill::ObservedBackfillPriority::Priority);
+}
+
 #[derive(PartialEq)]
 struct SortOption {
 	label: String,
@@ -862,6 +870,7 @@ fn render_scraped_subreddit_fragment(
 		crate::post_cache::publish_plain_subreddit_refresh(sub_name, scraped.posts.clone(), scraped.after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
 	} else {
 		utils::store_post_flairs(&scraped.posts);
+		enqueue_direct_subreddit_embedding_activity(sub_name, &scraped.posts);
 		utils::store_subreddit_users(sub_name, &scraped.posts);
 	}
 
@@ -2926,6 +2935,9 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					crate::post_cache::publish_plain_subreddit_refresh(&sub_name, raw_posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
 				} else {
 					utils::store_post_flairs(&raw_posts);
+					if is_single_sub {
+						enqueue_direct_subreddit_embedding_activity(&sub_name, &raw_posts);
+					}
 				}
 				if is_single_sub {
 					utils::store_subreddit_users(&sub_name, &raw_posts);
