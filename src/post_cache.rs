@@ -804,7 +804,7 @@ fn is_source_remembered(source: &FeedSource) -> bool {
 }
 
 fn source_cache_is_servable_with_mode(source: &FeedSource, entry: &CachedSourcePosts, mode: CacheServeMode) -> bool {
-	if matches!(mode, CacheServeMode::AllowStaleOnOauthOutage) && !oauth_is_available() {
+	if matches!(mode, CacheServeMode::AllowStaleOnOauthOutage) && (!oauth_is_available() || crate::instance_scrape::reddit_rate_limited_now()) {
 		return true;
 	}
 

@@ -3028,8 +3028,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				)
 			}
 			Err(msg) => {
-				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-					crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+				let can_serve_stale_single_subreddit_cache = is_single_sub && request_after.is_empty() && request_before.is_empty();
+				if can_serve_stale_single_subreddit_cache {
+					if uses_remembered_subreddit_cache {
+						crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					}
 					if msg.contains("oauth_unavailable") || instance_scrape::should_attempt_scrape_fallback(&msg) {
 						if let Some((mut posts, mut after, mut has_prev, mut has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(
 							&sub_name,
