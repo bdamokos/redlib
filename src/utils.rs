@@ -96,7 +96,7 @@ impl ResourceType {
 }
 
 /// Post flair with content, background color and foreground color
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Flair {
 	pub flair_parts: Vec<FlairPart>,
 	pub text: String,
@@ -105,7 +105,7 @@ pub struct Flair {
 }
 
 /// Part of flair, either emoji or text
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct FlairPart {
 	pub flair_part_type: String,
 	pub value: String,
@@ -177,7 +177,7 @@ impl FlairPart {
 	}
 }
 
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Author {
 	pub name: String,
 	pub flair: Flair,
@@ -186,7 +186,7 @@ pub struct Author {
 	pub avg_video_length: Option<(String, String)>,
 }
 
-#[derive(Default, Clone, Serialize, PartialEq, Eq)]
+#[derive(Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalLink {
 	pub label: String,
 	pub url: String,
@@ -254,7 +254,7 @@ struct CachedSubredditUsers {
 	cached_at: Instant,
 }
 
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Poll {
 	pub poll_options: Vec<PollOption>,
 	pub voting_end_timestamp: (String, String),
@@ -282,7 +282,7 @@ impl Poll {
 	}
 }
 
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct PollOption {
 	pub id: u64,
 	pub text: String,
@@ -312,7 +312,7 @@ impl PollOption {
 }
 
 /// Post flags with NSFW and stickied
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Flags {
 	pub spoiler: bool,
 	pub nsfw: bool,
@@ -336,9 +336,15 @@ impl Flags {
 			stickied_str: if stickied { "true" } else { "false" },
 		}
 	}
+
+	pub fn normalize_template_strings(&mut self) {
+		self.nsfw_str = if self.nsfw { "true" } else { "false" };
+		self.spoiler_str = if self.spoiler { "true" } else { "false" };
+		self.stickied_str = if self.stickied { "true" } else { "false" };
+	}
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Media {
 	pub url: String,
 	pub preview_url: String,
@@ -718,7 +724,7 @@ pub fn creator_identity_slug_from_profile_url(raw_url: &str) -> Option<String> {
 	Some(normalize_creator_identity_slug(slug))
 }
 
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct GalleryMedia {
 	pub url: String,
 	pub preview_url: String,
@@ -762,7 +768,7 @@ impl GalleryMedia {
 	}
 }
 
-#[derive(Clone, Default, Serialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ParentComment {
 	pub id: String,
 	pub body: String,
@@ -773,7 +779,7 @@ pub struct ParentComment {
 }
 
 /// Bundled comment row for `/following` (and similar) aggregate feeds.
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct FollowingComment {
 	pub id: String,
 	/// Author of the followed-user comment that caused this thread to surface.
@@ -799,7 +805,7 @@ pub struct FollowingComment {
 }
 
 /// Post containing content, metadata and media
-#[derive(Serialize, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq)]
 pub struct Post {
 	pub id: String,
 	pub kind: String,
@@ -844,7 +850,7 @@ pub struct Post {
 	pub bookmark_new_comments: Option<u64>,
 }
 
-#[derive(Clone, Serialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollapsedDuplicate {
 	pub title: String,
 	pub permalink: String,
@@ -1194,7 +1200,7 @@ pub struct Comment {
 	pub prefs: Preferences,
 }
 
-#[derive(Default, Clone, Serialize, PartialEq)]
+#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Award {
 	pub name: String,
 	pub icon_url: String,
@@ -1208,7 +1214,7 @@ impl std::fmt::Display for Award {
 	}
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq)]
 pub struct Awards(pub Vec<Award>);
 
 impl std::ops::Deref for Awards {
@@ -1339,7 +1345,7 @@ pub struct NSFWLandingTemplate {
 	pub url: String,
 }
 
-#[derive(Default, Clone, Serialize, PartialEq)]
+#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
 /// User struct containing metadata about user
 pub struct User {
 	pub name: String,
@@ -1798,7 +1804,7 @@ pub(crate) fn clear_test_caches() {
 	}
 }
 
-#[derive(Clone, Default, Serialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 /// Subreddit struct containing metadata about community
 pub struct Subreddit {
 	pub name: String,

@@ -419,7 +419,11 @@ async fn main() {
 	spawn_oauth_maintenance();
 	video_preview::init();
 	cache_persistence::init();
-	post_cache::spawn_remembered_feed_daemon();
+	if post_cache::remembered_feed_daemon_enabled() {
+		post_cache::spawn_remembered_feed_daemon();
+	} else {
+		warn!("post_cache: remembered feed daemon disabled by REDLIB_REMEMBERED_FEED_DAEMON_ENABLED");
+	}
 	observed_semantic_backfill::spawn_observed_semantic_backfill_worker();
 
 	// Define default headers (added to all responses)

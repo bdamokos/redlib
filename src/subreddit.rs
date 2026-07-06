@@ -1,6 +1,6 @@
 #![allow(clippy::cmp_owned)]
 
-use crate::{config, instance_scrape, prefs_store, seen_posts, utils, video_mode};
+use crate::{config, instance_scrape, peer_api_fallback, prefs_store, seen_posts, utils, video_mode};
 // CRATES
 use crate::cache_persistence::{instant_to_unix, unix_to_instant, PersistedSubredditMetadataEntry, PersistedSubredditNsfwEntry};
 use crate::post_cache::{FeedSessionRequest, FeedSort, FeedSource};
@@ -220,7 +220,7 @@ fn enqueue_direct_subreddit_embedding_activity(sub_name: &str, posts: &[Post]) {
 	crate::observed_semantic_backfill::enqueue_observed_posts(&source_key, posts, crate::observed_semantic_backfill::ObservedBackfillPriority::Priority);
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct SortOption {
 	label: String,
 	url: String,
@@ -864,6 +864,7 @@ fn render_scraped_subreddit_fragment(
 	request_before: &str,
 	is_flair_subscribed: bool,
 	cacheable_first_page: bool,
+	cache_notice: &str,
 ) -> Result<Response<Body>, String> {
 	cache_subreddit_metadata(&scraped.subreddit);
 	if cacheable_first_page {
@@ -925,7 +926,7 @@ fn render_scraped_subreddit_fragment(
 			all_posts_filtered,
 			all_posts_hidden_nsfw,
 			no_posts,
-			cache_notice: instance_scrape::scrape_notice().to_string(),
+			cache_notice: cache_notice.to_string(),
 			is_flair_subscribed,
 			feed_session_id: String::new(),
 			feed_status_url: String::new(),
@@ -940,6 +941,56 @@ fn render_scraped_subreddit_fragment(
 		},
 		None,
 	)
+}
+
+async fn render_peer_api_subreddit_fragment(
+	req: &Request<Body>,
+	sub_name: &str,
+	sort: &str,
+	sort_options: Vec<SortOption>,
+	active_flair_filter: &str,
+	url: &str,
+	redirect_url: &str,
+	filters: &HashSet<String>,
+	request_before: &str,
+	is_flair_subscribed: bool,
+	cacheable_first_page: bool,
+	query: Option<&str>,
+	timeframe: &str,
+) -> Option<Result<Response<Body>, String>> {
+	if !peer_api_fallback::peer_api_fallback_enabled() {
+		return None;
+	}
+	match peer_api_fallback::fetch_subreddit_listing(sub_name, sort, query).await {
+		Ok(peer) => {
+			info!("subreddit: rendering {} via configured Redlib peer API {}", url, peer.origin);
+			let scraped = instance_scrape::ScrapedSubredditPage {
+				subreddit: peer.subreddit.unwrap_or_else(|| placeholder_subreddit(sub_name)),
+				posts: peer.posts,
+				after: peer.after,
+			};
+			Some(render_scraped_subreddit_fragment(
+				req,
+				scraped,
+				sub_name,
+				sort,
+				timeframe,
+				sort_options,
+				active_flair_filter,
+				url,
+				redirect_url,
+				filters,
+				request_before,
+				is_flair_subscribed,
+				cacheable_first_page,
+				peer_api_fallback::peer_api_notice(),
+			))
+		}
+		Err(error) => {
+			warn!("subreddit: Redlib peer API fallback failed for {}: {}", url, error);
+			None
+		}
+	}
 }
 
 fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
@@ -2338,8 +2389,12 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		build_listing_path(&sub_name, &sort, &reddit_query, &request_after, &request_before)
 	};
 
-	if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
-		info!("subreddit: using scrape fallback for {} because Reddit is currently rate limited", req_url);
+	if is_subreddit_route
+		&& is_single_sub
+		&& (peer_api_fallback::peer_api_fallback_enabled() || instance_scrape::instance_scrape_enabled())
+		&& instance_scrape::reddit_rate_limited_now()
+	{
+		info!("subreddit: using configured fallback for {} because Reddit is currently rate limited", req_url);
 		let sort_base_path = if is_following_route(&url) {
 			FOLLOWING_ROUTE.to_string()
 		} else if aggregate_saved_feeds {
@@ -2360,22 +2415,44 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				.iter()
 				.any(|subscription| subscription.subreddit == sub_name && subscription.flair == active_flair_filter);
 		let scrape_cacheable_first_page = uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty();
-		if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
-			return render_scraped_subreddit_fragment(
-				&req,
-				scraped,
-				&sub_name,
-				&sort,
-				&timeframe,
-				sort_options,
-				&active_flair_filter,
-				&url,
-				&redirect_url,
-				&filters,
-				&request_before,
-				is_flair_subscribed,
-				scrape_cacheable_first_page,
-			);
+		if let Some(response) = render_peer_api_subreddit_fragment(
+			&req,
+			&sub_name,
+			&sort,
+			sort_options.clone(),
+			&active_flair_filter,
+			&url,
+			&redirect_url,
+			&filters,
+			&request_before,
+			is_flair_subscribed,
+			scrape_cacheable_first_page,
+			req.uri().query(),
+			&timeframe,
+		)
+		.await
+		{
+			return response;
+		}
+		if instance_scrape::instance_scrape_enabled() {
+			if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
+				return render_scraped_subreddit_fragment(
+					&req,
+					scraped,
+					&sub_name,
+					&sort,
+					&timeframe,
+					sort_options,
+					&active_flair_filter,
+					&url,
+					&redirect_url,
+					&filters,
+					&request_before,
+					is_flair_subscribed,
+					scrape_cacheable_first_page,
+					instance_scrape::scrape_notice(),
+				);
+			}
 		}
 		warn!("subreddit: preemptive scrape fallback failed for {}", req_url);
 	}
@@ -2464,7 +2541,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 
 	if is_subreddit_route
 		&& is_single_sub
-		&& instance_scrape::instance_scrape_enabled()
+		&& (peer_api_fallback::peer_api_fallback_enabled() || instance_scrape::instance_scrape_enabled())
 		&& metadata_error.as_deref().is_some_and(instance_scrape::should_attempt_scrape_fallback)
 	{
 		info!(
@@ -2472,22 +2549,44 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			req_url,
 			metadata_error.as_deref().unwrap_or_default()
 		);
-		if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
-			return render_scraped_subreddit_fragment(
-				&req,
-				scraped,
-				&sub_name,
-				&sort,
-				&timeframe,
-				sort_options,
-				&active_flair_filter,
-				&url,
-				&redirect_url,
-				&filters,
-				&request_before,
-				is_flair_subscribed,
-				scrape_cacheable_first_page,
-			);
+		if let Some(response) = render_peer_api_subreddit_fragment(
+			&req,
+			&sub_name,
+			&sort,
+			sort_options.clone(),
+			&active_flair_filter,
+			&url,
+			&redirect_url,
+			&filters,
+			&request_before,
+			is_flair_subscribed,
+			scrape_cacheable_first_page,
+			req.uri().query(),
+			&timeframe,
+		)
+		.await
+		{
+			return response;
+		}
+		if instance_scrape::instance_scrape_enabled() {
+			if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
+				return render_scraped_subreddit_fragment(
+					&req,
+					scraped,
+					&sub_name,
+					&sort,
+					&timeframe,
+					sort_options,
+					&active_flair_filter,
+					&url,
+					&redirect_url,
+					&filters,
+					&request_before,
+					is_flair_subscribed,
+					scrape_cacheable_first_page,
+					instance_scrape::scrape_notice(),
+				);
+			}
 		}
 		warn!("subreddit: metadata scrape fallback failed for {}", req_url);
 	}
@@ -3133,24 +3232,50 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						}
 					}
 				}
-				if is_subreddit_route && is_single_sub && instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) {
-					info!("subreddit: retrying {} via scrape fallback after listing error: {}", req_url, msg);
-					if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
-						return render_scraped_subreddit_fragment(
-							&req,
-							scraped,
-							&sub_name,
-							&sort,
-							&timeframe,
-							sort_options,
-							&active_flair_filter,
-							&url,
-							&redirect_url,
-							&filters,
-							&request_before,
-							is_flair_subscribed,
-							scrape_cacheable_first_page,
-						);
+				if is_subreddit_route
+					&& is_single_sub
+					&& (peer_api_fallback::peer_api_fallback_enabled() || instance_scrape::instance_scrape_enabled())
+					&& instance_scrape::should_attempt_scrape_fallback(&msg)
+				{
+					info!("subreddit: retrying {} via configured fallback after listing error: {}", req_url, msg);
+					if let Some(response) = render_peer_api_subreddit_fragment(
+						&req,
+						&sub_name,
+						&sort,
+						sort_options.clone(),
+						&active_flair_filter,
+						&url,
+						&redirect_url,
+						&filters,
+						&request_before,
+						is_flair_subscribed,
+						scrape_cacheable_first_page,
+						req.uri().query(),
+						&timeframe,
+					)
+					.await
+					{
+						return response;
+					}
+					if instance_scrape::instance_scrape_enabled() {
+						if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
+							return render_scraped_subreddit_fragment(
+								&req,
+								scraped,
+								&sub_name,
+								&sort,
+								&timeframe,
+								sort_options,
+								&active_flair_filter,
+								&url,
+								&redirect_url,
+								&filters,
+								&request_before,
+								is_flair_subscribed,
+								scrape_cacheable_first_page,
+								instance_scrape::scrape_notice(),
+							);
+						}
 					}
 					warn!("subreddit: listing scrape fallback failed for {}", req_url);
 				}

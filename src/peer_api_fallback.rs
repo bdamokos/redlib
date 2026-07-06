@@ -1,0 +1,289 @@
+use crate::client::CLIENT;
+use crate::config::get_setting;
+use crate::utils::{Post, Subreddit};
+use hyper::body::to_bytes;
+use hyper::header::{ACCEPT, USER_AGENT};
+use hyper::{Body, Method, Request, StatusCode};
+use log::{info, warn};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use url::{form_urlencoded, Url};
+
+const DEFAULT_TIMEOUT_SECS: u64 = 5;
+const PEER_FAILURE_BACKOFF_SECS: u64 = 60;
+const PEER_API_NOTICE: &str = "Showing content fetched from a configured Redlib API peer because Reddit rate limited this request.";
+const PEER_API_UA: &str = "Redlib peer API fallback";
+pub(crate) const PEER_API_FALLBACK_HEADER: &str = "x-redlib-peer-api-fallback";
+
+static PEER_FAILURE_BACKOFF: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static LAST_SUCCESSFUL_PEER: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone)]
+pub(crate) struct PeerSubredditListing {
+	pub(crate) origin: String,
+	pub(crate) subreddit: Option<Subreddit>,
+	pub(crate) posts: Vec<Post>,
+	pub(crate) after: String,
+}
+
+#[derive(Deserialize)]
+struct ApiEnvelope<T> {
+	data: Option<T>,
+	error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PeerListingResponse {
+	subreddit: Option<Subreddit>,
+	posts: Vec<Post>,
+	after: Option<String>,
+}
+
+pub(crate) fn peer_api_notice() -> &'static str {
+	PEER_API_NOTICE
+}
+
+pub(crate) fn request_is_peer_api_fallback(req: &Request<Body>) -> bool {
+	req.headers().contains_key(PEER_API_FALLBACK_HEADER)
+}
+
+pub(crate) fn peer_api_fallback_enabled() -> bool {
+	!configured_peer_origins().is_empty()
+}
+
+pub(crate) async fn fetch_subreddit_listing(subreddit: &str, sort: &str, query: Option<&str>) -> Result<PeerSubredditListing, String> {
+	let origins = prioritize_last_successful_peer(configured_peer_origins());
+	if origins.is_empty() {
+		return Err("no configured Redlib peer API fallback sources".to_string());
+	}
+
+	let path = build_subreddit_api_path(subreddit, sort, query);
+	info!(
+		"peer_api_fallback: attempting subreddit listing fallback for {} using {} configured peer(s)",
+		path,
+		origins.len()
+	);
+
+	let mut last_error = "no peer attempted".to_string();
+	for origin in origins {
+		if peer_is_backed_off(&origin) {
+			info!("peer_api_fallback: skipping backed off peer {}", origin);
+			continue;
+		}
+
+		let url = format!("{origin}{path}");
+		match fetch_peer_json(&url).await {
+			Ok((status, body)) => match parse_subreddit_listing_response(status, &body) {
+				Ok(mut listing) => {
+					normalize_peer_posts(&mut listing.posts);
+					note_peer_success(&origin);
+					info!("peer_api_fallback: fetched {} from {}", path, origin);
+					return Ok(PeerSubredditListing {
+						origin,
+						subreddit: listing.subreddit,
+						posts: listing.posts,
+						after: listing.after.unwrap_or_default(),
+					});
+				}
+				Err(error) => {
+					note_peer_failure(&origin);
+					warn!("peer_api_fallback: peer {} returned unusable listing for {}: {}", origin, path, error);
+					last_error = error;
+				}
+			},
+			Err(error) => {
+				note_peer_failure(&origin);
+				warn!("peer_api_fallback: peer {} failed for {}: {}", origin, path, error);
+				last_error = error;
+			}
+		}
+	}
+
+	Err(last_error)
+}
+
+fn normalize_peer_posts(posts: &mut [Post]) {
+	for post in posts {
+		post.flags.normalize_template_strings();
+	}
+}
+
+fn configured_peer_origins() -> Vec<String> {
+	configured_peer_origins_from(get_setting("REDLIB_PEER_API_FALLBACK_SOURCES").as_deref().unwrap_or_default())
+}
+
+fn configured_peer_origins_from(configured: &str) -> Vec<String> {
+	configured
+		.split(',')
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.filter_map(|value| normalize_origin(value).ok())
+		.collect()
+}
+
+fn normalize_origin(value: &str) -> Result<String, String> {
+	let parsed = Url::parse(value).map_err(|error| error.to_string())?;
+	if !matches!(parsed.scheme(), "http" | "https") {
+		return Err("peer origin must use http or https".to_string());
+	}
+	let mut origin = parsed.origin().ascii_serialization();
+	if let Some(path) = parsed.path().strip_suffix('/') {
+		if !path.is_empty() {
+			origin.push_str(path);
+		}
+	}
+	Ok(origin.trim_end_matches('/').to_string())
+}
+
+fn build_subreddit_api_path(subreddit: &str, sort: &str, query: Option<&str>) -> String {
+	let encoded_subreddit = subreddit.replace('+', "%2B");
+	let normalized_sort = sort.trim_end_matches(".js").trim_matches('/');
+	let path = if normalized_sort.is_empty() || normalized_sort == "hot" {
+		format!("/api/r/{encoded_subreddit}")
+	} else {
+		format!("/api/r/{encoded_subreddit}/{normalized_sort}")
+	};
+	let filtered_query = filtered_peer_query(query.unwrap_or_default());
+	if filtered_query.is_empty() {
+		path
+	} else {
+		format!("{path}?{filtered_query}")
+	}
+}
+
+fn filtered_peer_query(query: &str) -> String {
+	form_urlencoded::Serializer::new(String::new())
+		.extend_pairs(
+			form_urlencoded::parse(query.as_bytes())
+				.into_owned()
+				.filter(|(key, _)| !matches!(key.as_str(), "cache_page" | "feed_session" | "front_cursor" | "raw_json")),
+		)
+		.finish()
+}
+
+fn request_timeout() -> Duration {
+	let secs = get_setting("REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS")
+		.and_then(|value| value.parse::<u64>().ok())
+		.filter(|value| *value > 0)
+		.unwrap_or(DEFAULT_TIMEOUT_SECS);
+	Duration::from_secs(secs)
+}
+
+async fn fetch_peer_json(url: &str) -> Result<(StatusCode, String), String> {
+	let request = Request::builder()
+		.method(Method::GET)
+		.uri(url)
+		.header(ACCEPT, "application/json")
+		.header(USER_AGENT, PEER_API_UA)
+		.header(PEER_API_FALLBACK_HEADER, "1")
+		.body(Body::empty())
+		.map_err(|error| error.to_string())?;
+	let response = tokio::time::timeout(request_timeout(), CLIENT.request(request))
+		.await
+		.map_err(|_| "peer API request timed out".to_string())?
+		.map_err(|error| error.to_string())?;
+	let status = response.status();
+	let body = to_bytes(response.into_body()).await.map_err(|error| error.to_string())?;
+	let body = String::from_utf8_lossy(&body).to_string();
+	Ok((status, body))
+}
+
+fn parse_subreddit_listing_response(status: StatusCode, body: &str) -> Result<PeerListingResponse, String> {
+	if status != StatusCode::OK {
+		return Err(format!("peer returned HTTP {}", status.as_u16()));
+	}
+	let envelope: ApiEnvelope<PeerListingResponse> = serde_json::from_str(body).map_err(|error| error.to_string())?;
+	if let Some(error) = envelope.error.filter(|error| !error.trim().is_empty()) {
+		return Err(format!("peer API error: {error}"));
+	}
+	envelope.data.ok_or_else(|| "peer API response did not include data".to_string())
+}
+
+fn peer_is_backed_off(origin: &str) -> bool {
+	PEER_FAILURE_BACKOFF
+		.lock()
+		.ok()
+		.and_then(|backoff| backoff.get(origin).copied())
+		.is_some_and(|failed_at| failed_at.elapsed().as_secs() < PEER_FAILURE_BACKOFF_SECS)
+}
+
+fn note_peer_failure(origin: &str) {
+	if let Ok(mut backoff) = PEER_FAILURE_BACKOFF.lock() {
+		backoff.insert(origin.to_string(), Instant::now());
+	}
+}
+
+fn note_peer_success(origin: &str) {
+	if let Ok(mut backoff) = PEER_FAILURE_BACKOFF.lock() {
+		backoff.remove(origin);
+	}
+	if let Ok(mut last) = LAST_SUCCESSFUL_PEER.lock() {
+		*last = Some(origin.to_string());
+	}
+}
+
+fn prioritize_last_successful_peer(mut origins: Vec<String>) -> Vec<String> {
+	let last_successful = LAST_SUCCESSFUL_PEER.lock().ok().and_then(|value| value.clone());
+	let Some(last_successful) = last_successful else {
+		return origins;
+	};
+	let Some(index) = origins.iter().position(|origin| *origin == last_successful) else {
+		return origins;
+	};
+	if index > 0 {
+		let origin = origins.remove(index);
+		origins.insert(0, origin);
+	}
+	origins
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parses_configured_peer_origins() {
+		assert_eq!(
+			configured_peer_origins_from(" http://127.0.0.1:18081/, https://example.com/redlib/ "),
+			vec!["http://127.0.0.1:18081".to_string(), "https://example.com/redlib".to_string()]
+		);
+	}
+
+	#[test]
+	fn builds_subreddit_api_path_without_internal_cursor_params() {
+		assert_eq!(
+			build_subreddit_api_path("rust+programming", "new", Some("after=t3_next&cache_page=2&flair=Help&raw_json=1")),
+			"/api/r/rust%2Bprogramming/new?after=t3_next&flair=Help"
+		);
+	}
+
+	#[test]
+	fn parses_peer_listing_envelope() {
+		let body = r#"{"data":{"subreddit":{"name":"rust","title":"Rust","description":"","info":"","has_sidebar":false,"icon":"","members":["0","0"],"active":["0","0"],"wiki":false,"nsfw":false},"posts":[],"after":null},"error":null}"#;
+		let listing = parse_subreddit_listing_response(StatusCode::OK, body).unwrap();
+		assert_eq!(listing.subreddit.unwrap().name, "rust");
+		assert_eq!(listing.posts.len(), 0);
+		assert_eq!(listing.after, None);
+	}
+
+	#[test]
+	fn rejects_peer_api_errors() {
+		let body = r#"{"data":null,"error":"rate limited"}"#;
+		let error = match parse_subreddit_listing_response(StatusCode::OK, body) {
+			Ok(_) => panic!("expected peer API error"),
+			Err(error) => error,
+		};
+		assert!(error.contains("rate limited"));
+	}
+
+	#[test]
+	fn rejects_non_success_status() {
+		let error = match parse_subreddit_listing_response(StatusCode::BAD_GATEWAY, "{}") {
+			Ok(_) => panic!("expected HTTP status error"),
+			Err(error) => error,
+		};
+		assert!(error.contains("502"));
+	}
+}

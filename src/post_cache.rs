@@ -1702,6 +1702,16 @@ pub fn spawn_remembered_feed_daemon() {
 	});
 }
 
+pub fn remembered_feed_daemon_enabled() -> bool {
+	remembered_feed_daemon_enabled_from(crate::config::get_setting("REDLIB_REMEMBERED_FEED_DAEMON_ENABLED").as_deref())
+}
+
+fn remembered_feed_daemon_enabled_from(value: Option<&str>) -> bool {
+	value
+		.map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+		.unwrap_or(true)
+}
+
 pub fn spawn_remembered_subreddit_daemon() {
 	spawn_remembered_feed_daemon();
 }
@@ -3254,6 +3264,9 @@ fn visible_sources_from_preferences(preferences: &Preferences) -> Vec<FeedSource
 }
 
 pub fn cache_status_seconds_until_daemon_tick() -> u64 {
+	if !remembered_feed_daemon_enabled() {
+		return 0;
+	}
 	REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT
 		.lock()
 		.ok()
@@ -3508,6 +3521,21 @@ mod tests {
 		crate::materialized_catalog::reset_catalog();
 		crate::utils::clear_test_caches();
 		crate::user::clear_test_caches();
+	}
+
+	#[test]
+	fn remembered_feed_daemon_enabled_defaults_on() {
+		assert!(super::remembered_feed_daemon_enabled_from(None));
+		assert!(super::remembered_feed_daemon_enabled_from(Some("on")));
+		assert!(super::remembered_feed_daemon_enabled_from(Some("TRUE")));
+		assert!(super::remembered_feed_daemon_enabled_from(Some("1")));
+	}
+
+	#[test]
+	fn remembered_feed_daemon_enabled_rejects_off_values() {
+		assert!(!super::remembered_feed_daemon_enabled_from(Some("off")));
+		assert!(!super::remembered_feed_daemon_enabled_from(Some("false")));
+		assert!(!super::remembered_feed_daemon_enabled_from(Some("0")));
 	}
 
 	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {

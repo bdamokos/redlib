@@ -141,6 +141,16 @@ impl InstanceInfo {
 					},
 				],
 				["Instance scrape timeout", &convert(&self.config.instance_scrape_timeout_secs)],
+				[
+					"Peer API fallback sources",
+					if self.config.peer_api_fallback_sources.is_some() {
+						"<span>Configured</span>"
+					} else {
+						"<span class=\"unset\"><i>Unset</i></span>"
+					},
+				],
+				["Peer API fallback timeout", &convert(&self.config.peer_api_fallback_timeout_secs)],
+				["Remembered feed daemon enabled", &convert(&self.config.remembered_feed_daemon_enabled)],
 				//TODO: fallback to crate::config::DEFAULT_PUSHSHIFT_FRONTEND
 			])
 			.with_header_row(["Settings"]),
@@ -188,6 +198,9 @@ impl InstanceInfo {
 				Instance scrape enabled: {:?}\n
 				Instance scrape sources: {}\n
 				Instance scrape timeout: {:?}\n
+				Peer API fallback sources: {}\n
+				Peer API fallback timeout: {:?}\n
+				Remembered feed daemon enabled: {:?}\n
                 Config:\n
                     Banner: {:?}\n
                     Hide awards: {:?}\n
@@ -221,6 +234,9 @@ impl InstanceInfo {
 					self.config.instance_scrape_enabled,
 					if self.config.instance_scrape_sources.is_some() { "Configured" } else { "Unset" },
 					self.config.instance_scrape_timeout_secs,
+					if self.config.peer_api_fallback_sources.is_some() { "Configured" } else { "Unset" },
+					self.config.peer_api_fallback_timeout_secs,
+					self.config.remembered_feed_daemon_enabled,
 					self.config.banner,
 					self.config.default_hide_awards,
 					self.config.default_hide_score,

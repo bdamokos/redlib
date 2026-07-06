@@ -1,26 +1,28 @@
 use crate::client;
+use crate::peer_api_fallback;
 use crate::post as post_page;
 use crate::server::RequestExt;
 use crate::subreddit;
 use crate::utils::{self, filter_posts, get_filters, parse_post, setting, sfw_only, should_be_nsfw_gated, Comment, Post, Subreddit, User};
 use hyper::{Body, Request, Response};
-use serde::Serialize;
+use log::{info, warn};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::form_urlencoded;
 
-#[derive(Serialize)]
-struct ApiEnvelope<T: Serialize> {
+#[derive(Serialize, Deserialize)]
+struct ApiEnvelope<T> {
 	data: Option<T>,
 	error: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ListingResponse {
-	subreddit: Option<Subreddit>,
-	posts: Vec<Post>,
-	after: Option<String>,
-	all_posts_filtered: bool,
-	all_posts_hidden_nsfw: bool,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ListingResponse {
+	pub(crate) subreddit: Option<Subreddit>,
+	pub(crate) posts: Vec<Post>,
+	pub(crate) after: Option<String>,
+	pub(crate) all_posts_filtered: bool,
+	pub(crate) all_posts_hidden_nsfw: bool,
 }
 
 #[derive(Serialize)]
@@ -214,7 +216,26 @@ pub async fn subreddit_listing(req: Request<Body>) -> Result<Response<Body>, Str
 	let path = format!("/r/{}/{}.json?{}", sub.replace('+', "%2B"), sort, query);
 	let (mut posts, after) = match Post::fetch(&path, quarantined).await {
 		Ok(result) => result,
-		Err(msg) => return upstream_error(msg),
+		Err(msg) => {
+			if !peer_api_fallback::request_is_peer_api_fallback(&req) && crate::instance_scrape::should_attempt_scrape_fallback(&msg) {
+				info!("json_api: retrying subreddit listing r/{sub}/{sort} through configured Redlib peer API after upstream error: {msg}");
+				match peer_api_fallback::fetch_subreddit_listing(&sub, &sort, req.uri().query()).await {
+					Ok(peer) => {
+						let mut posts = peer.posts;
+						let (all_posts_filtered, all_posts_hidden_nsfw) = finalize_posts(&req, &mut posts, true);
+						return json_response(ListingResponse {
+							subreddit: peer.subreddit,
+							posts,
+							after: after_value(peer.after),
+							all_posts_filtered,
+							all_posts_hidden_nsfw,
+						});
+					}
+					Err(error) => warn!("json_api: Redlib peer API fallback failed for r/{sub}/{sort}: {error}"),
+				}
+			}
+			return upstream_error(msg);
+		}
 	};
 	let (all_posts_filtered, all_posts_hidden_nsfw) = finalize_posts(&req, &mut posts, true);
 	let subreddit = subreddit_metadata(&sub, quarantined).await;

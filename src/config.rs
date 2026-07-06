@@ -145,6 +145,15 @@ pub struct Config {
 
 	#[serde(rename = "REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS")]
 	pub(crate) instance_scrape_timeout_secs: Option<String>,
+
+	#[serde(rename = "REDLIB_PEER_API_FALLBACK_SOURCES")]
+	pub(crate) peer_api_fallback_sources: Option<String>,
+
+	#[serde(rename = "REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS")]
+	pub(crate) peer_api_fallback_timeout_secs: Option<String>,
+
+	#[serde(rename = "REDLIB_REMEMBERED_FEED_DAEMON_ENABLED")]
+	pub(crate) remembered_feed_daemon_enabled: Option<String>,
 }
 
 impl Config {
@@ -205,6 +214,9 @@ impl Config {
 			instance_scrape_enabled: parse("REDLIB_INSTANCE_SCRAPE_ENABLED"),
 			instance_scrape_sources: parse("REDLIB_INSTANCE_SCRAPE_SOURCES"),
 			instance_scrape_timeout_secs: parse("REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS"),
+			peer_api_fallback_sources: parse("REDLIB_PEER_API_FALLBACK_SOURCES"),
+			peer_api_fallback_timeout_secs: parse("REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS"),
+			remembered_feed_daemon_enabled: parse("REDLIB_REMEMBERED_FEED_DAEMON_ENABLED"),
 		}
 	}
 }
@@ -247,6 +259,9 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_INSTANCE_SCRAPE_ENABLED" => config.instance_scrape_enabled.clone(),
 		"REDLIB_INSTANCE_SCRAPE_SOURCES" => config.instance_scrape_sources.clone(),
 		"REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS" => config.instance_scrape_timeout_secs.clone(),
+		"REDLIB_PEER_API_FALLBACK_SOURCES" => config.peer_api_fallback_sources.clone(),
+		"REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS" => config.peer_api_fallback_timeout_secs.clone(),
+		"REDLIB_REMEMBERED_FEED_DAEMON_ENABLED" => config.remembered_feed_daemon_enabled.clone(),
 		_ => None,
 	}
 }
