@@ -2340,6 +2340,9 @@ struct FooterRateLimitDisplay {
 	class_name: &'static str,
 }
 
+const FOOTER_LOCAL_RATELIMIT_LABEL: &str = "RS1";
+const FOOTER_PEER_RATELIMIT_LABEL: &str = "RS2";
+
 fn format_status_seconds(seconds: u64) -> String {
 	if seconds >= 3600 {
 		format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
@@ -2376,22 +2379,26 @@ fn footer_ratelimit_parts_for_status_and_peers(status: &RedditRateLimitStatus, p
 	let mut label = match status.state {
 		RedditRateLimitState::Cooldown => status
 			.cooldown_seconds
-			.map(|seconds| format!("RL wait {}", format_status_seconds(seconds)))
-			.unwrap_or_else(|| "RL wait".to_string()),
+			.map(|seconds| format!("{FOOTER_LOCAL_RATELIMIT_LABEL} wait {}", format_status_seconds(seconds)))
+			.unwrap_or_else(|| format!("{FOOTER_LOCAL_RATELIMIT_LABEL} wait")),
 		RedditRateLimitState::Limited => status
 			.retry_after_seconds
 			.or(status.reset_seconds)
-			.map(|seconds| format!("RL wait {}", format_status_seconds(seconds)))
-			.or_else(|| status.remaining.map(|remaining| format!("RL {}", format_status_float(remaining))))
-			.unwrap_or_else(|| "RL limited".to_string()),
+			.map(|seconds| format!("{FOOTER_LOCAL_RATELIMIT_LABEL} wait {}", format_status_seconds(seconds)))
+			.or_else(|| {
+				status
+					.remaining
+					.map(|remaining| format!("{FOOTER_LOCAL_RATELIMIT_LABEL} {}", format_status_float(remaining)))
+			})
+			.unwrap_or_else(|| format!("{FOOTER_LOCAL_RATELIMIT_LABEL} limited")),
 		RedditRateLimitState::Ok => status
 			.remaining
-			.map(|remaining| format!("RL {}", format_status_float(remaining)))
-			.unwrap_or_else(|| "RL ok".to_string()),
-		RedditRateLimitState::Unknown => "RL idle".to_string(),
+			.map(|remaining| format!("{FOOTER_LOCAL_RATELIMIT_LABEL} {}", format_status_float(remaining)))
+			.unwrap_or_else(|| format!("{FOOTER_LOCAL_RATELIMIT_LABEL} ok")),
+		RedditRateLimitState::Unknown => format!("{FOOTER_LOCAL_RATELIMIT_LABEL} idle"),
 	};
 	if !peers.is_empty() {
-		label.push_str(&format!(" P{peer_limited_count}/{}", peers.len()));
+		label.push_str(&format!(" {FOOTER_PEER_RATELIMIT_LABEL} {peer_limited_count}/{}", peers.len()));
 	}
 
 	let mut details = Vec::new();
@@ -2429,7 +2436,7 @@ fn footer_ratelimit_parts_for_status_and_peers(status: &RedditRateLimitStatus, p
 		details.push("stale".to_string());
 	}
 	if !peers.is_empty() {
-		details.push(format!("{peer_limited_count}/{} learned peers limited", peers.len()));
+		details.push(format!("{FOOTER_PEER_RATELIMIT_LABEL}: {peer_limited_count}/{} learned peers limited", peers.len()));
 	}
 
 	FooterRateLimitDisplay {
@@ -5828,7 +5835,7 @@ mod tests {
 		};
 
 		let display = footer_ratelimit_parts_for_status(&status);
-		assert_eq!(display.label, "RL wait 2m 5s");
+		assert_eq!(display.label, "RS1 wait 2m 5s");
 		assert_eq!(display.class_name, "rate-limit-bad");
 		assert!(display.title.contains("HTTP 429"));
 		assert!(display.title.contains("reset in 2m 5s"));
@@ -5873,9 +5880,9 @@ mod tests {
 		];
 
 		let display = footer_ratelimit_parts_for_status_and_peers(&local, &peers);
-		assert_eq!(display.label, "RL 72 P1/2");
+		assert_eq!(display.label, "RS1 72 RS2 1/2");
 		assert_eq!(display.class_name, "rate-limit-bad");
-		assert!(display.title.contains("1/2 learned peers limited"));
+		assert!(display.title.contains("RS2: 1/2 learned peers limited"));
 	}
 
 	#[test]

@@ -1,9 +1,11 @@
-use crate::client::{self, CLIENT};
+use crate::client;
 use crate::config::get_setting;
 use crate::utils::{Post, Subreddit};
 use hyper::body::to_bytes;
+use hyper::client::HttpConnector;
 use hyper::header::{ACCEPT, USER_AGENT};
-use hyper::{Body, Method, Request, StatusCode};
+use hyper::{Body, Client as HyperClient, Method, Request, StatusCode};
+use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use log::{info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -19,6 +21,18 @@ pub(crate) const PEER_API_FALLBACK_HEADER: &str = "x-redlib-peer-api-fallback";
 
 static PEER_FAILURE_BACKOFF: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static LAST_SUCCESSFUL_PEER: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static PEER_API_CLIENT: LazyLock<HyperClient<HttpsConnector<HttpConnector>, Body>> = LazyLock::new(|| {
+	let connector = hyper_rustls::HttpsConnectorBuilder::new()
+		.with_tls_config(rustls::ClientConfig::builder().with_safe_defaults().with_native_roots().with_no_client_auth())
+		.https_or_http()
+		.enable_http2()
+		.build();
+	let mut builder = HyperClient::builder();
+	if cfg!(test) {
+		builder.pool_max_idle_per_host(0);
+	}
+	builder.build::<_, Body>(connector)
+});
 
 #[derive(Clone)]
 pub(crate) struct PeerSubredditListing {
@@ -183,7 +197,7 @@ async fn fetch_peer_json(url: &str) -> Result<(StatusCode, String), String> {
 		.header(PEER_API_FALLBACK_HEADER, "1")
 		.body(Body::empty())
 		.map_err(|error| error.to_string())?;
-	let response = tokio::time::timeout(request_timeout(), CLIENT.request(request))
+	let response = tokio::time::timeout(request_timeout(), PEER_API_CLIENT.request(request))
 		.await
 		.map_err(|_| "peer API request timed out".to_string())?
 		.map_err(|error| error.to_string())?;
@@ -245,6 +259,9 @@ fn prioritize_last_successful_peer(mut origins: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use hyper::service::{make_service_fn, service_fn};
+	use hyper::Response;
+	use std::convert::Infallible;
 
 	#[test]
 	fn parses_configured_peer_origins() {
@@ -260,6 +277,32 @@ mod tests {
 			build_subreddit_api_path("rust+programming", "new", Some("after=t3_next&cache_page=2&flair=Help&raw_json=1")),
 			"/api/r/rust%2Bprogramming/new?after=t3_next&flair=Help"
 		);
+	}
+
+	#[tokio::test]
+	async fn fetch_peer_json_supports_http_origin() {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		let server = hyper::Server::from_tcp(listener).unwrap().serve(make_service_fn(|_| async {
+			Ok::<_, Infallible>(service_fn(|req: Request<Body>| async move {
+				assert_eq!(req.uri().path(), "/api/r/rust");
+				assert_eq!(req.headers().get(PEER_API_FALLBACK_HEADER).and_then(|value| value.to_str().ok()), Some("1"));
+				Ok::<_, Infallible>(
+					Response::builder()
+						.status(StatusCode::OK)
+						.header("content-type", "application/json")
+						.body(Body::from(r#"{"data":{"subreddit":null,"posts":[],"after":null},"error":null}"#))
+						.unwrap(),
+				)
+			}))
+		}));
+		let server_handle = tokio::spawn(server);
+
+		let (status, body) = fetch_peer_json(&format!("http://{addr}/api/r/rust")).await.unwrap();
+		assert_eq!(status, StatusCode::OK);
+		assert!(body.contains(r#""posts":[]"#));
+
+		server_handle.abort();
 	}
 
 	#[test]
