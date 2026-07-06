@@ -536,11 +536,25 @@ fn content_text_for_post(post: &cache_persistence::PersistedPost, max_text_chars
 	content_text_from_parts(&post.title, &post.link_title, &post.body, &post.preview_body, max_text_chars_per_post)
 }
 
+fn content_text_for_runtime_post(post: &crate::utils::Post, max_text_chars_per_post: usize) -> Option<String> {
+	content_text_from_parts(&post.title, &post.link_title, &post.body, &post.preview_body, max_text_chars_per_post)
+}
+
 fn content_text_for_legacy_post(post: &LegacyPersistedPost, max_text_chars_per_post: usize) -> Option<String> {
 	content_text_from_parts(&post.title, &post.link_title, &post.body, &post.preview_body, max_text_chars_per_post)
 }
 
 fn post_identity(post: &cache_persistence::PersistedPost) -> String {
+	if !post.id.trim().is_empty() {
+		return format!("{}:{}", post.kind.trim(), post.id.trim());
+	}
+	if !post.permalink.trim().is_empty() {
+		return post.permalink.trim().to_string();
+	}
+	semantic_hash(&format!("{}:{}:{}", post.community, post.title, post.created_ts))
+}
+
+fn runtime_post_identity(post: &crate::utils::Post) -> String {
 	if !post.id.trim().is_empty() {
 		return format!("{}:{}", post.kind.trim(), post.id.trim());
 	}
@@ -609,6 +623,40 @@ fn post_embedding_candidate(subreddit: &str, identity: &str, text: String, sourc
 		created_ts,
 		text_chars,
 	})
+}
+
+pub fn runtime_post_embedding_candidates(source_key: &str, posts: &[crate::utils::Post], max_text_chars_per_post: usize) -> Vec<SubredditContentPostEmbeddingCandidate> {
+	let mut candidates_by_post = HashMap::<String, SubredditContentPostEmbeddingCandidate>::new();
+	for post in posts {
+		let subreddit = crate::subreddit_semantics::normalize_subreddit_name(&post.community);
+		if subreddit.is_empty() || subreddit.starts_with("u_") {
+			continue;
+		}
+		let Some(text) = content_text_for_runtime_post(post, max_text_chars_per_post) else {
+			continue;
+		};
+		let identity = runtime_post_identity(post);
+		if let Some(candidate) = post_embedding_candidate(&subreddit, &identity, text, source_key, post.created_ts) {
+			candidates_by_post
+				.entry(candidate.post_key_hash.clone())
+				.and_modify(|existing| {
+					if candidate.created_ts > existing.created_ts {
+						*existing = candidate.clone();
+					}
+				})
+				.or_insert(candidate);
+		}
+	}
+
+	let mut candidates = candidates_by_post.into_values().collect::<Vec<_>>();
+	candidates.sort_by(|left, right| {
+		left
+			.subreddit
+			.cmp(&right.subreddit)
+			.then_with(|| left.created_ts.cmp(&right.created_ts))
+			.then_with(|| left.post_key_hash.cmp(&right.post_key_hash))
+	});
+	candidates
 }
 
 pub fn build_subreddit_content_post_embedding_candidates(options: &SubredditContentCorpusOptions) -> Result<SubredditContentPostCandidateCollection, String> {

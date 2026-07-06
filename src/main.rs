@@ -15,8 +15,8 @@ use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
-	bookmarks, cache_persistence, config, creator_links, duplicates, headers, instance_info, post, post_cache, post_feedback, search, settings, site_icon, subreddit,
-	suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
+	bookmarks, cache_persistence, config, creator_links, duplicates, headers, instance_info, observed_semantic_backfill, post, post_cache, post_feedback, search, settings,
+	site_icon, subreddit, suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
 };
 use url::Url;
 
@@ -360,6 +360,7 @@ async fn main() {
 	video_preview::init();
 	cache_persistence::init();
 	post_cache::spawn_remembered_feed_daemon();
+	observed_semantic_backfill::spawn_observed_semantic_backfill_worker();
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {

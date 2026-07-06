@@ -1169,6 +1169,15 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	if is_persisted_subreddit_feed_source(source) || materialized_catalog::source_is_supported(source) {
 		crate::cache_persistence::mark_dirty();
 	}
+	let priority = match refresh_origin {
+		Some(RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) => crate::observed_semantic_backfill::ObservedBackfillPriority::Priority,
+		Some(RefreshOrigin::DirectLiveFetch) | None => crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
+	};
+	if let Ok(cache) = SOURCE_CACHE.lock() {
+		if let Some(entry) = cache.get(&source.cache_key()) {
+			crate::observed_semantic_backfill::enqueue_observed_posts(&source.cache_key(), &entry.posts, priority);
+		}
+	}
 }
 
 fn publish_remembered_source_refresh(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) {
