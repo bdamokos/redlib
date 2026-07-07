@@ -10,7 +10,18 @@ fi
 
 IMAGE="${REDLIB_SEMANTIC_BACKFILL_IMAGE:-127.0.0.1:5010/redlib:latest}"
 MODEL="${REDLIB_SUBREDDIT_SEMANTIC_MODEL:-nomic-embed-text}"
-OLLAMA_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+default_ollama_url() {
+	local url
+	for url in http://127.0.0.1:11434 http://172.17.0.1:11434; do
+		if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 "$url/api/version" >/dev/null 2>&1; then
+			printf '%s' "$url"
+			return
+		fi
+	done
+	printf '%s' "http://127.0.0.1:11434"
+}
+
+OLLAMA_URL="${OLLAMA_BASE_URL:-$(default_ollama_url)}"
 CONTENT_MAX_POSTS="${REDLIB_SUBREDDIT_CONTENT_MAX_POSTS:-16}"
 CONTENT_MAX_POST_CHARS="${REDLIB_SUBREDDIT_CONTENT_MAX_POST_CHARS:-360}"
 CONTENT_MAX_CORPUS_CHARS="${REDLIB_SUBREDDIT_CONTENT_MAX_CORPUS_CHARS:-3000}"
