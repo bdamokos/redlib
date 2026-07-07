@@ -1242,6 +1242,10 @@ fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
 		|| normalized.contains("403")
 		|| normalized.contains("forbidden")
 		|| normalized.contains("404")
+		|| normalized == "not_found"
+		|| normalized.contains("not_found")
+		|| normalized == "not-found"
+		|| normalized.contains("not-found")
 		|| normalized.contains("not found")
 		|| normalized.contains("no posts found")
 	{
@@ -4841,6 +4845,34 @@ mod tests {
 		let remaining = banned_until.saturating_duration_since(Instant::now());
 		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
 		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
+	}
+
+	#[test]
+	fn failure_recording_treats_underscore_not_found_as_permanent() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("couplescumshots");
+		record_plain_subreddit_refresh_failure("couplescumshots", "not_found", RefreshOrigin::Daemon);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("couplescumshots").unwrap();
+		let banned_until = entry.banned_until.expect("not_found should get permanent backoff");
+		let remaining = banned_until.saturating_duration_since(Instant::now());
+		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
+		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
+	}
+
+	#[test]
+	fn picker_skips_underscore_not_found_feed_after_failure() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("couplescumshots");
+		remember_subreddit_request("rust");
+		record_plain_subreddit_refresh_failure("couplescumshots", "not_found", RefreshOrigin::Daemon);
+
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("rust".to_string()));
 	}
 
 	#[test]
