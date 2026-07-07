@@ -415,7 +415,8 @@ async fn main() -> Result<(), String> {
 
 	match run_backfill(&args, &mut counters).await {
 		Ok(()) => {
-			let state = if counters.failed > 0 { "completed_with_errors" } else { "completed" };
+			let completion_error = backfill_completion_error(&counters);
+			let state = if completion_error.is_some() { "failed" } else { "completed" };
 			record_backfill_status(SubredditSemanticBackfillStatus {
 				state: state.to_string(),
 				model: args.model.clone(),
@@ -425,10 +426,14 @@ async fn main() -> Result<(), String> {
 				dry_run: args.dry_run,
 				force: args.force,
 				limit: args.limit,
-				error: None,
+				error: completion_error.clone(),
 			});
 			print_backfill_summary(&counters);
-			Ok(())
+			if let Some(error) = completion_error {
+				Err(error)
+			} else {
+				Ok(())
+			}
 		}
 		Err(error) => {
 			record_backfill_status(SubredditSemanticBackfillStatus {
@@ -445,6 +450,15 @@ async fn main() -> Result<(), String> {
 			Err(error)
 		}
 	}
+}
+
+fn backfill_completion_error(counters: &SubredditSemanticBackfillCounters) -> Option<String> {
+	(counters.failed > 0).then(|| {
+		format!(
+			"subreddit semantic backfill had {} failed embedding attempts (embedded={}, already_current={})",
+			counters.failed, counters.embedded, counters.already_current
+		)
+	})
 }
 
 fn record_backfill_status(status: SubredditSemanticBackfillStatus) {
@@ -669,5 +683,14 @@ mod tests {
 		let discovered = HashSet::from(["newcandidate".to_string()]);
 		assert!(!allow_name_only_metadata_for_candidate(&args, &discovered, "newcandidate"));
 		assert!(allow_name_only_metadata_for_candidate(&args, &discovered, "cachedcandidate"));
+	}
+
+	#[test]
+	fn backfill_completion_error_fails_on_embedding_failures() {
+		let mut counters = SubredditSemanticBackfillCounters::default();
+		assert!(backfill_completion_error(&counters).is_none());
+		counters.already_current = 10;
+		counters.failed = 1;
+		assert!(backfill_completion_error(&counters).unwrap().contains("1 failed embedding attempts"));
 	}
 }

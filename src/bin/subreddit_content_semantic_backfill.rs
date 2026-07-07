@@ -169,7 +169,8 @@ async fn main() -> Result<(), String> {
 
 	match run_backfill(&args, &options, &mut counters).await {
 		Ok(report) => {
-			let state = if counters.failed > 0 { "completed_with_errors" } else { "completed" };
+			let completion_error = backfill_completion_error(&counters);
+			let state = if completion_error.is_some() { "failed" } else { "completed" };
 			record_backfill_status(status_for_run(
 				&args,
 				&options,
@@ -177,7 +178,7 @@ async fn main() -> Result<(), String> {
 				started_at_unix,
 				state,
 				Some(cache_persistence::unix_now()),
-				None,
+				completion_error.clone(),
 			));
 			print_backfill_summary(&counters, &report);
 			if let Some(path) = &args.report_json {
@@ -187,7 +188,11 @@ async fn main() -> Result<(), String> {
 					println!("wrote report {}", path.display());
 				}
 			}
-			Ok(())
+			if let Some(error) = completion_error {
+				Err(error)
+			} else {
+				Ok(())
+			}
 		}
 		Err(error) => {
 			record_backfill_status(status_for_run(
@@ -202,6 +207,15 @@ async fn main() -> Result<(), String> {
 			Err(error)
 		}
 	}
+}
+
+fn backfill_completion_error(counters: &SubredditContentSemanticBackfillCounters) -> Option<String> {
+	(counters.failed > 0).then(|| {
+		format!(
+			"content semantic backfill had {} failed embedding attempts (embedded={}, already_current={})",
+			counters.failed, counters.embedded, counters.already_current
+		)
+	})
 }
 
 fn corpus_options_from_args(args: &Args) -> SubredditContentCorpusOptions {
@@ -470,5 +484,19 @@ fn build_report(args: &Args, options: &SubredditContentCorpusOptions, counters: 
 		similarity,
 		most_generic,
 		samples,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn backfill_completion_error_fails_on_embedding_failures() {
+		let mut counters = SubredditContentSemanticBackfillCounters::default();
+		assert!(backfill_completion_error(&counters).is_none());
+		counters.already_current = 2;
+		counters.failed = 1;
+		assert!(backfill_completion_error(&counters).unwrap().contains("1 failed embedding attempts"));
 	}
 }

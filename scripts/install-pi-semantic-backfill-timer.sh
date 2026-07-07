@@ -54,6 +54,7 @@ After=docker.service ollama.service
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/default/redlib-semantic-backfill
+ExecStartPre=/bin/sh -c 'set -eu; for attempt in $(seq 1 60); do if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 "$OLLAMA_BASE_URL/api/version" >/dev/null 2>&1; then exit 0; fi; sleep 2; done; echo "Ollama is not reachable at $OLLAMA_BASE_URL" >&2; exit 1'
 ExecStart=/bin/sh -c 'set -eu; /usr/bin/docker run --rm --entrypoint /usr/local/bin/subreddit_content_semantic_backfill "$REDLIB_SEMANTIC_BACKFILL_IMAGE" --help | grep -q "content semantic sidecar"; /usr/bin/docker run --rm --name redlib-semantic-backfill --network host --user nobody --cpus "$REDLIB_SEMANTIC_BACKFILL_CPUS" --memory "$REDLIB_SEMANTIC_BACKFILL_MEMORY" -e REDLIB_CACHE_DIR="$REDLIB_CACHE_DIR" -e REDLIB_SUBREDDIT_SEMANTIC_MODEL="$REDLIB_SUBREDDIT_SEMANTIC_MODEL" -e OLLAMA_BASE_URL="$OLLAMA_BASE_URL" -e REDLIB_SUBREDDIT_CONTENT_MAX_POSTS="$REDLIB_SUBREDDIT_CONTENT_MAX_POSTS" -e REDLIB_SUBREDDIT_CONTENT_MAX_POST_CHARS="$REDLIB_SUBREDDIT_CONTENT_MAX_POST_CHARS" -e REDLIB_SUBREDDIT_CONTENT_MAX_CORPUS_CHARS="$REDLIB_SUBREDDIT_CONTENT_MAX_CORPUS_CHARS" -e REDLIB_SUBREDDIT_CONTENT_MIN_POSTS="$REDLIB_SUBREDDIT_CONTENT_MIN_POSTS" -e REDLIB_SUBREDDIT_CONTENT_MIN_CHARS="$REDLIB_SUBREDDIT_CONTENT_MIN_CHARS" -v redlib-cache:/var/lib/redlib/cache "$REDLIB_SEMANTIC_BACKFILL_IMAGE" subreddit_content_semantic_backfill --quiet'
 Nice=10
 IOSchedulingClass=best-effort
