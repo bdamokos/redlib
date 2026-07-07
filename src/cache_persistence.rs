@@ -561,72 +561,23 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 
 #[cfg(not(test))]
 pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
-	let mut seeds = Vec::new();
-	let mut seen_keys = HashSet::new();
-	for dir in readable_source_cache_dirs() {
-		let entries = match fs::read_dir(&dir) {
-			Ok(entries) => entries,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-			Err(error) => return Err(error.to_string()),
-		};
+	read_persisted_source_cache_files_with_options(false).map(source_cache_seed_entries_from_files)
+}
 
-		for entry in entries {
-			let entry = match entry {
-				Ok(entry) => entry,
-				Err(error) => {
-					warn!("cache_persistence: failed to read source cache dir entry: {error}");
-					continue;
-				}
-			};
-			let path = entry.path();
-			if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
-				continue;
-			}
-			let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-				continue;
-			};
-			let decoded = match URL_SAFE_NO_PAD.decode(stem) {
-				Ok(decoded) => decoded,
-				Err(error) => {
-					warn!("cache_persistence: ignoring source cache file with undecodable name {:?}: {error}", path.file_name());
-					continue;
-				}
-			};
-			let key = match String::from_utf8(decoded) {
-				Ok(key) => key,
-				Err(error) => {
-					warn!("cache_persistence: ignoring source cache file with non-utf8 key {:?}: {error}", path.file_name());
-					continue;
-				}
-			};
-			if !seen_keys.insert(key.clone()) {
-				continue;
-			}
-			let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
-				Ok(modified) => modified,
-				Err(error) => {
-					warn!("cache_persistence: failed to stat source cache file {:?}: {error}", path.file_name());
-					continue;
-				}
-			};
-			let fetched_at_unix = match modified.duration_since(UNIX_EPOCH) {
-				Ok(duration) => duration.as_secs(),
-				Err(error) => {
-					warn!("cache_persistence: source cache file {:?} has pre-epoch mtime: {error}", path.file_name());
-					continue;
-				}
-			};
-			seeds.push((key, fetched_at_unix));
-		}
-	}
-
-	Ok(seeds)
+fn source_cache_seed_entries_from_files(files: Vec<PersistedSourceCacheFile>) -> Vec<(String, u64)> {
+	files.into_iter().map(|file| (file.key, file.entry.fetched_at_unix)).collect()
 }
 
 #[cfg(not(test))]
 pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceCacheFile>, String> {
+	read_persisted_source_cache_files_with_options(true)
+}
+
+#[cfg(not(test))]
+fn read_persisted_source_cache_files_with_options(log_file_errors: bool) -> Result<Vec<PersistedSourceCacheFile>, String> {
 	let mut files = Vec::new();
 	let mut seen_keys = HashSet::new();
+	let mut skipped_files = 0usize;
 	for dir in readable_source_cache_dirs() {
 		let entries = match fs::read_dir(&dir) {
 			Ok(entries) => entries,
@@ -638,7 +589,10 @@ pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceC
 			let entry = match entry {
 				Ok(entry) => entry,
 				Err(error) => {
-					warn!("cache_persistence: failed to read source cache dir entry: {error}");
+					skipped_files += 1;
+					if log_file_errors {
+						warn!("cache_persistence: failed to read source cache dir entry: {error}");
+					}
 					continue;
 				}
 			};
@@ -652,14 +606,20 @@ pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceC
 			let decoded = match URL_SAFE_NO_PAD.decode(stem) {
 				Ok(decoded) => decoded,
 				Err(error) => {
-					warn!("cache_persistence: ignoring source cache file with undecodable name {:?}: {error}", path.file_name());
+					skipped_files += 1;
+					if log_file_errors {
+						warn!("cache_persistence: ignoring source cache file with undecodable name {:?}: {error}", path.file_name());
+					}
 					continue;
 				}
 			};
 			let key = match String::from_utf8(decoded) {
 				Ok(key) => key,
 				Err(error) => {
-					warn!("cache_persistence: ignoring source cache file with non-utf8 key {:?}: {error}", path.file_name());
+					skipped_files += 1;
+					if log_file_errors {
+						warn!("cache_persistence: ignoring source cache file with non-utf8 key {:?}: {error}", path.file_name());
+					}
 					continue;
 				}
 			};
@@ -669,19 +629,28 @@ pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceC
 			let bytes = match fs::read(&path) {
 				Ok(bytes) => bytes,
 				Err(error) => {
-					warn!("cache_persistence: failed to read source cache file {:?}: {error}", path.file_name());
+					skipped_files += 1;
+					if log_file_errors {
+						warn!("cache_persistence: failed to read source cache file {:?}: {error}", path.file_name());
+					}
 					continue;
 				}
 			};
 			let entry = match bincode::deserialize::<PersistedSourceCacheEntry>(&bytes) {
 				Ok(entry) => entry,
 				Err(error) => {
-					warn!("cache_persistence: failed to deserialize source cache file {:?}: {error}", path.file_name());
+					skipped_files += 1;
+					if log_file_errors {
+						warn!("cache_persistence: failed to deserialize source cache file {:?}: {error}", path.file_name());
+					}
 					continue;
 				}
 			};
 			files.push(PersistedSourceCacheFile { key, entry });
 		}
+	}
+	if skipped_files > 0 && !log_file_errors {
+		warn!("cache_persistence: ignored {skipped_files} unreadable source cache files while seeding remembered feed rows");
 	}
 	Ok(files)
 }
@@ -942,6 +911,19 @@ mod tests {
 		}
 	}
 
+	fn persisted_source_cache_file(key: &str, fetched_at_unix: u64) -> super::PersistedSourceCacheFile {
+		super::PersistedSourceCacheFile {
+			key: key.to_string(),
+			entry: super::PersistedSourceCacheEntry {
+				subreddit: "rust".to_string(),
+				posts: Vec::new(),
+				after: String::new(),
+				fetched_at_unix,
+				refresh_origin: None,
+			},
+		}
+	}
+
 	fn empty_legacy_v4_without_feedback_snapshot() -> PersistedCacheSnapshotV4WithoutFeedback {
 		PersistedCacheSnapshotV4WithoutFeedback {
 			version: LEGACY_SNAPSHOT_VERSION_V4,
@@ -1034,6 +1016,19 @@ mod tests {
 		assert_eq!(entry.visit_priority_score, 1.25);
 		assert_eq!(entry.feedback_priority_score, 0.0);
 		assert_eq!(entry.feedback_priority_last_update_unix, None);
+	}
+
+	#[test]
+	fn source_cache_seed_entries_use_payload_fetch_time() {
+		let seeds = super::source_cache_seed_entries_from_files(vec![
+			persisted_source_cache_file("subreddit:rust:new", 999_000),
+			persisted_source_cache_file("subreddit:programming:new", 999_100),
+		]);
+
+		assert_eq!(
+			seeds,
+			vec![("subreddit:rust:new".to_string(), 999_000), ("subreddit:programming:new".to_string(), 999_100),]
+		);
 	}
 
 	#[test]
