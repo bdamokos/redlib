@@ -14,6 +14,7 @@ Environment:
   CODEX_NOTIFY_THREAD_ID       Default: 019f0411-87a6-7112-a4a8-a005a28d3ee6
   CODEX_NOTIFY_BIN             Default: /Applications/Codex.app/Contents/Resources/codex
   CODEX_NOTIFY_WATCHDOG_SECS   Default: 300
+  CODEX_NOTIFY_SEND_TIMEOUT_SECS Default: 60
   CODEX_NOTIFY_LOG_DIR         Default: /tmp/redlib-deploy-notify
   CODEX_NOTIFY_SEND            Default: on; set to off for local dry-run output
 EOF
@@ -36,6 +37,7 @@ fi
 THREAD_ID="${CODEX_NOTIFY_THREAD_ID:-019f0411-87a6-7112-a4a8-a005a28d3ee6}"
 CODEX_BIN="${CODEX_NOTIFY_BIN:-/Applications/Codex.app/Contents/Resources/codex}"
 WATCHDOG_SECS="${CODEX_NOTIFY_WATCHDOG_SECS:-300}"
+SEND_TIMEOUT_SECS="${CODEX_NOTIFY_SEND_TIMEOUT_SECS:-60}"
 LOG_DIR="${CODEX_NOTIFY_LOG_DIR:-/tmp/redlib-deploy-notify}"
 SEND_MODE="${CODEX_NOTIFY_SEND:-on}"
 COMMAND_DISPLAY=$(printf '%q ' "$@")
@@ -57,7 +59,24 @@ notify_thread() {
 		printf 'Codex notify skipped: %s is not executable\n' "$CODEX_BIN" >&2
 		return 0
 	fi
-	"$CODEX_BIN" exec resume "$THREAD_ID" "$message" --json --skip-git-repo-check >/dev/null 2>&1 || true
+	"$CODEX_BIN" exec resume "$THREAD_ID" "$message" --json --skip-git-repo-check >/dev/null 2>&1 &
+	local notify_pid=$!
+	local notify_started
+	notify_started=$(date +%s)
+	while kill -0 "$notify_pid" >/dev/null 2>&1; do
+		local now
+		now=$(date +%s)
+		if (( now - notify_started >= SEND_TIMEOUT_SECS )); then
+			kill "$notify_pid" >/dev/null 2>&1 || true
+			sleep 1
+			kill -9 "$notify_pid" >/dev/null 2>&1 || true
+			wait "$notify_pid" >/dev/null 2>&1 || true
+			printf 'Codex notify timed out after %ss\n' "$SEND_TIMEOUT_SECS" >&2
+			return 0
+		fi
+		sleep 1
+	done
+	wait "$notify_pid" >/dev/null 2>&1 || true
 }
 
 tail_log() {
