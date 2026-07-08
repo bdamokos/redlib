@@ -28,6 +28,7 @@
   Before rebuilding, `deploy.sh` tries to reuse `redlib:local` when its `org.opencontainers.image.revision` label exactly matches `HEAD`, the worktree is clean, and the image platform matches `TARGET_PLATFORM`. Use `REUSE_LOCAL_IMAGE=never ./deploy.sh` to force a rebuild, or `REUSE_LOCAL_IMAGE=required ./deploy.sh` to fail instead of rebuilding when the local validation image is not reusable.
 - Two-server deploy:
   Use `./scripts/deploy-two-server.sh --target main`, `--target spare`, or `--target both` to apply the confirmed two-server defaults without ad hoc env setup.
+  For coordinator-run deploys, prefer wrapping the deploy command with `./scripts/deploy-with-codex-notify.sh -- ...`. It mirrors output to `/tmp/redlib-deploy-notify`, sends this coordinator thread a success/failure message when the command exits, and sends one watchdog message after five minutes if the command is still running.
   Main Server 1 uses `REDLIB_PEER_API_FALLBACK_SOURCES=http://192.168.50.251:18081` and `REDLIB_PEER_API_FALLBACK_TIMEOUT_SECS=5`.
   Raspberry Server 2 is reached with `ssh -J raspberryserver bence@192.168.50.251`, pulls `192.168.50.25:5010/redlib:latest`, runs as Compose project/container `redlib-rate-test`, and binds host port `18081`.
   Server 2 is a hot spare for Reddit API/API-layer fallback, not a second daemon/cache worker: keep `REDLIB_REMEMBERED_FEED_DAEMON_ENABLED=off`, `REDLIB_CONTENT_SEMANTIC_OBSERVED_BACKFILL=off`, `REDLIB_INSTANCE_SCRAPE_ENABLED=off`, and no peer fallback sources there.
