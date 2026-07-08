@@ -28,7 +28,7 @@
             {% if !user.description.is_empty() || !user.bio_html.is_empty() || user.external_links.len() > 0 || coomer_recent_posts.is_some() %}
             <div id="user_profile">
                 {% if !user.description.is_empty() %}
-                <p id="user_blurb">{{ user.description }}</p>
+                <p id="user_blurb">{{ user.description_html()|safe }}</p>
                 {% endif %}
                 {% if !user.bio_html.is_empty() %}
                 <div id="user_bio">{{ user.bio_html|safe }}</div>

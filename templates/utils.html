@@ -139,7 +139,7 @@
 				class="post_flair"
 				style="color:{{ post.flair.foreground_color }}; background:{{ post.flair.background_color }};">{% call render_flair(post.flair.flair_parts) %}</a>
 		{% endif %}
-		{{ post.title }}
+		{{ post.title_html()|safe }}
 		{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}
 		{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}
 	</h1>
@@ -564,8 +564,10 @@
 		{% if post.kind == "t1" %}
 		<a href="{{ post.permalink }}" class="post_comments">View thread</a>
 		<a href="{{ post.link_permalink }}" class="post_comments" title="{{ post.comments.1 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}">{{ post.comments.0 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}</a>
+		{{ post.link_title_helper_html()|safe }}
 		{% else %}
 		<a href="{{ post.permalink }}" class="post_comments" title="{{ post.comments.1 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}">{{ post.comments.0 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}</a>
+		{{ post.linked_users_in_title_helper_html()|safe }}
 		{% endif %}
 		{% if let Some(new_comments) = post.bookmark_new_comments %}
 		<span class="post_bookmark_activity{% if new_comments.to_string() != "0" %} unread{% endif %}">

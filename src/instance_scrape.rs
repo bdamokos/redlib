@@ -624,7 +624,7 @@ fn parse_user_page(document: &str) -> Result<ScrapedUserPage, String> {
 	user.name = normalize_resource_name(&first_text(&parsed, &SEL_USER_NAME));
 	user.icon = first_attr(&parsed, &SEL_USER_ICON, "src");
 	user.description = first_text(&parsed, &SEL_USER_DESCRIPTION);
-	user.bio_html = sanitize_html(&first_inner_html(&parsed, &SEL_USER_BIO));
+	user.bio_html = crate::utils::link_reddit_user_mentions_in_html(&sanitize_html(&first_inner_html(&parsed, &SEL_USER_BIO)));
 	user.external_links = Vec::<ExternalLink>::new();
 
 	if let Some(details) = parsed.select(&SEL_USER_DETAILS).next() {

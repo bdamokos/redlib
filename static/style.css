@@ -2978,6 +2978,12 @@ a.redgifs_uploader_mismatch {
     font-weight: bold;
 }
 
+.linked_users_in_title {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 600;
+}
+
 .post_bookmark_activity {
     font-size: 12px;
     font-weight: 600;

@@ -973,6 +973,18 @@ impl Default for Post {
 }
 
 impl Post {
+	pub fn title_html(&self) -> String {
+		link_reddit_user_mentions_in_plain_text(&self.title)
+	}
+
+	pub fn linked_users_in_title_helper_html(&self) -> String {
+		linked_users_in_title_helper_html(&self.title)
+	}
+
+	pub fn link_title_helper_html(&self) -> String {
+		linked_users_in_title_helper_html(&self.link_title)
+	}
+
 	/// Fetch posts of a user or subreddit and return a vector of posts and the "after" value
 	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {
 		// Send a request to the url
@@ -1361,6 +1373,12 @@ pub struct User {
 	pub bio_html: String,
 	pub external_links: Vec<ExternalLink>,
 	pub nsfw: bool,
+}
+
+impl User {
+	pub fn description_html(&self) -> String {
+		link_reddit_user_mentions_in_plain_text(&self.description)
+	}
 }
 
 const AUTHOR_LINKS_CACHE_SIZE: usize = 512;
@@ -3921,11 +3939,189 @@ static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 static HTML_HREF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="([^"]+)""#).unwrap());
 static PLAIN_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
 static BARE_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\b(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>"']*)?"#).unwrap());
+static REDDIT_USER_MENTION_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(^|[^A-Za-z0-9_/])u/([A-Za-z0-9_-]{2,20})").unwrap());
 static PROFILE_SOCIAL_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"data-faceplate-tracking-context="([^"]*social_link[^"]*)""#).unwrap());
 static LINKTREE_NEXT_DATA_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>"#).unwrap());
 static ALLMYLINKS_DATA_X_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bdata-x-url="([^"]+)""#).unwrap());
 static ALLMYLINKS_TITLE_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\btitle="(https?://[^"]+)""#).unwrap());
 static PERCENT_ENCODED_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)https?%3A%2F%2F[^\s<>"']+"#).unwrap());
+
+fn is_reddit_username_char(ch: char) -> bool {
+	ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn has_reddit_username_boundary_after(input: &str, index: usize) -> bool {
+	match input[index..].chars().next() {
+		Some(ch) => !is_reddit_username_char(ch),
+		None => true,
+	}
+}
+
+fn escape_html_text(input: &str) -> String {
+	let mut escaped = String::with_capacity(input.len());
+	for ch in input.chars() {
+		match ch {
+			'&' => escaped.push_str("&amp;"),
+			'<' => escaped.push_str("&lt;"),
+			'>' => escaped.push_str("&gt;"),
+			'"' => escaped.push_str("&quot;"),
+			'\'' => escaped.push_str("&#39;"),
+			_ => escaped.push(ch),
+		}
+	}
+	escaped
+}
+
+fn push_user_mention_text(output: &mut String, text: &str, escape_text: bool) {
+	if escape_text {
+		output.push_str(&escape_html_text(text));
+	} else {
+		output.push_str(text);
+	}
+}
+
+fn link_reddit_user_mentions_in_text_segment(input: &str, escape_text: bool) -> String {
+	let mut output = String::new();
+	let mut last = 0;
+
+	for capture in REDDIT_USER_MENTION_REGEX.captures_iter(input) {
+		let Some(username_match) = capture.get(2) else {
+			continue;
+		};
+		if !has_reddit_username_boundary_after(input, username_match.end()) {
+			continue;
+		}
+
+		let mention_start = username_match.start().saturating_sub("u/".len());
+		push_user_mention_text(&mut output, &input[last..mention_start], escape_text);
+
+		let mention_text = &input[mention_start..username_match.end()];
+		let username = username_match.as_str();
+		output.push_str(r#"<a class="user_mention" href="/user/"#);
+		output.push_str(username);
+		output.push_str(r#"">"#);
+		push_user_mention_text(&mut output, mention_text, escape_text);
+		output.push_str("</a>");
+
+		last = username_match.end();
+	}
+
+	if last == 0 {
+		if escape_text {
+			return escape_html_text(input);
+		}
+		return input.to_string();
+	}
+
+	push_user_mention_text(&mut output, &input[last..], escape_text);
+	output
+}
+
+pub fn link_reddit_user_mentions_in_plain_text(input: &str) -> String {
+	link_reddit_user_mentions_in_text_segment(input, true)
+}
+
+fn html_tag_name(tag: &str) -> Option<(&str, bool)> {
+	let trimmed = tag.trim_start_matches('<').trim_start();
+	if trimmed.starts_with('!') || trimmed.starts_with('?') {
+		return None;
+	}
+
+	let (closing, name_start) = if let Some(rest) = trimmed.strip_prefix('/') {
+		(true, rest.trim_start())
+	} else {
+		(false, trimmed)
+	};
+
+	let end = name_start.find(|ch: char| ch.is_ascii_whitespace() || ch == '>' || ch == '/').unwrap_or(name_start.len());
+	if end == 0 {
+		return None;
+	}
+
+	Some((&name_start[..end], closing))
+}
+
+pub fn link_reddit_user_mentions_in_html(input: &str) -> String {
+	let mut output = String::with_capacity(input.len());
+	let mut index = 0;
+	let mut anchor_depth = 0usize;
+
+	while index < input.len() {
+		if input.as_bytes()[index] == b'<' {
+			let Some(relative_end) = input[index..].find('>') else {
+				let segment = &input[index..];
+				if anchor_depth > 0 {
+					output.push_str(segment);
+				} else {
+					output.push_str(&link_reddit_user_mentions_in_text_segment(segment, false));
+				}
+				break;
+			};
+
+			let tag_end = index + relative_end + 1;
+			let tag = &input[index..tag_end];
+			if let Some((name, closing)) = html_tag_name(tag) {
+				if name.eq_ignore_ascii_case("a") {
+					if closing {
+						anchor_depth = anchor_depth.saturating_sub(1);
+					} else if !tag.trim_end().ends_with("/>") {
+						anchor_depth += 1;
+					}
+				}
+			}
+			output.push_str(tag);
+			index = tag_end;
+			continue;
+		}
+
+		let next_tag = input[index..].find('<').map_or(input.len(), |relative| index + relative);
+		let segment = &input[index..next_tag];
+		if anchor_depth > 0 {
+			output.push_str(segment);
+		} else {
+			output.push_str(&link_reddit_user_mentions_in_text_segment(segment, false));
+		}
+		index = next_tag;
+	}
+
+	output
+}
+
+fn reddit_user_mentions(input: &str) -> Vec<String> {
+	let mut mentions = Vec::new();
+	let mut seen = HashSet::new();
+
+	for capture in REDDIT_USER_MENTION_REGEX.captures_iter(input) {
+		let Some(username_match) = capture.get(2) else {
+			continue;
+		};
+		if !has_reddit_username_boundary_after(input, username_match.end()) {
+			continue;
+		}
+
+		let username = username_match.as_str();
+		if seen.insert(username.to_ascii_lowercase()) {
+			mentions.push(username.to_string());
+		}
+	}
+
+	mentions
+}
+
+fn linked_users_in_title_helper_html(title: &str) -> String {
+	let mentions = reddit_user_mentions(title);
+	if mentions.is_empty() {
+		return String::new();
+	}
+
+	let links = mentions
+		.iter()
+		.map(|username| format!(r#"<a class="user_mention" href="/user/{username}">u/{}</a>"#, escape_html_text(username)))
+		.collect::<Vec<_>>()
+		.join(", ");
+
+	format!(r#"<p class="linked_users_in_title">linked users in title: {links}</p>"#)
+}
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
@@ -3949,7 +4145,7 @@ pub fn rewrite_urls(input_text: &str) -> String {
 	// Rewrite external media previews to Redlib
 	loop {
 		if REDDIT_PREVIEW_REGEX.find(&text1).is_none() {
-			return text1;
+			return link_reddit_user_mentions_in_html(&text1);
 		} else {
 			let formatted_url = format_url(REDDIT_PREVIEW_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default());
 
@@ -5878,7 +6074,7 @@ mod tests {
 		hydrate_post_author_links_from_cache, is_creator_archive_link, is_creator_profile_overview_link, post_feedback_score_adjustment, post_feedback_summary_affinity,
 		read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links, store_subreddit_users, time,
 		user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media,
-		Post, PostFeedbackEntry, PostFeedbackSummary, Preferences,
+		Post, PostFeedbackEntry, PostFeedbackSummary, Preferences, User,
 	};
 	use crate::cache_persistence::PersistedSubredditUsersEntry;
 	use crate::client::{PeerRateLimitStatus, RedditRateLimitState, RedditRateLimitStatus};
@@ -6207,6 +6403,43 @@ mod tests {
 	}
 
 	#[test]
+	fn links_reddit_user_mentions_in_plain_text() {
+		assert_eq!(
+			super::link_reddit_user_mentions_in_plain_text(r#"Hello U/Demo_User and <u/not_html>"#),
+			r#"Hello <a class="user_mention" href="/user/Demo_User">U/Demo_User</a> and &lt;<a class="user_mention" href="/user/not_html">u/not_html</a>&gt;"#
+		);
+	}
+
+	#[test]
+	fn rewrite_urls_links_user_mentions_outside_existing_links() {
+		assert_eq!(
+			rewrite_urls(r#"<div class="md"><p>Thanks u/Alice and <a href="https://example.com/u/Bob">u/Bob</a>.</p></div>"#),
+			r#"<div class="md"><p>Thanks <a class="user_mention" href="/user/Alice">u/Alice</a> and <a href="https://example.com/u/Bob">u/Bob</a>.</p></div>"#
+		);
+	}
+
+	#[test]
+	fn linked_users_in_title_helper_dedupes_title_mentions() {
+		assert_eq!(
+			super::linked_users_in_title_helper_html("Credit to u/Alice and U/alice plus u/Bob."),
+			r#"<p class="linked_users_in_title">linked users in title: <a class="user_mention" href="/user/Alice">u/Alice</a>, <a class="user_mention" href="/user/Bob">u/Bob</a></p>"#
+		);
+	}
+
+	#[test]
+	fn user_description_html_links_reddit_user_mentions() {
+		let user = User {
+			description: "Bio points to u/Alice & friends".to_string(),
+			..User::default()
+		};
+
+		assert_eq!(
+			user.description_html(),
+			r#"Bio points to <a class="user_mention" href="/user/Alice">u/Alice</a> &amp; friends"#
+		);
+	}
+
+	#[test]
 	fn hydrate_post_author_links_from_cache_refreshes_avg_video_length() {
 		let _guard = crate::materialized_catalog::MATERIALIZED_CATALOG_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 		crate::user::clear_test_caches();
@@ -6344,13 +6577,14 @@ mod tests {
 	#[test]
 	fn extracts_external_links_from_user_profile_details() {
 		let profile = user_profile_details(&json!({
-			"public_description": "Find me elsewhere https://paa.ge/example",
+			"public_description": "Find me elsewhere https://paa.ge/example and u/Alice",
 			"public_description_html": "<div class=\"md\"><p>Also on https://reddit.com/u/example</p></div>",
 			"description": "https://fansly.com/example",
-			"description_html": "<div class=\"md\"><p><a href=\"https://fansly.com/example\">Fansly</a> <a href=\"https://www.reddit.com/u/example\">Reddit</a></p></div>"
+			"description_html": "<div class=\"md\"><p>Credits u/Bob <a href=\"https://fansly.com/example\">Fansly</a> <a href=\"https://www.reddit.com/u/example\">Reddit</a></p></div>"
 		}));
 
-		assert_eq!(profile.blurb, "Find me elsewhere https://paa.ge/example");
+		assert_eq!(profile.blurb, "Find me elsewhere https://paa.ge/example and u/Alice");
+		assert!(profile.bio_html.contains(r#"<a class="user_mention" href="/user/Bob">u/Bob</a>"#));
 		assert_eq!(profile.external_links.len(), 2);
 		assert_eq!(profile.external_links[0].host, "fansly.com");
 		assert_eq!(profile.external_links[0].icon_path, "/site_icon/fansly.com");
