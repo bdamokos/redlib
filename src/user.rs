@@ -3575,6 +3575,12 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let mut fragment = fragment;
 	utils::hydrate_post_author_links_from_cache(&mut fragment.posts);
 	utils::refresh_post_times(&mut fragment.posts);
+	crate::observed_semantic_backfill::enqueue_observed_user_posts(
+		&username,
+		&format!("user:{username}:{}:direct-page", fragment.listing),
+		&fragment.posts,
+		crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
+	);
 	let body = fragment.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)

@@ -194,6 +194,10 @@ fn now_unix() -> u64 {
 	crate::cache_persistence::unix_now()
 }
 
+fn semantic_target_label(target: &str) -> String {
+	target.strip_prefix("u_").map_or_else(|| format!("r/{target}"), |username| format!("u/{username}"))
+}
+
 fn update_activity<F>(subreddit: &str, update: F)
 where
 	F: FnOnce(&mut ObservedBackfillActivity),
@@ -400,6 +404,27 @@ pub fn enqueue_observed_posts(source_key: &str, posts: &[Post], priority: Observ
 	}
 }
 
+pub fn enqueue_observed_user_posts(username: &str, source_key: &str, posts: &[Post], priority: ObservedBackfillPriority) {
+	if !observed_backfill_enabled() || posts.is_empty() {
+		return;
+	}
+
+	let options = subreddit_content_semantics::corpus_options_from_env();
+	let candidates = subreddit_content_semantics::runtime_user_post_embedding_candidates(username, source_key, posts, options.max_text_chars_per_post)
+		.into_iter()
+		.filter(|candidate| subreddit_content_semantics::post_candidate_needs_embedding(candidate, &crate::subreddit_semantics::embedding_model()))
+		.collect::<Vec<_>>();
+	let candidate_count = candidates.len();
+	let queued = enqueue_candidates(candidates, priority);
+	if queued > 0 {
+		info!(
+			"observed_semantic_backfill: queued {} post candidates for user {} from {} ({:?})",
+			candidate_count, username, source_key, priority
+		);
+		OBSERVED_BACKFILL_NOTIFY.notify_one();
+	}
+}
+
 fn pop_next_job() -> Option<ObservedBackfillJob> {
 	let Ok(mut queue) = OBSERVED_BACKFILL_QUEUE.lock() else {
 		return None;
@@ -469,7 +494,8 @@ async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome
 			continue;
 		}
 
-		let prompt = format!("r/{}\nCached post title and text:\n{}", candidate.subreddit, candidate.text);
+		let semantic_target = semantic_target_label(&candidate.subreddit);
+		let prompt = format!("{semantic_target}\nCached post title and text:\n{}", candidate.text);
 		match ollama_embedding(&client, &base_url, &model, &prompt).await {
 			Ok(embedding) => {
 				let embedded_at_unix = now_unix();
@@ -485,13 +511,13 @@ async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome
 					Err(error) => {
 						outcome.failed += 1;
 						mark_failed_activity(&candidate.subreddit);
-						warn!("observed_semantic_backfill: failed to store r/{} embedding: {}", candidate.subreddit, error);
+						warn!("observed_semantic_backfill: failed to store {semantic_target} embedding: {error}");
 					}
 				}
 			}
 			Err(error) => {
 				mark_failed_activity(&candidate.subreddit);
-				return Err(format!("embedding failed for r/{}: {error}", candidate.subreddit));
+				return Err(format!("embedding failed for {semantic_target}: {error}"));
 			}
 		}
 
@@ -583,5 +609,11 @@ mod tests {
 		let grouped = group_candidates_by_subreddit(vec![candidate("rust", "b", 2), candidate("go", "a", 1), candidate("rust", "a", 1)]);
 		assert_eq!(grouped["rust"].iter().map(|candidate| candidate.post_key_hash.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
 		assert_eq!(grouped["go"].len(), 1);
+	}
+
+	#[test]
+	fn semantic_target_label_distinguishes_users_from_subreddits() {
+		assert_eq!(semantic_target_label("rust"), "r/rust");
+		assert_eq!(semantic_target_label("u_exampleuser"), "u/exampleuser");
 	}
 }

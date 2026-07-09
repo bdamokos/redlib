@@ -602,7 +602,7 @@ fn source_key_label(source_key: &PersistedContentCatalogSourceKey) -> String {
 
 fn post_embedding_candidate(subreddit: &str, identity: &str, text: String, source_key: &str, created_ts: u64) -> Option<SubredditContentPostEmbeddingCandidate> {
 	let subreddit = crate::subreddit_semantics::normalize_subreddit_name(subreddit);
-	if subreddit.is_empty() || subreddit.starts_with("u_") {
+	if subreddit.is_empty() {
 		return None;
 	}
 	let text = compact_text(&text);
@@ -623,6 +623,45 @@ fn post_embedding_candidate(subreddit: &str, identity: &str, text: String, sourc
 		created_ts,
 		text_chars,
 	})
+}
+
+/// Build embedding candidates for a user's own aggregate vibe vector.
+///
+/// Ordinary runtime candidates remain grouped by the post's subreddit. User
+/// pages call this explicitly so the same bounded post sample also contributes
+/// to a separate `u_<username>` aggregate.
+pub fn runtime_user_post_embedding_candidates(
+	username: &str,
+	source_key: &str,
+	posts: &[crate::utils::Post],
+	max_text_chars_per_post: usize,
+) -> Vec<SubredditContentPostEmbeddingCandidate> {
+	let username = username.trim().trim_start_matches("/u/").trim_start_matches("u/").trim();
+	if username.is_empty() {
+		return Vec::new();
+	}
+	let user_target = format!("u_{}", username.to_lowercase());
+	let mut candidates_by_post = HashMap::<String, SubredditContentPostEmbeddingCandidate>::new();
+	for post in posts {
+		let Some(text) = content_text_for_runtime_post(post, max_text_chars_per_post) else {
+			continue;
+		};
+		let identity = runtime_post_identity(post);
+		if let Some(candidate) = post_embedding_candidate(&user_target, &identity, text, source_key, post.created_ts) {
+			candidates_by_post
+				.entry(candidate.post_key_hash.clone())
+				.and_modify(|existing| {
+					if candidate.created_ts > existing.created_ts {
+						*existing = candidate.clone();
+					}
+				})
+				.or_insert(candidate);
+		}
+	}
+
+	let mut candidates = candidates_by_post.into_values().collect::<Vec<_>>();
+	candidates.sort_by(|left, right| left.created_ts.cmp(&right.created_ts).then_with(|| left.post_key_hash.cmp(&right.post_key_hash)));
+	candidates
 }
 
 pub fn runtime_post_embedding_candidates(source_key: &str, posts: &[crate::utils::Post], max_text_chars_per_post: usize) -> Vec<SubredditContentPostEmbeddingCandidate> {
@@ -1506,6 +1545,63 @@ mod tests {
 	fn normalized_embedding_rejects_zero_vector() {
 		assert!(normalized_embedding(vec![0.0, 0.0]).is_none());
 		assert!(normalized_embedding(vec![1.0, 0.0]).is_some());
+	}
+
+	#[test]
+	fn user_runtime_candidates_target_the_user_instead_of_the_post_subreddit() {
+		let post = crate::utils::Post {
+			id: "post-1".to_string(),
+			title: "A useful submission".to_string(),
+			community: "rust".to_string(),
+			body: "Async runtimes and task scheduling".to_string(),
+			created_ts: 123,
+			..crate::utils::Post::default()
+		};
+
+		let candidates = runtime_user_post_embedding_candidates("ExampleUser", "user:ExampleUser:overview", &[post], 360);
+
+		assert_eq!(candidates.len(), 1);
+		assert_eq!(candidates[0].subreddit, "u_exampleuser");
+		assert_eq!(candidates[0].created_ts, 123);
+		assert!(candidates[0].text.contains("A useful submission"));
+	}
+
+	#[test]
+	fn user_candidate_is_stored_as_its_own_aggregate_vector() {
+		let _guard = TEST_CACHE_LOCK.lock().unwrap();
+		clear_test_cache();
+		let post = crate::utils::Post {
+			id: "post-1".to_string(),
+			title: "A useful submission".to_string(),
+			community: "rust".to_string(),
+			body: "Async runtimes and task scheduling".to_string(),
+			created_ts: 123,
+			..crate::utils::Post::default()
+		};
+		let candidate = runtime_user_post_embedding_candidates("ExampleUser", "user:ExampleUser:overview", &[post], 360)
+			.into_iter()
+			.next()
+			.unwrap();
+
+		assert!(store_post_aggregate_embedding(&candidate, "test-model", vec![3.0, 4.0], 200).unwrap());
+		let stored = active_entries_for_model("test-model").into_iter().find(|entry| entry.subreddit == "u_exampleuser").unwrap();
+
+		assert_eq!(stored.post_count, 1);
+		assert_eq!(stored.vector_sum, vec![0.6, 0.8]);
+		assert_eq!(stored.embedding, vec![0.6, 0.8]);
+	}
+
+	#[test]
+	fn ordinary_runtime_candidates_still_reject_user_pseudo_communities() {
+		let post = crate::utils::Post {
+			id: "post-1".to_string(),
+			title: "A useful submission".to_string(),
+			community: "u_exampleuser".to_string(),
+			created_ts: 123,
+			..crate::utils::Post::default()
+		};
+
+		assert!(runtime_post_embedding_candidates("subreddit:u_exampleuser:new", &[post], 360).is_empty());
 	}
 
 	#[test]
