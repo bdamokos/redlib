@@ -11,7 +11,8 @@
   The active integration branch for parallel Redlib work is `feature/video-audio`. Feature and fix threads should work there by default; if they use a temporary `codex/...` branch or separate worktree, merge or rebase the finished work into `feature/video-audio` before deployment handoff unless the user explicitly asks for a different target.
   If there are parallel active threads or workstreams that could also affect deployment, spawn or defer to an orchestrator thread that can coordinate those parallel changes and manage the final deploy ordering.
 - Persistent deployment thread:
-  The designated Redlib deployment coordinator thread is `019f0411-87a6-7112-a4a8-a005a28d3ee6`.
+  The designated Redlib deployment coordinator thread is `019f4cf0-4037-7101-addd-8dd170284f6b`.
+  The previous coordinator thread `019f0411-87a6-7112-a4a8-a005a28d3ee6` is archived and must not receive new deployment requests.
   Defer Raspberry Pi deployment requests to that thread instead of running `./deploy.sh` directly from feature or fix threads, unless the user explicitly tells the current thread to bypass the coordinator.
   Deployment requests should include the originating thread id, branch, commit SHA, validation summary, and whether the request is urgent.
   The deployment coordinator queues requests, batches compatible requests when practical, and runs `./deploy.sh` from the repo root once the deployable work is committed.

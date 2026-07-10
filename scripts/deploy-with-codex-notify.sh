@@ -11,8 +11,8 @@ the command exits. A watchdog sends one "still running" message if the command i
 still active after five minutes.
 
 Environment:
-  CODEX_NOTIFY_THREAD_ID       Default: 019f0411-87a6-7112-a4a8-a005a28d3ee6
-  CODEX_NOTIFY_BIN             Default: /Applications/Codex.app/Contents/Resources/codex
+  CODEX_NOTIFY_THREAD_ID       Default: 019f4cf0-4037-7101-addd-8dd170284f6b
+  CODEX_NOTIFY_BIN             Default: /Applications/ChatGPT.app/Contents/Resources/codex
   CODEX_NOTIFY_WATCHDOG_SECS   Default: 300
   CODEX_NOTIFY_SEND_TIMEOUT_SECS Default: 60
   CODEX_NOTIFY_LOG_DIR         Default: /tmp/redlib-deploy-notify
@@ -34,8 +34,8 @@ if [[ $# -eq 0 ]]; then
 	exit 2
 fi
 
-THREAD_ID="${CODEX_NOTIFY_THREAD_ID:-019f0411-87a6-7112-a4a8-a005a28d3ee6}"
-CODEX_BIN="${CODEX_NOTIFY_BIN:-/Applications/Codex.app/Contents/Resources/codex}"
+THREAD_ID="${CODEX_NOTIFY_THREAD_ID:-019f4cf0-4037-7101-addd-8dd170284f6b}"
+CODEX_BIN="${CODEX_NOTIFY_BIN:-/Applications/ChatGPT.app/Contents/Resources/codex}"
 WATCHDOG_SECS="${CODEX_NOTIFY_WATCHDOG_SECS:-300}"
 SEND_TIMEOUT_SECS="${CODEX_NOTIFY_SEND_TIMEOUT_SECS:-60}"
 LOG_DIR="${CODEX_NOTIFY_LOG_DIR:-/tmp/redlib-deploy-notify}"
