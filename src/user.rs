@@ -6,7 +6,7 @@ use crate::instance_scrape;
 use crate::redgifs;
 use crate::server::RequestExt;
 use crate::utils::{error, filter_posts, format_num, format_url, get_filters, param, setting, template, FollowingComment, ParentComment, Post, Preferences, User};
-use crate::{config, utils, video_mode};
+use crate::{config, peer_api_fallback, utils, video_mode};
 use askama::Template;
 use chrono::DateTime;
 use htmlescape::decode_html;
@@ -3269,7 +3269,22 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let sort = param(&path, "sort").unwrap_or_default();
 	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
 	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
-	let pre_scraped = if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
+	let mut pre_peer = if !video_listing
+		&& !peer_api_fallback::request_is_peer_api_fallback(&req)
+		&& (peer_api_fallback::request_should_force_peer_api_fallback(&req) || instance_scrape::reddit_rate_limited_now())
+	{
+		info!("user: using configured Redlib peer API for {} before a local Reddit request", current_url);
+		match peer_api_fallback::fetch_user_listing(&username, &listing, &sort, Some(query)).await {
+			Ok(peer) => Some(peer),
+			Err(peer_error) => {
+				warn!("user: preemptive Redlib peer API fallback failed for {}: {}", current_url, peer_error);
+				None
+			}
+		}
+	} else {
+		None
+	};
+	let pre_scraped = if pre_peer.is_none() && instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
 		info!("user: using scrape fallback for {} because Reddit is currently rate limited", current_url);
 		match instance_scrape::scrape_user_page(&current_url).await {
 			Ok(scraped) => Some(scraped),
@@ -3281,13 +3296,14 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	} else {
 		None
 	};
-	let mut user = pre_scraped
+	let mut user = pre_peer
 		.as_ref()
-		.map(|scraped| scraped.user.clone())
+		.map(|peer| peer.user.clone())
+		.or_else(|| pre_scraped.as_ref().map(|scraped| scraped.user.clone()))
 		.unwrap_or_else(|| cached_or_placeholder_user(&username));
 	let mut status_notice = String::new();
 	let mut upstream_user_unavailable = false;
-	if pre_scraped.is_none() {
+	if pre_peer.is_none() && pre_scraped.is_none() {
 		match tokio::time::timeout(StdDuration::from_secs(4), fetch_user_metadata_status(&username)).await {
 			Ok(Ok(fresh_user)) => {
 				user = fresh_user;
@@ -3303,6 +3319,19 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			Err(_) => {
 				warn!("user: profile metadata timed out for u/{username}");
 			}
+		}
+	}
+	if !video_listing && pre_peer.is_none() && pre_scraped.is_none() && !peer_api_fallback::request_is_peer_api_fallback(&req) && instance_scrape::reddit_rate_limited_now() {
+		info!(
+			"user: quota state changed while loading metadata for {}; switching listing to configured Redlib peer API",
+			current_url
+		);
+		match peer_api_fallback::fetch_user_listing(&username, &listing, &sort, Some(query)).await {
+			Ok(peer) => {
+				user = peer.user.clone();
+				pre_peer = Some(peer);
+			}
+			Err(peer_error) => warn!("user: Redlib peer API fallback failed after metadata request for {}: {}", current_url, peer_error),
 		}
 	}
 	let coomer_recent_posts: Option<utils::CoomerRecentPostsPanel> = None;
@@ -3456,7 +3485,26 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		};
 		let mut fallback_notice = String::new();
 		let maybe_scraped = pre_scraped;
-		let (fragment_user, posts, cached_post_ids, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some(scraped) = maybe_scraped {
+		let (fragment_user, posts, cached_post_ids, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some(peer) = pre_peer {
+			store_user_metadata(&username, &peer.user);
+			utils::store_post_flairs(&peer.posts);
+			utils::store_user_subreddits(&username, &peer.posts);
+			crate::materialized_catalog::record_author_history_from_posts(&peer.posts);
+			store_live_listing_cache(&peer.posts, &peer.after);
+			let mut peer_posts = peer.posts;
+			let (_, all_peer_posts_filtered) = filter_posts(&mut peer_posts, &filters);
+			let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(peer_posts, all_peer_posts_filtered);
+			fallback_notice = join_notices(&status_notice, peer_api_fallback::peer_api_notice());
+			(
+				peer.user,
+				posts,
+				cached_post_ids,
+				(String::new(), peer.after),
+				String::new(),
+				String::new(),
+				all_posts_filtered,
+			)
+		} else if let Some(scraped) = maybe_scraped {
 			store_user_metadata(&username, &scraped.user);
 			utils::store_post_flairs(&scraped.posts);
 			utils::store_user_subreddits(&username, &scraped.posts);
@@ -3515,27 +3563,56 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 						merged.all_cached_posts_filtered,
 					)
 				}
-				Err(msg) if instance_scrape::instance_scrape_enabled() && instance_scrape::should_attempt_scrape_fallback(&msg) => {
-					info!("user: retrying {} via scrape fallback after listing error: {}", current_url, msg);
-					let scraped = instance_scrape::scrape_user_page(&current_url).await.map_err(|_| msg.clone())?;
-					store_user_metadata(&username, &scraped.user);
-					utils::store_post_flairs(&scraped.posts);
-					utils::store_user_subreddits(&username, &scraped.posts);
-					crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
-					store_live_listing_cache(&scraped.posts, &scraped.after);
-					let mut scraped_posts = scraped.posts.clone();
-					let (_, all_scraped_posts_filtered) = filter_posts(&mut scraped_posts, &filters);
-					let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(scraped_posts, all_scraped_posts_filtered);
-					fallback_notice = join_notices(&status_notice, instance_scrape::scrape_notice());
-					(
-						scraped.user,
-						posts,
-						cached_post_ids,
-						(String::new(), scraped.after),
-						String::new(),
-						String::new(),
-						all_posts_filtered,
-					)
+				Err(msg) if !peer_api_fallback::request_is_peer_api_fallback(&req) && instance_scrape::should_attempt_scrape_fallback(&msg) => {
+					info!("user: retrying {} via configured Redlib peer API after listing error: {}", current_url, msg);
+					match peer_api_fallback::fetch_user_listing(&username, &listing, &sort, Some(query)).await {
+						Ok(peer) => {
+							store_user_metadata(&username, &peer.user);
+							utils::store_post_flairs(&peer.posts);
+							utils::store_user_subreddits(&username, &peer.posts);
+							crate::materialized_catalog::record_author_history_from_posts(&peer.posts);
+							store_live_listing_cache(&peer.posts, &peer.after);
+							let mut peer_posts = peer.posts;
+							let (_, all_peer_posts_filtered) = filter_posts(&mut peer_posts, &filters);
+							let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(peer_posts, all_peer_posts_filtered);
+							fallback_notice = join_notices(&status_notice, peer_api_fallback::peer_api_notice());
+							(
+								peer.user,
+								posts,
+								cached_post_ids,
+								(String::new(), peer.after),
+								String::new(),
+								String::new(),
+								all_posts_filtered,
+							)
+						}
+						Err(peer_error) if instance_scrape::instance_scrape_enabled() => {
+							warn!("user: Redlib peer API fallback failed for {}: {}; trying scrape fallback", current_url, peer_error);
+							let scraped = instance_scrape::scrape_user_page(&current_url).await.map_err(|_| msg.clone())?;
+							store_user_metadata(&username, &scraped.user);
+							utils::store_post_flairs(&scraped.posts);
+							utils::store_user_subreddits(&username, &scraped.posts);
+							crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
+							store_live_listing_cache(&scraped.posts, &scraped.after);
+							let mut scraped_posts = scraped.posts.clone();
+							let (_, all_scraped_posts_filtered) = filter_posts(&mut scraped_posts, &filters);
+							let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(scraped_posts, all_scraped_posts_filtered);
+							fallback_notice = join_notices(&status_notice, instance_scrape::scrape_notice());
+							(
+								scraped.user,
+								posts,
+								cached_post_ids,
+								(String::new(), scraped.after),
+								String::new(),
+								String::new(),
+								all_posts_filtered,
+							)
+						}
+						Err(peer_error) => {
+							warn!("user: Redlib peer API fallback failed for {}: {}", current_url, peer_error);
+							return Err(msg);
+						}
+					}
 				}
 				Err(msg) => {
 					warn!("user: direct listing request failed for {} without usable scrape fallback: {}", current_url, msg);

@@ -48,6 +48,8 @@ struct UserResponse {
 	user: User,
 	posts: Vec<Post>,
 	after: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	peer_origin: Option<String>,
 	all_posts_filtered: bool,
 	all_posts_hidden_nsfw: bool,
 }
@@ -303,6 +305,27 @@ pub async fn user_listing(req: Request<Body>) -> Result<Response<Body>, String> 
 	if !matches!(listing.as_str(), "overview" | "submitted" | "comments") {
 		return json_error("Unsupported user listing", 400);
 	}
+	let sort = query_param(&req, "sort").unwrap_or_else(|| default_user_sort(&req));
+	let should_preemptively_use_peer = !peer_api_fallback::request_is_peer_api_fallback(&req)
+		&& (peer_api_fallback::request_should_force_peer_api_fallback(&req) || crate::instance_scrape::reddit_rate_limited_now());
+	if should_preemptively_use_peer {
+		info!("json_api: using configured Redlib peer API for u/{username}/{listing} before a local Reddit request");
+		match peer_api_fallback::fetch_user_listing(&username, &listing, &sort, req.uri().query()).await {
+			Ok(peer) => {
+				let mut posts = peer.posts;
+				let (all_posts_filtered, all_posts_hidden_nsfw) = finalize_posts(&req, &mut posts, false);
+				return json_response(UserResponse {
+					user: peer.user,
+					posts,
+					after: after_value(peer.after),
+					peer_origin: Some(peer.origin),
+					all_posts_filtered,
+					all_posts_hidden_nsfw,
+				});
+			}
+			Err(error) => warn!("json_api: Redlib peer API fallback failed for u/{username}/{listing}: {error}"),
+		}
+	}
 
 	let defaults = if has_query_param(&req, "sort") {
 		Vec::new()
@@ -313,7 +336,27 @@ pub async fn user_listing(req: Request<Body>) -> Result<Response<Body>, String> 
 	let path = format!("/user/{username}/{listing}.json?{query}");
 	let (mut posts, after) = match Post::fetch(&path, false).await {
 		Ok(result) => result,
-		Err(msg) => return upstream_error(msg),
+		Err(msg) => {
+			if !peer_api_fallback::request_is_peer_api_fallback(&req) && crate::instance_scrape::should_attempt_scrape_fallback(&msg) {
+				info!("json_api: retrying user listing u/{username}/{listing} through configured Redlib peer API after upstream error: {msg}");
+				match peer_api_fallback::fetch_user_listing(&username, &listing, &sort, req.uri().query()).await {
+					Ok(peer) => {
+						let mut posts = peer.posts;
+						let (all_posts_filtered, all_posts_hidden_nsfw) = finalize_posts(&req, &mut posts, false);
+						return json_response(UserResponse {
+							user: peer.user,
+							posts,
+							after: after_value(peer.after),
+							peer_origin: Some(peer.origin),
+							all_posts_filtered,
+							all_posts_hidden_nsfw,
+						});
+					}
+					Err(error) => warn!("json_api: Redlib peer API fallback failed for u/{username}/{listing}: {error}"),
+				}
+			}
+			return upstream_error(msg);
+		}
 	};
 	let (all_posts_filtered, all_posts_hidden_nsfw) = finalize_posts(&req, &mut posts, false);
 	let user = crate::user::fetch_user_metadata_status(&username).await.unwrap_or_else(|_| User {
@@ -325,6 +368,7 @@ pub async fn user_listing(req: Request<Body>) -> Result<Response<Body>, String> 
 		user,
 		posts,
 		after: after_value(after),
+		peer_origin: None,
 		all_posts_filtered,
 		all_posts_hidden_nsfw,
 	})
@@ -407,7 +451,8 @@ pub async fn post(req: Request<Body>) -> Result<Response<Body>, String> {
 
 #[cfg(test)]
 mod tests {
-	use super::{api_metadata, upstream_error, ApiEnvelope, ListingResponse};
+	use super::{api_metadata, upstream_error, ApiEnvelope, ListingResponse, UserResponse};
+	use crate::utils::User;
 	use hyper::body;
 
 	#[test]
@@ -447,6 +492,31 @@ mod tests {
 			all_posts_hidden_nsfw: false,
 		})
 		.expect("listing response should serialize");
+		assert_eq!(peer["peer_origin"], "http://192.168.50.251:18081");
+	}
+
+	#[test]
+	fn user_response_serializes_peer_origin_only_when_present() {
+		let normal = serde_json::to_value(UserResponse {
+			user: User::default(),
+			posts: Vec::new(),
+			after: None,
+			peer_origin: None,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+		})
+		.expect("user response should serialize");
+		assert!(normal.get("peer_origin").is_none());
+
+		let peer = serde_json::to_value(UserResponse {
+			user: User::default(),
+			posts: Vec::new(),
+			after: None,
+			peer_origin: Some("http://192.168.50.251:18081".to_string()),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+		})
+		.expect("user response should serialize");
 		assert_eq!(peer["peer_origin"], "http://192.168.50.251:18081");
 	}
 

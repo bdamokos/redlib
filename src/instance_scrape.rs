@@ -14,7 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 use url::Url;
 
-use crate::client::{latest_ratelimit_snapshot, CLIENT};
+use crate::client::{current_ratelimit_status, RedditRateLimitState, CLIENT};
 use crate::config::get_setting;
 use crate::utils::{cached_author_external_links, format_num, Author, Awards, Comment, ExternalLink, Flags, Flair, Media, Post, Preferences, Subreddit, User};
 
@@ -148,7 +148,7 @@ pub(crate) fn should_attempt_scrape_fallback(error: &str) -> bool {
 }
 
 pub(crate) fn reddit_rate_limited_now() -> bool {
-	latest_ratelimit_snapshot().is_some_and(|snapshot| snapshot.is_rate_limited())
+	matches!(current_ratelimit_status().state, RedditRateLimitState::Limited | RedditRateLimitState::Cooldown)
 }
 
 pub(crate) fn apply_comment_prefs(comments: &mut [Comment], prefs: &Preferences) {

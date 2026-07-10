@@ -1,6 +1,6 @@
 use crate::client;
 use crate::config::get_setting;
-use crate::utils::{Post, Subreddit};
+use crate::utils::{Post, Subreddit, User};
 use hyper::body::to_bytes;
 use hyper::client::HttpConnector;
 use hyper::header::{HeaderValue, ACCEPT, USER_AGENT};
@@ -44,6 +44,14 @@ pub(crate) struct PeerSubredditListing {
 	pub(crate) after: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct PeerUserListing {
+	pub(crate) origin: String,
+	pub(crate) user: User,
+	pub(crate) posts: Vec<Post>,
+	pub(crate) after: String,
+}
+
 #[derive(Deserialize)]
 struct ApiEnvelope<T> {
 	data: Option<T>,
@@ -53,6 +61,13 @@ struct ApiEnvelope<T> {
 #[derive(Deserialize)]
 struct PeerListingResponse {
 	subreddit: Option<Subreddit>,
+	posts: Vec<Post>,
+	after: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PeerUserListingResponse {
+	user: User,
 	posts: Vec<Post>,
 	after: Option<String>,
 }
@@ -151,6 +166,60 @@ pub(crate) async fn fetch_subreddit_listing(subreddit: &str, sort: &str, query: 
 	Err(last_error)
 }
 
+pub(crate) async fn fetch_user_listing(username: &str, listing: &str, sort: &str, query: Option<&str>) -> Result<PeerUserListing, String> {
+	let origins = prioritize_last_successful_peer(configured_peer_origins());
+	if origins.is_empty() {
+		return Err("no configured Redlib peer API fallback sources".to_string());
+	}
+
+	let path = build_user_api_path(username, listing, sort, query);
+	info!(
+		"peer_api_fallback: attempting user listing fallback for {} using {} configured peer(s)",
+		path,
+		origins.len()
+	);
+
+	let mut last_error = "no peer attempted".to_string();
+	for origin in origins {
+		if peer_is_backed_off(&origin) {
+			info!("peer_api_fallback: skipping backed off peer {}", origin);
+			continue;
+		}
+
+		let url = format!("{origin}{path}");
+		match fetch_peer_json(&url).await {
+			Ok((status, body)) => match parse_user_listing_response(status, &body) {
+				Ok(mut listing) => {
+					normalize_peer_posts(&mut listing.posts);
+					if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+						client::record_peer_ratelimit_from_api_value(&origin, &value);
+					}
+					note_peer_success(&origin);
+					info!("peer_api_fallback: fetched {} from {}", path, origin);
+					return Ok(PeerUserListing {
+						origin,
+						user: listing.user,
+						posts: listing.posts,
+						after: listing.after.unwrap_or_default(),
+					});
+				}
+				Err(error) => {
+					note_peer_failure(&origin);
+					warn!("peer_api_fallback: peer {} returned unusable user listing for {}: {}", origin, path, error);
+					last_error = error;
+				}
+			},
+			Err(error) => {
+				note_peer_failure(&origin);
+				warn!("peer_api_fallback: peer {} failed for {}: {}", origin, path, error);
+				last_error = error;
+			}
+		}
+	}
+
+	Err(last_error)
+}
+
 fn normalize_peer_posts(posts: &mut [Post]) {
 	for post in posts {
 		post.flags.normalize_template_strings();
@@ -200,6 +269,29 @@ fn build_subreddit_api_path(subreddit: &str, sort: &str, query: Option<&str>) ->
 	}
 }
 
+fn build_user_api_path(username: &str, listing: &str, sort: &str, query: Option<&str>) -> String {
+	let encoded_username: String = form_urlencoded::byte_serialize(username.as_bytes()).collect();
+	let normalized_listing = match listing.trim_end_matches(".js").trim_matches('/') {
+		"submitted" => "submitted",
+		"comments" => "comments",
+		_ => "overview",
+	};
+	let mut pairs = form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+		.into_owned()
+		.filter(|(key, _)| !matches!(key.as_str(), "cache_page" | "feed_session" | "front_cursor" | "raw_json" | PEER_API_FORCE_QUERY_PARAM))
+		.collect::<Vec<_>>();
+	if !sort.is_empty() && !pairs.iter().any(|(key, _)| key == "sort") {
+		pairs.push(("sort".to_string(), sort.to_string()));
+	}
+	let query = form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish();
+	let path = format!("/api/user/{encoded_username}/{normalized_listing}");
+	if query.is_empty() {
+		path
+	} else {
+		format!("{path}?{query}")
+	}
+}
+
 fn filtered_peer_query(query: &str) -> String {
 	form_urlencoded::Serializer::new(String::new())
 		.extend_pairs(
@@ -242,6 +334,17 @@ fn parse_subreddit_listing_response(status: StatusCode, body: &str) -> Result<Pe
 		return Err(format!("peer returned HTTP {}", status.as_u16()));
 	}
 	let envelope: ApiEnvelope<PeerListingResponse> = serde_json::from_str(body).map_err(|error| error.to_string())?;
+	if let Some(error) = envelope.error.filter(|error| !error.trim().is_empty()) {
+		return Err(format!("peer API error: {error}"));
+	}
+	envelope.data.ok_or_else(|| "peer API response did not include data".to_string())
+}
+
+fn parse_user_listing_response(status: StatusCode, body: &str) -> Result<PeerUserListingResponse, String> {
+	if status != StatusCode::OK {
+		return Err(format!("peer returned HTTP {}", status.as_u16()));
+	}
+	let envelope: ApiEnvelope<PeerUserListingResponse> = serde_json::from_str(body).map_err(|error| error.to_string())?;
 	if let Some(error) = envelope.error.filter(|error| !error.trim().is_empty()) {
 		return Err(format!("peer API error: {error}"));
 	}
@@ -310,6 +413,14 @@ mod tests {
 	}
 
 	#[test]
+	fn builds_user_api_path_with_explicit_sort_and_filtered_internal_params() {
+		assert_eq!(
+			build_user_api_path("demo user", "submitted", "new", Some("after=t3_next&cache_page=2&raw_json=1&force_peer=1")),
+			"/api/user/demo+user/submitted?after=t3_next&sort=new"
+		);
+	}
+
+	#[test]
 	fn force_peer_override_requires_enabled_gate() {
 		let request = Request::builder().uri("/api/r/rust?force_peer=1").body(Body::empty()).unwrap();
 		assert!(request_should_force_peer_api_fallback_with_setting(&request, Some("on")));
@@ -367,6 +478,15 @@ mod tests {
 		let listing = parse_subreddit_listing_response(StatusCode::OK, body).unwrap();
 		assert_eq!(listing.subreddit.unwrap().name, "rust");
 		assert_eq!(listing.posts.len(), 0);
+		assert_eq!(listing.after, None);
+	}
+
+	#[test]
+	fn parses_peer_user_listing_envelope() {
+		let body = r#"{"data":{"user":{"name":"demo","title":"","icon":"","post_karma":["0","0"],"comment_karma":["0","0"],"created":"","banner":"","description":"","bio_html":"","external_links":[],"nsfw":false},"posts":[],"after":null,"all_posts_filtered":false,"all_posts_hidden_nsfw":false},"error":null}"#;
+		let listing = parse_user_listing_response(StatusCode::OK, body).unwrap();
+		assert_eq!(listing.user.name, "demo");
+		assert!(listing.posts.is_empty());
 		assert_eq!(listing.after, None);
 	}
 
