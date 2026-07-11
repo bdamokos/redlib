@@ -1690,6 +1690,7 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 	let mut candidate_subreddits = subreddit_stats.keys().cloned().collect::<HashSet<_>>();
 	candidate_subreddits.extend(followed_subreddits.iter().cloned());
 	candidate_subreddits.extend(content_entries.into_iter().map(|entry| entry.subreddit));
+	candidate_subreddits.retain(|candidate| !candidate.starts_with("u_"));
 	let mut related_subreddits = candidate_subreddits
 		.into_iter()
 		.filter(|candidate| candidate != &subreddit && !normalized_filters.contains(candidate))
@@ -3498,6 +3499,8 @@ mod tests {
 		crate::subreddit_semantics::store_embedding("sourdough", "nomic-embed-text", "sourdough-hash", vec![0.98, 0.02], 1).unwrap();
 		crate::subreddit_semantics::store_embedding("cake", "nomic-embed-text", "cake-hash", vec![0.95, 0.05], 1).unwrap();
 		crate::subreddit_semantics::store_embedding("rust", "nomic-embed-text", "rust-hash", vec![0.0, 1.0], 1).unwrap();
+		crate::subreddit_content_semantics::clear_test_cache();
+		crate::subreddit_content_semantics::store_embedding("u_cached_profile", "nomic-embed-text", "profile-hash", vec![1.0, 0.0], 1, 25, 1, 400).unwrap();
 
 		apply_source_refresh(
 			&FeedSource::subreddit("u_baker", FeedSort::New),
@@ -3511,9 +3514,11 @@ mod tests {
 		assert_eq!(report.followed_subreddits[0].name, "sourdough");
 		assert!(report.cached_subreddits.iter().any(|entry| entry.name == "cake"));
 		assert!(!report.cached_subreddits.iter().any(|entry| entry.name == "rust"));
+		assert!(!report.cached_subreddits.iter().any(|entry| entry.name == "u_cached_profile"));
 		assert_eq!(report.followed_profiles[0].name, "baker");
 		assert!(report.cached_profiles.iter().any(|entry| entry.name == "cake_author"));
 		crate::subreddit_semantics::clear_test_cache();
+		crate::subreddit_content_semantics::clear_test_cache();
 	}
 
 	#[test]
