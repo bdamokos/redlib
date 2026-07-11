@@ -226,12 +226,24 @@ impl UserFragmentTemplate {
 	pub fn post_from_cache(&self, post: &Post) -> bool {
 		cached_post_ids_contains(&self.cached_post_ids, post)
 	}
+
+	pub fn show_successful_empty_state(&self) -> bool {
+		show_successful_empty_state(self.no_posts, self.all_posts_filtered, &self.fallback_notice)
+	}
 }
 
 impl UserTemplate {
 	pub fn post_from_cache(&self, post: &Post) -> bool {
 		cached_post_ids_contains(&self.cached_post_ids, post)
 	}
+
+	pub fn show_successful_empty_state(&self) -> bool {
+		show_successful_empty_state(self.no_posts, self.all_posts_filtered, &self.fallback_notice)
+	}
+}
+
+fn show_successful_empty_state(no_posts: bool, all_posts_filtered: bool, fallback_notice: &str) -> bool {
+	no_posts && !all_posts_filtered && fallback_notice.is_empty()
 }
 
 #[derive(PartialEq)]
@@ -1430,12 +1442,24 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<(Vec<Post>, b
 
 #[cfg(test)]
 mod tests {
-	use super::{append_missing_following_link_posts, collapse_duplicate_submissions};
+	use super::{append_missing_following_link_posts, collapse_duplicate_submissions, show_successful_empty_state};
 	use askama::Template;
 	use std::collections::HashSet;
 	use url::form_urlencoded;
 
 	use crate::utils::{Author, Awards, CollapsedDuplicate, Flags, Flair, FlairPart, FollowingComment, Media, ParentComment, Post, Preferences};
+
+	#[test]
+	fn successful_zero_post_listing_has_a_distinct_empty_state() {
+		assert!(show_successful_empty_state(true, false, ""));
+	}
+
+	#[test]
+	fn filtered_and_fallback_listings_do_not_use_the_successful_empty_state() {
+		assert!(!show_successful_empty_state(true, true, ""));
+		assert!(!show_successful_empty_state(true, false, "Reddit is rate-limited; showing cached posts."));
+		assert!(!show_successful_empty_state(false, false, ""));
+	}
 
 	fn test_post(id: &str, title: &str, community: &str, body: &str, post_type: &str, media_url: &str, gallery_urls: &[&str]) -> Post {
 		Post {
@@ -2369,6 +2393,8 @@ mod tests {
 		assert!(html.contains("data-video-filter-toggle=\"check\""));
 		assert!(html.contains("name=\"video_sub\" value=\"demo_sub\" checked"));
 		assert!(html.contains("name=\"video_user\" value=\"demo_user\" checked"));
+		assert!(html.contains("role=\"status\" aria-live=\"polite\""));
+		assert!(html.contains("Reddit returned no posts for this user."));
 	}
 
 	#[test]

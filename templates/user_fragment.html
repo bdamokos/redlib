@@ -32,8 +32,8 @@
     {% if !fallback_notice.is_empty() %}
     <center class="user_page_notice">{{ fallback_notice }}</center>
     {% endif %}
-    {% if no_posts %}
-    <center>No posts were found.</center>
+    {% if self.show_successful_empty_state() %}
+    <p class="user-listing-status" role="status" aria-live="polite">Reddit returned no posts for this user.</p>
     {% endif %}
     {% if all_posts_filtered %}
     <center>(All content on this page has been filtered)</center>
