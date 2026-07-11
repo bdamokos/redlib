@@ -259,7 +259,7 @@ document.addEventListener("DOMContentLoaded", () => {
         window.setTimeout(resolve, retryDelayMs);
     });
 
-    const shouldRetryResponse = (status) => status >= 500;
+    const shouldRetryResponse = (status) => status === 408 || status === 425 || status === 429 || status >= 500;
 
     const loadSidebarFragment = async () => {
         if (!sidebarFragmentUrl) {
@@ -299,7 +299,10 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     };
 
-    const loadFragment = async (attempt = 1) => {
+    let loadInFlight = false;
+    let reloadRequested = false;
+
+    const loadFragmentAttempt = async (attempt = 1) => {
         if (banner) {
             setBannerVisible(true);
             banner.textContent = loadingMessage;
@@ -342,7 +345,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (attempt < maxAttempts) {
                 showRetryState(attempt);
                 await waitForRetry();
-                return loadFragment(attempt + 1);
+                return loadFragmentAttempt(attempt + 1);
             }
             showErrorState();
         } finally {
@@ -350,5 +353,29 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     };
 
-    void loadFragment(1);
+    const loadFragment = async () => {
+        if (loadInFlight) {
+            return;
+        }
+        reloadRequested = false;
+        loadInFlight = true;
+        try {
+            await loadFragmentAttempt(1);
+        } finally {
+            loadInFlight = false;
+            if (reloadRequested && !document.querySelector("#page_fragment .post")) {
+                reloadRequested = false;
+                void loadFragment();
+            }
+        }
+    };
+
+    document.addEventListener("redlib:content-progress", () => {
+        if (!document.querySelector("#page_fragment .post")) {
+            reloadRequested = true;
+            void loadFragment();
+        }
+    });
+
+    void loadFragment();
 });

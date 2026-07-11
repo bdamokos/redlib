@@ -249,6 +249,9 @@
         Boolean(status?.enabled && (status.state === "active" || status.state === "queued" || status.queued_candidates > 0 || status.active_remaining > 0));
 
     const renderStatus = (container, status) => {
+        const previousEmbedded = Number.parseInt(container.dataset.embeddingLastEmbedded || "0", 10);
+        const currentEmbedded = Number(status.embedded || 0);
+        container.dataset.embeddingLastEmbedded = String(currentEmbedded);
         container.dataset.embeddingReady = shouldShow(status) ? "true" : "false";
         setContainerState(container, status);
         setText(container, embeddedSelector, String(status.embedded || 0));
@@ -256,6 +259,11 @@
         setText(container, queuedSelector, String(status.queued_candidates || 0));
         updateMeta(container, status);
         updateAverageMeta(container, status);
+        if (currentEmbedded > previousEmbedded) {
+            document.dispatchEvent(new CustomEvent("redlib:content-progress", {
+                detail: { embedded: currentEmbedded },
+            }));
+        }
 
         const embedding = status.latest_embedding;
         const latestGrid = container.querySelector(gridSelector);

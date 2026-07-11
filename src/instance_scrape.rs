@@ -144,7 +144,19 @@ pub(crate) fn instance_scrape_enabled() -> bool {
 
 pub(crate) fn should_attempt_scrape_fallback(error: &str) -> bool {
 	let message = error.to_ascii_lowercase();
-	message.contains("too many requests") || message.contains("rate limit") || message.contains("ratelimit") || reddit_rate_limited_now()
+	message.contains("too many requests")
+		|| message.contains("rate limit")
+		|| message.contains("ratelimit")
+		|| message.contains("oauth_unavailable")
+		|| message.contains("timed out")
+		|| message.contains("timeout")
+		|| message.contains("connection")
+		|| message.contains("http 429")
+		|| message.contains("http 500")
+		|| message.contains("http 502")
+		|| message.contains("http 503")
+		|| message.contains("http 504")
+		|| reddit_rate_limited_now()
 }
 
 pub(crate) fn reddit_rate_limited_now() -> bool {
@@ -1352,6 +1364,10 @@ mod tests {
 		));
 		assert!(should_attempt_scrape_fallback("Reddit rate limit hit"));
 		assert!(should_attempt_scrape_fallback("ratelimit exhausted"));
+		assert!(should_attempt_scrape_fallback("oauth_unavailable"));
+		assert!(should_attempt_scrape_fallback("request timed out"));
+		assert!(should_attempt_scrape_fallback("connection reset by peer"));
+		assert!(should_attempt_scrape_fallback("upstream returned HTTP 503"));
 	}
 
 	#[test]
