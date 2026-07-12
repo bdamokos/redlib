@@ -483,6 +483,14 @@ pub fn exact(post_id: &str, revision: &str) -> Option<Arc<StablePostContentV1>> 
 	CANONICAL_POSTS.lock().ok()?.revisions.get(&(id, revision)).cloned()
 }
 
+/// Ensure a rendered submission has an exact local stable revision and return
+/// the revision used by its private context wrapper.
+pub fn revision_for_post(post: &Post) -> String {
+	observe_post(post, ObservationSource::Listing, "render", crate::cache_persistence::unix_now())
+		.map(|snapshot| snapshot.revision.to_string())
+		.unwrap_or_default()
+}
+
 fn merge_stable(existing: &CanonicalPostSnapshot, observation: &PostObservation) -> StablePostContentV1 {
 	let mut merged = existing.stable.as_ref().clone();
 	let incoming = &observation.stable;

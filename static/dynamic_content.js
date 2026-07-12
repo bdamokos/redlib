@@ -15,6 +15,7 @@
         window.observeVideoPreviewHosts?.(root);
         window.observeVideoVisibility?.(root);
         window.resizeSinglePostMediaToViewport?.(root);
+		window.initializePostComponents?.(root);
     };
 
     window.refreshDynamicContent = initialize;

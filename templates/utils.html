@@ -686,6 +686,46 @@
 </div>
 {%- endmacro %}
 
+{% macro post_in_list_hybrid(post, show_subscription_button, redirect_url, auto_expand_followed_users, defer_stable) -%}
+{% if defer_stable && post.kind == "t3" %}
+{% set revision = crate::post_components::revision_for_post(post) %}
+{% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
+<div
+	id="{{ post.id }}"
+	class="post post_component_wrapper{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post_should_be_blurred %} post_blurred{% endif %}"
+	data-post-type="{{ post.post_type }}"
+	data-created-ts="{{ post.created_ts }}"
+	data-reddit-url="https://www.reddit.com{{ post.permalink }}"
+	data-post-merge-keys="{{ crate::user::post_merge_keys_attr(post) }}"
+	data-post-component-id="{{ post.id }}"
+	data-post-component-revision="{{ revision }}"
+	data-post-component-url="/post-content/{{ post.id }}/{{ revision }}/card"
+	data-allow-stable-media="{% if post_should_be_blurred %}false{% else %}true{% endif %}">
+	<div class="post_header">
+		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
+		{% call external_site_icons(post.author.external_links, post.author.name, post.author.avg_video_length) %}
+		<span class="dot">&bull;</span>
+		<span class="created" title="{{ post.display_created_tooltip() }}" data-created-ts="{{ post.created_ts }}">{{ post.display_rel_time() }}</span>
+	</div>
+	<div class="post_component_slot" data-post-component-slot aria-busy="true">
+		<h2 class="post_title"><a href="{{ post.permalink }}">{{ post.title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}</h2>
+	</div>
+	<div class="post_score" title="{{ post.score.1 }}">{% if !str_eq(prefs.hide_score, "on") %}{{ post.score.0 }}{% else %}&#x2022;{% endif %}<span class="label"> Upvotes</span></div>
+	<div class="post_footer">
+		<a href="{{ post.permalink }}" class="post_comments" title="{{ post.comments.1 }} comments">{{ post.comments.0 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}</a>
+		{% if let Some(new_comments) = post.bookmark_new_comments %}<span class="post_bookmark_activity{% if new_comments.to_string() != "0" %} unread{% endif %}">{% if new_comments.to_string() != "0" %}{{ new_comments }} new comments{% else %}Up to date{% endif %}</span>{% endif %}
+		{% call post_feedback_controls(post, "manual", redirect_url) %}
+		{% call mobile_post_author_actions(post, redirect_url) %}
+		{% call bookmark_form(post, redirect_url) %}
+	</div>
+</div>
+{% else %}
+{% call post_in_list(post, show_subscription_button, redirect_url, auto_expand_followed_users) %}
+{% endif %}
+{%- endmacro %}
+
 {% macro visit_reddit_confirmation(url) -%}
 <div class="popup" id="popup">
 	<div class="popup-inner">

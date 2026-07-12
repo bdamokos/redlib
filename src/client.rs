@@ -15,6 +15,8 @@ use wreq::{Client as WreqClient, EmulationFactory, Method as WreqMethod, Respons
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -1396,6 +1398,14 @@ fn persist_debug_response(path: &str, status: hyper::StatusCode, headers: &[(Str
 /// browser request is cancelled.
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	let key = (path.clone(), quarantine);
+	run_json_flight(key, move || json_completed_cache(path, quarantine)).await
+}
+
+async fn run_json_flight<F, Fut>(key: JsonFlightKey, producer: F) -> Result<Value, String>
+where
+	F: FnOnce() -> Fut + Send + 'static,
+	Fut: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+{
 	let (sender, receiver) = oneshot::channel();
 	let is_leader = {
 		let mut flights = JSON_INFLIGHT.lock().unwrap_or_else(|error| error.into_inner());
@@ -1413,7 +1423,7 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 
 	if is_leader {
 		tokio::spawn(async move {
-			let result = json_completed_cache(path, quarantine).await;
+			let result = producer().await;
 			let waiters = JSON_INFLIGHT.lock().unwrap_or_else(|error| error.into_inner()).remove(&key).unwrap_or_default();
 			for waiter in waiters {
 				let _ = waiter.send(result.clone());
@@ -1914,6 +1924,46 @@ fn test_default_subscriptions() {
 
 #[cfg(test)]
 const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identical_json_flights_run_one_producer() {
+	let producers = Arc::new(AtomicUsize::new(0));
+	let key = ("/__singleflight_test".to_string(), false);
+	let mut tasks = Vec::new();
+	for _ in 0..50 {
+		let producers = producers.clone();
+		let key = key.clone();
+		tasks.push(tokio::spawn(async move {
+			run_json_flight(key, move || async move {
+				producers.fetch_add(1, Ordering::SeqCst);
+				tokio::time::sleep(Duration::from_millis(25)).await;
+				Ok(serde_json::json!({"ok": true}))
+			})
+			.await
+		}));
+	}
+	for task in tasks {
+		assert_eq!(task.await.unwrap().unwrap()["ok"], true);
+	}
+	assert_eq!(producers.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_first_waiter_does_not_cancel_json_producer() {
+	let key = ("/__singleflight_cancel_test".to_string(), false);
+	let leader_key = key.clone();
+	let leader = tokio::spawn(async move {
+		run_json_flight(leader_key, || async {
+			tokio::time::sleep(Duration::from_millis(40)).await;
+			Ok(serde_json::json!({"completed": true}))
+		})
+		.await
+	});
+	tokio::time::sleep(Duration::from_millis(5)).await;
+	leader.abort();
+	let follower = run_json_flight(key, || async { panic!("follower must not become producer") }).await.unwrap();
+	assert_eq!(follower["completed"], true);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_localization_popular() {

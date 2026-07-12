@@ -470,6 +470,18 @@ Assign a default value for each instance-specific setting by passing environment
 
 > `REDLIB_PEER_API_FALLBACK_SOURCES` is separate from `REDLIB_INSTANCE_SCRAPE_SOURCES`: peer API fallback is intended for controlled Redlib instances you operate, and currently covers subreddit listing API/page fallback only.
 > Set `REDLIB_PEER_API_FALLBACK_FORCE_TESTING=on` only on instances where operators should be able to force the peer path for validation. When enabled, `?force_peer=1` makes subreddit listing API and fragment requests try the configured peer before local Reddit/cache paths; peer requests carry Redlib's loop-guard header so hot spares do not need their own peer sources. `X-Redlib-Force-Peer: 1` is also accepted for non-browser tooling, but the URL parameter is the primary deterministic test interface.
+
+## Cloudflare cache rules
+
+The origin fails closed: page shells, private fragments, APIs, mutations, errors, redirects, and any response carrying `Set-Cookie` are `private, no-store`. Do not override those directives with a hostname-wide Cache Everything rule or an Edge TTL that ignores origin cache control.
+
+The only initial shared-cache allowlist is:
+
+- successful exact `/post-content/<post-id>/<64-hex-revision>/card` responses;
+- successful exact `/redlib-static/<asset-revision>/<file>` responses.
+
+Configure Cache Rules to make only those path families eligible, respect origin cache headers, retain the full canonical scheme/host/path in the key, reject query variants, ignore cookies only for these two cookie-independent families, cache only HTTP 200, and disable HTML transforms/minification. Keep all other routes bypassed. Purge the affected path family whenever cache-key, compression, or `Vary` behavior changes; rollback by disabling the two allowlist rules, never by weakening the origin's no-store policy.
+
 ## Default user settings
 
 Assign a default value for each user-modifiable setting by passing environment variables to Redlib in the format `REDLIB_DEFAULT_{Y}`. Replace `{Y}` with the setting name (see list below) in capital letters.

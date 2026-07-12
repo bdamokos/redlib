@@ -42,5 +42,8 @@
   The active public hostname routing is managed in the Cloudflare dashboard.
   If a Redlib domain fails externally but `http://127.0.0.1:8081/settings` works on the Pi, inspect the Cloudflare dashboard/tunnel config before changing any local YAML.
 
+- Cloudflare caching:
+  The dashboard cache allowlist is limited to exact successful revisioned `/post-content/<id>/<revision>/card` and `/redlib-static/<revision>/<file>` responses while respecting origin cache headers. Never enable hostname-wide Cache Everything or override `private, no-store` for shells, fragments, APIs, mutations, redirects, errors, or responses with `Set-Cookie`.
+
 - `settings.txt`:
   This file is not a line-oriented config file; it is an **import string payload** (may be non-UTF8/binary-looking when opened).

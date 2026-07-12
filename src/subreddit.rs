@@ -3646,12 +3646,20 @@ mod tests {
 
 	#[test]
 	fn aggregate_feed_pages_do_not_render_client_duplicate_script_by_default() {
+		let posts = (0..7)
+			.map(|index| {
+				let mut post = test_post();
+				post.id = format!("demo{index}");
+				post.permalink = format!("/r/demo_sub/comments/demo{index}/");
+				post
+			})
+			.collect();
 		let html = SubredditTemplate {
 			sub: Subreddit {
 				name: "rust+programming".to_string(),
 				..Default::default()
 			},
-			posts: vec![test_post()],
+			posts,
 			top_users: Vec::new(),
 			related_subreddits: Default::default(),
 			sort: ("hot".to_string(), String::new()),
@@ -3689,6 +3697,8 @@ mod tests {
 		.unwrap();
 
 		assert!(!html.contains("submitted_duplicates.js"));
+		assert_eq!(html.matches("data-post-component-url=").count(), 1);
+		assert!(html.contains("data-post-component-id=\"demo6\""));
 	}
 
 	#[test]

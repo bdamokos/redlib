@@ -79,7 +79,7 @@
 				{% if !peer_origin.is_empty() %}
 				<div class="post_origin_marker peer_origin_marker" title="Fetched from Redlib peer {{ peer_origin }}">from spare</div>
 				{% endif %}
-				{% call utils::post_in_list(post, false, "", true) %}
+				{% call utils::post_in_list_hybrid(post, false, "", true, loop.index > 6) %}
 				{% endif %}
 				{% endfor %}
 				{% if prefs.use_hls == "on" %}

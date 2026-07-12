@@ -317,6 +317,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"embedding_activity.js" => resource(include_str!("../static/embedding_activity.js"), "text/javascript", false).await,
 		"feed_status.js" => resource(include_str!("../static/feed_status.js"), "text/javascript", false).await,
 		"page_fragment.js" => resource(include_str!("../static/page_fragment.js"), "text/javascript", false).await,
+		"post_components.js" => resource(include_str!("../static/post_components.js"), "text/javascript", false).await,
 		"dynamic_content.js" => resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).await,
 		"video_visibility.js" => resource(include_str!("../static/video_visibility.js"), "text/javascript", false).await,
 		"video_preview_gallery.js" => resource(include_str!("../static/video_preview_gallery.js"), "text/javascript", false).await,
