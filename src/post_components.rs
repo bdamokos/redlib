@@ -1,5 +1,5 @@
 use crate::server::RequestExt;
-use crate::utils::{Flair, Post};
+use crate::utils::{Flair, Media, Post, Preferences};
 use askama::Template;
 use hyper::{Body, Request, Response};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,8 @@ const MAX_CANONICAL_POSTS: usize = 10_000;
 const MAX_REVISION_BYTES: usize = 192 * 1024 * 1024;
 const REVISIONS_PER_POST: usize = 2;
 const MAX_REVISION_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_LIVE_MEDIA_BYTES_PER_POST: usize = 256 * 1024;
+const MAX_LIVE_MEDIA_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -151,6 +153,57 @@ pub struct PostLiveV1 {
 	pub observed_at: u64,
 }
 
+/// Preference-sensitive, short-lived media metadata kept outside immutable
+/// stable-card bytes. This projection is deliberately bounded and rendered
+/// only by a private/no-store endpoint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PostLiveMediaV1 {
+	pub id: PostId,
+	pub permalink: String,
+	pub post_type: String,
+	pub media: Media,
+	pub uploader_css_classes: String,
+	pub observed_at: u64,
+}
+
+impl PostLiveMediaV1 {
+	fn from_post(post: &Post, stable: &StablePostContentV1, observed_at: u64) -> Option<Self> {
+		if !matches!(post.post_type.as_str(), "video" | "gif") {
+			return None;
+		}
+		if post.media.url.is_empty() && post.media.embed_code.is_empty() && post.media.hls_url.is_empty() && post.media.dash_url.is_empty() {
+			return None;
+		}
+
+		let uploader_css_classes = post.redgifs_uploader_css_classes().to_string();
+		let projection = Self {
+			id: stable.id.clone(),
+			permalink: post.permalink.clone(),
+			post_type: post.post_type.clone(),
+			media: post.media.clone(),
+			uploader_css_classes,
+			observed_at,
+		};
+		(projection.canonical_bytes().len() <= MAX_LIVE_MEDIA_BYTES_PER_POST).then_some(projection)
+	}
+
+	fn canonical_bytes(&self) -> Vec<u8> {
+		serde_json::to_vec(self).unwrap_or_default()
+	}
+
+	fn deterministic_tie_break(&self) -> [u8; 32] {
+		Sha256::digest(self.canonical_bytes()).into()
+	}
+
+	fn estimated_bytes(&self) -> usize {
+		self.canonical_bytes().len()
+	}
+
+	pub fn redgifs_uploader_css_classes(&self) -> &str {
+		&self.uploader_css_classes
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewerPostStateV1 {
 	pub bookmarked: bool,
@@ -161,6 +214,7 @@ pub struct ViewerPostStateV1 {
 pub struct PostObservation {
 	pub stable: StablePostContentV1,
 	pub live: PostLiveV1,
+	pub live_media: Option<PostLiveMediaV1>,
 	pub source: ObservationSource,
 	pub source_key: String,
 	pub observed_at: u64,
@@ -171,10 +225,14 @@ pub struct CanonicalPostSnapshot {
 	pub stable: Arc<StablePostContentV1>,
 	pub revision: ContentRevision,
 	pub live: PostLiveV1,
+	pub live_media: Option<Arc<PostLiveMediaV1>>,
 	pub source: ObservationSource,
 	pub source_key: String,
 	pub stable_observed_at: u64,
 	pub live_observed_at: u64,
+	pub live_media_source: ObservationSource,
+	pub live_media_source_key: String,
+	pub live_media_observed_at: u64,
 }
 
 #[derive(Default)]
@@ -184,6 +242,7 @@ struct CanonicalPostStore {
 	revision_order: VecDeque<(PostId, ContentRevision)>,
 	revision_seen_at: HashMap<(PostId, ContentRevision), u64>,
 	revision_bytes: usize,
+	live_media_bytes: usize,
 }
 
 static CANONICAL_POSTS: LazyLock<Mutex<CanonicalPostStore>> = LazyLock::new(|| Mutex::new(CanonicalPostStore::default()));
@@ -195,27 +254,139 @@ struct StablePostCardTemplate<'a> {
 	revision: &'a str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedStableCard {
+	pub post_id: String,
+	pub revision: String,
+	pub path: String,
+	pub html: String,
+}
+
+#[derive(Template)]
+#[template(path = "post_live_media.html")]
+struct PostLiveMediaTemplate<'a> {
+	post: &'a PostLiveMediaV1,
+	revision: &'a str,
+	prefs: Preferences,
+	url: &'a str,
+}
+
+crate::impl_template_str_eq!(PostLiveMediaTemplate<'_>);
+
 pub async fn card(req: Request<Body>) -> Result<Response<Body>, String> {
 	if req.uri().query().is_some() {
 		return not_found();
 	}
-	let Some(post_id) = req.param("id") else {
+	let Some(raw_post_id) = req.param("id") else {
 		return not_found();
 	};
-	let Some(revision) = req.param("revision") else {
+	let Some(post_id) = PostId::parse(&raw_post_id) else {
 		return not_found();
 	};
-	let Some(post) = exact(&post_id, &revision) else {
+	if post_id.as_str() != raw_post_id {
+		return not_found();
+	}
+	let Some(raw_revision) = req.param("revision") else {
 		return not_found();
 	};
-	let body = StablePostCardTemplate { post: &post, revision: &revision }.render().map_err(|error| error.to_string())?;
+	let Some(revision) = ContentRevision::parse(&raw_revision) else {
+		return not_found();
+	};
+	if revision.as_str() != raw_revision {
+		return not_found();
+	}
+	let Some(post) = exact(post_id.as_str(), revision.as_str()) else {
+		return not_found();
+	};
+	let body = StablePostCardTemplate {
+		post: &post,
+		revision: revision.as_str(),
+	}
+	.render()
+	.map_err(|error| error.to_string())?;
 
 	Response::builder()
 		.status(200)
 		.header("content-type", "text/html; charset=utf-8")
 		.header("cache-control", "public, max-age=31536000, s-maxage=86400, immutable")
-		.header("etag", card_etag(&revision))
+		.header("etag", card_etag(revision.as_str()))
 		.header("x-redlib-cache-policy", "immutable-post-content")
+		.body(Body::from(body))
+		.map_err(|error| error.to_string())
+}
+
+/// Render the exact bytes and identity of the latest stable card without
+/// involving HTTP or an upstream fetch. Private shells can use this to reuse a
+/// locally known card immediately while comments continue loading separately.
+pub fn render_latest_stable_card(post_id: &str) -> Result<Option<RenderedStableCard>, String> {
+	let Some(snapshot) = latest(post_id) else {
+		return Ok(None);
+	};
+	let post_id = snapshot.stable.id.to_string();
+	let revision = snapshot.revision.to_string();
+	let html = StablePostCardTemplate {
+		post: &snapshot.stable,
+		revision: &revision,
+	}
+	.render()
+	.map_err(|error| error.to_string())?;
+	Ok(Some(RenderedStableCard {
+		path: format!("/post-content/{post_id}/{revision}/card"),
+		post_id,
+		revision,
+		html,
+	}))
+}
+
+pub async fn live_media(req: Request<Body>) -> Result<Response<Body>, String> {
+	if req.uri().query().is_some() {
+		return live_media_not_found();
+	}
+	let Some(raw_post_id) = req.param("id") else {
+		return live_media_not_found();
+	};
+	let Some(post_id) = PostId::parse(&raw_post_id) else {
+		return live_media_not_found();
+	};
+	if post_id.as_str() != raw_post_id {
+		return live_media_not_found();
+	}
+	let Some(raw_revision) = req.param("revision") else {
+		return live_media_not_found();
+	};
+	let Some(revision) = ContentRevision::parse(&raw_revision) else {
+		return live_media_not_found();
+	};
+	if revision.as_str() != raw_revision || exact(post_id.as_str(), revision.as_str()).is_none() {
+		return live_media_not_found();
+	}
+
+	let Some(snapshot) = latest(post_id.as_str()) else {
+		return live_media_not_found();
+	};
+	if !snapshot.stable.expects_live_media() {
+		return live_media_not_found();
+	}
+	let Some(media) = snapshot.live_media else {
+		return live_media_not_found();
+	};
+	let prefs = Preferences::new(&req);
+	let body = PostLiveMediaTemplate {
+		post: &media,
+		revision: revision.as_str(),
+		prefs,
+		url: &media.permalink,
+	}
+	.render()
+	.map_err(|error| error.to_string())?;
+
+	Response::builder()
+		.status(200)
+		.header("content-type", "text/html; charset=utf-8")
+		.header("cache-control", "private, no-store")
+		.header("cloudflare-cdn-cache-control", "no-store")
+		.header("vary", "Cookie")
+		.header("x-redlib-cache-policy", "private-post-live-media")
 		.body(Body::from(body))
 		.map_err(|error| error.to_string())
 }
@@ -230,6 +401,17 @@ fn not_found() -> Result<Response<Body>, String> {
 		.header("content-type", "text/plain; charset=utf-8")
 		.header("cache-control", "no-store")
 		.body(Body::from("Post content revision not found"))
+		.map_err(|error| error.to_string())
+}
+
+fn live_media_not_found() -> Result<Response<Body>, String> {
+	Response::builder()
+		.status(404)
+		.header("content-type", "text/plain; charset=utf-8")
+		.header("cache-control", "private, no-store")
+		.header("cloudflare-cdn-cache-control", "no-store")
+		.header("vary", "Cookie")
+		.body(Body::from("Live post media not found"))
 		.map_err(|error| error.to_string())
 }
 
@@ -350,6 +532,10 @@ impl StablePostContentV1 {
 		}
 	}
 
+	fn expects_live_media(&self) -> bool {
+		matches!(self.volatile_media_kind(), Some("video" | "gif"))
+	}
+
 	pub fn revision(&self) -> ContentRevision {
 		self.revision_with_schema(REVISION_SCHEMA)
 	}
@@ -432,8 +618,10 @@ impl ViewerPostStateV1 {
 
 impl PostObservation {
 	pub fn from_post(post: &Post, source: ObservationSource, source_key: impl Into<String>, observed_at: u64) -> Option<Self> {
+		let stable = StablePostContentV1::from_post(post)?;
 		Some(Self {
-			stable: StablePostContentV1::from_post(post)?,
+			live_media: PostLiveMediaV1::from_post(post, &stable, observed_at),
+			stable,
 			live: PostLiveV1::from_post(post, observed_at),
 			source,
 			source_key: source_key.into(),
@@ -476,18 +664,64 @@ pub fn observe(observation: PostObservation) -> CanonicalPostSnapshot {
 		Some(existing) if existing.live_observed_at > observation.observed_at => (existing.live.clone(), existing.live_observed_at),
 		_ => (observation.live.clone(), observation.observed_at),
 	};
+	let (live_media, live_media_source, live_media_source_key, live_media_observed_at) = match store.latest.get(&id) {
+		Some(existing) if !live_media_observation_outranks(existing, &observation) => (
+			existing.live_media.clone(),
+			existing.live_media_source,
+			existing.live_media_source_key.clone(),
+			existing.live_media_observed_at,
+		),
+		_ => (
+			observation.live_media.clone().map(Arc::new),
+			observation.source,
+			observation.source_key.clone(),
+			observation.observed_at,
+		),
+	};
 	let snapshot = CanonicalPostSnapshot {
 		stable,
 		revision,
 		live,
+		live_media,
 		source: stable_source,
 		source_key: stable_source_key,
 		stable_observed_at,
 		live_observed_at,
+		live_media_source,
+		live_media_source_key,
+		live_media_observed_at,
 	};
+	if let Some(existing) = store.latest.get(&id).and_then(|snapshot| snapshot.live_media.as_ref()) {
+		store.live_media_bytes = store.live_media_bytes.saturating_sub(existing.estimated_bytes());
+	}
+	if let Some(media) = snapshot.live_media.as_ref() {
+		store.live_media_bytes = store.live_media_bytes.saturating_add(media.estimated_bytes());
+	}
 	store.latest.insert(id, snapshot.clone());
 	prune_store(&mut store, observation.observed_at);
 	snapshot
+}
+
+fn live_media_observation_outranks(existing: &CanonicalPostSnapshot, incoming: &PostObservation) -> bool {
+	match (&existing.live_media, &incoming.live_media) {
+		(Some(_), None) => return incoming.source >= ObservationSource::Direct && !incoming.stable.expects_live_media(),
+		(None, Some(_)) => return true,
+		(None, None) => return false,
+		(Some(_), Some(_)) => {}
+	}
+	if incoming.observed_at != existing.live_media_observed_at {
+		return incoming.observed_at > existing.live_media_observed_at;
+	}
+	if incoming.source != existing.live_media_source {
+		return incoming.source > existing.live_media_source;
+	}
+	if incoming.source_key != existing.live_media_source_key {
+		return incoming.source_key < existing.live_media_source_key;
+	}
+
+	let incoming_key = incoming.live_media.as_ref().map(PostLiveMediaV1::deterministic_tie_break).unwrap_or([0; 32]);
+	let existing_key = existing.live_media.as_ref().map(|media| media.deterministic_tie_break()).unwrap_or([0; 32]);
+	incoming_key > existing_key
 }
 
 pub fn latest(post_id: &str) -> Option<CanonicalPostSnapshot> {
@@ -504,6 +738,12 @@ pub fn exact(post_id: &str, revision: &str) -> Option<Arc<StablePostContentV1>> 
 /// Ensure a rendered submission has an exact local stable revision and return
 /// the revision used by its private context wrapper.
 pub fn revision_for_post(post: &Post) -> String {
+	if post.kind != "t3" {
+		return String::new();
+	}
+	if let Some(snapshot) = latest(&post.id) {
+		return snapshot.revision.to_string();
+	}
 	observe_post(post, ObservationSource::Listing, "render", crate::cache_persistence::unix_now())
 		.map(|snapshot| snapshot.revision.to_string())
 		.unwrap_or_default()
@@ -630,13 +870,15 @@ fn prune_store(store: &mut CanonicalPostStore, now: u64) {
 	for key in stale {
 		remove_revision(store, &key);
 	}
-	while store.latest.len() > MAX_CANONICAL_POSTS || store.revision_bytes > MAX_REVISION_BYTES {
+	while store.latest.len() > MAX_CANONICAL_POSTS || store.revision_bytes > MAX_REVISION_BYTES || store.live_media_bytes > MAX_LIVE_MEDIA_BYTES {
 		let Some(oldest) = store.revision_order.front().cloned() else {
 			break;
 		};
 		remove_revision(store, &oldest);
 		if !store.revisions.keys().any(|(post_id, _)| post_id == &oldest.0) {
-			store.latest.remove(&oldest.0);
+			if let Some(removed) = store.latest.remove(&oldest.0).and_then(|snapshot| snapshot.live_media) {
+				store.live_media_bytes = store.live_media_bytes.saturating_sub(removed.estimated_bytes());
+			}
 		}
 	}
 }
@@ -719,7 +961,10 @@ fn estimated_flair_bytes(flair: &Flair) -> usize {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::server::RequestExt;
 	use crate::utils::{Flags, GalleryMedia, Media};
+	use hyper::body::to_bytes;
+	use hyper::StatusCode;
 
 	fn sample_post() -> Post {
 		Post {
@@ -741,6 +986,24 @@ mod tests {
 		}
 	}
 
+	fn sample_video_post(id: &str, media_url: &str) -> Post {
+		let mut post = sample_post();
+		post.id = id.to_string();
+		post.post_type = "video".to_string();
+		post.media = Media {
+			url: media_url.to_string(),
+			hls_url: format!("/hls/{id}/HLSPlaylist.m3u8"),
+			dash_url: format!("/dash/{id}/DASHPlaylist.mpd"),
+			poster: format!("/preview/{id}.jpg"),
+			width: 720,
+			height: 1280,
+			video_preview_enabled: true,
+			video_preview_job_hint: media_url.to_string(),
+			..Media::empty()
+		};
+		post
+	}
+
 	#[test]
 	fn live_and_viewer_changes_do_not_change_revision() {
 		let first = sample_post();
@@ -753,6 +1016,27 @@ mod tests {
 			StablePostContentV1::from_post(&first).unwrap().revision(),
 			StablePostContentV1::from_post(&second).unwrap().revision()
 		);
+	}
+
+	#[test]
+	fn volatile_media_urls_are_live_and_do_not_change_stable_revision() {
+		let first = sample_video_post("volatile1", "/vid/volatile1/DASH_720.mp4?token=first");
+		let second = sample_video_post("volatile1", "/vid/volatile1/DASH_720.mp4?token=second");
+		let first_observation = PostObservation::from_post(&first, ObservationSource::Listing, "listing", 100).unwrap();
+		let second_observation = PostObservation::from_post(&second, ObservationSource::Listing, "listing", 101).unwrap();
+
+		assert_eq!(first_observation.stable.revision(), second_observation.stable.revision());
+		assert!(matches!(first_observation.stable.media, StableMediaV1::Volatile { ref kind } if kind == "video"));
+		assert_eq!(first_observation.live_media.as_ref().unwrap().media.url, "/vid/volatile1/DASH_720.mp4?token=first");
+		assert_eq!(second_observation.live_media.as_ref().unwrap().media.url, "/vid/volatile1/DASH_720.mp4?token=second");
+	}
+
+	#[test]
+	fn live_media_projection_rejects_unbounded_payloads() {
+		let mut post = sample_video_post("bounded1", "/vid/bounded1/DASH_720.mp4");
+		post.media.embed_code = "x".repeat(MAX_LIVE_MEDIA_BYTES_PER_POST + 1);
+		let observation = PostObservation::from_post(&post, ObservationSource::Direct, "direct", 100).unwrap();
+		assert!(observation.live_media.is_none());
 	}
 
 	#[test]
@@ -823,11 +1107,169 @@ mod tests {
 			revision: stable.revision(),
 			stable,
 			live: observation.live.clone(),
+			live_media: observation.live_media.clone().map(Arc::new),
 			source: observation.source,
 			source_key: observation.source_key.clone(),
 			stable_observed_at: observation.observed_at,
 			live_observed_at: observation.observed_at,
+			live_media_source: observation.source,
+			live_media_source_key: observation.source_key.clone(),
+			live_media_observed_at: observation.observed_at,
 		}
+	}
+
+	#[test]
+	fn live_media_freshness_and_ties_are_deterministic() {
+		let existing_post = sample_video_post("mediaorder1", "/vid/mediaorder1/old.mp4");
+		let incoming_post = sample_video_post("mediaorder1", "/vid/mediaorder1/new.mp4");
+		let existing = PostObservation::from_post(&existing_post, ObservationSource::Direct, "source-b", 100).unwrap();
+
+		let newer = PostObservation::from_post(&incoming_post, ObservationSource::Listing, "source-z", 101).unwrap();
+		assert!(live_media_observation_outranks(&snapshot_from(&existing), &newer));
+
+		let equal_time_direct = PostObservation::from_post(&incoming_post, ObservationSource::Direct, "source-z", 100).unwrap();
+		let equal_time_listing = PostObservation::from_post(&incoming_post, ObservationSource::Listing, "source-a", 100).unwrap();
+		assert!(live_media_observation_outranks(&snapshot_from(&equal_time_listing), &equal_time_direct));
+
+		let source_a = PostObservation::from_post(&incoming_post, ObservationSource::Listing, "source-a", 100).unwrap();
+		let source_b = PostObservation::from_post(&existing_post, ObservationSource::Listing, "source-b", 100).unwrap();
+		assert!(live_media_observation_outranks(&snapshot_from(&source_b), &source_a));
+		assert!(!live_media_observation_outranks(&snapshot_from(&source_a), &source_b));
+	}
+
+	#[test]
+	fn incomplete_observation_cannot_erase_playable_live_media() {
+		let playable_post = sample_video_post("mediaincomplete1", "/vid/mediaincomplete1/video.mp4");
+		let playable = PostObservation::from_post(&playable_post, ObservationSource::Direct, "direct", 100).unwrap();
+		let mut incomplete_post = playable_post.clone();
+		incomplete_post.media = Media::empty();
+		let incomplete = PostObservation::from_post(&incomplete_post, ObservationSource::Listing, "listing", 200).unwrap();
+
+		assert!(incomplete.live_media.is_none());
+		assert!(!live_media_observation_outranks(&snapshot_from(&playable), &incomplete));
+
+		let direct_incomplete = PostObservation::from_post(&incomplete_post, ObservationSource::Direct, "direct", 201).unwrap();
+		assert!(!live_media_observation_outranks(&snapshot_from(&playable), &direct_incomplete));
+	}
+
+	#[tokio::test]
+	async fn authoritative_type_change_clears_and_stops_serving_old_media() {
+		let id = "mediacleared1";
+		let playable_post = sample_video_post(id, "/vid/mediacleared1/video.mp4");
+		let playable = observe_post(&playable_post, ObservationSource::Direct, "direct-video", 100).unwrap();
+		let old_revision = playable.revision.to_string();
+		let mut changed_post = playable_post.clone();
+		changed_post.post_type = "self".to_string();
+		changed_post.media = Media::empty();
+		let changed = observe_post(&changed_post, ObservationSource::Direct, "direct-self", 200).unwrap();
+
+		assert!(changed.live_media.is_none());
+		assert!(!changed.stable.expects_live_media());
+		let uri = format!("/post-live/{id}/{old_revision}/media");
+		let response = live_media(request_with_live_media_params(&uri, id, &old_revision)).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+		assert_eq!(response.headers()["cache-control"], "private, no-store");
+	}
+
+	#[test]
+	fn render_time_revision_lookup_does_not_advance_live_media() {
+		let id = "renderlookup1";
+		let fresh = sample_video_post(id, "/vid/renderlookup1/fresh.mp4");
+		let snapshot = observe_post(&fresh, ObservationSource::Direct, "direct", 100).unwrap();
+		let stale = sample_video_post(id, "/vid/renderlookup1/stale.mp4");
+
+		assert_eq!(revision_for_post(&stale), snapshot.revision.to_string());
+		let after = latest(id).unwrap();
+		assert_eq!(after.live_media_observed_at, 100);
+		assert_eq!(after.live_media.unwrap().media.url, "/vid/renderlookup1/fresh.mp4");
+	}
+
+	fn request_with_live_media_params(uri: &str, id: &str, revision: &str) -> Request<Body> {
+		let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+		let mut params = route_recognizer::Params::new();
+		params.insert("id".to_string(), id.to_string());
+		params.insert("revision".to_string(), revision.to_string());
+		req.set_params(params);
+		req
+	}
+
+	#[tokio::test]
+	async fn live_media_endpoint_is_revision_bound_private_and_uses_latest_media() {
+		let id = "liveendpoint1";
+		let first = sample_video_post(id, "/vid/liveendpoint1/old.mp4");
+		let first_snapshot = observe_post(&first, ObservationSource::Listing, "listing", 100).unwrap();
+		let revision = first_snapshot.revision.to_string();
+		let second = sample_video_post(id, "/vid/liveendpoint1/fresh.mp4");
+		observe_post(&second, ObservationSource::Direct, "direct", 101).unwrap();
+
+		let uri = format!("/post-live/{id}/{revision}/media");
+		let response = live_media(request_with_live_media_params(&uri, id, &revision)).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers()["cache-control"], "private, no-store");
+		assert_eq!(response.headers()["cloudflare-cdn-cache-control"], "no-store");
+		assert_eq!(response.headers()["vary"], "Cookie");
+		assert!(!response.headers().contains_key("etag"));
+		let body = String::from_utf8(to_bytes(response.into_body()).await.unwrap().to_vec()).unwrap();
+		assert!(body.contains(&format!("data-post-live-media-id=\"{id}\"")));
+		assert!(body.contains(&format!("data-post-live-media-revision=\"{revision}\"")));
+		assert!(body.contains("data-post-live-media-observed-at=\"101\""));
+		assert!(body.contains("/vid/liveendpoint1/fresh.mp4"));
+		assert!(!body.contains("/vid/liveendpoint1/old.mp4"));
+	}
+
+	#[tokio::test]
+	async fn live_media_endpoint_rejects_queries_and_unknown_revisions_no_store() {
+		let id = "liveendpoint2";
+		let post = sample_video_post(id, "/vid/liveendpoint2/video.mp4");
+		let snapshot = observe_post(&post, ObservationSource::Direct, "direct", 200).unwrap();
+		let revision = snapshot.revision.to_string();
+
+		let query_uri = format!("/post-live/{id}/{revision}/media?variant=1");
+		let query_response = live_media(request_with_live_media_params(&query_uri, id, &revision)).await.unwrap();
+		assert_eq!(query_response.status(), StatusCode::NOT_FOUND);
+		assert_eq!(query_response.headers()["cache-control"], "private, no-store");
+
+		let unknown_revision = "0".repeat(64);
+		let unknown_uri = format!("/post-live/{id}/{unknown_revision}/media");
+		let unknown_response = live_media(request_with_live_media_params(&unknown_uri, id, &unknown_revision)).await.unwrap();
+		assert_eq!(unknown_response.status(), StatusCode::NOT_FOUND);
+		assert_eq!(unknown_response.headers()["cloudflare-cdn-cache-control"], "no-store");
+	}
+
+	#[tokio::test]
+	async fn immutable_card_rejects_noncanonical_cache_aliases() {
+		let id = "cardalias1";
+		let mut post = sample_post();
+		post.id = id.to_string();
+		let snapshot = observe_post(&post, ObservationSource::Direct, "direct", 250).unwrap();
+		let revision = snapshot.revision.to_string();
+
+		let uppercase_id = id.to_ascii_uppercase();
+		let uppercase_id_uri = format!("/post-content/{uppercase_id}/{revision}/card");
+		let id_response = card(request_with_live_media_params(&uppercase_id_uri, &uppercase_id, &revision)).await.unwrap();
+		assert_eq!(id_response.status(), StatusCode::NOT_FOUND);
+		assert_eq!(id_response.headers()["cache-control"], "no-store");
+
+		let uppercase_revision = revision.to_ascii_uppercase();
+		let uppercase_revision_uri = format!("/post-content/{id}/{uppercase_revision}/card");
+		let revision_response = card(request_with_live_media_params(&uppercase_revision_uri, id, &uppercase_revision)).await.unwrap();
+		assert_eq!(revision_response.status(), StatusCode::NOT_FOUND);
+		assert_eq!(revision_response.headers()["cache-control"], "no-store");
+	}
+
+	#[test]
+	fn latest_stable_card_helper_matches_exact_card_identity() {
+		let id = "cardhelper1";
+		let post = sample_video_post(id, "/vid/cardhelper1/video.mp4");
+		let snapshot = observe_post(&post, ObservationSource::Listing, "listing", 300).unwrap();
+		let rendered = render_latest_stable_card(id).unwrap().unwrap();
+
+		assert_eq!(rendered.post_id, id);
+		assert_eq!(rendered.revision, snapshot.revision.to_string());
+		assert_eq!(rendered.path, format!("/post-content/{id}/{}/card", snapshot.revision));
+		assert!(rendered.html.contains(&format!("data-post-content-id=\"{id}\"")));
+		assert!(rendered.html.contains(&format!("data-post-content-revision=\"{}\"", snapshot.revision)));
+		assert!(!rendered.html.contains("/vid/cardhelper1/video.mp4"));
 	}
 
 	#[test]

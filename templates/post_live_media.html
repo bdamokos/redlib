@@ -1,0 +1,10 @@
+{% import "utils.html" as utils %}
+
+<div
+	class="post_live_media"
+	data-post-live-media-id="{{ post.id }}"
+	data-post-live-media-revision="{{ revision }}"
+	data-post-live-media-kind="{{ post.post_type }}"
+	data-post-live-media-observed-at="{{ post.observed_at }}">
+	{% call utils::render_video_html(post, "post") %}
+</div>

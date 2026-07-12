@@ -40,9 +40,10 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     };
 
-    const replaceFragment = (html) => {
+    const replaceFragment = async (html) => {
         const template = document.createElement("template");
         template.innerHTML = html.trim();
+        await window.preparePostFragment?.(template.content);
         applyDocumentMetadata(template.content);
 
         if (appendFragmentContent && appendIntoCurrentFragment(template.content)) {
@@ -62,7 +63,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         }
 
-        container.outerHTML = html;
+        container.replaceWith(...template.content.childNodes);
         refreshDynamicContent(document);
         settleBannerState();
     };
@@ -94,6 +95,10 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         if (appendFragmentContent) {
+            return;
+        }
+
+        if (!replaceSelector && target.querySelector?.("[data-post-content-id]")) {
             return;
         }
 
@@ -336,7 +341,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             const html = await response.text();
-            replaceFragment(html);
+            await replaceFragment(html);
             void loadSidebarFragment();
         } catch (error) {
             window.console?.warn?.("page_fragment: fetch attempt failed", {

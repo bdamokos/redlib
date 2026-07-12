@@ -10,7 +10,7 @@ use crate::subreddit::{can_access_quarantine, quarantine};
 use crate::utils::{
 	error, format_num, get_filters, nsfw_landing, param, parse_post, rewrite_emotes, setting, template, time, val, Author, Awards, Comment, Flair, FlairPart, Post, Preferences,
 };
-use hyper::{Body, Request, Response};
+use hyper::{header, Body, Request, Response};
 use log::{info, warn};
 
 use askama::Template;
@@ -24,6 +24,8 @@ use std::sync::LazyLock;
 pub struct PostTemplate {
 	comments: Vec<Comment>,
 	post: Post,
+	cached_post_shell: Option<CachedPostShell>,
+	post_shell_id: String,
 	post_shell_subreddit: String,
 	fallback_notice: String,
 	sort: String,
@@ -39,6 +41,19 @@ pub struct PostTemplate {
 }
 
 crate::impl_template_str_eq!(PostTemplate);
+
+#[derive(Clone, Debug)]
+struct CachedPostShell {
+	post_id: String,
+	revision: String,
+	component_path: String,
+	request_path: String,
+	card_html: String,
+	title: String,
+	community: String,
+	blurred: bool,
+	allow_stable_media: bool,
+}
 
 #[derive(Template)]
 #[template(path = "post_fragment.html")]
@@ -143,11 +158,52 @@ pub fn full_render_requested(url: &str) -> bool {
 }
 
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
-	let post_shell_subreddit = req.param("sub").unwrap_or_default();
+	let requested_post_id = req.param("id").unwrap_or_default();
 	let url = req.uri().to_string();
-	return Ok(template(&PostTemplate {
+	let request_path = req.uri().path().to_string();
+	let prefs = Preferences::new(&req);
+	let cached_snapshot = crate::post_components::latest(&requested_post_id);
+	if cached_snapshot.as_ref().is_some_and(|snapshot| snapshot.stable.nsfw) && crate::utils::should_be_nsfw_gated(&req, &url) {
+		return nsfw_landing(req, url).await;
+	}
+
+	let cached_post_shell = match (cached_snapshot.as_ref(), crate::post_components::render_latest_stable_card(&requested_post_id)) {
+		(Some(snapshot), Ok(Some(rendered)))
+			if rendered.post_id == requested_post_id && rendered.revision == snapshot.revision.as_str() && rendered.post_id == snapshot.stable.id.as_str() =>
+		{
+			let blurred = (snapshot.stable.nsfw && prefs.blur_nsfw == "on") || (snapshot.stable.spoiler && prefs.blur_spoiler == "on");
+			Some(CachedPostShell {
+				post_id: rendered.post_id,
+				revision: rendered.revision,
+				component_path: rendered.path,
+				request_path,
+				card_html: rendered.html,
+				title: snapshot.stable.title.clone(),
+				community: snapshot.stable.community.clone(),
+				blurred,
+				allow_stable_media: !blurred,
+			})
+		}
+		(_, Err(error)) => {
+			warn!("post: failed to render cached stable shell for {}: {}", requested_post_id, error);
+			None
+		}
+		_ => None,
+	};
+	let post_shell_subreddit = cached_post_shell
+		.as_ref()
+		.map(|cached| cached.community.clone())
+		.unwrap_or_else(|| req.param("sub").unwrap_or_default());
+	let loading_message = if cached_post_shell.is_some() {
+		"Loading fresh post metadata and comments..."
+	} else {
+		"Loading post and comments..."
+	};
+	let mut response = template(&PostTemplate {
 		comments: Vec::new(),
 		post: empty_post_for_shell(&post_shell_subreddit, &url),
+		cached_post_shell,
+		post_shell_id: requested_post_id,
 		post_shell_subreddit,
 		fallback_notice: String::new(),
 		sort: String::new(),
@@ -159,8 +215,11 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 		comment_query: String::new(),
 		shell_mode: true,
 		fragment_url: post_fragment_path(&req),
-		loading_message: "Loading post and comments...".to_string(),
-	}));
+		loading_message: loading_message.to_string(),
+	});
+	response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("private, no-store"));
+	response.headers_mut().insert("cloudflare-cdn-cache-control", header::HeaderValue::from_static("no-store"));
+	Ok(response)
 }
 
 pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -366,6 +425,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 #[cfg(test)]
 mod tests {
 	use super::{full_render_requested, post_fragment_path, post_source_path, PostFragmentTemplate, PostTemplate};
+	use crate::server::RequestExt;
 	use crate::utils::Preferences;
 	use askama::Template;
 	use hyper::{Body, Request};
@@ -386,6 +446,8 @@ mod tests {
 		let html = PostTemplate {
 			comments: Vec::new(),
 			post: super::empty_post_for_shell("rust", "/r/rust/comments/demo/title"),
+			cached_post_shell: None,
+			post_shell_id: "demo".to_string(),
 			post_shell_subreddit: "rust".to_string(),
 			fallback_notice: String::new(),
 			sort: String::new(),
@@ -406,6 +468,47 @@ mod tests {
 		assert!(html.contains("data-error-message=\"Loading the post is taking longer than expected.\""));
 		assert!(html.contains("data-timeout-ms=\"20000\""));
 		assert!(html.contains("Loading post and comments..."));
+		assert!(html.contains("data-post-shell-id=\"demo\""));
+	}
+
+	#[tokio::test]
+	async fn item_paints_latest_stable_card_before_private_fragment() {
+		let mut post = super::empty_post_for_shell("rust", "/r/rust/comments/shellcache01/stable_title");
+		post.id = "shellcache01".to_string();
+		post.title = "Stable cached title".to_string();
+		post.community = "rust".to_string();
+		post.permalink = "/r/rust/comments/shellcache01/stable_title/".to_string();
+		post.body = "<div class=\"md\"><p>Stable cached body</p></div>".to_string();
+		let snapshot =
+			crate::post_components::observe_post(&post, crate::post_components::ObservationSource::Listing, "post-shell-test", 1_700_000_000).expect("stable observation");
+		let expected_card = crate::post_components::render_latest_stable_card(&post.id)
+			.expect("stable card render")
+			.expect("latest stable card");
+
+		let mut req = Request::builder().uri("/r/rust/comments/shellcache01/stable_title?sort=new").body(Body::empty()).unwrap();
+		let mut params = route_recognizer::Params::new();
+		params.insert("sub".to_string(), "rust".to_string());
+		params.insert("id".to_string(), post.id.clone());
+		params.insert("title".to_string(), "stable_title".to_string());
+		req.set_params(params);
+
+		let response = super::item(req).await.expect("cached shell response");
+		assert_eq!(response.headers()[hyper::header::CACHE_CONTROL], "private, no-store");
+		assert_eq!(response.headers()["cloudflare-cdn-cache-control"], "no-store");
+		assert!(!response.headers().contains_key(hyper::header::SET_COOKIE));
+		let body = hyper::body::to_bytes(response.into_body()).await.expect("cached shell body");
+		let html = String::from_utf8(body.to_vec()).expect("utf8 shell");
+
+		assert_eq!(expected_card.revision, snapshot.revision.as_str());
+		assert!(html.contains(&format!("data-post-shell-id=\"{}\"", post.id)));
+		assert!(html.contains(&format!("data-post-shell-revision=\"{}\"", snapshot.revision)));
+		assert!(html.contains(&format!("data-post-component-url=\"{}\"", expected_card.path)));
+		assert!(html.contains("data-post-shell-request-path=\"/r/rust/comments/shellcache01/stable_title\""));
+		assert!(html.contains(&expected_card.html), "shell must inline the exact stable-card bytes");
+		assert!(html.contains("data-fragment-url=\"/post-fragment/r/rust/comments/shellcache01/stable_title?sort=new\""));
+		let cached_content = html.find("Stable cached body").expect("cached content");
+		let loading_comments = html.rfind("Loading fresh post metadata and comments...").expect("private fragment loading state");
+		assert!(cached_content < loading_comments, "stable content should paint before the private loading state");
 	}
 
 	#[test]
@@ -451,6 +554,8 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-post-component-url=\"/post-content/demo/"));
+		assert!(html.contains("data-post-live-media-url=\"/post-live/demo/"));
+		assert!(html.contains("data-post-type=\"self\""));
 		assert!(html.contains("data-post-component-slot"));
 		assert!(html.contains("id=\"commentQueryForms\""));
 	}

@@ -2,8 +2,8 @@
 {% import "utils.html" as utils %}
 
 {% block title %}
-    {% if shell_mode %}
-        Loading post - Redlib
+	{% if shell_mode %}
+		{% if let Some(cached) = cached_post_shell %}{{ cached.title }} - r/{{ cached.community }}{% else %}Loading post - Redlib{% endif %}
     {% else if single_thread && comments.len() > 0 %}
         {{ comments[0].author.name }} comments on {{ post.title }} - r/{{ post.community }}
     {% else %}
@@ -63,15 +63,37 @@
     <main class="post_page_main">
         {% if shell_mode %}
         <div class="feed_status_banner warming">{{ loading_message }}</div>
-        <div
-            id="page_fragment"
-            data-fragment-url="{{ fragment_url }}"
-            data-loading-message="{{ loading_message }}"
-            data-error-message="Loading the post is taking longer than expected."
-            data-timeout-ms="20000">
-            <div id="column_one" class="post_page">
-                <center>Loading post and comments...</center>
-            </div>
+		<div
+			id="page_fragment"
+			data-fragment-url="{{ fragment_url }}"
+			data-loading-message="{{ loading_message }}"
+			data-error-message="Loading the post is taking longer than expected."
+			data-timeout-ms="20000"
+			{% if !post_shell_id.is_empty() %}data-post-shell-id="{{ post_shell_id }}"{% endif %}
+			{% if let Some(cached) = cached_post_shell %}
+			data-post-shell-revision="{{ cached.revision }}"
+			data-post-shell-component-path="{{ cached.component_path }}"
+			data-post-shell-request-path="{{ cached.request_path }}"
+			{% endif %}>
+			<div id="column_one" class="post_page">
+				{% if let Some(cached) = cached_post_shell %}
+				<div
+					id="{{ cached.post_id }}"
+					class="post highlighted post_component_wrapper{% if cached.blurred %} post_blurred{% endif %}"
+					data-post-component-id="{{ cached.post_id }}"
+					data-post-component-revision="{{ cached.revision }}"
+					data-post-component-url="{{ cached.component_path }}"
+					data-post-component-source-path="{{ cached.request_path }}"
+					data-post-component-state="ready"
+					data-allow-stable-media="{% if cached.allow_stable_media %}true{% else %}false{% endif %}"
+					aria-busy="false">
+					<div class="post_component_slot" data-post-component-slot aria-busy="false">{{ cached.card_html|safe }}</div>
+				</div>
+				<center>{{ loading_message }}</center>
+				{% else %}
+				<center>Loading post and comments...</center>
+				{% endif %}
+			</div>
         </div>
         {% else %}
         {% include "post_fragment.html" %}

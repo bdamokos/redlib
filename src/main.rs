@@ -655,6 +655,7 @@ async fn main() {
 	app.at("/cache-status").get(|r| subreddit::cache_status_page(r).boxed());
 	app.at("/cache-status.json").get(|r| subreddit::cache_status_api(r).boxed());
 	app.at("/post-content/:id/:revision/card").get(|r| post_components::card(r).boxed());
+	app.at("/post-live/:id/:revision/media").get(|r| post_components::live_media(r).boxed());
 	app.at("/feed-fragment").get(|r| subreddit::feed_fragment(r).boxed());
 	app.at("/bookmarks").get(|r| bookmarks::page(r).boxed());
 	app.at("/bookmarks/add").post(|r| bookmarks::add(r).boxed());
