@@ -925,7 +925,7 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 
 		update_user_video_stats_from_posts(&entry.posts);
 		if materialized_catalog::source_is_supported(source) {
-			materialized_catalog::apply_source_refresh(source, &entry.posts);
+			materialized_catalog::apply_source_refresh_with_observation(source, &entry.posts, crate::post_components::ObservationSource::Persisted);
 		}
 		if let Ok(mut cache) = SOURCE_CACHE.lock() {
 			cache.insert(cache_key, entry.clone());
@@ -1468,7 +1468,7 @@ pub(crate) fn rebuild_materialized_catalog_from_source_cache() {
 
 	materialized_catalog::reset_source_catalog_preserving_author_history();
 	for (source, posts) in sources {
-		materialized_catalog::apply_source_refresh(&source, &posts);
+		materialized_catalog::apply_source_refresh_with_observation(&source, &posts, crate::post_components::ObservationSource::Persisted);
 	}
 }
 

@@ -1370,16 +1370,15 @@ pub fn source_is_supported(source: &FeedSource) -> bool {
 }
 
 pub(crate) fn apply_source_refresh(source: &FeedSource, posts: &[Post]) {
+	apply_source_refresh_with_observation(source, posts, crate::post_components::ObservationSource::Listing);
+}
+
+pub(crate) fn apply_source_refresh_with_observation(source: &FeedSource, posts: &[Post], observation_source: crate::post_components::ObservationSource) {
 	let Some(source_key) = normalize_catalog_source(source) else {
 		return;
 	};
 
-	crate::post_components::observe_posts(
-		posts,
-		crate::post_components::ObservationSource::Listing,
-		format!("{source_key:?}"),
-		crate::cache_persistence::unix_now(),
-	);
+	crate::post_components::observe_posts(posts, observation_source, format!("{source_key:?}"), crate::cache_persistence::unix_now());
 
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	if !posts.is_empty() {

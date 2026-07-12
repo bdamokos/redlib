@@ -939,6 +939,16 @@ fn render_scraped_subreddit_fragment(
 	peer_origin: &str,
 ) -> Result<Response<Body>, String> {
 	cache_subreddit_metadata(&scraped.subreddit);
+	crate::post_components::observe_posts(
+		&scraped.posts,
+		if peer_origin.is_empty() {
+			crate::post_components::ObservationSource::Scrape
+		} else {
+			crate::post_components::ObservationSource::Peer
+		},
+		if peer_origin.is_empty() { "instance-scrape" } else { peer_origin },
+		crate::cache_persistence::unix_now(),
+	);
 	if cacheable_first_page {
 		crate::post_cache::publish_plain_subreddit_refresh(sub_name, scraped.posts.clone(), scraped.after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
 	} else {

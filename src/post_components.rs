@@ -13,6 +13,7 @@ const MAX_POST_ID_LEN: usize = 24;
 const MAX_CANONICAL_POSTS: usize = 10_000;
 const MAX_REVISION_BYTES: usize = 192 * 1024 * 1024;
 const REVISIONS_PER_POST: usize = 2;
+const MAX_REVISION_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -66,8 +67,8 @@ pub enum ObservationSource {
 	#[default]
 	Persisted,
 	Scrape,
-	Peer,
 	Listing,
+	Peer,
 	Direct,
 }
 
@@ -180,6 +181,7 @@ struct CanonicalPostStore {
 	latest: HashMap<PostId, CanonicalPostSnapshot>,
 	revisions: HashMap<(PostId, ContentRevision), Arc<StablePostContentV1>>,
 	revision_order: VecDeque<(PostId, ContentRevision)>,
+	revision_seen_at: HashMap<(PostId, ContentRevision), u64>,
 	revision_bytes: usize,
 }
 
@@ -459,7 +461,7 @@ pub fn observe(observation: PostObservation) -> CanonicalPostSnapshot {
 	};
 	let revision = merged_stable.revision();
 	let stable = Arc::new(merged_stable);
-	insert_revision(&mut store, id.clone(), revision.clone(), stable.clone());
+	insert_revision(&mut store, id.clone(), revision.clone(), stable.clone(), observation.observed_at);
 
 	let (live, live_observed_at) = match store.latest.get(&id) {
 		Some(existing) if existing.live_observed_at > observation.observed_at => (existing.live.clone(), existing.live_observed_at),
@@ -475,7 +477,7 @@ pub fn observe(observation: PostObservation) -> CanonicalPostSnapshot {
 		live_observed_at,
 	};
 	store.latest.insert(id, snapshot.clone());
-	prune_store(&mut store);
+	prune_store(&mut store, observation.observed_at);
 	snapshot
 }
 
@@ -591,13 +593,15 @@ fn merge_string(current: &mut String, incoming: &str, authoritative: bool) {
 	}
 }
 
-fn insert_revision(store: &mut CanonicalPostStore, id: PostId, revision: ContentRevision, stable: Arc<StablePostContentV1>) {
+fn insert_revision(store: &mut CanonicalPostStore, id: PostId, revision: ContentRevision, stable: Arc<StablePostContentV1>, observed_at: u64) {
 	let key = (id.clone(), revision.clone());
 	if store.revisions.contains_key(&key) {
+		store.revision_seen_at.insert(key, observed_at);
 		return;
 	}
 	store.revision_bytes = store.revision_bytes.saturating_add(stable.estimated_bytes());
 	store.revisions.insert(key.clone(), stable);
+	store.revision_seen_at.insert(key.clone(), observed_at);
 	store.revision_order.push_back(key);
 
 	let same_post = store.revision_order.iter().filter(|(post_id, _)| post_id == &id).cloned().collect::<Vec<_>>();
@@ -607,7 +611,16 @@ fn insert_revision(store: &mut CanonicalPostStore, id: PostId, revision: Content
 	}
 }
 
-fn prune_store(store: &mut CanonicalPostStore) {
+fn prune_store(store: &mut CanonicalPostStore, now: u64) {
+	let stale = store
+		.revision_seen_at
+		.iter()
+		.filter(|(key, seen_at)| now.saturating_sub(**seen_at) > MAX_REVISION_AGE_SECS && store.latest.get(&key.0).map(|latest| latest.revision != key.1).unwrap_or(true))
+		.map(|(key, _)| key.clone())
+		.collect::<Vec<_>>();
+	for key in stale {
+		remove_revision(store, &key);
+	}
 	while store.latest.len() > MAX_CANONICAL_POSTS || store.revision_bytes > MAX_REVISION_BYTES {
 		let Some(oldest) = store.revision_order.front().cloned() else {
 			break;
@@ -623,6 +636,7 @@ fn remove_revision(store: &mut CanonicalPostStore, key: &(PostId, ContentRevisio
 	if let Some(stable) = store.revisions.remove(key) {
 		store.revision_bytes = store.revision_bytes.saturating_sub(stable.estimated_bytes());
 	}
+	store.revision_seen_at.remove(key);
 	store.revision_order.retain(|candidate| candidate != key);
 }
 
@@ -823,5 +837,23 @@ mod tests {
 		assert!(!incoming_won);
 		assert_eq!(merged.title, "Authoritative title");
 		assert_eq!(merged.body_html(), "<p>Authoritative body</p>");
+	}
+
+	#[test]
+	fn age_pruning_removes_old_prior_revision_but_keeps_current() {
+		let first = PostObservation::from_post(&sample_post(), ObservationSource::Listing, "listing", 1).unwrap();
+		let mut edited_post = sample_post();
+		edited_post.title = "Edited".to_string();
+		let edited = PostObservation::from_post(&edited_post, ObservationSource::Direct, "direct", 2).unwrap();
+		let first_revision = first.stable.revision();
+		let edited_revision = edited.stable.revision();
+		let id = first.stable.id.clone();
+		let mut store = CanonicalPostStore::default();
+		insert_revision(&mut store, id.clone(), first_revision.clone(), Arc::new(first.stable), 1);
+		insert_revision(&mut store, id.clone(), edited_revision.clone(), Arc::new(edited.stable.clone()), 2);
+		store.latest.insert(id.clone(), snapshot_from(&edited));
+		prune_store(&mut store, MAX_REVISION_AGE_SECS + 10);
+		assert!(!store.revisions.contains_key(&(id.clone(), first_revision)));
+		assert!(store.revisions.contains_key(&(id, edited_revision)));
 	}
 }
