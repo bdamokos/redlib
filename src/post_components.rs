@@ -8,7 +8,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, LazyLock, Mutex};
 
-const REVISION_SCHEMA: &[u8] = b"stable-post-v1";
+const REVISION_SCHEMA: &[u8] = b"stable-post-v2";
+const CARD_ETAG_SCHEMA: &str = "card-v2";
 const MAX_POST_ID_LEN: usize = 24;
 const MAX_CANONICAL_POSTS: usize = 10_000;
 const MAX_REVISION_BYTES: usize = 192 * 1024 * 1024;
@@ -213,10 +214,14 @@ pub async fn card(req: Request<Body>) -> Result<Response<Body>, String> {
 		.status(200)
 		.header("content-type", "text/html; charset=utf-8")
 		.header("cache-control", "public, max-age=31536000, s-maxage=86400, immutable")
-		.header("etag", format!("\"{revision}-card-v1\""))
+		.header("etag", card_etag(&revision))
 		.header("x-redlib-cache-policy", "immutable-post-content")
 		.body(Body::from(body))
 		.map_err(|error| error.to_string())
+}
+
+fn card_etag(revision: &str) -> String {
+	format!("\"{revision}-{CARD_ETAG_SCHEMA}\"")
 }
 
 fn not_found() -> Result<Response<Body>, String> {
@@ -346,8 +351,12 @@ impl StablePostContentV1 {
 	}
 
 	pub fn revision(&self) -> ContentRevision {
+		self.revision_with_schema(REVISION_SCHEMA)
+	}
+
+	fn revision_with_schema(&self, schema: &[u8]) -> ContentRevision {
 		let mut canonical = Vec::new();
-		push_bytes(&mut canonical, REVISION_SCHEMA);
+		push_bytes(&mut canonical, schema);
 		push_str(&mut canonical, self.id.as_str());
 		push_str(&mut canonical, &self.title);
 		push_str(&mut canonical, self.body.as_str());
@@ -744,6 +753,18 @@ mod tests {
 			StablePostContentV1::from_post(&first).unwrap().revision(),
 			StablePostContentV1::from_post(&second).unwrap().revision()
 		);
+	}
+
+	#[test]
+	fn revision_schema_v2_invalidates_v1_card_urls() {
+		let stable = StablePostContentV1::from_post(&sample_post()).unwrap();
+		assert_eq!(REVISION_SCHEMA, b"stable-post-v2");
+		assert_ne!(stable.revision(), stable.revision_with_schema(b"stable-post-v1"));
+	}
+
+	#[test]
+	fn card_etag_uses_v2_identity() {
+		assert_eq!(card_etag("abc123"), "\"abc123-card-v2\"");
 	}
 
 	#[test]
