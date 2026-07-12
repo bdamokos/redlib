@@ -69,11 +69,13 @@
             }
             slot.replaceChildren(component);
             slot.setAttribute("aria-busy", "false");
+            wrapper.setAttribute("aria-busy", "false");
             wrapper.dataset.postComponentState = "ready";
             window.refreshDynamicContent?.(wrapper);
         } catch (error) {
             wrapper.dataset.postComponentState = "fallback";
             slot?.setAttribute("aria-busy", "false");
+            wrapper.setAttribute("aria-busy", "false");
             window.console?.warn?.("post_components: hydration failed", String(error));
         }
     };

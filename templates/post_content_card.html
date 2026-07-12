@@ -51,7 +51,7 @@
 	{% endif %}
 
 	{% if post.poll_options.len() > 0 %}
-	<div class="poll" data-post-live-poll>
+	<div class="post_poll" data-post-live-poll>
 		{% for option in post.poll_options %}
 		<div class="poll_option" data-poll-option-id="{{ option.id }}"><span>{{ option.text }}</span></div>
 		{% endfor %}

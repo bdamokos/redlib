@@ -1991,6 +1991,34 @@ a.search_subreddit_link:hover {
         / minmax(40px, auto) minmax(0, 1fr) fit-content(min(20%, 152px));
 }
 
+/* Let hydrated stable-card children participate in the post's existing grid. */
+.post_component_slot,
+.post_cached_content {
+    display: contents;
+}
+
+.post_cached_link,
+.post_cached_media_placeholder {
+    align-self: start;
+    grid-area: post_media;
+    margin: 5px 12px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.post_cached_link {
+    color: var(--accent);
+}
+
+.post_cached_media_placeholder {
+    color: var(--visited);
+}
+
+.post_component_wrapper > noscript {
+    grid-area: post_body;
+    min-width: 0;
+}
+
 .post[data-temporary-author-filtered="true"],
 .sep[data-temporary-author-filtered="true"],
 .post[data-permanent-author-filtered="true"],

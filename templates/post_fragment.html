@@ -19,7 +19,8 @@
         data-post-component-id="{{ post.id }}"
         data-post-component-revision="{{ revision }}"
         data-post-component-url="/post-content/{{ post.id }}/{{ revision }}/card"
-        data-allow-stable-media="{% if post_should_be_blurred %}false{% else %}true{% endif %}">
+        data-allow-stable-media="{% if post_should_be_blurred %}false{% else %}true{% endif %}"
+        aria-busy="true">
         <p class="post_header">
             <a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
             <span class="dot">&bull;</span>
