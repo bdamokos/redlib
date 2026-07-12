@@ -750,7 +750,6 @@ fn merge_vary(headers: &mut HeaderMap<header::HeaderValue>, name: &str) {
 ///
 /// This is a helper function for [`compress_response`] and should not be
 /// called directly.
-
 fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
 	// io::Cursor implements io::Read, required for our encoders.
 	let mut reader = io::Cursor::new(body_bytes);
