@@ -136,7 +136,8 @@ fn post_source_path(req: &Request<Body>) -> String {
 }
 
 pub fn full_render_requested(url: &str) -> bool {
-	url.split_once('?')
+	url
+		.split_once('?')
 		.map(|(_, query)| url::form_urlencoded::parse(query.as_bytes()).any(|(key, value)| key == "render" && value == "full"))
 		.unwrap_or(false)
 }

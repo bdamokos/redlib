@@ -281,6 +281,9 @@ fn static_asset_not_found() -> Result<Response<Body>, String> {
 
 /// Serves bundled CSS/JS only under the exact revision advertised by this build.
 async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Body>, String> {
+	if req.uri().query().is_some() {
+		return static_asset_not_found();
+	}
 	let Some(revision) = req.param("rev") else {
 		return static_asset_not_found();
 	};

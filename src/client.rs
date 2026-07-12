@@ -3,7 +3,7 @@ use cached::proc_macro::cached;
 use futures_lite::{future::Boxed, FutureExt};
 use hyper::client::HttpConnector;
 use hyper::header::HeaderValue;
-use hyper::{body, body::Buf, header, Body, Client, Method, Request, Response, StatusCode, Uri};
+use hyper::{body, body::Buf, body::HttpBody, header, Body, Client, Method, Request, Response, StatusCode, Uri};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use libflate::gzip;
 use log::{error, info, trace, warn};
@@ -54,6 +54,7 @@ type JsonFlightKey = (String, bool);
 type JsonFlightWaiter = oneshot::Sender<Result<Value, String>>;
 static JSON_INFLIGHT: LazyLock<Mutex<HashMap<JsonFlightKey, Vec<JsonFlightWaiter>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static REDDIT_JSON_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(env_usize("REDLIB_REDDIT_MAX_CONCURRENCY", 8, 1, 64))));
+static MEDIA_STREAM_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(env_usize("REDLIB_MEDIA_MAX_CONCURRENCY", 12, 1, 128))));
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default).clamp(min, max)
@@ -1093,6 +1094,10 @@ pub async fn proxy(req: Request<Body>, format: &str) -> Result<Response<Body>, S
 }
 
 async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String> {
+	let permit = tokio::time::timeout(Duration::from_millis(2_000), MEDIA_STREAM_SEMAPHORE.clone().acquire_owned())
+		.await
+		.map_err(|_| "local_overload: media admission timed out".to_string())?
+		.map_err(|_| "local_overload: media admission closed".to_string())?;
 	// First parameter is target URL (mandatory).
 	let parsed_uri = url.parse::<Uri>().map_err(|_| "Couldn't parse URL".to_string())?;
 
@@ -1102,7 +1107,7 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 	let mut builder = Request::get(parsed_uri);
 
 	// Copy useful headers from original request
-	for &key in &["Range", "If-Modified-Since", "Cache-Control"] {
+	for &key in &["Range", "If-Range", "If-None-Match", "If-Modified-Since"] {
 		if let Some(value) = req.headers().get(key) {
 			builder = builder.header(key, value);
 		}
@@ -1128,8 +1133,6 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 
 	rm("access-control-expose-headers");
 	rm("server");
-	rm("vary");
-	rm("etag");
 	rm("x-cdn");
 	rm("x-cdn-client-region");
 	rm("x-cdn-name");
@@ -1159,7 +1162,32 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 		return Ok(Response::from_parts(parts, Body::from(body)));
 	}
 
-	Ok(res)
+	if req.headers().contains_key(header::RANGE) || res.status() != StatusCode::OK {
+		res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+	}
+
+	// Keep the media permit until the downstream body reaches EOF, errors, or
+	// is dropped. This prevents many tabs from opening unbounded origin streams.
+	let (parts, mut upstream) = res.into_parts();
+	let (mut sender, downstream) = Body::channel();
+	tokio::spawn(async move {
+		let _permit = permit;
+		while let Some(next) = upstream.data().await {
+			match next {
+				Ok(chunk) => {
+					if sender.send_data(chunk).await.is_err() {
+						return;
+					}
+				}
+				Err(_) => return,
+			}
+		}
+		if let Ok(Some(trailers)) = upstream.trailers().await {
+			let _ = sender.send_trailers(trailers).await;
+		}
+	});
+
+	Ok(Response::from_parts(parts, downstream))
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
