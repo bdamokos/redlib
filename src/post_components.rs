@@ -446,9 +446,16 @@ pub fn observe_posts(posts: &[Post], source: ObservationSource, source_key: impl
 pub fn observe(observation: PostObservation) -> CanonicalPostSnapshot {
 	let mut store = CANONICAL_POSTS.lock().unwrap_or_else(|error| error.into_inner());
 	let id = observation.stable.id.clone();
-	let merged_stable = match store.latest.get(&id) {
-		Some(existing) => merge_stable(existing, &observation),
-		None => observation.stable.clone(),
+	let (merged_stable, stable_source, stable_source_key, stable_observed_at) = match store.latest.get(&id) {
+		Some(existing) => {
+			let (stable, incoming_wins) = merge_stable(existing, &observation);
+			if incoming_wins {
+				(stable, observation.source, observation.source_key.clone(), observation.observed_at)
+			} else {
+				(stable, existing.source, existing.source_key.clone(), existing.stable_observed_at)
+			}
+		}
+		None => (observation.stable.clone(), observation.source, observation.source_key.clone(), observation.observed_at),
 	};
 	let revision = merged_stable.revision();
 	let stable = Arc::new(merged_stable);
@@ -462,9 +469,9 @@ pub fn observe(observation: PostObservation) -> CanonicalPostSnapshot {
 		stable,
 		revision,
 		live,
-		source: observation.source,
-		source_key: observation.source_key,
-		stable_observed_at: observation.observed_at,
+		source: stable_source,
+		source_key: stable_source_key,
+		stable_observed_at,
 		live_observed_at,
 	};
 	store.latest.insert(id, snapshot.clone());
@@ -491,16 +498,15 @@ pub fn revision_for_post(post: &Post) -> String {
 		.unwrap_or_default()
 }
 
-fn merge_stable(existing: &CanonicalPostSnapshot, observation: &PostObservation) -> StablePostContentV1 {
+fn merge_stable(existing: &CanonicalPostSnapshot, observation: &PostObservation) -> (StablePostContentV1, bool) {
 	let mut merged = existing.stable.as_ref().clone();
 	let incoming = &observation.stable;
 	let incoming_is_authoritative = observation.source >= ObservationSource::Direct;
-	let incoming_is_preferred = observation.source > existing.source
-		|| (observation.source == existing.source && observation.observed_at >= existing.stable_observed_at)
-		|| incoming.completeness_score() > merged.completeness_score();
+	let incoming_is_preferred = observation_outranks(existing, observation);
 
 	if !incoming_is_preferred {
-		return merged;
+		fill_missing_stable_fields(&mut merged, incoming);
+		return (merged, false);
 	}
 	merge_string(&mut merged.title, &incoming.title, incoming_is_authoritative);
 	if !incoming.body.as_str().is_empty() || incoming_is_authoritative {
@@ -528,7 +534,55 @@ fn merge_stable(existing: &CanonicalPostSnapshot, observation: &PostObservation)
 	if !incoming.poll_options.is_empty() || incoming_is_authoritative {
 		merged.poll_options = incoming.poll_options.clone();
 	}
-	merged
+	(merged, true)
+}
+
+fn observation_outranks(existing: &CanonicalPostSnapshot, incoming: &PostObservation) -> bool {
+	if incoming.source != existing.source {
+		return incoming.source > existing.source;
+	}
+	if incoming.observed_at != existing.stable_observed_at {
+		return incoming.observed_at > existing.stable_observed_at;
+	}
+	if incoming.stable.completeness_score() != existing.stable.completeness_score() {
+		return incoming.stable.completeness_score() > existing.stable.completeness_score();
+	}
+	if incoming.source_key != existing.source_key {
+		return incoming.source_key < existing.source_key;
+	}
+	incoming.stable.revision().as_str() > existing.revision.as_str()
+}
+
+fn fill_missing_stable_fields(current: &mut StablePostContentV1, incoming: &StablePostContentV1) {
+	fill_missing_string(&mut current.title, &incoming.title);
+	if current.body.as_str().is_empty() && !incoming.body.as_str().is_empty() {
+		current.body = incoming.body.clone();
+	}
+	fill_missing_string(&mut current.author_name, &incoming.author_name);
+	if current.author_flair.flair_parts.is_empty() && !incoming.author_flair.flair_parts.is_empty() {
+		current.author_flair = incoming.author_flair.clone();
+	}
+	fill_missing_string(&mut current.author_distinguished, &incoming.author_distinguished);
+	fill_missing_string(&mut current.community, &incoming.community);
+	fill_missing_string(&mut current.permalink, &incoming.permalink);
+	if current.created_ts == 0 {
+		current.created_ts = incoming.created_ts;
+	}
+	if current.flair.flair_parts.is_empty() && !incoming.flair.flair_parts.is_empty() {
+		current.flair = incoming.flair.clone();
+	}
+	if matches!(current.media, StableMediaV1::None | StableMediaV1::Volatile { .. }) && !matches!(incoming.media, StableMediaV1::None | StableMediaV1::Volatile { .. }) {
+		current.media = incoming.media.clone();
+	}
+	if current.poll_options.is_empty() && !incoming.poll_options.is_empty() {
+		current.poll_options = incoming.poll_options.clone();
+	}
+}
+
+fn fill_missing_string(current: &mut String, incoming: &str) {
+	if current.is_empty() && !incoming.is_empty() {
+		*current = incoming.to_string();
+	}
 }
 
 fn merge_string(current: &mut String, incoming: &str, authoritative: bool) {
@@ -726,5 +780,48 @@ mod tests {
 		assert!(PostId::parse("abc123").is_some());
 		assert!(PostId::parse("../abc").is_none());
 		assert!(PostId::parse("").is_none());
+	}
+
+	fn snapshot_from(observation: &PostObservation) -> CanonicalPostSnapshot {
+		let stable = Arc::new(observation.stable.clone());
+		CanonicalPostSnapshot {
+			revision: stable.revision(),
+			stable,
+			live: observation.live.clone(),
+			source: observation.source,
+			source_key: observation.source_key.clone(),
+			stable_observed_at: observation.observed_at,
+			live_observed_at: observation.observed_at,
+		}
+	}
+
+	#[test]
+	fn equal_time_merge_is_independent_of_arrival_order() {
+		let mut first = sample_post();
+		first.title = "Alpha".to_string();
+		let mut second = sample_post();
+		second.title = "Beta".to_string();
+		let first = PostObservation::from_post(&first, ObservationSource::Listing, "source-b", 100).unwrap();
+		let second = PostObservation::from_post(&second, ObservationSource::Listing, "source-a", 100).unwrap();
+		let (forward, _) = merge_stable(&snapshot_from(&first), &second);
+		let (reverse, _) = merge_stable(&snapshot_from(&second), &first);
+		assert_eq!(forward.revision(), reverse.revision());
+		assert_eq!(forward.title, "Beta");
+	}
+
+	#[test]
+	fn lower_quality_observation_cannot_erase_richer_direct_content() {
+		let mut direct = sample_post();
+		direct.title = "Authoritative title".to_string();
+		direct.body = "<p>Authoritative body</p>".to_string();
+		let mut listing = sample_post();
+		listing.title = "Listing title".to_string();
+		listing.body.clear();
+		let direct = PostObservation::from_post(&direct, ObservationSource::Direct, "direct", 10).unwrap();
+		let listing = PostObservation::from_post(&listing, ObservationSource::Listing, "listing", 20).unwrap();
+		let (merged, incoming_won) = merge_stable(&snapshot_from(&direct), &listing);
+		assert!(!incoming_won);
+		assert_eq!(merged.title, "Authoritative title");
+		assert_eq!(merged.body_html(), "<p>Authoritative body</p>");
 	}
 }
