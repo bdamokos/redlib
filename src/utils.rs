@@ -5911,7 +5911,15 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 	.render()
 	.unwrap_or_default();
 
-	Ok(Response::builder().status(404).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+	let mut response = Response::builder()
+		.status(if msg.starts_with("local_overload:") { 503 } else { 404 })
+		.header("content-type", "text/html")
+		.body(body.into())
+		.unwrap_or_default();
+	if msg.starts_with("local_overload:") {
+		response.headers_mut().insert("retry-after", "2".parse().unwrap());
+	}
+	Ok(response)
 }
 
 /// Renders a generic info landing page.

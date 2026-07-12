@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{io, result::Result};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 
 use crate::config::get_setting;
 use crate::dbg_msg;
@@ -51,6 +51,15 @@ const PEER_RATE_LIMIT_STATUS_TTL: Duration = Duration::from_secs(5 * 60);
 type JsonFlightKey = (String, bool);
 type JsonFlightWaiter = oneshot::Sender<Result<Value, String>>;
 static JSON_INFLIGHT: LazyLock<Mutex<HashMap<JsonFlightKey, Vec<JsonFlightWaiter>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static REDDIT_JSON_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(env_usize("REDLIB_REDDIT_MAX_CONCURRENCY", 8, 1, 64))));
+
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default).clamp(min, max)
+}
+
+fn reddit_json_deadline() -> Duration {
+	Duration::from_millis(env_usize("REDLIB_REDDIT_REQUEST_DEADLINE_MS", 20_000, 1_000, 120_000) as u64)
+}
 
 pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::new(|| {
 	hyper_rustls::HttpsConnectorBuilder::new()
@@ -1417,6 +1426,22 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 
 #[cached(size = 100, time = 30, result = true)]
 async fn json_completed_cache(path: String, quarantine: bool) -> Result<Value, String> {
+	let deadline = reddit_json_deadline();
+	let operation = async {
+		let _permit = REDDIT_JSON_SEMAPHORE
+			.clone()
+			.acquire_owned()
+			.await
+			.map_err(|_| format!("local_overload: Reddit request admission closed | {path}"))?;
+		json_upstream(path.clone(), quarantine).await
+	};
+	match tokio::time::timeout(deadline, operation).await {
+		Ok(result) => result,
+		Err(_) => Err(format!("local_overload: Reddit request exceeded {}ms deadline | {path}", deadline.as_millis())),
+	}
+}
+
+async fn json_upstream(path: String, quarantine: bool) -> Result<Value, String> {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);

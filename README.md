@@ -462,6 +462,8 @@ Assign a default value for each instance-specific setting by passing environment
 | `PEER_API_FALLBACK_TIMEOUT_SECS` | Integer  | `5`                    | Per-request timeout for configured Redlib peer API fallback requests.                                      |
 | `PEER_API_FALLBACK_FORCE_TESTING` | `["on", "off"]` | `off`          | Enables the guarded `?force_peer=1` URL test override for subreddit listing API and fragment requests. |
 | `REMEMBERED_FEED_DAEMON_ENABLED` | `["on", "off"]` | `on`            | Enables the remembered-feed background refresh daemon. Set to `off` on passive hot-spare instances.        |
+| `REDDIT_MAX_CONCURRENCY` | Integer 1-64 | `8` | Caps distinct Reddit JSON operations. Identical concurrent requests share one producer and do not consume additional permits. |
+| `REDDIT_REQUEST_DEADLINE_MS` | Integer 1000-120000 | `20000` | Absolute deadline covering admission, upstream redirects/transports, response body collection, and JSON parsing. |
 
 > [!WARNING]
 > When `REDLIB_INSTANCE_SCRAPE_ENABLED=on`, direct subreddit, user, and post page requests that hit a Reddit rate limit may be fetched from a public Redlib instance instead. That leaks the requested path to the selected external instance. Front-page warming, remembered-subreddit background refreshes, and other background cache traffic do not use this fallback.
