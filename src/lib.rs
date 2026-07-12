@@ -14,6 +14,7 @@ pub mod observed_semantic_backfill;
 pub mod peer_api_fallback;
 pub mod post;
 pub mod post_cache;
+pub mod post_components;
 pub mod post_feedback;
 pub mod prefs_store;
 pub mod redgifs;

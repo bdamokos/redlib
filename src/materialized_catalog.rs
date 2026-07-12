@@ -1374,6 +1374,13 @@ pub(crate) fn apply_source_refresh(source: &FeedSource, posts: &[Post]) {
 		return;
 	};
 
+	crate::post_components::observe_posts(
+		posts,
+		crate::post_components::ObservationSource::Listing,
+		format!("{source_key:?}"),
+		crate::cache_persistence::unix_now(),
+	);
+
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	if !posts.is_empty() {
 		record_author_history_from_posts_locked(&mut catalog, posts, crate::cache_persistence::unix_now());

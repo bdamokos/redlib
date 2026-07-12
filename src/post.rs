@@ -200,6 +200,12 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 	if instance_scrape::instance_scrape_enabled() && instance_scrape::reddit_rate_limited_now() {
 		info!("post: using scrape fallback for {} because Reddit is currently rate limited", url);
 		if let Ok(mut scraped) = instance_scrape::scrape_post_page(&url, highlighted_comment).await {
+			crate::post_components::observe_post(
+				&scraped.post,
+				crate::post_components::ObservationSource::Scrape,
+				url.clone(),
+				crate::cache_persistence::unix_now(),
+			);
 			let prefs = Preferences::new(&req);
 			bookmarks::decorate_post(&req, &mut scraped.post);
 			if scraped.post.bookmarked {
@@ -238,6 +244,12 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 		Ok(response) => {
 			// Parse the JSON into Post and Comment structs
 			let mut post = parse_post(&response[0]["data"]["children"][0]).await;
+			crate::post_components::observe_post(
+				&post,
+				crate::post_components::ObservationSource::Direct,
+				request_path.clone(),
+				crate::cache_persistence::unix_now(),
+			);
 			post.author.external_links = crate::utils::cached_author_external_links(&post.author.name);
 			bookmarks::decorate_post(&req, &mut post);
 			if post.bookmarked {
@@ -294,6 +306,12 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				info!("post: retrying {} via scrape fallback after Reddit error: {}", url, msg);
 				match instance_scrape::scrape_post_page(&url, highlighted_comment).await {
 					Ok(mut scraped) => {
+						crate::post_components::observe_post(
+							&scraped.post,
+							crate::post_components::ObservationSource::Scrape,
+							url.clone(),
+							crate::cache_persistence::unix_now(),
+						);
 						let prefs = Preferences::new(&req);
 						bookmarks::decorate_post(&req, &mut scraped.post);
 						if scraped.post.bookmarked {

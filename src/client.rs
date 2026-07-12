@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{io, result::Result};
+use tokio::sync::oneshot;
 
 use crate::config::get_setting;
 use crate::dbg_msg;
@@ -46,6 +47,10 @@ const IMAGE_PRELOAD_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_REDDIT_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(3);
 const RATE_LIMIT_STATUS_TTL: Duration = Duration::from_secs(15 * 60);
 const PEER_RATE_LIMIT_STATUS_TTL: Duration = Duration::from_secs(5 * 60);
+
+type JsonFlightKey = (String, bool);
+type JsonFlightWaiter = oneshot::Sender<Result<Value, String>>;
+static JSON_INFLIGHT: LazyLock<Mutex<HashMap<JsonFlightKey, Vec<JsonFlightWaiter>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::new(|| {
 	hyper_rustls::HttpsConnectorBuilder::new()
@@ -1377,9 +1382,41 @@ fn persist_debug_response(path: &str, status: hyper::StatusCode, headers: &[(Str
 	let _ = writeln!(file, "{text}");
 }
 
-/// Make a request to a Reddit API and parse the JSON response
-#[cached(size = 100, time = 30, result = true)]
+/// Make a request to a Reddit API and parse the JSON response. Concurrent cold
+/// requests for the same upstream key share one producer, even if the original
+/// browser request is cancelled.
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
+	let key = (path.clone(), quarantine);
+	let (sender, receiver) = oneshot::channel();
+	let is_leader = {
+		let mut flights = JSON_INFLIGHT.lock().unwrap_or_else(|error| error.into_inner());
+		match flights.get_mut(&key) {
+			Some(waiters) => {
+				waiters.push(sender);
+				false
+			}
+			None => {
+				flights.insert(key.clone(), vec![sender]);
+				true
+			}
+		}
+	};
+
+	if is_leader {
+		tokio::spawn(async move {
+			let result = json_completed_cache(path, quarantine).await;
+			let waiters = JSON_INFLIGHT.lock().unwrap_or_else(|error| error.into_inner()).remove(&key).unwrap_or_default();
+			for waiter in waiters {
+				let _ = waiter.send(result.clone());
+			}
+		});
+	}
+
+	receiver.await.unwrap_or_else(|_| Err("Reddit request producer stopped before completion".to_string()))
+}
+
+#[cached(size = 100, time = 30, result = true)]
+async fn json_completed_cache(path: String, quarantine: bool) -> Result<Value, String> {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);

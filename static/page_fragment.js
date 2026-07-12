@@ -13,7 +13,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const loadingMessage = container.dataset.loadingMessage || "Loading the page...";
     const errorMessage = container.dataset.errorMessage || "Loading the page is taking longer than expected.";
     const timeoutMs = Number.parseInt(container.dataset.timeoutMs || "15000", 10);
-    const maxAttempts = Number.parseInt(container.dataset.maxAttempts || "3", 10);
+    const maxAttempts = Math.min(2, Number.parseInt(container.dataset.maxAttempts || "2", 10));
     const retryDelayMs = Number.parseInt(container.dataset.retryDelayMs || "1500", 10);
     const replaceSelector = container.dataset.replaceSelector || "";
     const appendFragmentContent = container.dataset.appendFragmentContent === "true";
@@ -259,7 +259,7 @@ document.addEventListener("DOMContentLoaded", () => {
         window.setTimeout(resolve, retryDelayMs);
     });
 
-    const shouldRetryResponse = (status) => status === 408 || status === 425 || status === 429 || status >= 500;
+    const shouldRetryResponse = (status) => [408, 425, 429, 502, 503, 504].includes(status);
 
     const loadSidebarFragment = async () => {
         if (!sidebarFragmentUrl) {
@@ -268,6 +268,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         try {
             const response = await fetch(sidebarFragmentUrl, {
+                cache: "no-store",
                 credentials: "same-origin",
                 headers: {
                     "Cache-Control": "no-store",
@@ -313,6 +314,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         try {
             const response = await fetch(fragmentUrl, {
+                cache: "no-store",
                 credentials: "same-origin",
                 headers: {
                     "Cache-Control": "no-store",

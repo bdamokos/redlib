@@ -369,11 +369,11 @@ impl Server {
 								match func.await {
 									Ok(mut res) => {
 										prefs_actions.apply(&mut res);
+										finalize_cache_policy(&mut res);
 										res.headers_mut().extend(def_headers);
+										let _ = compress_response(&req_headers, &mut res).await;
 										if is_head {
 											*res.body_mut() = Body::empty();
-										} else {
-											let _ = compress_response(&req_headers, &mut res).await;
 										}
 
 										Ok(res)
@@ -424,12 +424,35 @@ async fn new_boilerplate(
 ) -> Result<Response<Body>, String> {
 	match Response::builder().status(status).body(body) {
 		Ok(mut res) => {
+			finalize_cache_policy(&mut res);
 			let _ = compress_response(&req_headers, &mut res).await;
 
 			res.headers_mut().extend(default_headers.clone());
 			Ok(res)
 		}
 		Err(msg) => Err(msg.to_string()),
+	}
+}
+
+/// Fail closed for shared caches. A handler must explicitly opt a successful,
+/// cookie-independent response into public caching.
+fn finalize_cache_policy(res: &mut Response<Body>) {
+	let explicitly_public = res
+		.headers()
+		.get_all(header::CACHE_CONTROL)
+		.iter()
+		.filter_map(|value| value.to_str().ok())
+		.any(|value| value.split(',').any(|directive| directive.trim().eq_ignore_ascii_case("public")));
+	let varies_by_cookie = res
+		.headers()
+		.get_all(header::VARY)
+		.iter()
+		.filter_map(|value| value.to_str().ok())
+		.any(|value| value.split(',').any(|name| name.trim().eq_ignore_ascii_case("cookie")));
+
+	if !res.status().is_success() || !explicitly_public || res.headers().contains_key(header::SET_COOKIE) || varies_by_cookie {
+		res.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("private, no-store"));
+		res.headers_mut().insert("cloudflare-cdn-cache-control", header::HeaderValue::from_static("no-store"));
 	}
 }
 
@@ -609,6 +632,19 @@ fn determine_compressor(accept_encoding: String) -> Option<CompressionType> {
 /// This function logs errors to stderr, but only in debug mode. No information
 /// is logged in release builds.
 async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &mut Response<Body>) -> Result<(), String> {
+	if res.headers().contains_key(header::CONTENT_ENCODING)
+		|| res.headers().contains_key(header::CONTENT_RANGE)
+		|| matches!(res.status().as_u16(), 100..=199 | 204 | 206 | 304)
+		|| res
+			.headers()
+			.get_all(header::CACHE_CONTROL)
+			.iter()
+			.filter_map(|value| value.to_str().ok())
+			.any(|value| value.split(',').any(|directive| directive.trim().eq_ignore_ascii_case("no-transform")))
+	{
+		return Ok(());
+	}
+
 	// Check if the data is eligible for compression.
 	if let Some(hdr) = res.headers().get(header::CONTENT_TYPE) {
 		match from_utf8(hdr.as_bytes()) {
@@ -660,6 +696,7 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 		Some(c) => c,
 		None => return Ok(()),
 	};
+	merge_vary(res.headers_mut(), "Accept-Encoding");
 
 	// Get the body from the response.
 	let body_bytes: Vec<u8> = match body::to_bytes(res.body_mut()).await {
@@ -688,6 +725,25 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 	}
 
 	Ok(())
+}
+
+fn merge_vary(headers: &mut HeaderMap<header::HeaderValue>, name: &str) {
+	let mut values = headers
+		.get_all(header::VARY)
+		.iter()
+		.filter_map(|value| value.to_str().ok())
+		.flat_map(|value| value.split(','))
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.map(str::to_string)
+		.collect::<Vec<_>>();
+	if values.iter().any(|value| value == "*") || values.iter().any(|value| value.eq_ignore_ascii_case(name)) {
+		return;
+	}
+	values.push(name.to_string());
+	if let Ok(value) = header::HeaderValue::from_str(&values.join(", ")) {
+		headers.insert(header::VARY, value);
+	}
 }
 
 /// Compresses a `Vec<u8>` given a [`CompressionType`].
@@ -870,5 +926,40 @@ mod tests {
 
 			assert!(decompressed.eq(&expected_lorem_ipsum));
 		}
+	}
+
+	#[test]
+	fn cache_policy_fails_closed_and_protects_cookies() {
+		let mut unclassified = Response::builder().status(200).body(Body::empty()).unwrap();
+		finalize_cache_policy(&mut unclassified);
+		assert_eq!(unclassified.headers()[header::CACHE_CONTROL], "private, no-store");
+
+		let mut public = Response::builder()
+			.status(200)
+			.header(header::CACHE_CONTROL, "public, max-age=60")
+			.body(Body::empty())
+			.unwrap();
+		finalize_cache_policy(&mut public);
+		assert_eq!(public.headers()[header::CACHE_CONTROL], "public, max-age=60");
+
+		let mut public_with_cookie = Response::builder()
+			.status(200)
+			.header(header::CACHE_CONTROL, "public, max-age=60")
+			.header(header::SET_COOKIE, "session=private")
+			.body(Body::empty())
+			.unwrap();
+		finalize_cache_policy(&mut public_with_cookie);
+		assert_eq!(public_with_cookie.headers()[header::CACHE_CONTROL], "private, no-store");
+		assert_eq!(public_with_cookie.headers()["cloudflare-cdn-cache-control"], "no-store");
+	}
+
+	#[test]
+	fn vary_merge_preserves_existing_values() {
+		let mut headers = HeaderMap::new();
+		headers.insert(header::VARY, "Origin".parse().unwrap());
+		merge_vary(&mut headers, "Accept-Encoding");
+		assert_eq!(headers[header::VARY], "Origin, Accept-Encoding");
+		merge_vary(&mut headers, "accept-encoding");
+		assert_eq!(headers[header::VARY], "Origin, Accept-Encoding");
 	}
 }

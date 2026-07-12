@@ -98,7 +98,7 @@ impl ResourceType {
 }
 
 /// Post flair with content, background color and foreground color
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Flair {
 	pub flair_parts: Vec<FlairPart>,
 	pub text: String,
@@ -107,7 +107,7 @@ pub struct Flair {
 }
 
 /// Part of flair, either emoji or text
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FlairPart {
 	pub flair_part_type: String,
 	pub value: String,
@@ -2557,23 +2557,9 @@ fn footer_peer_ratelimit_entries(peers: &[PeerRateLimitStatus], configured_peers
 	entries
 }
 
-fn static_asset_revision_token_ok(s: &str) -> bool {
-	!s.is_empty() && !s.contains('/') && !s.contains("..") && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
-}
-
-static STATIC_ASSET_REVISION: LazyLock<String> = LazyLock::new(|| {
-	if let Ok(raw) = env::var("REDLIB_DEPLOY_GIT_HASH") {
-		let token = raw.trim();
-		if static_asset_revision_token_ok(token) {
-			return token.to_string();
-		}
-	}
-	env!("GIT_HASH").to_string()
-});
-
-/// Revision segment for [`static_asset_href`] (`REDLIB_DEPLOY_GIT_HASH` when set and safe, else compile-time `GIT_HASH`).
+/// Content-derived revision segment for [`static_asset_href`].
 pub fn static_asset_revision() -> &'static str {
-	STATIC_ASSET_REVISION.as_str()
+	env!("STATIC_ASSET_REVISION")
 }
 
 /// Path under `/redlib-static/{revision}/…` for cache-friendly CSS/JS URLs (`rel` must be a single file name).

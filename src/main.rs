@@ -16,8 +16,8 @@ use redlib::json_api;
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
-	bookmarks, cache_persistence, config, creator_links, duplicates, headers, instance_info, observed_semantic_backfill, post, post_cache, post_feedback, search, settings,
-	site_icon, subreddit, suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
+	bookmarks, cache_persistence, config, creator_links, duplicates, headers, instance_info, observed_semantic_backfill, post, post_cache, post_components, post_feedback,
+	search, settings, site_icon, subreddit, suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
 };
 use url::Url;
 
@@ -273,19 +273,27 @@ fn static_asset_not_found() -> Result<Response<Body>, String> {
 	Response::builder()
 		.status(404)
 		.header("content-type", "text/plain; charset=utf-8")
+		.header("cache-control", "private, no-store")
+		.header("cloudflare-cdn-cache-control", "no-store")
 		.body(Body::from("Not found"))
 		.map_err(|e| e.to_string())
 }
 
-/// Serves bundled CSS/JS at `/redlib-static/:rev/:file`. The `rev` segment is ignored so stale HTML still loads.
+/// Serves bundled CSS/JS only under the exact revision advertised by this build.
 async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Body>, String> {
+	let Some(revision) = req.param("rev") else {
+		return static_asset_not_found();
+	};
+	if revision != redlib::utils::static_asset_revision() {
+		return static_asset_not_found();
+	}
 	let Some(file) = req.param("file") else {
 		return static_asset_not_found();
 	};
 	if file.contains('/') || file.contains("..") {
 		return static_asset_not_found();
 	}
-	match file.as_str() {
+	let mut response = match file.as_str() {
 		"style.css" => style().await,
 		"playHLSVideo.js" => resource(include_str!("../static/playHLSVideo.js"), "text/javascript", false).await,
 		"hls.min.js" => resource(include_str!("../static/hls.min.js"), "text/javascript", false).await,
@@ -315,8 +323,12 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"submitted_duplicates.js" => resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).await,
 		"video_mode_filters.js" => resource(include_str!("../static/video_mode_filters.js"), "text/javascript", false).await,
 		"cache_status.js" => resource(include_str!("../static/cache_status.js"), "text/javascript", false).await,
-		_ => static_asset_not_found(),
-	}
+		_ => return static_asset_not_found(),
+	}?;
+	response
+		.headers_mut()
+		.insert("cache-control", "public, max-age=31536000, s-maxage=31536000, immutable".parse().unwrap());
+	Ok(response)
 }
 
 #[tokio::main]
@@ -638,6 +650,7 @@ async fn main() {
 	app.at("/feed-status").get(|r| subreddit::feed_status_api(r).boxed());
 	app.at("/cache-status").get(|r| subreddit::cache_status_page(r).boxed());
 	app.at("/cache-status.json").get(|r| subreddit::cache_status_api(r).boxed());
+	app.at("/post-content/:id/:revision/card").get(|r| post_components::card(r).boxed());
 	app.at("/feed-fragment").get(|r| subreddit::feed_fragment(r).boxed());
 	app.at("/bookmarks").get(|r| bookmarks::page(r).boxed());
 	app.at("/bookmarks/add").post(|r| bookmarks::add(r).boxed());

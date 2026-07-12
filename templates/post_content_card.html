@@ -1,0 +1,60 @@
+<div
+	class="post_cached_content{% if post.nsfw %} post_cached_content_nsfw{% endif %}{% if post.spoiler %} post_cached_content_spoiler{% endif %}"
+	data-post-content-id="{{ post.id }}"
+	data-post-content-revision="{{ revision }}"
+	data-created-ts="{{ post.created_ts }}">
+	<h2 class="post_title">
+		{% if !post.flair.text.is_empty() %}
+		<span class="post_flair" style="color:{{ post.flair.foreground_color }}; background:{{ post.flair.background_color }};">{{ post.flair.text }}</span>
+		{% endif %}
+		<a href="{{ post.permalink }}">{{ post.title }}</a>
+		{% if post.nsfw %}<small class="nsfw">NSFW</small>{% endif %}
+		{% if post.spoiler %}<small class="spoiler">Spoiler</small>{% endif %}
+	</h2>
+
+	{% if post.is_image() %}
+	<div class="post_media_content post_cached_media" data-post-media-state="inactive">
+		<a href="{{ post.image_url() }}" class="post_media_image">
+			<img loading="lazy" alt="Post image" data-stable-media-src="{{ post.image_url() }}"{% if post.image_width() > 0 %} width="{{ post.image_width() }}"{% endif %}{% if post.image_height() > 0 %} height="{{ post.image_height() }}"{% endif %}>
+		</a>
+	</div>
+	{% endif %}
+
+	{% if post.gallery().len() > 0 %}
+	<div class="gallery post_preview post_cached_media" data-post-media-state="inactive">
+		{% for image in post.gallery() %}
+		<figure>
+			<a href="{{ image.url }}">
+				<img loading="lazy" alt="Gallery image" data-stable-media-src="{{ image.url }}"{% if image.width > 0 %} width="{{ image.width }}"{% endif %}{% if image.height > 0 %} height="{{ image.height }}"{% endif %}>
+			</a>
+			{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
+			<figcaption>
+				{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
+				{% if !image.outbound_url.is_empty() %}<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>{% endif %}
+			</figcaption>
+			{% endif %}
+		</figure>
+		{% endfor %}
+	</div>
+	{% endif %}
+
+	{% if let Some((url, domain)) = post.link() %}
+	<a class="post_cached_link" href="{{ url }}" rel="nofollow">{% if domain.is_empty() %}{{ url }}{% else %}{{ domain }}{% endif %}</a>
+	{% endif %}
+
+	{% if let Some(kind) = post.volatile_media_kind() %}
+	<div class="post_cached_media_placeholder" data-post-live-media-kind="{{ kind }}">Media loads with fresh post metadata.</div>
+	{% endif %}
+
+	{% if !post.body_html().is_empty() %}
+	<div class="post_body post_preview">{{ post.body_html()|safe }}</div>
+	{% endif %}
+
+	{% if post.poll_options.len() > 0 %}
+	<div class="poll" data-post-live-poll>
+		{% for option in post.poll_options %}
+		<div class="poll_option" data-poll-option-id="{{ option.id }}"><span>{{ option.text }}</span></div>
+		{% endfor %}
+	</div>
+	{% endif %}
+</div>
