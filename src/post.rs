@@ -135,6 +135,12 @@ fn post_source_path(req: &Request<Body>) -> String {
 	path.replacen("/post-fragment", "", 1)
 }
 
+pub fn full_render_requested(url: &str) -> bool {
+	url.split_once('?')
+		.map(|(_, query)| url::form_urlencoded::parse(query.as_bytes()).any(|(key, value)| key == "render" && value == "full"))
+		.unwrap_or(false)
+}
+
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	let post_shell_subreddit = req.param("sub").unwrap_or_default();
 	let url = req.uri().to_string();
@@ -358,7 +364,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 
 #[cfg(test)]
 mod tests {
-	use super::{post_fragment_path, post_source_path, PostTemplate};
+	use super::{full_render_requested, post_fragment_path, post_source_path, PostFragmentTemplate, PostTemplate};
 	use crate::utils::Preferences;
 	use askama::Template;
 	use hyper::{Body, Request};
@@ -413,6 +419,39 @@ mod tests {
 		let request = Request::builder().uri("/post-fragment/r/rust/comments/demo/title").body(Body::empty()).unwrap();
 
 		assert_eq!(post_source_path(&request), "/r/rust/comments/demo/title");
+	}
+
+	#[test]
+	fn full_render_flag_requires_exact_query_value() {
+		assert!(full_render_requested("/post-fragment/r/rust/comments/demo/title?sort=new&render=full"));
+		assert!(!full_render_requested("/post-fragment/r/rust/comments/demo/title?render=card"));
+	}
+
+	#[test]
+	fn post_fragment_separates_revisioned_content_from_private_comments() {
+		let mut post = super::empty_post_for_shell("rust", "/r/rust/comments/demo/title");
+		post.kind = "t3".to_string();
+		post.id = "demo".to_string();
+		post.title = "Demo title".to_string();
+		post.community = "rust".to_string();
+		post.permalink = "/r/rust/comments/demo/title".to_string();
+		let html = PostFragmentTemplate {
+			comments: Vec::new(),
+			post,
+			fallback_notice: String::new(),
+			sort: "confidence".to_string(),
+			prefs: test_prefs(),
+			single_thread_str: "false",
+			url: "/post-fragment/r/rust/comments/demo/title".to_string(),
+			url_without_query: "/r/rust/comments/demo/title".to_string(),
+			comment_query: String::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-post-component-url=\"/post-content/demo/"));
+		assert!(html.contains("data-post-component-slot"));
+		assert!(html.contains("id=\"commentQueryForms\""));
 	}
 }
 

@@ -7,7 +7,39 @@
     {% if !fallback_notice.is_empty() %}
     <center>{{ fallback_notice }}</center>
     {% endif %}
+    {% if crate::post::full_render_requested(self.url) %}
     {% call utils::post(post) %}
+    {% else %}
+    {% set revision = crate::post_components::revision_for_post(post) %}
+    {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") %}
+    <div
+        id="{{ post.id }}"
+        class="post highlighted post_component_wrapper{% if post_should_be_blurred %} post_blurred{% endif %}"
+        data-reddit-url="https://www.reddit.com{{ post.permalink }}"
+        data-post-component-id="{{ post.id }}"
+        data-post-component-revision="{{ revision }}"
+        data-post-component-url="/post-content/{{ post.id }}/{{ revision }}/card"
+        data-allow-stable-media="{% if post_should_be_blurred %}false{% else %}true{% endif %}">
+        <p class="post_header">
+            <a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
+            <span class="dot">&bull;</span>
+            <a class="post_author {{ post.author.distinguished }}" href="/user/{{ post.author.name }}">u/{{ post.author.name }}</a>
+            <span class="dot">&bull;</span>
+            <span class="created" title="{{ post.display_created_tooltip() }}" data-created-ts="{{ post.created_ts }}">{{ post.display_rel_time() }}</span>
+        </p>
+        <div class="post_component_slot" data-post-component-slot aria-busy="true">
+            <h1 class="post_title"><a href="{{ post.permalink }}">{{ post.title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}</h1>
+        </div>
+        <div class="post_score" title="{{ post.score.1 }}">{% if !str_eq(prefs.hide_score, "on") %}{{ post.score.0 }}{% else %}&#x2022;{% endif %}<span class="label"> Upvotes</span></div>
+        <div class="post_footer">
+            <a href="{{ post.permalink }}" class="post_comments">{{ post.comments.0 }} {% if post.comments.1 == "1" %}comment{% else %}comments{% endif %}</a>
+            {% call utils::post_feedback_controls(post, "manual", self.url) %}
+            {% call utils::bookmark_form(post, "") %}
+            <p>{{ post.upvote_ratio }}%<span id="upvoted"> Upvoted</span></p>
+        </div>
+        <noscript><p><a href="{{ post.permalink }}?render=full">Load the complete uncached post view</a></p></noscript>
+    </div>
+    {% endif %}
 
     <div id="commentQueryForms">
     <form id="sort">
