@@ -719,6 +719,7 @@
 	</div>
 	<div class="post_component_slot" data-post-component-slot aria-busy="true">
 		<h2 class="post_title"><a href="{{ post.permalink }}">{{ post.title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}</h2>
+		<div class="post_component_loading" data-post-component-loading role="status">Loading post content…</div>
 	</div>
 	<div class="post_score" title="{{ post.score.1 }}">{% if !str_eq(prefs.hide_score, "on") %}{{ post.score.0 }}{% else %}&#x2022;{% endif %}<span class="label"> Upvotes</span></div>
 	<div class="post_footer">

@@ -1999,7 +1999,8 @@ a.search_subreddit_link:hover {
 }
 
 .post_cached_link,
-.post_cached_media_placeholder {
+.post_cached_media_placeholder,
+.post_component_loading {
     align-self: start;
     grid-area: post_media;
     margin: 5px 12px;
@@ -2013,6 +2014,11 @@ a.search_subreddit_link:hover {
 
 .post_cached_media_placeholder {
     color: var(--visited);
+}
+
+.post_component_loading {
+    color: var(--visited);
+    min-height: 2.5rem;
 }
 
 .post_cached_media_reveal {

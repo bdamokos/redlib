@@ -6,6 +6,7 @@
     const NAVIGATION_TTL_MS = 2 * 60 * 1000;
     const NAVIGATION_HTML_LIMIT = 256 * 1024;
     const shared = new Map();
+    const queued = new Map();
     const liveShared = new Map();
     const stableHtml = new Map();
     const queue = [];
@@ -41,12 +42,19 @@
         return component;
     };
 
-    const fetchStable = (url) => {
+    const fetchStable = (url, priority = "high") => {
         if (shared.has(url)) {
+            const queuedItem = queued.get(url);
+            if (queuedItem && priority === "high") {
+                queuedItem.priority = "high";
+                drain();
+            }
             return shared.get(url);
         }
         const request = new Promise((resolve, reject) => {
-            queue.push({ url, resolve, reject });
+            const item = { url, resolve, reject, priority };
+            queue.push(item);
+            queued.set(url, item);
             drain();
         });
         shared.set(url, request);
@@ -73,7 +81,12 @@
 
     const drain = () => {
         while (active < MAX_CONCURRENT && queue.length > 0) {
-            const item = queue.shift();
+            const highPriorityIndex = queue.findIndex((item) => item.priority === "high");
+            if (highPriorityIndex < 0 && active > 0) {
+                return;
+            }
+            const item = queue.splice(highPriorityIndex < 0 ? 0 : highPriorityIndex, 1)[0];
+            queued.delete(item.url);
             active += 1;
             fetchAttempt(item.url).then(item.resolve, item.reject).finally(() => {
                 active -= 1;
@@ -229,7 +242,7 @@
         void hydrateLiveMedia(wrapper, component);
     };
 
-    const hydrate = async (wrapper) => {
+    const hydrate = async (wrapper, priority = "high") => {
         const existing = wrapper.querySelector("[data-post-component-slot] > [data-post-content-id]");
         if (existing && wrapper.dataset.postComponentState === "ready") {
             if (!stableHtml.has(wrapper.dataset.postComponentUrl)) {
@@ -244,13 +257,16 @@
             return;
         }
         if (wrapper.dataset.postComponentState === "loading") {
+            if (priority === "high") {
+                void fetchStable(wrapper.dataset.postComponentUrl, "high");
+            }
             return;
         }
 
         wrapper.dataset.postComponentState = "loading";
         const slot = wrapper.querySelector("[data-post-component-slot]");
         try {
-            const html = await fetchStable(wrapper.dataset.postComponentUrl);
+            const html = await fetchStable(wrapper.dataset.postComponentUrl, priority);
             const component = parseStableComponent(
                 html,
                 wrapper.dataset.postComponentId,
@@ -261,6 +277,10 @@
             wrapper.dataset.postComponentState = "fallback";
             slot?.setAttribute("aria-busy", "false");
             wrapper.setAttribute("aria-busy", "false");
+            const loading = slot?.querySelector("[data-post-component-loading]");
+            if (loading) {
+                loading.textContent = "Post content is temporarily unavailable.";
+            }
             window.console?.warn?.("post_components: hydration failed", String(error));
         }
     };
@@ -271,7 +291,7 @@
         }
         wrapper.dataset.postComponentWarmObserved = "true";
         try {
-            const html = await fetchStable(wrapper.dataset.postComponentWarmUrl);
+            const html = await fetchStable(wrapper.dataset.postComponentWarmUrl, "low");
             parseStableComponent(
                 html,
                 wrapper.dataset.postComponentWarmId,
@@ -481,35 +501,47 @@
     };
 
     const initialize = (root = document) => {
-        const warmers = root.querySelectorAll?.("[data-post-component-warm-url]:not([data-post-component-warm-observed])") || [];
-        for (const wrapper of warmers) {
-            if (eagerWarms >= MAX_EAGER_WARMS) {
-                break;
-            }
-            eagerWarms += 1;
-            void warm(wrapper);
-        }
-
         const wrappers = root.querySelectorAll?.("[data-post-component-url]:not([data-post-component-observed])") || [];
         if (!("IntersectionObserver" in window)) {
             wrappers.forEach((wrapper) => {
                 wrapper.dataset.postComponentObserved = "true";
                 void hydrate(wrapper);
             });
-            return;
-        }
-        const observer = new IntersectionObserver((entries) => {
-            entries.forEach((entry) => {
-                if (entry.isIntersecting) {
-                    observer.unobserve(entry.target);
-                    void hydrate(entry.target);
-                }
+        } else {
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach((entry) => {
+                    if (entry.isIntersecting) {
+                        observer.unobserve(entry.target);
+                        void hydrate(entry.target);
+                    }
+                });
+            }, { rootMargin: "100% 0px" });
+            wrappers.forEach((wrapper) => {
+                wrapper.dataset.postComponentObserved = "true";
+                observer.observe(wrapper);
             });
-        }, { rootMargin: "100% 0px" });
-        wrappers.forEach((wrapper) => {
-            wrapper.dataset.postComponentObserved = "true";
-            observer.observe(wrapper);
-        });
+        }
+
+        if (!document.hidden) {
+            wrappers.forEach((wrapper) => void hydrate(wrapper, "low"));
+        }
+
+        const warmers = root.querySelectorAll?.("[data-post-component-warm-url]:not([data-post-component-warm-observed]):not([data-post-component-warm-scheduled])") || [];
+        for (const wrapper of warmers) {
+            if (eagerWarms >= MAX_EAGER_WARMS) {
+                break;
+            }
+            eagerWarms += 1;
+            wrapper.dataset.postComponentWarmScheduled = "true";
+            window.setTimeout(() => {
+                const run = () => void warm(wrapper);
+                if ("requestIdleCallback" in window) {
+                    window.requestIdleCallback(run, { timeout: 1000 });
+                } else {
+                    run();
+                }
+            }, 750);
+        }
     };
 
     document.addEventListener("click", (event) => {
@@ -518,6 +550,12 @@
             saveNavigationHint(anchor);
         }
     }, { capture: true });
+
+    document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+            document.querySelectorAll("[data-post-component-url]").forEach((wrapper) => void hydrate(wrapper, "low"));
+        }
+    });
 
     window.initializePostComponents = initialize;
     window.preparePostFragment = preparePostFragment;
