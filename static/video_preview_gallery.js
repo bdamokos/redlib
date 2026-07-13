@@ -117,7 +117,7 @@
     }
 
     function browserAllowsPreviewSound() {
-        return browserAllowsForegroundPreviewPlayback();
+        return browserAllowsPreviewPlayback();
     }
 
     function pageIsVisible() {
@@ -1205,7 +1205,7 @@
     }
 
     function pauseBackgroundPreviewWork() {
-        syncPreviewFallbackPlayback(false);
+        syncPreviewFallbackPlayback();
         syncPreviewSoundMode();
     }
 

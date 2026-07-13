@@ -98,12 +98,20 @@
         });
     }
 
+    function mobileVideoFocusIsUnreliable() {
+        if (navigator.maxTouchPoints && navigator.maxTouchPoints > 0) {
+            return true;
+        }
+
+        return Boolean(window.matchMedia && window.matchMedia("(hover: none), (pointer: coarse)").matches);
+    }
+
     function browserAllowsVideoPlayback() {
         if (document.visibilityState !== "visible") {
             return false;
         }
 
-        return typeof document.hasFocus !== "function" || document.hasFocus();
+        return mobileVideoFocusIsUnreliable() || typeof document.hasFocus !== "function" || document.hasFocus();
     }
 
     function handleVideoVisibility(entries) {
@@ -155,7 +163,9 @@
         }
     });
     window.addEventListener("blur", function () {
-        pauseVideos(document);
+        if (!browserAllowsVideoPlayback()) {
+            pauseVideos(document);
+        }
     });
     observeVideoVisibility(document);
 })();
