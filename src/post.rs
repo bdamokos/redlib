@@ -554,6 +554,7 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-post-component-url=\"/post-content/demo/"));
+		assert!(html.contains("/card.bin\""));
 		assert!(html.contains("data-post-live-media-url=\"/post-live/demo/"));
 		assert!(html.contains("data-post-type=\"self\""));
 		assert!(html.contains("data-post-component-slot"));

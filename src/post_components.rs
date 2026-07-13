@@ -274,6 +274,17 @@ struct PostLiveMediaTemplate<'a> {
 crate::impl_template_str_eq!(PostLiveMediaTemplate<'_>);
 
 pub async fn card(req: Request<Body>) -> Result<Response<Body>, String> {
+	card_response(req, false).await
+}
+
+/// Cache-friendly representation of the stable card. Cloudflare's standard
+/// cache recognizes the `.bin` suffix without a custom Cache Rule, while the
+/// octet-stream media type and `nosniff` keep the HTML fragment non-executable.
+pub async fn card_bin(req: Request<Body>) -> Result<Response<Body>, String> {
+	card_response(req, true).await
+}
+
+async fn card_response(req: Request<Body>, binary: bool) -> Result<Response<Body>, String> {
 	if req.uri().query().is_some() {
 		return not_found();
 	}
@@ -305,14 +316,16 @@ pub async fn card(req: Request<Body>) -> Result<Response<Body>, String> {
 	.render()
 	.map_err(|error| error.to_string())?;
 
-	Response::builder()
+	let mut response = Response::builder()
 		.status(200)
-		.header("content-type", "text/html; charset=utf-8")
+		.header("content-type", if binary { "application/octet-stream" } else { "text/html; charset=utf-8" })
 		.header("cache-control", "public, max-age=31536000, s-maxage=86400, immutable")
 		.header("etag", card_etag(revision.as_str()))
-		.header("x-redlib-cache-policy", "immutable-post-content")
-		.body(Body::from(body))
-		.map_err(|error| error.to_string())
+		.header("x-redlib-cache-policy", "immutable-post-content");
+	if binary {
+		response = response.header("x-content-type-options", "nosniff");
+	}
+	response.body(Body::from(body)).map_err(|error| error.to_string())
 }
 
 /// Render the exact bytes and identity of the latest stable card without
@@ -331,7 +344,7 @@ pub fn render_latest_stable_card(post_id: &str) -> Result<Option<RenderedStableC
 	.render()
 	.map_err(|error| error.to_string())?;
 	Ok(Some(RenderedStableCard {
-		path: format!("/post-content/{post_id}/{revision}/card"),
+		path: format!("/post-content/{post_id}/{revision}/card.bin"),
 		post_id,
 		revision,
 		html,
@@ -1245,16 +1258,58 @@ mod tests {
 		let revision = snapshot.revision.to_string();
 
 		let uppercase_id = id.to_ascii_uppercase();
-		let uppercase_id_uri = format!("/post-content/{uppercase_id}/{revision}/card");
-		let id_response = card(request_with_live_media_params(&uppercase_id_uri, &uppercase_id, &revision)).await.unwrap();
+		let uppercase_id_uri = format!("/post-content/{uppercase_id}/{revision}/card.bin");
+		let id_response = card_bin(request_with_live_media_params(&uppercase_id_uri, &uppercase_id, &revision)).await.unwrap();
 		assert_eq!(id_response.status(), StatusCode::NOT_FOUND);
 		assert_eq!(id_response.headers()["cache-control"], "no-store");
 
 		let uppercase_revision = revision.to_ascii_uppercase();
-		let uppercase_revision_uri = format!("/post-content/{id}/{uppercase_revision}/card");
-		let revision_response = card(request_with_live_media_params(&uppercase_revision_uri, id, &uppercase_revision)).await.unwrap();
+		let uppercase_revision_uri = format!("/post-content/{id}/{uppercase_revision}/card.bin");
+		let revision_response = card_bin(request_with_live_media_params(&uppercase_revision_uri, id, &uppercase_revision)).await.unwrap();
 		assert_eq!(revision_response.status(), StatusCode::NOT_FOUND);
 		assert_eq!(revision_response.headers()["cache-control"], "no-store");
+	}
+
+	#[tokio::test]
+	async fn binary_card_is_nosniff_and_matches_legacy_card_identity() {
+		let id = "cardbinary1";
+		let mut post = sample_post();
+		post.id = id.to_string();
+		let snapshot = observe_post(&post, ObservationSource::Direct, "direct", 275).unwrap();
+		let revision = snapshot.revision.to_string();
+
+		let binary_uri = format!("/post-content/{id}/{revision}/card.bin");
+		let binary = card_bin(request_with_live_media_params(&binary_uri, id, &revision)).await.unwrap();
+		assert_eq!(binary.status(), StatusCode::OK);
+		assert_eq!(binary.headers()["content-type"], "application/octet-stream");
+		assert_eq!(binary.headers()["x-content-type-options"], "nosniff");
+		assert_eq!(binary.headers()["cache-control"], "public, max-age=31536000, s-maxage=86400, immutable");
+		assert_eq!(binary.headers()["etag"], card_etag(&revision));
+		assert_eq!(binary.headers()["x-redlib-cache-policy"], "immutable-post-content");
+		assert!(!binary.headers().contains_key("set-cookie"));
+		let binary_body = to_bytes(binary.into_body()).await.unwrap();
+
+		let legacy_uri = format!("/post-content/{id}/{revision}/card");
+		let legacy = card(request_with_live_media_params(&legacy_uri, id, &revision)).await.unwrap();
+		assert_eq!(legacy.status(), StatusCode::OK);
+		assert_eq!(legacy.headers()["content-type"], "text/html; charset=utf-8");
+		assert_eq!(legacy.headers()["etag"], card_etag(&revision));
+		let legacy_body = to_bytes(legacy.into_body()).await.unwrap();
+		assert_eq!(binary_body, legacy_body);
+	}
+
+	#[tokio::test]
+	async fn binary_card_query_variant_is_no_store() {
+		let id = "cardbinary2";
+		let mut post = sample_post();
+		post.id = id.to_string();
+		let snapshot = observe_post(&post, ObservationSource::Direct, "direct", 276).unwrap();
+		let revision = snapshot.revision.to_string();
+		let uri = format!("/post-content/{id}/{revision}/card.bin?variant=1");
+
+		let response = card_bin(request_with_live_media_params(&uri, id, &revision)).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
+		assert_eq!(response.headers()["cache-control"], "no-store");
 	}
 
 	#[test]
@@ -1266,7 +1321,7 @@ mod tests {
 
 		assert_eq!(rendered.post_id, id);
 		assert_eq!(rendered.revision, snapshot.revision.to_string());
-		assert_eq!(rendered.path, format!("/post-content/{id}/{}/card", snapshot.revision));
+		assert_eq!(rendered.path, format!("/post-content/{id}/{}/card.bin", snapshot.revision));
 		assert!(rendered.html.contains(&format!("data-post-content-id=\"{id}\"")));
 		assert!(rendered.html.contains(&format!("data-post-content-revision=\"{}\"", snapshot.revision)));
 		assert!(!rendered.html.contains("/vid/cardhelper1/video.mp4"));

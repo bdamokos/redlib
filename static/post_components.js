@@ -2,7 +2,7 @@
     const MAX_CONCURRENT = 4;
     const MAX_EAGER_WARMS = 6;
     const MAX_REMEMBERED_COMPONENTS = 32;
-    const NAVIGATION_CACHE_KEY = "redlib:post-content-navigation-v1";
+    const NAVIGATION_CACHE_KEY = "redlib:post-content-navigation-v2";
     const NAVIGATION_TTL_MS = 2 * 60 * 1000;
     const NAVIGATION_HTML_LIMIT = 256 * 1024;
     const shared = new Map();
@@ -348,7 +348,7 @@
         try {
             parseStableComponent(html, postId, revision);
             safeSessionStorage()?.setItem(NAVIGATION_CACHE_KEY, JSON.stringify({
-                version: 1,
+                version: 2,
                 postId,
                 revision,
                 componentUrl,
@@ -377,7 +377,7 @@
         } catch (_) {
             return;
         }
-        if (hint?.version !== 1
+        if (hint?.version !== 2
             || hint.postId !== container.dataset.postShellId
             || !/^[a-z0-9]{1,24}$/.test(hint.postId || "")
             || !/^[a-f0-9]{64}$/.test(hint.revision || "")
@@ -385,7 +385,7 @@
             || !Number.isFinite(hint.storedAt)
             || hint.storedAt > Date.now()
             || Date.now() - hint.storedAt > NAVIGATION_TTL_MS
-            || hint.componentUrl !== `/post-content/${hint.postId}/${hint.revision}/card`) {
+            || hint.componentUrl !== `/post-content/${hint.postId}/${hint.revision}/card.bin`) {
             return;
         }
 

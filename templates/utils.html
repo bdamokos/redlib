@@ -413,7 +413,7 @@
 	{% if post.kind == "t3" %}
 	data-post-component-warm-id="{{ post.id }}"
 	data-post-component-warm-revision="{{ component_revision }}"
-	data-post-component-warm-url="/post-content/{{ post.id }}/{{ component_revision }}/card"
+	data-post-component-warm-url="/post-content/{{ post.id }}/{{ component_revision }}/card.bin"
 	{% endif %}
 	data-post-merge-keys="{{ crate::user::post_merge_keys_attr(post) }}">
 	<div class="post_header">
@@ -705,7 +705,7 @@
 	data-post-merge-keys="{{ crate::user::post_merge_keys_attr(post) }}"
 	data-post-component-id="{{ post.id }}"
 	data-post-component-revision="{{ revision }}"
-	data-post-component-url="/post-content/{{ post.id }}/{{ revision }}/card"
+	data-post-component-url="/post-content/{{ post.id }}/{{ revision }}/card.bin"
 	data-post-live-media-url="/post-live/{{ post.id }}/{{ revision }}/media"
 	data-allow-stable-media="{% if post_should_be_blurred %}false{% else %}true{% endif %}"
 	aria-busy="true">

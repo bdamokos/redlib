@@ -3632,6 +3632,7 @@ mod tests {
 		assert_eq!(html.matches("data-post-component-url=").count(), 1);
 		assert_eq!(html.matches("data-post-live-media-url=").count(), 1);
 		assert!(html.contains("data-post-component-warm-url=\"/post-content/warm1/"));
+		assert!(html.contains("/card.bin\""));
 		assert!(html.contains("data-post-component-url=\"/post-content/warm7/"));
 		assert!(html.contains("data-post-live-media-url=\"/post-live/warm7/"));
 		assert_eq!(html.matches("data-post-component-loading").count(), 1);
