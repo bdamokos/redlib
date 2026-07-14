@@ -845,6 +845,7 @@
 			{% endif %}
 			{% if !post.media.video_preview_fallback_url.is_empty() %}
 			data-preview-fallback-video-url="{{ post.media.display_video_preview_fallback_url(prefs) }}"
+			data-preview-normalization-url="{{ post.media.video_preview_fallback_url }}"
 			{% endif %}
 			{% endif %}
 		>

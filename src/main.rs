@@ -323,6 +323,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"post_components.js" => resource(include_str!("../static/post_components.js"), "text/javascript", false).await,
 		"dynamic_content.js" => resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).await,
 		"video_visibility.js" => resource(include_str!("../static/video_visibility.js"), "text/javascript", false).await,
+		"preview_audio_normalizer.js" => resource(include_str!("../static/preview_audio_normalizer.js"), "text/javascript", false).await,
 		"video_preview_gallery.js" => resource(include_str!("../static/video_preview_gallery.js"), "text/javascript", false).await,
 		"submitted_duplicates.js" => resource(include_str!("../static/submitted_duplicates.js"), "text/javascript", false).await,
 		"video_mode_filters.js" => resource(include_str!("../static/video_mode_filters.js"), "text/javascript", false).await,
@@ -553,6 +554,9 @@ async fn main() {
 	app
 		.at("/video_visibility.js")
 		.get(|_| resource(include_str!("../static/video_visibility.js"), "text/javascript", false).boxed());
+	app
+		.at("/preview_audio_normalizer.js")
+		.get(|_| resource(include_str!("../static/preview_audio_normalizer.js"), "text/javascript", false).boxed());
 	app
 		.at("/video_preview_gallery.js")
 		.get(|_| resource(include_str!("../static/video_preview_gallery.js"), "text/javascript", false).boxed());

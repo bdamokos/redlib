@@ -9,6 +9,7 @@
     var PREVIEW_FALLBACK_POLL_MS = 500;
     var DESKTOP_PREVIEW_FALLBACK_QUERY = "(min-width: 1000px) and (hover: hover) and (pointer: fine)";
     var PREVIEW_SOUND_STORAGE_KEY = "redlib_video_preview_sound";
+    var UNNORMALIZED_PREVIEW_VOLUME = 0.65;
 
     function createPageSessionId() {
         if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -165,6 +166,7 @@
 
     function syncPreviewSoundMode() {
         var soundHost = previewSoundEnabled && browserAllowsPreviewSound() ? currentPreviewSoundHost() : null;
+        var normalizer = window.RedlibPreviewAudioNormalizer;
 
         Array.from(activeHosts.keys()).forEach(function (host) {
             var fallback = previewFallbackVideo(host);
@@ -173,9 +175,22 @@
             }
 
             var shouldPlaySound = host === soundHost && !fallback.hidden;
-            fallback.muted = !shouldPlaySound;
+            if (!shouldPlaySound) {
+                if (normalizer) {
+                    normalizer.silence(fallback);
+                }
+                fallback.muted = true;
+                return;
+            }
+
+            if (normalizer && normalizer.ready() && restartPreviewFallbackForNormalization(host, fallback)) {
+                return;
+            }
+
+            var normalized = normalizer && normalizer.normalize(fallback);
+            fallback.muted = false;
+            fallback.volume = normalized ? 1 : UNNORMALIZED_PREVIEW_VOLUME;
             if (shouldPlaySound) {
-                fallback.volume = 1;
                 var playPromise = fallback.play();
                 if (playPromise && typeof playPromise.catch === "function") {
                     playPromise.catch(function () {});
@@ -199,6 +214,12 @@
         previewSoundButton.addEventListener("click", function () {
             previewSoundEnabled = !previewSoundEnabled;
             writePreviewSoundEnabled(previewSoundEnabled);
+            var normalizer = window.RedlibPreviewAudioNormalizer;
+            if (previewSoundEnabled && normalizer) {
+                normalizer.unlock().then(function () {
+                    syncPreviewSoundMode();
+                });
+            }
             syncPreviewSoundMode();
         });
     }
@@ -433,6 +454,38 @@
         } catch (error) {}
     }
 
+    function restartPreviewFallbackForNormalization(host, fallback) {
+        var state = activeHosts.get(host);
+        var layer = previewLayer(host);
+        var image = previewImage(host);
+        // Web Audio must output silence for non-CORS cross-origin media. Reload
+        // only the audible preview through Redlib's same-origin media route.
+        var nextPath = host.dataset.previewNormalizationUrl || "";
+        if (!state || !layer || !nextPath || fallback.getAttribute("src") === nextPath || state.previewFallbackLoading) {
+            return false;
+        }
+
+        rememberPreviewFallbackResumePoint(host, fallback);
+        state.previewFallbackResumeSrc = nextPath;
+        var normalizer = window.RedlibPreviewAudioNormalizer;
+        if (normalizer) {
+            normalizer.silence(fallback);
+        }
+        delete layer.dataset.previewFallbackActive;
+        state.previewFallbackActive = false;
+        state.previewFallbackLoading = true;
+        previewFallbackLoadingHost = host;
+        if (image) {
+            image.hidden = false;
+        }
+        fallback.muted = true;
+        fallback.pause();
+        fallback.hidden = true;
+        fallback.setAttribute("src", nextPath);
+        fallback.load();
+        return true;
+    }
+
     function stopPreviewFallback(host, unloadSource) {
         var layer = previewLayer(host);
         var image = previewImage(host);
@@ -447,6 +500,10 @@
         }
         if (fallback) {
             rememberPreviewFallbackResumePoint(host, fallback);
+            var normalizer = window.RedlibPreviewAudioNormalizer;
+            if (normalizer) {
+                normalizer.silence(fallback);
+            }
             fallback.muted = true;
             fallback.pause();
             fallback.hidden = true;
