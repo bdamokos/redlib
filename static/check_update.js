@@ -40,6 +40,9 @@ async function checkInstanceUpdateStatus() {
 async function checkOtherInstances() {
     try {
         const response = await fetch('/instances.json');
+        if (!response.ok) {
+            throw new Error(`Instance list request failed with status ${response.status}`);
+        }
         const data = await response.json();
         const instances = window.location.host.endsWith('.onion') ? data.instances.filter(i => i.onion) : data.instances.filter(i => i.url);
         if (instances.length == 0) return;
@@ -50,7 +53,6 @@ async function checkOtherInstances() {
         document.getElementById('random-instance').innerText = "Visit Random Instance";
     } catch (error) {
         console.error('Error fetching instances:', error);
-        document.getElementById('update-status').innerText = '⚠️ Error checking other instances: ' + error;
     }
 }
 
