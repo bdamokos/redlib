@@ -3651,6 +3651,40 @@ mod tests {
 		assert!(!html.contains("post-content-desktop"));
 	}
 
+	#[test]
+	fn deferred_feed_rows_mark_followed_authors() {
+		let posts = (1..=7)
+			.map(|index| {
+				let mut post = test_post();
+				post.id = format!("followed{index}");
+				post.permalink = format!("/r/demo_sub/comments/followed{index}/");
+				post
+			})
+			.collect();
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["u_Demo_User".to_string()];
+		prefs.subscriptions_lc = prefs.subscriptions.iter().map(|value| value.to_ascii_lowercase()).collect();
+
+		let html = FeedFragmentTemplate {
+			posts,
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs,
+			url: "/".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert_eq!(html.matches("class=\"followed_author_marker\">followed</span>").count(), 7);
+		assert!(html.contains("data-post-component-id=\"followed7\""));
+		assert!(html.contains("data-post-component-url=\"/post-content/followed7/"));
+	}
+
 	fn metric_post(id: &str, community: &str, created_ts: u64, score: i64, stickied: bool) -> Post {
 		let mut post = test_post();
 		post.id = id.to_string();
