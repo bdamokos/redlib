@@ -53,7 +53,8 @@ const PER_SOURCE_LIMIT: usize = 40;
 const INITIAL_SOURCE_WINDOW: usize = 32;
 const PAGE_FILL_BATCH: usize = 4;
 const MAX_SYNC_FILL_BATCHES: usize = 2;
-const BACKGROUND_LOOKAHEAD_PAGES: usize = 2;
+const BACKGROUND_LOOKAHEAD_PAGES: usize = 1;
+const BACKGROUND_DIVERSITY_SOURCE_CAP: usize = 12;
 pub const POSTS_PER_PAGE: usize = 25;
 const DEFAULT_SOURCE_RESIDENT_TTL_SECS: u64 = 15 * 60;
 
@@ -2647,7 +2648,9 @@ fn max_sync_source_budget(page: usize) -> usize {
 }
 
 fn background_target_sources(session: &FeedSession) -> usize {
-	source_budget_target(session.requested_page + BACKGROUND_LOOKAHEAD_PAGES, POSTS_PER_PAGE).min(session.sources.len())
+	source_budget_target(session.requested_page + BACKGROUND_LOOKAHEAD_PAGES, POSTS_PER_PAGE)
+		.min(BACKGROUND_DIVERSITY_SOURCE_CAP)
+		.min(session.sources.len())
 }
 
 fn attempted_source_count(session: &FeedSession) -> usize {
@@ -2663,7 +2666,7 @@ fn followup_source_budget(session: &FeedSession) -> usize {
 }
 
 fn background_target_reached(session: &FeedSession) -> bool {
-	merged_posts_for_session(session).len() >= background_target_posts(session) && attempted_source_count(session) >= background_target_sources(session)
+	merged_posts_for_session(session).len() >= background_target_posts(session) || attempted_source_count(session) >= background_target_sources(session)
 }
 
 fn session_has_remaining_sources(session: &FeedSession) -> bool {
@@ -2987,7 +2990,7 @@ async fn ensure_feed_session_inner(request: FeedSessionRequest, page: usize, per
 			return session_id;
 		};
 		let sync_sources = sync_sources_to_request(session, page);
-		warm_targets(session, max_sync_sources_override.unwrap_or(sync_sources).min(sync_sources))
+		warm_targets(session, max_sync_sources_override.unwrap_or(sync_sources).min(sync_sources).min(PAGE_FILL_BATCH))
 	} else {
 		Vec::new()
 	};
@@ -5334,7 +5337,7 @@ mod tests {
 	}
 
 	#[test]
-	fn background_target_prefers_loading_more_sources_for_future_pages() {
+	fn background_target_caps_speculative_source_diversity() {
 		let _guard = test_lock();
 		reset_test_caches();
 		let session = FeedSession {
@@ -5357,7 +5360,7 @@ mod tests {
 			revision: 0,
 		};
 
-		assert_eq!(background_target_sources(&session), 75);
+		assert_eq!(background_target_sources(&session), 12);
 	}
 
 	#[test]
@@ -5508,7 +5511,7 @@ mod tests {
 	}
 
 	#[test]
-	fn enough_posts_from_too_few_sources_does_not_stop_background_warming() {
+	fn enough_posts_stop_background_warming_without_more_speculative_sources() {
 		let _guard = test_lock();
 		reset_test_caches();
 		let posts = (0..100)
@@ -5535,6 +5538,38 @@ mod tests {
 				.collect(),
 			frozen_pages: HashMap::new(),
 			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		assert!(background_target_reached(&session));
+	}
+
+	#[test]
+	fn sparse_session_keeps_warming_until_diversity_cap() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+				..Default::default()
+			},
+			sources: (0..40)
+				.map(|index| {
+					session_entry(
+						new_source(&format!("subreddit{index}")),
+						if index < 8 { SessionSourceState::Ready } else { SessionSourceState::Unstarted },
+					)
+				})
+				.collect(),
+			frozen_pages: HashMap::new(),
+			background_active: true,
 			background_complete: false,
 			requested_page: 0,
 			last_updated: Instant::now(),
@@ -5687,7 +5722,7 @@ mod tests {
 
 		assert_eq!(first_page_sources.len(), POSTS_PER_PAGE);
 		assert!(attempted_source_count(&session) > first_page_sources.len());
-		assert!(!background_target_reached(&session));
+		assert!(background_target_reached(&session));
 	}
 
 	#[test]

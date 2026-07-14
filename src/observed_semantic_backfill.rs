@@ -527,7 +527,9 @@ async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome
 	}
 
 	if outcome.embedded > 0 {
-		subreddit_content_semantics::write_persisted_embeddings_sidecar_now()?;
+		tokio::task::spawn_blocking(subreddit_content_semantics::write_persisted_embeddings_sidecar_now)
+			.await
+			.map_err(|error| format!("embedding sidecar writer stopped: {error}"))??;
 	}
 
 	Ok(outcome)

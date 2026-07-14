@@ -3322,42 +3322,19 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	} else {
 		None
 	};
-	let mut user = pre_peer
+	let user = pre_peer
 		.as_ref()
 		.map(|peer| peer.user.clone())
 		.or_else(|| pre_scraped.as_ref().map(|scraped| scraped.user.clone()))
 		.unwrap_or_else(|| cached_or_placeholder_user(&username));
 	let mut status_notice = String::new();
-	let mut upstream_user_unavailable = false;
-	if pre_peer.is_none() && pre_scraped.is_none() {
-		match tokio::time::timeout(StdDuration::from_secs(4), fetch_user_metadata_status(&username)).await {
-			Ok(Ok(fresh_user)) => {
-				user = fresh_user;
-			}
-			Ok(Err(msg)) => {
-				if let Some(notice) = user_upstream_unavailable_notice(&username, &msg) {
-					status_notice = notice;
-					upstream_user_unavailable = true;
-				} else {
-					info!("user: profile metadata unavailable for u/{username}: {msg}");
-				}
-			}
-			Err(_) => {
-				warn!("user: profile metadata timed out for u/{username}");
-			}
-		}
-	}
 	if !video_listing && pre_peer.is_none() && pre_scraped.is_none() && !peer_api_fallback::request_is_peer_api_fallback(&req) && instance_scrape::reddit_rate_limited_now() {
-		info!(
-			"user: quota state changed while loading metadata for {}; switching listing to configured Redlib peer API",
-			current_url
-		);
+		info!("user: quota state requires configured Redlib peer API before loading listing {}", current_url);
 		match peer_api_fallback::fetch_user_listing(&username, &listing, &sort, Some(query)).await {
 			Ok(peer) => {
-				user = peer.user.clone();
 				pre_peer = Some(peer);
 			}
-			Err(peer_error) => warn!("user: Redlib peer API fallback failed after metadata request for {}: {}", current_url, peer_error),
+			Err(peer_error) => warn!("user: preemptive Redlib peer API fallback failed for {}: {}", current_url, peer_error),
 		}
 	}
 	let coomer_recent_posts: Option<utils::CoomerRecentPostsPanel> = None;
@@ -3397,18 +3374,14 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			video_mode_sidebar: empty_video_mode_sidebar(),
 		}
 	} else if video_listing {
-		let (source_posts, source_posts_from_cache) = if upstream_user_unavailable {
-			(cached_user_posts_for_listing(&username, "videos", &filters), true)
-		} else {
-			match cached_or_live_user_video_posts(&username).await {
-				Ok(posts) => posts,
-				Err(msg) => {
-					if let Some(notice) = user_upstream_unavailable_notice(&username, &msg) {
-						status_notice = join_notices(&status_notice, &notice);
-						(cached_user_posts_for_listing(&username, "videos", &filters), true)
-					} else {
-						return Err(msg);
-					}
+		let (source_posts, source_posts_from_cache) = match cached_or_live_user_video_posts(&username).await {
+			Ok(posts) => posts,
+			Err(msg) => {
+				if let Some(notice) = user_upstream_unavailable_notice(&username, &msg) {
+					status_notice = join_notices(&status_notice, &notice);
+					(cached_user_posts_for_listing(&username, "videos", &filters), true)
+				} else {
+					return Err(msg);
 				}
 			}
 		};
@@ -3548,17 +3521,6 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				String::new(),
 				String::new(),
 				all_posts_filtered,
-			)
-		} else if upstream_user_unavailable {
-			let merged = merge_user_posts_with_cached_posts(Vec::new(), cached_user_posts_for_listing(&username, &listing, &filters), &filters);
-			(
-				user.clone(),
-				merged.posts,
-				merged.cached_post_ids,
-				(String::new(), String::new()),
-				String::new(),
-				String::new(),
-				merged.all_cached_posts_filtered,
 			)
 		} else {
 			match fetch_user_listing_posts(&username, &path, &listing, &filters).await {

@@ -1434,6 +1434,7 @@ where
 	F: FnOnce() -> Fut + Send + 'static,
 	Fut: std::future::Future<Output = Result<Value, String>> + Send + 'static,
 {
+	let request_path = key.0.clone();
 	let (sender, receiver) = oneshot::channel();
 	let is_leader = {
 		let mut flights = JSON_INFLIGHT.lock().unwrap_or_else(|error| error.into_inner());
@@ -1459,10 +1460,20 @@ where
 		});
 	}
 
-	receiver.await.unwrap_or_else(|_| Err("Reddit request producer stopped before completion".to_string()))
+	match tokio::time::timeout(reddit_json_deadline() + Duration::from_secs(1), receiver).await {
+		Ok(result) => result.unwrap_or_else(|_| Err("Reddit request producer stopped before completion".to_string())),
+		Err(_) => Err(format!(
+			"local_overload: Reddit shared request exceeded {}ms deadline | {}",
+			(reddit_json_deadline() + Duration::from_secs(1)).as_millis(),
+			request_path
+		)),
+	}
 }
 
-#[cached(size = 100, time = 30, result = true)]
+// Keep successful cursor/listing responses long enough for a browser retry or
+// back/forward pagination to reuse them. Failed responses are intentionally not
+// cached, so a transient Reddit failure can still recover immediately.
+#[cached(size = 512, time = 120, result = true)]
 async fn json_completed_cache(path: String, quarantine: bool) -> Result<Value, String> {
 	let deadline = reddit_json_deadline();
 	let operation = async {

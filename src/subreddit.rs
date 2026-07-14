@@ -2607,12 +2607,22 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				placeholder_subreddit(&sub_name)
 			}
 		} else if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-			match refresh_subreddit_metadata(&sub_name, quarantined).await {
-				Ok(subreddit) => subreddit,
-				Err(error) => {
-					metadata_error = Some(error);
-					placeholder_subreddit(&sub_name)
+			if let Some(cached) = cached_subreddit_metadata(&sub_name) {
+				cached
+			} else if cached_subreddit_nsfw_status(&sub_name) == Some(false) {
+				warm_subreddit_metadata(&sub_name, quarantined);
+				placeholder_subreddit(&sub_name)
+			} else if crate::utils::should_be_nsfw_gated(&req, &req_url) {
+				match subreddit(&sub_name, quarantined).await {
+					Ok(subreddit) => subreddit,
+					Err(error) => {
+						metadata_error = Some(error);
+						placeholder_subreddit(&sub_name)
+					}
 				}
+			} else {
+				warm_subreddit_metadata(&sub_name, quarantined);
+				placeholder_subreddit(&sub_name)
 			}
 		} else {
 			match subreddit(&sub_name, quarantined).await {
