@@ -14,7 +14,11 @@ use tokio::sync::Notify;
 
 const DEFAULT_OPPORTUNISTIC_JOB_BUDGET_SECS: u64 = 5 * 60;
 const DEFAULT_OPPORTUNISTIC_DELAY_MS: u64 = 150;
+const DEFAULT_BACKGROUND_DELAY_MS: u64 = 150;
 const DEFAULT_PRIORITY_DELAY_MS: u64 = 25;
+const DEFAULT_SIDECAR_FLUSH_MAX_DELAY_SECS: u64 = 60;
+const DEFAULT_WORK_SLICE_CANDIDATES: usize = 32;
+const SIDECAR_FLUSH_RETRY_SECS: u64 = 5;
 const MAX_QUEUE_SUBREDDITS: usize = 512;
 const MAX_PENDING_CANDIDATES_PER_SUBREDDIT: usize = 512;
 const VECTOR_PREVIEW_VALUES: usize = 30;
@@ -23,10 +27,12 @@ static OBSERVED_BACKFILL_QUEUE: LazyLock<Mutex<ObservedBackfillQueue>> = LazyLoc
 static OBSERVED_BACKFILL_ACTIVITY: LazyLock<Mutex<HashMap<String, ObservedBackfillActivity>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static OBSERVED_BACKFILL_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static OBSERVED_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
+static OBSERVED_BACKFILL_SIDECAR_DIRTY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObservedBackfillPriority {
 	Opportunistic,
+	Background,
 	Priority,
 }
 
@@ -271,12 +277,12 @@ fn aggregate_preview(subreddit: &str, model: &str) -> Option<ObservedAggregateVe
 	})
 }
 
-fn mark_embedded_activity(candidate: &SubredditContentPostEmbeddingCandidate, model: &str, embedding: &[f32], embedded_at_unix: u64) {
+fn mark_embedded_activity(candidate: &SubredditContentPostEmbeddingCandidate, model: &str, latest_embedding: ObservedEmbeddingVectorPreview) {
 	let aggregate_embedding = aggregate_preview(&candidate.subreddit, model);
 	update_activity(&candidate.subreddit, |activity| {
 		activity.embedded = activity.embedded.saturating_add(1);
 		activity.active_remaining = activity.active_remaining.saturating_sub(1);
-		activity.latest_embedding = Some(vector_preview(candidate, embedding, embedded_at_unix));
+		activity.latest_embedding = Some(latest_embedding);
 		activity.aggregate_embedding = aggregate_embedding;
 	});
 }
@@ -440,6 +446,22 @@ fn pop_next_job() -> Option<ObservedBackfillJob> {
 	queue.jobs.remove(&subreddit)
 }
 
+fn split_job_for_work_slice(mut job: ObservedBackfillJob, max_candidates: usize) -> (ObservedBackfillJob, Option<ObservedBackfillJob>) {
+	let max_candidates = max_candidates.max(1);
+	if job.candidates.len() <= max_candidates {
+		return (job, None);
+	}
+
+	let remaining_candidates = job.candidates.split_off(max_candidates);
+	let continuation = ObservedBackfillJob {
+		subreddit: job.subreddit.clone(),
+		candidates: remaining_candidates,
+		priority: job.priority,
+		updated_at: job.updated_at,
+	};
+	(job, Some(continuation))
+}
+
 async fn ollama_embedding(client: &Client<hyper::client::HttpConnector>, base_url: &str, model: &str, prompt: &str) -> Result<Vec<f32>, String> {
 	let uri = format!("{}/api/embeddings", normalize_ollama_url(base_url))
 		.parse::<Uri>()
@@ -447,6 +469,7 @@ async fn ollama_embedding(client: &Client<hyper::client::HttpConnector>, base_ur
 	let body = json!({
 		"model": model,
 		"prompt": prompt,
+		"keep_alive": crate::ollama::keep_alive(),
 	})
 	.to_string();
 	let request = Request::builder()
@@ -469,17 +492,17 @@ async fn ollama_embedding(client: &Client<hyper::client::HttpConnector>, base_ur
 		.ok_or_else(|| "Ollama response did not contain an embedding".to_string())
 }
 
-async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome, String> {
+async fn process_job(client: &Client<hyper::client::HttpConnector>, job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome, String> {
 	let model = crate::subreddit_semantics::embedding_model();
 	let base_url = ollama_url();
 	let delay_ms = match job.priority {
 		ObservedBackfillPriority::Priority => env_u64("REDLIB_CONTENT_SEMANTIC_PRIORITY_DELAY_MS", DEFAULT_PRIORITY_DELAY_MS),
+		ObservedBackfillPriority::Background => env_u64("REDLIB_CONTENT_SEMANTIC_BACKGROUND_DELAY_MS", DEFAULT_BACKGROUND_DELAY_MS),
 		ObservedBackfillPriority::Opportunistic => env_u64("REDLIB_CONTENT_SEMANTIC_OPPORTUNISTIC_DELAY_MS", DEFAULT_OPPORTUNISTIC_DELAY_MS),
 	};
 	let budget = (job.priority == ObservedBackfillPriority::Opportunistic)
 		.then(|| Duration::from_secs(env_u64("REDLIB_CONTENT_SEMANTIC_OPPORTUNISTIC_JOB_BUDGET_SECS", DEFAULT_OPPORTUNISTIC_JOB_BUDGET_SECS)));
 	let started = Instant::now();
-	let client = Client::new();
 	let mut outcome = ObservedBackfillOutcome::default();
 	mark_active_activity(&job);
 
@@ -496,22 +519,23 @@ async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome
 
 		let semantic_target = semantic_target_label(&candidate.subreddit);
 		let prompt = format!("{semantic_target}\nCached post title and text:\n{}", candidate.text);
-		match ollama_embedding(&client, &base_url, &model, &prompt).await {
+		match ollama_embedding(client, &base_url, &model, &prompt).await {
 			Ok(embedding) => {
 				let embedded_at_unix = now_unix();
-				match subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &model, embedding.clone(), embedded_at_unix) {
+				let latest_embedding = vector_preview(&candidate, &embedding, embedded_at_unix);
+				match subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &model, embedding, embedded_at_unix) {
 					Ok(true) => {
 						outcome.embedded += 1;
-						mark_embedded_activity(&candidate, &model, &embedding, embedded_at_unix);
+						OBSERVED_BACKFILL_SIDECAR_DIRTY.store(true, AtomicOrdering::Release);
+						mark_embedded_activity(&candidate, &model, latest_embedding);
 					}
 					Ok(false) => {
 						outcome.already_current += 1;
 						mark_skipped_current_activity(&candidate.subreddit);
 					}
 					Err(error) => {
-						outcome.failed += 1;
 						mark_failed_activity(&candidate.subreddit);
-						warn!("observed_semantic_backfill: failed to store {semantic_target} embedding: {error}");
+						return Err(format!("failed to store {semantic_target} embedding: {error}"));
 					}
 				}
 			}
@@ -526,22 +550,62 @@ async fn process_job(job: ObservedBackfillJob) -> Result<ObservedBackfillOutcome
 		}
 	}
 
-	if outcome.embedded > 0 {
-		tokio::task::spawn_blocking(subreddit_content_semantics::write_persisted_embeddings_sidecar_now)
-			.await
-			.map_err(|error| format!("embedding sidecar writer stopped: {error}"))??;
-	}
-
 	Ok(outcome)
+}
+
+fn should_flush_sidecar(dirty: bool, queue_empty: bool, elapsed: Duration, max_delay: Duration) -> bool {
+	dirty && (queue_empty || elapsed >= max_delay)
+}
+
+async fn flush_sidecar_and_trim_allocator() -> Result<bool, String> {
+	tokio::task::spawn_blocking(|| {
+		let result = subreddit_content_semantics::write_persisted_embeddings_sidecar_now();
+		let trimmed = crate::memory::trim_allocator();
+		result.map(|()| trimmed)
+	})
+	.await
+	.map_err(|error| format!("embedding sidecar writer stopped: {error}"))?
 }
 
 async fn worker_loop() {
 	info!("observed_semantic_backfill: worker started");
+	let client = Client::new();
+	let flush_max_delay = Duration::from_secs(env_u64("REDLIB_CONTENT_SEMANTIC_SIDECAR_FLUSH_MAX_DELAY_SECS", DEFAULT_SIDECAR_FLUSH_MAX_DELAY_SECS));
+	let work_slice_candidates =
+		env_u64("REDLIB_CONTENT_SEMANTIC_WORK_SLICE_CANDIDATES", DEFAULT_WORK_SLICE_CANDIDATES as u64).clamp(1, MAX_PENDING_CANDIDATES_PER_SUBREDDIT as u64) as usize;
+	let mut last_flush_attempt = Instant::now();
 	loop {
 		let Some(job) = pop_next_job() else {
+			let dirty = OBSERVED_BACKFILL_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+			if should_flush_sidecar(dirty, true, last_flush_attempt.elapsed(), flush_max_delay) {
+				last_flush_attempt = Instant::now();
+				match flush_sidecar_and_trim_allocator().await {
+					Ok(trimmed) => {
+						OBSERVED_BACKFILL_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
+						info!("observed_semantic_backfill: persisted drained embedding burst (allocator_trimmed={trimmed})");
+					}
+					Err(error) => {
+						warn!("observed_semantic_backfill: failed to persist drained embedding burst: {error}");
+						tokio::select! {
+							_ = tokio::time::sleep(Duration::from_secs(SIDECAR_FLUSH_RETRY_SECS)) => {},
+							_ = OBSERVED_BACKFILL_NOTIFY.notified() => {},
+						}
+					}
+				}
+				continue;
+			}
 			OBSERVED_BACKFILL_NOTIFY.notified().await;
 			continue;
 		};
+		// Opportunistic jobs retain their existing whole-job time budget. Daemon
+		// and visible-session jobs are sliced so queued foreground work can run
+		// between slices without resetting that budget.
+		let slice_limit = if job.priority == ObservedBackfillPriority::Opportunistic {
+			usize::MAX
+		} else {
+			work_slice_candidates
+		};
+		let (job, continuation) = split_job_for_work_slice(job, slice_limit);
 		let subreddit = job.subreddit.clone();
 		let priority = job.priority;
 		let candidate_count = job.candidates.len();
@@ -549,13 +613,14 @@ async fn worker_loop() {
 			"observed_semantic_backfill: processing r/{} with {} candidates ({:?})",
 			subreddit, candidate_count, priority
 		);
-		match process_job(job).await {
+		let should_resume_continuation = match process_job(&client, job).await {
 			Ok(outcome) => {
 				mark_finished_activity(&subreddit, &outcome);
 				info!(
 					"observed_semantic_backfill: finished r/{} ({:?}): embedded={}, already_current={}, failed={}, timed_out={}",
 					subreddit, priority, outcome.embedded, outcome.already_current, outcome.failed, outcome.timed_out
 				);
+				!outcome.timed_out
 			}
 			Err(error) => {
 				update_activity(&subreddit, |activity| {
@@ -563,6 +628,34 @@ async fn worker_loop() {
 					activity.state = ObservedBackfillState::Errored;
 				});
 				warn!("observed_semantic_backfill: failed r/{} ({:?}): {}", subreddit, priority, error);
+				false
+			}
+		};
+		// On an error or time-budget stop, leave the cursor before the
+		// unprocessed tail. The normal next source observation will retry that
+		// tail in order; running a later slice now could advance past it forever.
+		if should_resume_continuation {
+			if let Some(continuation) = continuation {
+				let remaining = continuation.candidates.len();
+				let priority = continuation.priority;
+				if enqueue_candidates(continuation.candidates, priority) > 0 {
+					info!(
+						"observed_semantic_backfill: yielded r/{} with {} candidates remaining ({:?})",
+						subreddit, remaining, priority
+					);
+				}
+			}
+		}
+
+		let dirty = OBSERVED_BACKFILL_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+		if should_flush_sidecar(dirty, false, last_flush_attempt.elapsed(), flush_max_delay) {
+			last_flush_attempt = Instant::now();
+			match flush_sidecar_and_trim_allocator().await {
+				Ok(trimmed) => {
+					OBSERVED_BACKFILL_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
+					info!("observed_semantic_backfill: persisted active embedding burst (allocator_trimmed={trimmed})");
+				}
+				Err(error) => warn!("observed_semantic_backfill: failed to persist active embedding burst: {error}"),
 			}
 		}
 	}
@@ -617,5 +710,32 @@ mod tests {
 	fn semantic_target_label_distinguishes_users_from_subreddits() {
 		assert_eq!(semantic_target_label("rust"), "r/rust");
 		assert_eq!(semantic_target_label("u_exampleuser"), "u/exampleuser");
+	}
+
+	#[test]
+	fn sidecar_flushes_when_queue_drains_or_max_delay_elapses() {
+		let max_delay = Duration::from_secs(60);
+		assert!(!should_flush_sidecar(false, true, Duration::from_secs(60), max_delay));
+		assert!(should_flush_sidecar(true, true, Duration::ZERO, max_delay));
+		assert!(!should_flush_sidecar(true, false, Duration::from_secs(59), max_delay));
+		assert!(should_flush_sidecar(true, false, Duration::from_secs(60), max_delay));
+	}
+
+	#[test]
+	fn work_slices_preserve_every_candidate_for_resumption() {
+		let job = ObservedBackfillJob {
+			subreddit: "rust".to_string(),
+			candidates: (0..40).map(|index| candidate("rust", &format!("post-{index}"), index)).collect(),
+			priority: ObservedBackfillPriority::Background,
+			updated_at: Instant::now(),
+		};
+		let (active, continuation) = split_job_for_work_slice(job, 32);
+		let continuation = continuation.expect("remaining candidates");
+
+		assert_eq!(active.candidates.len(), 32);
+		assert_eq!(continuation.candidates.len(), 8);
+		assert_eq!(active.candidates[31].post_key_hash, "post-31");
+		assert_eq!(continuation.candidates[0].post_key_hash, "post-32");
+		assert_eq!(continuation.priority, ObservedBackfillPriority::Background);
 	}
 }

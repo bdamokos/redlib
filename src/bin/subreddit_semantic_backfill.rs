@@ -297,6 +297,7 @@ async fn ollama_embedding(client: &Client<hyper::client::HttpConnector>, base_ur
 	let body = json!({
 		"model": model,
 		"prompt": prompt,
+		"keep_alive": redlib::ollama::keep_alive(),
 	})
 	.to_string();
 	let request = Request::builder()

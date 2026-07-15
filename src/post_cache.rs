@@ -1101,6 +1101,14 @@ fn prune_source_cache_locked(cache: &mut HashMap<String, CachedSourcePosts>) -> 
 	pruned_sources
 }
 
+fn semantic_backfill_priority(refresh_origin: Option<RefreshOrigin>) -> crate::observed_semantic_backfill::ObservedBackfillPriority {
+	match refresh_origin {
+		Some(RefreshOrigin::FrontPageSession) => crate::observed_semantic_backfill::ObservedBackfillPriority::Priority,
+		Some(RefreshOrigin::Daemon) => crate::observed_semantic_backfill::ObservedBackfillPriority::Background,
+		Some(RefreshOrigin::DirectLiveFetch) | None => crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
+	}
+}
+
 pub fn source_cache_revision() -> u64 {
 	SOURCE_CACHE_REVISION.load(AtomicOrdering::Relaxed)
 }
@@ -1137,10 +1145,9 @@ pub(crate) fn prune_source_cache() {
 		return;
 	}
 
+	let sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
+	materialized_catalog::remove_sources(&sources);
 	for (source, remove_disk_entry) in &pruned_sources {
-		if materialized_catalog::source_is_supported(source) {
-			materialized_catalog::apply_source_refresh(source, &[]);
-		}
 		if *remove_disk_entry {
 			crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
 		}
@@ -1156,10 +1163,9 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	} else {
 		Vec::new()
 	};
+	let pruned_catalog_sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
+	materialized_catalog::remove_sources(&pruned_catalog_sources);
 	for (pruned_source, remove_disk_entry) in &pruned_sources {
-		if materialized_catalog::source_is_supported(pruned_source) {
-			materialized_catalog::apply_source_refresh(pruned_source, &[]);
-		}
 		if *remove_disk_entry {
 			crate::cache_persistence::remove_source_cache_entry(&pruned_source.cache_key());
 		}
@@ -1194,10 +1200,7 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	if is_persisted_subreddit_feed_source(source) || materialized_catalog::source_is_supported(source) {
 		crate::cache_persistence::mark_dirty();
 	}
-	let priority = match refresh_origin {
-		Some(RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) => crate::observed_semantic_backfill::ObservedBackfillPriority::Priority,
-		Some(RefreshOrigin::DirectLiveFetch) | None => crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
-	};
+	let priority = semantic_backfill_priority(refresh_origin);
 	if let Ok(cache) = SOURCE_CACHE.lock() {
 		if let Some(entry) = cache.get(&source.cache_key()) {
 			crate::observed_semantic_backfill::enqueue_observed_posts(&source.cache_key(), &entry.posts, priority);
@@ -1338,6 +1341,7 @@ pub fn cleanup_decayed_remembered_subreddits() {
 		return;
 	}
 
+	let mut removed_sources = Vec::new();
 	let mut cache = SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
 	for key in &decayed {
 		let Some(source) = remembered_feed_source_from_key(key) else {
@@ -1345,11 +1349,13 @@ pub fn cleanup_decayed_remembered_subreddits() {
 		};
 		cache.remove(&source.cache_key());
 		crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
-		materialized_catalog::apply_source_refresh(&source, &[]);
 		if let FeedSource::Subreddit { name, .. } = &source {
 			crate::subreddit::remove_subreddit_metadata_cache(name);
 		}
+		removed_sources.push(source);
 	}
+	drop(cache);
+	materialized_catalog::remove_sources(&removed_sources);
 	crate::cache_persistence::mark_dirty();
 }
 
@@ -3635,6 +3641,18 @@ mod tests {
 		assert!(!super::remembered_feed_daemon_enabled_from(Some("off")));
 		assert!(!super::remembered_feed_daemon_enabled_from(Some("false")));
 		assert!(!super::remembered_feed_daemon_enabled_from(Some("0")));
+	}
+
+	#[test]
+	fn daemon_embeddings_are_background_while_visible_sessions_stay_priority() {
+		use crate::observed_semantic_backfill::ObservedBackfillPriority;
+
+		assert_eq!(super::semantic_backfill_priority(Some(RefreshOrigin::Daemon)), ObservedBackfillPriority::Background);
+		assert_eq!(super::semantic_backfill_priority(Some(RefreshOrigin::FrontPageSession)), ObservedBackfillPriority::Priority);
+		assert_eq!(
+			super::semantic_backfill_priority(Some(RefreshOrigin::DirectLiveFetch)),
+			ObservedBackfillPriority::Opportunistic
+		);
 	}
 
 	fn session_entry(source: FeedSource, state: SessionSourceState) -> SessionSourceEntry {

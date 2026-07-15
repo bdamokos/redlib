@@ -76,6 +76,9 @@ ENV REDLIB_DEFAULT_AUTOPLAY_VIDEOS=off
 ENV REDLIB_BANNER_TEXT=Redlib
 ENV REDLIB_CACHE_DIR=/var/lib/redlib/cache
 ENV REDLIB_PREFS_DB=/var/lib/redlib/state/preferences.sqlite3
+# Keep glibc from creating a large arena per Tokio/blocking worker. Runtime
+# environments may still override this for allocator A/B tests.
+ENV MALLOC_ARENA_MAX=2
 
 LABEL org.opencontainers.image.title="Redlib" \
     org.opencontainers.image.revision="${GIT_HASH}"

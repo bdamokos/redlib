@@ -2011,6 +2011,7 @@ dependencies = [
  "htmlescape",
  "hyper",
  "hyper-rustls",
+ "libc",
  "libflate",
  "lipsum",
  "log",

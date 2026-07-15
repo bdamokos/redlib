@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
@@ -269,9 +269,7 @@ fn system_time_to_unix(time: SystemTime) -> Option<u64> {
 }
 
 pub(crate) fn snapshot_persisted_embeddings(_now_unix: u64) -> Vec<PersistedSubredditSemanticEmbedding> {
-	let Ok(cache) = SUBREDDIT_SEMANTIC_CACHE.lock() else {
-		return Vec::new();
-	};
+	let cache = SUBREDDIT_SEMANTIC_CACHE.lock().unwrap_or_else(|error| error.into_inner());
 	let mut entries = cache.values().cloned().collect::<Vec<_>>();
 	entries.sort_by(|left, right| left.subreddit.cmp(&right.subreddit).then_with(|| left.model.cmp(&right.model)));
 	entries
@@ -298,12 +296,12 @@ pub(crate) fn restore_persisted_embeddings(entries: Vec<PersistedSubredditSemant
 }
 
 fn read_persisted_embeddings_file(path: &Path) -> Result<Option<PersistedSubredditSemanticEmbeddingFile>, String> {
-	let bytes = match fs::read(path) {
-		Ok(bytes) => bytes,
+	let file = match File::open(path) {
+		Ok(file) => file,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error.to_string()),
 	};
-	let file: PersistedSubredditSemanticEmbeddingFile = bincode::deserialize(&bytes).map_err(|error| error.to_string())?;
+	let file: PersistedSubredditSemanticEmbeddingFile = bincode::deserialize_from(BufReader::new(file)).map_err(|error| error.to_string())?;
 	if file.version != SUBREDDIT_SEMANTIC_SIDECAR_VERSION {
 		return Err(format!("unsupported semantic embeddings sidecar version {}", file.version));
 	}
@@ -499,13 +497,20 @@ pub fn write_persisted_embeddings_sidecar_now() -> Result<(), String> {
 	}
 
 	let _lock = acquire_sidecar_lock()?;
-	let mut entries_by_subreddit = read_persisted_embeddings_file(&final_path)?
-		.map(|file| normalized_entries_map(file.entries))
-		.unwrap_or_default();
-	for entry in snapshot_persisted_embeddings(crate::cache_persistence::unix_now()) {
-		entries_by_subreddit.insert(entry.subreddit.clone(), entry);
-	}
-	let mut entries = entries_by_subreddit.into_values().collect::<Vec<_>>();
+	let disk_modified = fs::metadata(&final_path).and_then(|metadata| metadata.modified()).ok();
+	let known_modified = SUBREDDIT_SEMANTIC_SIDECAR_MTIME.lock().ok().and_then(|mtime| *mtime);
+	let live_entries = snapshot_persisted_embeddings(crate::cache_persistence::unix_now());
+	let mut entries = if disk_modified == known_modified {
+		live_entries
+	} else {
+		let mut entries_by_subreddit = read_persisted_embeddings_file(&final_path)?
+			.map(|file| normalized_entries_map(file.entries))
+			.unwrap_or_default();
+		for entry in live_entries {
+			entries_by_subreddit.insert(entry.subreddit.clone(), entry);
+		}
+		entries_by_subreddit.into_values().collect::<Vec<_>>()
+	};
 	entries.sort_by(|left, right| left.subreddit.cmp(&right.subreddit).then_with(|| left.model.cmp(&right.model)));
 
 	let file = PersistedSubredditSemanticEmbeddingFile {
@@ -513,10 +518,12 @@ pub fn write_persisted_embeddings_sidecar_now() -> Result<(), String> {
 		saved_at_unix: crate::cache_persistence::unix_now(),
 		entries,
 	};
-	let bytes = bincode::serialize(&file).map_err(|error| error.to_string())?;
 	let temp_path = final_path.with_extension(format!("tmp.{}", std::process::id()));
-	let mut temp_file = File::create(&temp_path).map_err(|error| error.to_string())?;
-	temp_file.write_all(&bytes).map_err(|error| error.to_string())?;
+	let temp_file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	let mut writer = BufWriter::new(temp_file);
+	bincode::serialize_into(&mut writer, &file).map_err(|error| error.to_string())?;
+	writer.flush().map_err(|error| error.to_string())?;
+	let temp_file = writer.into_inner().map_err(|error| error.into_error().to_string())?;
 	temp_file.sync_all().map_err(|error| error.to_string())?;
 	drop(temp_file);
 	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())?;

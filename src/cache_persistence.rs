@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -507,8 +507,10 @@ pub fn init() {
 				while rx.recv().await.is_some() {
 					tokio::time::sleep(Duration::from_secs(WRITE_DEBOUNCE_SECS)).await;
 					while rx.try_recv().is_ok() {}
-					if let Err(error) = write_snapshot() {
-						warn!("cache_persistence: failed to persist subreddit cache snapshot: {error}");
+					match tokio::task::spawn_blocking(write_snapshot_and_trim_allocator).await {
+						Ok(Ok(())) => {}
+						Ok(Err(error)) => warn!("cache_persistence: failed to persist subreddit cache snapshot: {error}"),
+						Err(error) => warn!("cache_persistence: snapshot writer stopped: {error}"),
 					}
 				}
 			});
@@ -694,8 +696,7 @@ fn load_snapshot() -> Result<(), String> {
 
 fn write_snapshot() -> Result<(), String> {
 	let now_unix = unix_now();
-	let author_history = crate::materialized_catalog::snapshot_persisted_author_history(now_unix);
-	let rejected_author_redgifs_profiles = crate::materialized_catalog::snapshot_persisted_rejected_author_redgifs_profiles(now_unix);
+	let (author_history, rejected_author_redgifs_profiles) = crate::materialized_catalog::snapshot_persisted_author_state(now_unix);
 	let snapshot = PersistedCacheSnapshot {
 		version: SNAPSHOT_VERSION,
 		saved_at_unix: now_unix,
@@ -710,7 +711,6 @@ fn write_snapshot() -> Result<(), String> {
 		subreddit_semantic_embeddings: subreddit_semantics::snapshot_persisted_embeddings(now_unix),
 	};
 
-	let bytes = serialize_snapshot(&snapshot)?;
 	let final_path = &*PERSISTENCE_PATH;
 	let temp_path = final_path.with_extension("tmp");
 
@@ -718,21 +718,31 @@ fn write_snapshot() -> Result<(), String> {
 		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
 	}
 
-	let mut file = File::create(&temp_path).map_err(|error| error.to_string())?;
-	file.write_all(&bytes).map_err(|error| error.to_string())?;
+	let file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	let mut writer = BufWriter::new(file);
+	bincode::serialize_into(&mut writer, &snapshot).map_err(|error| error.to_string())?;
+	writer.flush().map_err(|error| error.to_string())?;
+	let file = writer.into_inner().map_err(|error| error.to_string())?;
 	file.sync_all().map_err(|error| error.to_string())?;
 	drop(file);
 	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())
 }
 
+fn write_snapshot_and_trim_allocator() -> Result<(), String> {
+	let result = write_snapshot();
+	crate::memory::trim_allocator();
+	result
+}
+
 pub fn write_snapshot_now() -> Result<(), String> {
-	write_snapshot()
+	write_snapshot_and_trim_allocator()
 }
 
 fn load_catalog_snapshot_or_rebuild() {
 	post_cache::rebuild_materialized_catalog_from_source_cache();
 }
 
+#[cfg(test)]
 fn serialize_snapshot(snapshot: &PersistedCacheSnapshot) -> Result<Vec<u8>, String> {
 	bincode::serialize(snapshot).map_err(|error| error.to_string())
 }

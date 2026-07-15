@@ -34,6 +34,7 @@ services:
       REDLIB_INSTANCE_SCRAPE_ENABLED: "${REDLIB_INSTANCE_SCRAPE_ENABLED:-off}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       REDLIB_SUBREDDIT_SEMANTIC_MODEL: "${REDLIB_SUBREDDIT_SEMANTIC_MODEL:-nomic-embed-text}"
+      REDLIB_OLLAMA_KEEP_ALIVE: "${REDLIB_OLLAMA_KEEP_ALIVE:-30s}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

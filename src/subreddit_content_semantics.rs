@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
@@ -989,12 +989,11 @@ fn aggregate_corpus_hash(entry: &PersistedSubredditContentSemanticEmbedding) -> 
 }
 
 fn recompute_aggregate_entry(entry: &mut PersistedSubredditContentSemanticEmbedding, embedded_at_unix: u64) -> Result<(), String> {
-	let mut embedding = entry.vector_sum.clone();
-	if embedding.is_empty() || !embedding.iter().all(|value| value.is_finite()) || !normalize_embedding(&mut embedding) {
+	entry.embedding.clone_from(&entry.vector_sum);
+	if entry.embedding.is_empty() || !entry.embedding.iter().all(|value| value.is_finite()) || !normalize_embedding(&mut entry.embedding) {
 		return Err("content semantic aggregate vector is empty".to_string());
 	}
 	entry.corpus_hash = aggregate_corpus_hash(entry);
-	entry.embedding = embedding;
 	entry.embedded_at_unix = embedded_at_unix;
 	entry.top_neighbor_similarity = None;
 	entry.top5_mean_similarity = None;
@@ -1185,9 +1184,7 @@ fn system_time_to_unix(time: SystemTime) -> Option<u64> {
 }
 
 fn snapshot_persisted_embeddings(_now_unix: u64) -> Vec<PersistedSubredditContentSemanticEmbedding> {
-	let Ok(cache) = CONTENT_SEMANTIC_CACHE.lock() else {
-		return Vec::new();
-	};
+	let cache = CONTENT_SEMANTIC_CACHE.lock().unwrap_or_else(|error| error.into_inner());
 	let mut entries = cache.values().cloned().collect::<Vec<_>>();
 	entries.sort_by(|left, right| left.subreddit.cmp(&right.subreddit).then_with(|| left.model.cmp(&right.model)));
 	entries
@@ -1205,11 +1202,10 @@ fn normalized_entry(mut entry: PersistedSubredditContentSemanticEmbedding) -> Op
 	if entry.vector_sum.len() != entry.embedding.len() || !entry.vector_sum.iter().all(|value| value.is_finite()) {
 		return None;
 	}
-	let mut embedding = entry.vector_sum.clone();
-	if !normalize_embedding(&mut embedding) {
+	entry.embedding.clone_from(&entry.vector_sum);
+	if !normalize_embedding(&mut entry.embedding) {
 		return None;
 	}
-	entry.embedding = embedding;
 	if entry.corpus_hash.is_empty() {
 		entry.corpus_hash = aggregate_corpus_hash(&entry);
 	}
@@ -1229,12 +1225,12 @@ fn restore_persisted_embeddings(entries: Vec<PersistedSubredditContentSemanticEm
 }
 
 fn read_persisted_embeddings_file(path: &Path) -> Result<Option<PersistedSubredditContentSemanticEmbeddingFile>, String> {
-	let bytes = match fs::read(path) {
-		Ok(bytes) => bytes,
+	let file = match File::open(path) {
+		Ok(file) => file,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error.to_string()),
 	};
-	let file: PersistedSubredditContentSemanticEmbeddingFile = bincode::deserialize(&bytes).map_err(|error| error.to_string())?;
+	let file: PersistedSubredditContentSemanticEmbeddingFile = bincode::deserialize_from(BufReader::new(file)).map_err(|error| error.to_string())?;
 	if file.version != SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_VERSION {
 		return Err(format!("unsupported content semantic embeddings sidecar version {}", file.version));
 	}
@@ -1495,13 +1491,20 @@ pub fn write_persisted_embeddings_sidecar_now() -> Result<(), String> {
 	}
 
 	let _lock = acquire_sidecar_lock()?;
-	let mut entries_by_subreddit = read_persisted_embeddings_file(&final_path)?
-		.map(|file| normalized_entries_map(file.entries))
-		.unwrap_or_default();
-	for entry in snapshot_persisted_embeddings(crate::cache_persistence::unix_now()) {
-		entries_by_subreddit.insert(entry.subreddit.clone(), entry);
-	}
-	let mut entries = entries_by_subreddit.into_values().collect::<Vec<_>>();
+	let disk_modified = fs::metadata(&final_path).and_then(|metadata| metadata.modified()).ok();
+	let known_modified = CONTENT_SEMANTIC_SIDECAR_MTIME.lock().ok().and_then(|mtime| *mtime);
+	let live_entries = snapshot_persisted_embeddings(crate::cache_persistence::unix_now());
+	let mut entries = if disk_modified == known_modified {
+		live_entries
+	} else {
+		let mut entries_by_subreddit = read_persisted_embeddings_file(&final_path)?
+			.map(|file| normalized_entries_map(file.entries))
+			.unwrap_or_default();
+		for entry in live_entries {
+			entries_by_subreddit.insert(entry.subreddit.clone(), entry);
+		}
+		entries_by_subreddit.into_values().collect::<Vec<_>>()
+	};
 	entries.sort_by(|left, right| left.subreddit.cmp(&right.subreddit).then_with(|| left.model.cmp(&right.model)));
 
 	let file = PersistedSubredditContentSemanticEmbeddingFile {
@@ -1509,10 +1512,12 @@ pub fn write_persisted_embeddings_sidecar_now() -> Result<(), String> {
 		saved_at_unix: crate::cache_persistence::unix_now(),
 		entries,
 	};
-	let bytes = bincode::serialize(&file).map_err(|error| error.to_string())?;
 	let temp_path = final_path.with_extension(format!("tmp.{}", std::process::id()));
-	let mut temp_file = File::create(&temp_path).map_err(|error| error.to_string())?;
-	temp_file.write_all(&bytes).map_err(|error| error.to_string())?;
+	let temp_file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	let mut writer = BufWriter::new(temp_file);
+	bincode::serialize_into(&mut writer, &file).map_err(|error| error.to_string())?;
+	writer.flush().map_err(|error| error.to_string())?;
+	let temp_file = writer.into_inner().map_err(|error| error.into_error().to_string())?;
 	temp_file.sync_all().map_err(|error| error.to_string())?;
 	drop(temp_file);
 	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())?;
@@ -1538,8 +1543,38 @@ pub(crate) fn clear_test_cache() {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::ffi::OsString;
+	use std::path::PathBuf;
 
 	static TEST_CACHE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+	struct CacheDirGuard {
+		previous: Option<OsString>,
+		path: PathBuf,
+	}
+
+	impl CacheDirGuard {
+		fn new(label: &str) -> Self {
+			let previous = std::env::var_os("REDLIB_CACHE_DIR");
+			let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+			let path = std::env::temp_dir().join(format!("redlib-content-semantic-{label}-{}-{unique}", std::process::id()));
+			std::fs::create_dir_all(&path).unwrap();
+			std::env::set_var("REDLIB_CACHE_DIR", &path);
+			Self { previous, path }
+		}
+	}
+
+	impl Drop for CacheDirGuard {
+		fn drop(&mut self) {
+			if let Some(previous) = &self.previous {
+				std::env::set_var("REDLIB_CACHE_DIR", previous);
+			} else {
+				std::env::remove_var("REDLIB_CACHE_DIR");
+			}
+			let _ = std::fs::remove_dir_all(&self.path);
+			clear_test_cache();
+		}
+	}
 
 	#[test]
 	fn normalized_embedding_rejects_zero_vector() {
@@ -1613,6 +1648,25 @@ mod tests {
 		assert_eq!(embedding.len(), 2);
 		assert!((embedding[0] - 0.6).abs() < 0.001);
 		assert!((embedding[1] - 0.8).abs() < 0.001);
+	}
+
+	#[test]
+	fn sidecar_fast_path_round_trips_and_changed_mtime_merges() {
+		let _lock = TEST_CACHE_LOCK.lock().unwrap();
+		let _cache_dir = CacheDirGuard::new("merge");
+		clear_test_cache();
+
+		store_embedding("Rust", "test-model", "rust-hash", vec![1.0, 0.0], 100, 1, 10, 100).unwrap();
+		write_persisted_embeddings_sidecar_now().unwrap();
+		clear_test_cache();
+
+		store_embedding("Baking", "test-model", "baking-hash", vec![0.0, 1.0], 200, 1, 10, 200).unwrap();
+		write_persisted_embeddings_sidecar_now().unwrap();
+		clear_test_cache();
+		assert!(refresh_persisted_embeddings_sidecar().unwrap());
+
+		let names = active_entries_for_model("test-model").into_iter().map(|entry| entry.subreddit).collect::<Vec<_>>();
+		assert_eq!(names, vec!["baking".to_string(), "rust".to_string()]);
 	}
 
 	#[test]

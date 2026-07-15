@@ -1414,6 +1414,25 @@ pub(crate) fn apply_source_refresh_with_observation(source: &FeedSource, posts: 
 	rebuild_indexes(&mut catalog);
 }
 
+/// Remove several expired source memberships with one catalog rebuild.
+///
+/// Source-cache pruning often evicts a small batch at once. Rebuilding every
+/// derived author/timeline index after each individual removal creates large,
+/// short-lived allocations while producing the same final catalog.
+pub(crate) fn remove_sources(sources: &[FeedSource]) {
+	let source_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
+	if source_keys.is_empty() {
+		return;
+	}
+
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	for record in catalog.posts_by_id.values_mut() {
+		record.source_keys.retain(|source_key| !source_keys.contains(source_key));
+	}
+	catalog.posts_by_id.retain(|_, record| !record.source_keys.is_empty());
+	rebuild_indexes(&mut catalog);
+}
+
 #[cfg(test)]
 pub(crate) fn restore_catalog(snapshot: PersistedCatalogSnapshot) {
 	let mut catalog = MaterializedCatalog::default();
@@ -2787,12 +2806,7 @@ pub(crate) fn catalog_video_stats(username: &str) -> Option<crate::user::UserVid
 	}
 }
 
-pub(crate) fn snapshot_persisted_author_history(now_unix: u64) -> Vec<PersistedAuthorHistoryEntry> {
-	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	prune_author_history_locked(&mut catalog, now_unix);
-	reject_author_history_with_many_redgifs_profiles_locked(&mut catalog, now_unix);
-	rebuild_indexes(&mut catalog);
-
+fn snapshot_persisted_author_history_locked(catalog: &MaterializedCatalog) -> Vec<PersistedAuthorHistoryEntry> {
 	let mut entries = catalog
 		.author_history
 		.iter()
@@ -2809,6 +2823,43 @@ pub(crate) fn snapshot_persisted_author_history(now_unix: u64) -> Vec<PersistedA
 		.collect::<Vec<_>>();
 	entries.sort_by(|left, right| left.author.cmp(&right.author));
 	entries
+}
+
+fn snapshot_persisted_rejected_author_redgifs_profiles_locked(catalog: &MaterializedCatalog, now_unix: u64) -> Vec<PersistedRejectedAuthorRedgifsProfileEntry> {
+	let mut entries = catalog
+		.rejected_author_redgifs_profiles
+		.values()
+		.filter(|entry| {
+			!entry.author.trim().is_empty()
+				&& entry.redgifs_profile_count >= SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD
+				&& now_unix.saturating_sub(entry.seen_at_unix) <= AUTHOR_HISTORY_MAX_POST_AGE_SECS
+		})
+		.cloned()
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| left.author.cmp(&right.author));
+	entries
+}
+
+fn prepare_persisted_author_state(catalog: &mut MaterializedCatalog, now_unix: u64) {
+	prune_author_history_locked(catalog, now_unix);
+	reject_author_history_with_many_redgifs_profiles_locked(catalog, now_unix);
+	rebuild_indexes(catalog);
+}
+
+pub(crate) fn snapshot_persisted_author_state(now_unix: u64) -> (Vec<PersistedAuthorHistoryEntry>, Vec<PersistedRejectedAuthorRedgifsProfileEntry>) {
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	prepare_persisted_author_state(&mut catalog, now_unix);
+	(
+		snapshot_persisted_author_history_locked(&catalog),
+		snapshot_persisted_rejected_author_redgifs_profiles_locked(&catalog, now_unix),
+	)
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_persisted_author_history(now_unix: u64) -> Vec<PersistedAuthorHistoryEntry> {
+	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	prepare_persisted_author_state(&mut catalog, now_unix);
+	snapshot_persisted_author_history_locked(&catalog)
 }
 
 pub(crate) fn restore_persisted_author_history(entries: Vec<PersistedAuthorHistoryEntry>, _saved_at_unix: u64, now_unix: u64) {
@@ -2837,24 +2888,11 @@ pub(crate) fn restore_persisted_author_history(entries: Vec<PersistedAuthorHisto
 	rebuild_indexes(&mut catalog);
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_persisted_rejected_author_redgifs_profiles(now_unix: u64) -> Vec<PersistedRejectedAuthorRedgifsProfileEntry> {
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	prune_author_history_locked(&mut catalog, now_unix);
-	reject_author_history_with_many_redgifs_profiles_locked(&mut catalog, now_unix);
-	rebuild_indexes(&mut catalog);
-
-	let mut entries = catalog
-		.rejected_author_redgifs_profiles
-		.values()
-		.filter(|entry| {
-			!entry.author.trim().is_empty()
-				&& entry.redgifs_profile_count >= SUGGESTED_PROFILE_REDGIFS_PROFILE_REJECT_THRESHOLD
-				&& now_unix.saturating_sub(entry.seen_at_unix) <= AUTHOR_HISTORY_MAX_POST_AGE_SECS
-		})
-		.cloned()
-		.collect::<Vec<_>>();
-	entries.sort_by(|left, right| left.author.cmp(&right.author));
-	entries
+	prepare_persisted_author_state(&mut catalog, now_unix);
+	snapshot_persisted_rejected_author_redgifs_profiles_locked(&catalog, now_unix)
 }
 
 pub(crate) fn restore_persisted_rejected_author_redgifs_profiles(entries: Vec<PersistedRejectedAuthorRedgifsProfileEntry>, _saved_at_unix: u64, now_unix: u64) {
@@ -2954,7 +2992,7 @@ impl PersistedCatalogSourceKey {
 mod tests {
 	use super::{
 		apply_source_refresh, catalog_user_sidebar_stats, mark_deleted_reddit_media_asset, query_author_posts_limited, query_source_candidates, record_author_history_from_posts,
-		rejected_author_redgifs_profile_count, related_subreddit_report, reset_catalog, restore_catalog, restore_persisted_author_history,
+		rejected_author_redgifs_profile_count, related_subreddit_report, remove_sources, reset_catalog, restore_catalog, restore_persisted_author_history,
 		restore_persisted_rejected_author_redgifs_profiles, snapshot_catalog, snapshot_persisted_author_history, snapshot_persisted_rejected_author_redgifs_profiles,
 		suggested_profiles, suggested_profiles_with_mode, suggested_profiles_with_mode_and_feedback, suggested_profiles_with_mode_center_and_feedback,
 		suggested_profiles_with_mode_center_mix_and_feedback, SuggestedProfileScoringMode, SuggestedProfileVectorCenterRequest,
@@ -3079,10 +3117,13 @@ mod tests {
 
 		apply_source_refresh(&subreddit_source, std::slice::from_ref(&post));
 		apply_source_refresh(&flair_source, std::slice::from_ref(&post));
-		apply_source_refresh(&flair_source, &[]);
+		remove_sources(std::slice::from_ref(&flair_source));
 
-		let posts = query_source_candidates(&[subreddit_source], &HashSet::new());
+		let posts = query_source_candidates(std::slice::from_ref(&subreddit_source), &HashSet::new());
 		assert_eq!(posts.into_iter().map(|post| post.id).collect::<Vec<_>>(), vec!["one".to_string()]);
+
+		remove_sources(std::slice::from_ref(&subreddit_source));
+		assert!(query_source_candidates(&[subreddit_source], &HashSet::new()).is_empty());
 	}
 
 	#[test]
