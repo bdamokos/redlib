@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_VERSION: u8 = 3;
 const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_FILE_NAME: &str = "subreddit-content-semantic-embeddings.v3.bin";
 const SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_LOCK_FILE_NAME: &str = "subreddit-content-semantic-embeddings.v3.lock";
+const SUBREDDIT_CONTENT_SEMANTIC_MUTATION_LOCK_FILE_NAME: &str = "subreddit-content-semantic-mutation.lock";
 const SUBREDDIT_CONTENT_SEMANTIC_BACKFILL_STATUS_FILE_NAME: &str = "subreddit-content-semantic-backfill-status.v1.json";
 const MATERIALIZED_CATALOG_FILE_NAME: &str = "materialized-catalog.v1.bin";
 const DEFAULT_CONTENT_SEMANTIC_MIX_PERCENT: u8 = 35;
@@ -580,12 +581,12 @@ fn materialized_catalog_path() -> PathBuf {
 
 fn read_materialized_catalog_snapshot() -> Result<Option<PersistedContentCatalogSnapshotFile>, String> {
 	let path = materialized_catalog_path();
-	let bytes = match fs::read(&path) {
-		Ok(bytes) => bytes,
+	let file = match File::open(&path) {
+		Ok(file) => file,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error.to_string()),
 	};
-	bincode::deserialize(&bytes)
+	bincode::deserialize_from(BufReader::new(file))
 		.map(Some)
 		.map_err(|error| format!("failed to read {}: {error}", path.display()))
 }
@@ -699,15 +700,11 @@ pub fn runtime_post_embedding_candidates(source_key: &str, posts: &[crate::utils
 }
 
 pub fn build_subreddit_content_post_embedding_candidates(options: &SubredditContentCorpusOptions) -> Result<SubredditContentPostCandidateCollection, String> {
-	let mut files = cache_persistence::read_persisted_source_cache_files()?;
-	files.sort_by(|left, right| left.key.cmp(&right.key));
-	let mut stats = SubredditContentCorpusStats {
-		source_files: files.len(),
-		..SubredditContentCorpusStats::default()
-	};
+	let mut stats = SubredditContentCorpusStats::default();
 	let mut candidates_by_post = HashMap::<String, SubredditContentPostEmbeddingCandidate>::new();
 
-	for file in files {
+	cache_persistence::for_each_persisted_source_cache_file(|file| {
+		stats.source_files += 1;
 		for post in &file.entry.posts {
 			stats.source_posts += 1;
 			let subreddit = crate::subreddit_semantics::normalize_subreddit_name(&post.community);
@@ -729,7 +726,7 @@ pub fn build_subreddit_content_post_embedding_candidates(options: &SubredditCont
 					.or_insert(candidate);
 			}
 		}
-	}
+	})?;
 
 	if let Some(catalog_file) = read_materialized_catalog_snapshot()? {
 		let _catalog_version = catalog_file.version;
@@ -784,17 +781,13 @@ pub fn build_subreddit_content_post_embedding_candidates(options: &SubredditCont
 }
 
 pub fn build_subreddit_content_corpora(options: &SubredditContentCorpusOptions) -> Result<SubredditContentCorpusCollection, String> {
-	let mut files = cache_persistence::read_persisted_source_cache_files()?;
-	files.sort_by(|left, right| left.key.cmp(&right.key));
-	let mut stats = SubredditContentCorpusStats {
-		source_files: files.len(),
-		..SubredditContentCorpusStats::default()
-	};
+	let mut stats = SubredditContentCorpusStats::default();
 	let mut seen_posts = HashSet::new();
 	let mut posts_by_subreddit = HashMap::<String, Vec<CandidatePostText>>::new();
 	let mut source_keys_by_subreddit = HashMap::<String, HashSet<String>>::new();
 
-	for file in files {
+	cache_persistence::for_each_persisted_source_cache_file(|file| {
+		stats.source_files += 1;
 		for post in &file.entry.posts {
 			stats.source_posts += 1;
 			let subreddit = crate::subreddit_semantics::normalize_subreddit_name(&post.community);
@@ -814,7 +807,7 @@ pub fn build_subreddit_content_corpora(options: &SubredditContentCorpusOptions) 
 			});
 			source_keys_by_subreddit.entry(subreddit).or_default().insert(file.key.clone());
 		}
-	}
+	})?;
 
 	if let Some(catalog_file) = read_materialized_catalog_snapshot()? {
 		let _catalog_version = catalog_file.version;
@@ -1035,28 +1028,35 @@ pub fn store_post_aggregate_embedding(candidate: &SubredditContentPostEmbeddingC
 		return Err("content semantic embedding cache lock is poisoned".to_string());
 	};
 	let entry = cache.entry(subreddit.clone()).or_insert_with(|| empty_aggregate_entry(subreddit.clone(), model.clone()));
-	if entry.model != model {
-		*entry = empty_aggregate_entry(subreddit.clone(), model.clone());
-	}
-	if !candidate_is_after_cursor(candidate, entry) {
+	if entry.model == model && !candidate_is_after_cursor(candidate, entry) {
 		return Ok(false);
 	}
-	if entry.vector_sum.is_empty() {
-		entry.vector_sum = vec![0.0; embedding.len()];
+
+	// Build the next aggregate off to the side. A zero/non-finite recompute or
+	// any future validation failure must not leave the live entry's cursor and
+	// counters advanced past a candidate that was not successfully stored.
+	let mut updated = if entry.model == model {
+		entry.clone()
+	} else {
+		empty_aggregate_entry(subreddit.clone(), model.clone())
+	};
+	if updated.vector_sum.is_empty() {
+		updated.vector_sum = vec![0.0; embedding.len()];
 	}
-	if entry.vector_sum.len() != embedding.len() {
-		*entry = empty_aggregate_entry(subreddit, model);
-		entry.vector_sum = vec![0.0; embedding.len()];
+	if updated.vector_sum.len() != embedding.len() {
+		updated = empty_aggregate_entry(subreddit, model);
+		updated.vector_sum = vec![0.0; embedding.len()];
 	}
-	for (sum_value, embedding_value) in entry.vector_sum.iter_mut().zip(&embedding) {
+	for (sum_value, embedding_value) in updated.vector_sum.iter_mut().zip(&embedding) {
 		*sum_value += *embedding_value;
 	}
-	entry.post_count = entry.post_count.saturating_add(1);
-	entry.source_count = entry.source_count.saturating_add(1);
-	entry.text_chars = entry.text_chars.saturating_add(candidate.text_chars);
-	entry.last_processed_created_ts = candidate.created_ts;
-	entry.last_processed_post_key_hash = candidate.post_key_hash.clone();
-	recompute_aggregate_entry(entry, embedded_at_unix)?;
+	updated.post_count = updated.post_count.saturating_add(1);
+	updated.source_count = updated.source_count.saturating_add(1);
+	updated.text_chars = updated.text_chars.saturating_add(candidate.text_chars);
+	updated.last_processed_created_ts = candidate.created_ts;
+	updated.last_processed_post_key_hash = candidate.post_key_hash.clone();
+	recompute_aggregate_entry(&mut updated, embedded_at_unix)?;
+	*entry = updated;
 	Ok(true)
 }
 
@@ -1173,6 +1173,10 @@ pub fn persisted_embeddings_sidecar_path() -> PathBuf {
 
 fn persisted_embeddings_lock_path() -> PathBuf {
 	Path::new(&crate::cache_persistence::cache_dir()).join(SUBREDDIT_CONTENT_SEMANTIC_SIDECAR_LOCK_FILE_NAME)
+}
+
+fn persisted_embeddings_mutation_lock_path() -> PathBuf {
+	Path::new(&crate::cache_persistence::cache_dir()).join(SUBREDDIT_CONTENT_SEMANTIC_MUTATION_LOCK_FILE_NAME)
 }
 
 pub fn backfill_status_path() -> PathBuf {
@@ -1401,6 +1405,31 @@ pub fn refresh_persisted_embeddings_sidecar() -> Result<bool, String> {
 	Ok(true)
 }
 
+/// Cross-process guard for content-semantic mutations. Every mutator holds an
+/// exclusive guard from sidecar refresh/load through its fully persisted
+/// burst, so overlapping Redlib processes and the standalone backfill cannot
+/// fork the same aggregate and overwrite each other's vector/cursor progress.
+pub struct ContentSemanticMutationGuard {
+	_file: File,
+}
+
+pub fn acquire_content_semantic_mutation_guard() -> Result<ContentSemanticMutationGuard, String> {
+	let path = persisted_embeddings_mutation_lock_path();
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+	}
+
+	let file = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(false)
+		.open(&path)
+		.map_err(|error| error.to_string())?;
+	file.lock().map_err(|error| format!("failed to lock {}: {error}", path.display()))?;
+	Ok(ContentSemanticMutationGuard { _file: file })
+}
+
 struct SidecarLock {
 	path: PathBuf,
 }
@@ -1482,6 +1511,30 @@ pub fn refresh_similarity_quality_scores_for_model(model: &str) -> Result<(), St
 		}
 	}
 	Ok(())
+}
+
+/// Return whether embeddings for this model have changed since the last full
+/// similarity-quality pass. Storing or updating an aggregate clears both
+/// scores on that entry; because one changed vector can affect every other
+/// entry's nearest-neighbor scores, any missing score makes the model stale.
+/// A lone embedding correctly has no neighbor and therefore needs no refresh.
+pub fn similarity_quality_scores_need_refresh_for_model(model: &str) -> bool {
+	let model = model.trim();
+	let Ok(cache) = CONTENT_SEMANTIC_CACHE.lock() else {
+		return true;
+	};
+	let mut entries = cache.values().filter(|entry| entry.model == model && !entry.embedding.is_empty());
+	let Some(first) = entries.next() else {
+		return false;
+	};
+	let first_missing = first.top_neighbor_similarity.is_none() || first.top5_mean_similarity.is_none();
+	let mut has_multiple = false;
+	let mut has_missing = first_missing;
+	for entry in entries {
+		has_multiple = true;
+		has_missing |= entry.top_neighbor_similarity.is_none() || entry.top5_mean_similarity.is_none();
+	}
+	has_multiple && has_missing
 }
 
 pub fn write_persisted_embeddings_sidecar_now() -> Result<(), String> {
@@ -1651,6 +1704,23 @@ mod tests {
 	}
 
 	#[test]
+	fn similarity_quality_refresh_is_needed_only_after_multi_entry_changes() {
+		let _guard = TEST_CACHE_LOCK.lock().unwrap();
+		clear_test_cache();
+
+		store_embedding("Rust", "test-model", "rust-hash", vec![1.0, 0.0], 100, 1, 1, 100).unwrap();
+		assert!(!similarity_quality_scores_need_refresh_for_model("test-model"));
+
+		store_embedding("Baking", "test-model", "baking-hash", vec![0.0, 1.0], 100, 1, 1, 100).unwrap();
+		assert!(similarity_quality_scores_need_refresh_for_model("test-model"));
+		refresh_similarity_quality_scores_for_model("test-model").unwrap();
+		assert!(!similarity_quality_scores_need_refresh_for_model("test-model"));
+
+		store_embedding("Rust", "test-model", "rust-new", vec![1.0, 1.0], 200, 2, 1, 200).unwrap();
+		assert!(similarity_quality_scores_need_refresh_for_model("test-model"));
+	}
+
+	#[test]
 	fn sidecar_fast_path_round_trips_and_changed_mtime_merges() {
 		let _lock = TEST_CACHE_LOCK.lock().unwrap();
 		let _cache_dir = CacheDirGuard::new("merge");
@@ -1667,6 +1737,23 @@ mod tests {
 
 		let names = active_entries_for_model("test-model").into_iter().map(|entry| entry.subreddit).collect::<Vec<_>>();
 		assert_eq!(names, vec!["baking".to_string(), "rust".to_string()]);
+	}
+
+	#[test]
+	fn content_semantic_mutation_guard_is_exclusive() {
+		let _lock = TEST_CACHE_LOCK.lock().unwrap();
+		let _cache_dir = CacheDirGuard::new("mutation-lock");
+		let first = acquire_content_semantic_mutation_guard().unwrap();
+		let (sender, receiver) = std::sync::mpsc::channel();
+		let waiter = std::thread::spawn(move || {
+			let _second = acquire_content_semantic_mutation_guard().unwrap();
+			sender.send(()).unwrap();
+		});
+
+		assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+		drop(first);
+		assert!(receiver.recv_timeout(Duration::from_secs(2)).is_ok());
+		waiter.join().unwrap();
 	}
 
 	#[test]
@@ -1745,6 +1832,33 @@ mod tests {
 		assert_eq!(first.corpus_hash, second.corpus_hash);
 		assert_eq!(first.embedding, second.embedding);
 		assert_eq!(first.embedded_at_unix, second.embedded_at_unix);
+	}
+
+	#[test]
+	fn failed_aggregate_recompute_does_not_advance_cursor_or_vector() {
+		let _guard = TEST_CACHE_LOCK.lock().unwrap();
+		clear_test_cache();
+		let first = SubredditContentPostEmbeddingCandidate {
+			subreddit: "rust".to_string(),
+			text: "First post".to_string(),
+			post_key_hash: "post-a".to_string(),
+			text_hash: "text-a".to_string(),
+			sort_key: 10,
+			source_key_hash: "source-a".to_string(),
+			created_ts: 100,
+			text_chars: 10,
+		};
+		let mut cancelling = first.clone();
+		cancelling.post_key_hash = "post-b".to_string();
+		cancelling.text_hash = "text-b".to_string();
+		cancelling.created_ts = 101;
+
+		assert!(store_post_aggregate_embedding(&first, "test-model", vec![1.0, 0.0], 100).unwrap());
+		let before = active_entries_for_model("test-model").into_iter().next().unwrap();
+		assert!(store_post_aggregate_embedding(&cancelling, "test-model", vec![-1.0, 0.0], 200).is_err());
+		let after = active_entries_for_model("test-model").into_iter().next().unwrap();
+
+		assert_eq!(after, before);
 	}
 
 	#[test]

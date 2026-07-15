@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
 use std::collections::HashSet;
 use std::fs::{self, File};
+#[cfg(not(test))]
+use std::io::BufReader;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
@@ -522,6 +524,16 @@ pub fn init() {
 	}
 }
 
+/// Initialize only the state required by the standalone content-semantic
+/// backfill. The normal server initializer restores the full request cache,
+/// subreddit metadata, feed daemon seed state, and materialized catalog. None
+/// of those in-memory copies are needed by the one-shot backfill, which reads
+/// its source files directly.
+pub fn init_content_semantic_backfill() -> Result<(), String> {
+	fs::create_dir_all(cache_dir()).map_err(|error| error.to_string())?;
+	subreddit_content_semantics::load_persisted_embeddings_sidecar()
+}
+
 pub fn mark_dirty() {
 	if let Some(sender) = PERSISTENCE_EVENTS.get() {
 		let _ = sender.send(());
@@ -563,21 +575,24 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 
 #[cfg(not(test))]
 pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
-	read_persisted_source_cache_files_with_options(false).map(source_cache_seed_entries_from_files)
+	let mut entries = Vec::new();
+	for_each_persisted_source_cache_file_with_options(false, |file| entries.push((file.key, file.entry.fetched_at_unix)))?;
+	Ok(entries)
 }
 
+#[cfg(test)]
 fn source_cache_seed_entries_from_files(files: Vec<PersistedSourceCacheFile>) -> Vec<(String, u64)> {
 	files.into_iter().map(|file| (file.key, file.entry.fetched_at_unix)).collect()
 }
 
 #[cfg(not(test))]
-pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceCacheFile>, String> {
-	read_persisted_source_cache_files_with_options(true)
+pub(crate) fn for_each_persisted_source_cache_file(visitor: impl FnMut(PersistedSourceCacheFile)) -> Result<usize, String> {
+	for_each_persisted_source_cache_file_with_options(true, visitor)
 }
 
 #[cfg(not(test))]
-fn read_persisted_source_cache_files_with_options(log_file_errors: bool) -> Result<Vec<PersistedSourceCacheFile>, String> {
-	let mut files = Vec::new();
+fn for_each_persisted_source_cache_file_with_options(log_file_errors: bool, mut visitor: impl FnMut(PersistedSourceCacheFile)) -> Result<usize, String> {
+	let mut descriptors = Vec::<(String, PathBuf)>::new();
 	let mut seen_keys = HashSet::new();
 	let mut skipped_files = 0usize;
 	for dir in readable_source_cache_dirs() {
@@ -628,38 +643,48 @@ fn read_persisted_source_cache_files_with_options(log_file_errors: bool) -> Resu
 			if !seen_keys.insert(key.clone()) {
 				continue;
 			}
-			let bytes = match fs::read(&path) {
-				Ok(bytes) => bytes,
-				Err(error) => {
-					skipped_files += 1;
-					if log_file_errors {
-						warn!("cache_persistence: failed to read source cache file {:?}: {error}", path.file_name());
-					}
-					continue;
-				}
-			};
-			let entry = match bincode::deserialize::<PersistedSourceCacheEntry>(&bytes) {
-				Ok(entry) => entry,
-				Err(error) => {
-					skipped_files += 1;
-					if log_file_errors {
-						warn!("cache_persistence: failed to deserialize source cache file {:?}: {error}", path.file_name());
-					}
-					continue;
-				}
-			};
-			files.push(PersistedSourceCacheFile { key, entry });
+			descriptors.push((key, path));
 		}
+	}
+
+	// Directory iteration order is filesystem-dependent. Sorting the small
+	// key/path index preserves the previous deterministic candidate ordering
+	// without retaining every deserialized feed payload at once.
+	descriptors.sort_by(|left, right| left.0.cmp(&right.0));
+	let mut visited_files = 0usize;
+	for (key, path) in descriptors {
+		let file = match File::open(&path) {
+			Ok(file) => file,
+			Err(error) => {
+				skipped_files += 1;
+				if log_file_errors {
+					warn!("cache_persistence: failed to read source cache file {:?}: {error}", path.file_name());
+				}
+				continue;
+			}
+		};
+		let entry = match bincode::deserialize_from::<_, PersistedSourceCacheEntry>(BufReader::new(file)) {
+			Ok(entry) => entry,
+			Err(error) => {
+				skipped_files += 1;
+				if log_file_errors {
+					warn!("cache_persistence: failed to deserialize source cache file {:?}: {error}", path.file_name());
+				}
+				continue;
+			}
+		};
+		visitor(PersistedSourceCacheFile { key, entry });
+		visited_files += 1;
 	}
 	if skipped_files > 0 && !log_file_errors {
 		warn!("cache_persistence: ignored {skipped_files} unreadable source cache files while seeding remembered feed rows");
 	}
-	Ok(files)
+	Ok(visited_files)
 }
 
 #[cfg(test)]
-pub(crate) fn read_persisted_source_cache_files() -> Result<Vec<PersistedSourceCacheFile>, String> {
-	Ok(Vec::new())
+pub(crate) fn for_each_persisted_source_cache_file(_visitor: impl FnMut(PersistedSourceCacheFile)) -> Result<usize, String> {
+	Ok(0)
 }
 
 #[cfg(test)]

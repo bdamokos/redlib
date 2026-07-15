@@ -567,6 +567,20 @@ async fn flush_sidecar_and_trim_allocator() -> Result<bool, String> {
 	.map_err(|error| format!("embedding sidecar writer stopped: {error}"))?
 }
 
+async fn acquire_mutation_guard() -> Result<subreddit_content_semantics::ContentSemanticMutationGuard, String> {
+	tokio::task::spawn_blocking(subreddit_content_semantics::acquire_content_semantic_mutation_guard)
+		.await
+		.map_err(|error| format!("embedding mutation lock task stopped: {error}"))?
+}
+
+async fn acquire_mutation_guard_and_refresh_sidecar() -> Result<subreddit_content_semantics::ContentSemanticMutationGuard, String> {
+	let guard = acquire_mutation_guard().await?;
+	tokio::task::spawn_blocking(subreddit_content_semantics::refresh_persisted_embeddings_sidecar)
+		.await
+		.map_err(|error| format!("embedding sidecar refresh task stopped: {error}"))??;
+	Ok(guard)
+}
+
 async fn worker_loop() {
 	info!("observed_semantic_backfill: worker started");
 	let client = Client::new();
@@ -574,15 +588,31 @@ async fn worker_loop() {
 	let work_slice_candidates =
 		env_u64("REDLIB_CONTENT_SEMANTIC_WORK_SLICE_CANDIDATES", DEFAULT_WORK_SLICE_CANDIDATES as u64).clamp(1, MAX_PENDING_CANDIDATES_PER_SUBREDDIT as u64) as usize;
 	let mut last_flush_attempt = Instant::now();
+	let mut mutation_guard = None;
 	loop {
 		let Some(job) = pop_next_job() else {
 			let dirty = OBSERVED_BACKFILL_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
 			if should_flush_sidecar(dirty, true, last_flush_attempt.elapsed(), flush_max_delay) {
+				if mutation_guard.is_none() {
+					// Dirty memory must never be replaced by a disk refresh. This
+					// branch is defensive—the normal worker retains its guard until a
+					// successful flush—but still preserves local progress if that
+					// invariant is ever broken.
+					match acquire_mutation_guard().await {
+						Ok(guard) => mutation_guard = Some(guard),
+						Err(error) => {
+							warn!("observed_semantic_backfill: failed to acquire mutation guard for flush: {error}");
+							tokio::time::sleep(Duration::from_secs(SIDECAR_FLUSH_RETRY_SECS)).await;
+							continue;
+						}
+					}
+				}
 				last_flush_attempt = Instant::now();
 				match flush_sidecar_and_trim_allocator().await {
 					Ok(trimmed) => {
 						OBSERVED_BACKFILL_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
 						info!("observed_semantic_backfill: persisted drained embedding burst (allocator_trimmed={trimmed})");
+						mutation_guard.take();
 					}
 					Err(error) => {
 						warn!("observed_semantic_backfill: failed to persist drained embedding burst: {error}");
@@ -594,9 +624,22 @@ async fn worker_loop() {
 				}
 				continue;
 			}
+			mutation_guard.take();
 			OBSERVED_BACKFILL_NOTIFY.notified().await;
 			continue;
 		};
+		if mutation_guard.is_none() {
+			match acquire_mutation_guard_and_refresh_sidecar().await {
+				Ok(guard) => mutation_guard = Some(guard),
+				Err(error) => {
+					let priority = job.priority;
+					enqueue_candidates(job.candidates, priority);
+					warn!("observed_semantic_backfill: failed to acquire mutation guard for work: {error}");
+					tokio::time::sleep(Duration::from_secs(SIDECAR_FLUSH_RETRY_SECS)).await;
+					continue;
+				}
+			}
+		}
 		// Opportunistic jobs retain their existing whole-job time budget. Daemon
 		// and visible-session jobs are sliced so queued foreground work can run
 		// between slices without resetting that budget.
@@ -654,6 +697,7 @@ async fn worker_loop() {
 				Ok(trimmed) => {
 					OBSERVED_BACKFILL_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
 					info!("observed_semantic_backfill: persisted active embedding burst (allocator_trimmed={trimmed})");
+					mutation_guard.take();
 				}
 				Err(error) => warn!("observed_semantic_backfill: failed to persist active embedding burst: {error}"),
 			}

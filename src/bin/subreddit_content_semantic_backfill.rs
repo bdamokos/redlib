@@ -7,7 +7,7 @@ use redlib::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 #[derive(Debug, Parser)]
 #[command(about = "Backfill cursor-based subreddit vibe aggregates into the Redlib content semantic sidecar using local Ollama.")]
@@ -21,8 +21,23 @@ struct Args {
 	#[arg(long, env = "OLLAMA_BASE_URL", default_value = "http://127.0.0.1:11434")]
 	ollama_url: String,
 
-	#[arg(long)]
+	#[arg(
+		long,
+		env = "REDLIB_SEMANTIC_BACKFILL_ATTEMPT_LIMIT",
+		help = "Maximum Ollama embedding attempts after already-current candidates are skipped"
+	)]
 	limit: Option<usize>,
+
+	#[arg(
+		long,
+		env = "REDLIB_SEMANTIC_BACKFILL_REQUEST_TIMEOUT_SECS",
+		default_value_t = 120,
+		help = "Maximum time allowed for one complete Ollama embedding request"
+	)]
+	ollama_timeout_secs: u64,
+
+	#[arg(long, env = "REDLIB_SEMANTIC_BACKFILL_DELAY_MS", default_value_t = 250, help = "Pause between Ollama embedding attempts")]
+	delay_ms: u64,
 
 	#[arg(long = "subreddit")]
 	subreddits: Vec<String>,
@@ -56,6 +71,9 @@ struct Args {
 
 	#[arg(long, default_value_t = 12)]
 	report_neighbor_samples: usize,
+
+	#[arg(long, hide = true)]
+	reconcile_interrupted_status: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +128,28 @@ struct ContentBackfillReport {
 	samples: Vec<NeighborSample>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddingAttemptDecision {
+	SkipCurrent,
+	Attempt,
+	BudgetExhausted,
+}
+
+fn embedding_attempt_decision(needs_embedding: bool, attempted: &mut usize, limit: Option<usize>) -> EmbeddingAttemptDecision {
+	if !needs_embedding {
+		return EmbeddingAttemptDecision::SkipCurrent;
+	}
+	if limit.map(|limit| *attempted >= limit).unwrap_or(false) {
+		return EmbeddingAttemptDecision::BudgetExhausted;
+	}
+	*attempted += 1;
+	EmbeddingAttemptDecision::Attempt
+}
+
+fn should_refresh_and_persist(dry_run: bool, embedded: usize, similarity_scores_stale: bool) -> bool {
+	!dry_run && (embedded > 0 || similarity_scores_stale)
+}
+
 fn normalize_ollama_url(value: &str) -> String {
 	value.trim().trim_end_matches('/').to_string()
 }
@@ -162,6 +202,9 @@ async fn main() -> Result<(), String> {
 	}
 	std::env::set_var("REDLIB_SUBREDDIT_SEMANTIC_MODEL", &args.model);
 	std::env::set_var("REDLIB_CACHE_PERSISTENCE_READ_ONLY", "on");
+	if args.reconcile_interrupted_status {
+		return reconcile_interrupted_status();
+	}
 
 	let started_at_unix = cache_persistence::unix_now();
 	let options = corpus_options_from_args(&args);
@@ -208,6 +251,26 @@ async fn main() -> Result<(), String> {
 			Err(error)
 		}
 	}
+}
+
+fn reconcile_interrupted_status() -> Result<(), String> {
+	let Some(status) = subreddit_content_semantics::read_backfill_status()? else {
+		return Ok(());
+	};
+	let Some(status) = reconciled_interrupted_status(status, cache_persistence::unix_now()) else {
+		return Ok(());
+	};
+	subreddit_content_semantics::write_backfill_status(&status)
+}
+
+fn reconciled_interrupted_status(mut status: SubredditContentSemanticBackfillStatus, finished_at_unix: u64) -> Option<SubredditContentSemanticBackfillStatus> {
+	if status.state != "running" {
+		return None;
+	}
+	status.state = "failed".to_string();
+	status.finished_at_unix = Some(finished_at_unix);
+	status.error = Some("backfill process ended before recording completion (timeout, OOM, or forced stop)".to_string());
+	Some(status)
 }
 
 fn backfill_completion_error(counters: &SubredditContentSemanticBackfillCounters) -> Option<String> {
@@ -301,7 +364,8 @@ fn print_backfill_summary(counters: &SubredditContentSemanticBackfillCounters, r
 }
 
 async fn run_backfill(args: &Args, options: &SubredditContentCorpusOptions, counters: &mut SubredditContentSemanticBackfillCounters) -> Result<ContentBackfillReport, String> {
-	cache_persistence::init();
+	let _mutation_guard = subreddit_content_semantics::acquire_content_semantic_mutation_guard()?;
+	cache_persistence::init_content_semantic_backfill()?;
 	let collection = subreddit_content_semantics::build_subreddit_content_post_embedding_candidates(options)?;
 	counters.source_files = collection.stats.source_files;
 	counters.source_posts = collection.stats.source_posts;
@@ -336,10 +400,22 @@ async fn run_backfill(args: &Args, options: &SubredditContentCorpusOptions, coun
 	});
 
 	let client = Client::new();
-	for candidate in candidates.into_iter().take(args.limit.unwrap_or(usize::MAX)) {
-		if !args.force && !subreddit_content_semantics::post_candidate_needs_embedding(&candidate, &args.model) {
-			counters.already_current += 1;
+	let mut attempted = 0usize;
+	let mut failed_subreddits = HashSet::new();
+	let ollama_timeout = Duration::from_secs(args.ollama_timeout_secs.max(1));
+	let attempt_delay = Duration::from_millis(args.delay_ms);
+	for candidate in candidates {
+		if failed_subreddits.contains(&candidate.subreddit) {
 			continue;
+		}
+		let needs_embedding = args.force || subreddit_content_semantics::post_candidate_needs_embedding(&candidate, &args.model);
+		match embedding_attempt_decision(needs_embedding, &mut attempted, args.limit) {
+			EmbeddingAttemptDecision::SkipCurrent => {
+				counters.already_current += 1;
+				continue;
+			}
+			EmbeddingAttemptDecision::BudgetExhausted => break,
+			EmbeddingAttemptDecision::Attempt => {}
 		}
 		if args.dry_run {
 			if !args.quiet {
@@ -352,26 +428,38 @@ async fn run_backfill(args: &Args, options: &SubredditContentCorpusOptions, coun
 		}
 
 		let prompt = format!("r/{}\nCached post title and text:\n{}", candidate.subreddit, candidate.text);
-		match ollama_embedding(&client, &args.ollama_url, &args.model, &prompt).await {
-			Ok(embedding) => {
-				let stored = subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &args.model, embedding, cache_persistence::unix_now())?;
-				if stored {
+		let embedding_result = match tokio::time::timeout(ollama_timeout, ollama_embedding(&client, &args.ollama_url, &args.model, &prompt)).await {
+			Ok(result) => result,
+			Err(_) => Err(format!("Ollama request timed out after {} seconds", ollama_timeout.as_secs())),
+		};
+		match embedding_result {
+			Ok(embedding) => match subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &args.model, embedding, cache_persistence::unix_now()) {
+				Ok(true) => {
 					counters.embedded += 1;
-				} else {
-					counters.already_current += 1;
+					if !args.quiet {
+						println!("embedded aggregate post r/{}", candidate.subreddit);
+					}
 				}
-				if !args.quiet {
-					println!("embedded aggregate post r/{}", candidate.subreddit);
+				Ok(false) => counters.already_current += 1,
+				Err(error) => {
+					counters.failed += 1;
+					failed_subreddits.insert(candidate.subreddit.clone());
+					eprintln!("embedding store failed aggregate post r/{}: {error}", candidate.subreddit);
 				}
-			}
+			},
 			Err(error) => {
 				counters.failed += 1;
+				failed_subreddits.insert(candidate.subreddit.clone());
 				eprintln!("embedding failed aggregate post r/{}: {error}", candidate.subreddit);
 			}
 		}
+		if !attempt_delay.is_zero() {
+			tokio::time::sleep(attempt_delay).await;
+		}
 	}
 
-	if !args.dry_run {
+	let similarity_scores_stale = subreddit_content_semantics::similarity_quality_scores_need_refresh_for_model(&args.model);
+	if should_refresh_and_persist(args.dry_run, counters.embedded, similarity_scores_stale) {
 		subreddit_content_semantics::refresh_similarity_quality_scores_for_model(&args.model)?;
 		subreddit_content_semantics::write_persisted_embeddings_sidecar_now()?;
 	}
@@ -499,5 +587,53 @@ mod tests {
 		counters.already_current = 2;
 		counters.failed = 1;
 		assert!(backfill_completion_error(&counters).unwrap().contains("1 failed embedding attempts"));
+	}
+
+	#[test]
+	fn attempt_budget_is_consumed_only_after_current_candidates_are_skipped() {
+		let mut attempted = 0;
+		assert_eq!(embedding_attempt_decision(false, &mut attempted, Some(2)), EmbeddingAttemptDecision::SkipCurrent);
+		assert_eq!(attempted, 0);
+		assert_eq!(embedding_attempt_decision(true, &mut attempted, Some(2)), EmbeddingAttemptDecision::Attempt);
+		assert_eq!(embedding_attempt_decision(true, &mut attempted, Some(2)), EmbeddingAttemptDecision::Attempt);
+		assert_eq!(attempted, 2);
+		assert_eq!(embedding_attempt_decision(true, &mut attempted, Some(2)), EmbeddingAttemptDecision::BudgetExhausted);
+		assert_eq!(attempted, 2);
+	}
+
+	#[test]
+	fn sidecar_refresh_requires_new_embeddings_or_stale_similarity_scores() {
+		assert!(!should_refresh_and_persist(false, 0, false));
+		assert!(should_refresh_and_persist(false, 1, false));
+		assert!(should_refresh_and_persist(false, 0, true));
+		assert!(!should_refresh_and_persist(true, 1, true));
+	}
+
+	#[test]
+	fn interrupted_running_status_is_closed_as_failed() {
+		let status = SubredditContentSemanticBackfillStatus {
+			state: "running".to_string(),
+			model: "test-model".to_string(),
+			started_at_unix: 100,
+			finished_at_unix: None,
+			counters: SubredditContentSemanticBackfillCounters::default(),
+			dry_run: false,
+			force: false,
+			limit: Some(250),
+			max_posts_per_subreddit: 16,
+			max_text_chars_per_post: 360,
+			max_corpus_text_chars: 3_000,
+			min_posts_per_subreddit: 6,
+			min_corpus_text_chars: 180,
+			error: None,
+		};
+		let reconciled = reconciled_interrupted_status(status.clone(), 200).unwrap();
+		assert_eq!(reconciled.state, "failed");
+		assert_eq!(reconciled.finished_at_unix, Some(200));
+		assert!(reconciled.error.unwrap().contains("forced stop"));
+
+		let mut completed = status;
+		completed.state = "completed".to_string();
+		assert!(reconciled_interrupted_status(completed, 200).is_none());
 	}
 }
