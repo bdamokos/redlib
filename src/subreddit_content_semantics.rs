@@ -586,7 +586,7 @@ fn read_materialized_catalog_snapshot() -> Result<Option<PersistedContentCatalog
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error.to_string()),
 	};
-	bincode::deserialize_from(BufReader::new(file))
+	cache_persistence::deserialize_bincode_file_bounded(file)
 		.map(Some)
 		.map_err(|error| format!("failed to read {}: {error}", path.display()))
 }

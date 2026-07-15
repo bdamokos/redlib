@@ -1,12 +1,12 @@
 use crate::config::get_setting;
 use crate::{post_cache, subreddit, subreddit_content_semantics, subreddit_semantics, utils};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use bincode::Options;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
 use std::collections::HashSet;
 use std::fs::{self, File};
-#[cfg(not(test))]
 use std::io::BufReader;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -430,6 +430,21 @@ pub fn cache_dir() -> String {
 	get_setting("REDLIB_CACHE_DIR").unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string())
 }
 
+/// Deserialize one bincode file without first materializing the whole file,
+/// while retaining the slice decoder's protection against corrupt length
+/// prefixes. `bincode::deserialize_from` is otherwise unbounded and can ask
+/// the allocator for an attacker- or corruption-controlled amount before the
+/// reader has a chance to report EOF.
+pub(crate) fn deserialize_bincode_file_bounded<T: serde::de::DeserializeOwned>(file: File) -> Result<T, String> {
+	let file_len = file.metadata().map_err(|error| error.to_string())?.len();
+	bincode::DefaultOptions::new()
+		.with_fixint_encoding()
+		.allow_trailing_bytes()
+		.with_limit(file_len)
+		.deserialize_from(BufReader::new(file))
+		.map_err(|error| error.to_string())
+}
+
 pub fn snapshot_path() -> PathBuf {
 	Path::new(&cache_dir()).join(SNAPSHOT_FILE_NAME)
 }
@@ -663,7 +678,7 @@ fn for_each_persisted_source_cache_file_with_options(log_file_errors: bool, mut 
 				continue;
 			}
 		};
-		let entry = match bincode::deserialize_from::<_, PersistedSourceCacheEntry>(BufReader::new(file)) {
+		let entry = match deserialize_bincode_file_bounded::<PersistedSourceCacheEntry>(file) {
 			Ok(entry) => entry,
 			Err(error) => {
 				skipped_files += 1;
@@ -1019,6 +1034,38 @@ mod tests {
 		assert!(decoded.source_entries.is_empty());
 		assert!(decoded.author_history.is_empty());
 		assert!(decoded.rejected_author_redgifs_profiles.is_empty());
+	}
+
+	#[test]
+	fn bounded_bincode_file_rejects_oversized_declared_allocation() {
+		// This is the exact bogus Vec length produced when a legacy RS1
+		// sources.v1 payload is decoded with the current source-cache shape.
+		const LEGACY_MISALIGNED_LENGTH: u64 = 7_378_412_645_484_933_433;
+		let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock after epoch").as_nanos();
+		let path = std::env::temp_dir().join(format!("redlib-bincode-limit-{}-{unique}.bin", std::process::id()));
+		let mut file = std::fs::File::create(&path).expect("create malformed bincode fixture");
+		std::io::Write::write_all(&mut file, &LEGACY_MISALIGNED_LENGTH.to_le_bytes()).expect("write oversized vector length");
+		drop(file);
+
+		let file = std::fs::File::open(&path).expect("open malformed bincode fixture");
+		let error = super::deserialize_bincode_file_bounded::<Vec<u8>>(file).expect_err("oversized allocation must be rejected");
+		std::fs::remove_file(path).expect("remove malformed bincode fixture");
+
+		assert!(error.to_lowercase().contains("size limit"), "unexpected bincode error: {error}");
+	}
+
+	#[test]
+	fn bounded_bincode_file_preserves_root_fixed_int_encoding() {
+		let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock after epoch").as_nanos();
+		let path = std::env::temp_dir().join(format!("redlib-bincode-fixed-int-{}-{unique}.bin", std::process::id()));
+		let expected = vec![0x0102_0304_0506_0708_u64];
+		std::fs::write(&path, bincode::serialize(&expected).expect("serialize fixed-int fixture")).expect("write fixed-int fixture");
+
+		let file = std::fs::File::open(&path).expect("open fixed-int fixture");
+		let decoded = super::deserialize_bincode_file_bounded::<Vec<u64>>(file).expect("decode fixed-int fixture");
+		std::fs::remove_file(path).expect("remove fixed-int fixture");
+
+		assert_eq!(decoded, expected);
 	}
 
 	#[test]
