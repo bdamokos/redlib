@@ -127,6 +127,16 @@
         });
     };
 
+    const applyViewerPreviewState = (wrapper, component) => {
+        if (wrapper.dataset.autoExpandPreview !== "true") {
+            return;
+        }
+        component.querySelectorAll(".post_preview").forEach((preview) => {
+            preview.classList.add("expanded");
+            preview.classList.remove("truncated");
+        });
+    };
+
     const configureConcealedMedia = (wrapper, component) => {
         const placeholder = component.querySelector("[data-post-live-media-kind]");
         if (!placeholder) {
@@ -229,6 +239,7 @@
         if (!slot) {
             throw new Error("Stable post component slot missing");
         }
+        applyViewerPreviewState(wrapper, component);
         if (wrapper.dataset.allowStableMedia === "true") {
             activateStableMedia(wrapper, component);
         } else {
@@ -248,6 +259,7 @@
             if (!stableHtml.has(wrapper.dataset.postComponentUrl)) {
                 rememberStableHtml(wrapper.dataset.postComponentUrl, existing.outerHTML);
             }
+            applyViewerPreviewState(wrapper, existing);
             if (wrapper.dataset.allowStableMedia === "true") {
                 activateStableMedia(wrapper, existing);
             } else {

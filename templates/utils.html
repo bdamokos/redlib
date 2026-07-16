@@ -696,7 +696,8 @@
 {% if defer_stable && post.kind == "t3" %}
 {% set revision = crate::post_components::revision_for_post(post) %}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
-{% set show_followed_author_marker = auto_expand_followed_users && prefs.has_followed_user(post.author.name.as_str()) -%}
+{% set auto_expand_preview = auto_expand_followed_users && prefs.has_followed_user(post.author.name.as_str()) -%}
+{% set show_followed_author_marker = auto_expand_preview -%}
 <div
 	id="{{ post.id }}"
 	class="post post_component_wrapper{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post_should_be_blurred %} post_blurred{% endif %}"
@@ -708,6 +709,7 @@
 	data-post-component-revision="{{ revision }}"
 	data-post-component-url="/post-content/{{ post.id }}/{{ revision }}/card.bin"
 	data-post-live-media-url="/post-live/{{ post.id }}/{{ revision }}/media"
+	{% if auto_expand_preview %}data-auto-expand-preview="true"{% endif %}
 	data-allow-stable-media="{% if post_should_be_blurred %}false{% else %}true{% endif %}"
 	aria-busy="true">
 	<div class="post_header">

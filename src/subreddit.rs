@@ -3683,6 +3683,37 @@ mod tests {
 		assert_eq!(html.matches("class=\"followed_author_marker\">followed</span>").count(), 7);
 		assert!(html.contains("data-post-component-id=\"followed7\""));
 		assert!(html.contains("data-post-component-url=\"/post-content/followed7/"));
+		assert_eq!(html.matches("data-auto-expand-preview=\"true\"").count(), 1);
+	}
+
+	#[test]
+	fn deferred_unfollowed_rows_do_not_request_preview_expansion() {
+		let posts = (1..=7)
+			.map(|index| {
+				let mut post = test_post();
+				post.id = format!("unfollowed{index}");
+				post.permalink = format!("/r/demo_sub/comments/unfollowed{index}/");
+				post
+			})
+			.collect();
+
+		let html = FeedFragmentTemplate {
+			posts,
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("data-post-component-id=\"unfollowed7\""));
+		assert!(!html.contains("data-auto-expand-preview=\"true\""));
 	}
 
 	fn metric_post(id: &str, community: &str, created_ts: u64, score: i64, stickied: bool) -> Post {
