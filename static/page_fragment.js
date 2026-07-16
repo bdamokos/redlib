@@ -18,6 +18,135 @@ document.addEventListener("DOMContentLoaded", () => {
     const replaceSelector = container.dataset.replaceSelector || "";
     const appendFragmentContent = container.dataset.appendFragmentContent === "true";
     const banner = document.querySelector(".feed_status_banner");
+    const scrollStorageKey = `redlib:fragment-scroll-v1:${window.location.pathname}${window.location.search}`;
+    const scrollRestoreTtlMs = 2 * 60 * 1000;
+
+    const safeSessionStorage = () => {
+        try {
+            return window.sessionStorage;
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const currentScrollAnchor = () => {
+        const posts = Array.from(document.querySelectorAll("#column_one .post[id]"));
+        if (posts.length === 0) {
+            return null;
+        }
+
+        const viewportTarget = window.innerHeight / 2;
+        return posts.reduce((closest, post) => {
+            const rect = post.getBoundingClientRect();
+            const distance = rect.top <= viewportTarget && rect.bottom >= viewportTarget
+                ? 0
+                : Math.min(Math.abs(rect.top - viewportTarget), Math.abs(rect.bottom - viewportTarget));
+            return !closest || distance < closest.distance ? { post, rect, distance } : closest;
+        }, null);
+    };
+
+    const saveScrollPosition = () => {
+        const storage = safeSessionStorage();
+        if (!storage) {
+            return;
+        }
+        const anchor = currentScrollAnchor();
+        try {
+            storage.setItem(scrollStorageKey, JSON.stringify({
+                version: 1,
+                storedAt: Date.now(),
+                scrollY: window.scrollY,
+                anchorId: anchor?.post.id || "",
+                anchorOffset: anchor?.rect.top || 0,
+            }));
+        } catch (_) {
+            // Storage is an optional enhancement to native history restoration.
+        }
+    };
+
+    let pendingScrollPosition = (() => {
+        if (window.performance?.getEntriesByType?.("navigation")?.[0]?.type !== "back_forward") {
+            return null;
+        }
+        const storage = safeSessionStorage();
+        if (!storage) {
+            return null;
+        }
+        try {
+            const raw = storage.getItem(scrollStorageKey);
+            storage.removeItem(scrollStorageKey);
+            if (!raw) {
+                return null;
+            }
+            const saved = JSON.parse(raw);
+            if (saved?.version !== 1
+                || !Number.isFinite(saved.storedAt)
+                || saved.storedAt > Date.now()
+                || Date.now() - saved.storedAt > scrollRestoreTtlMs
+                || !Number.isFinite(saved.scrollY)
+                || !Number.isFinite(saved.anchorOffset)) {
+                return null;
+            }
+            return saved;
+        } catch (_) {
+            return null;
+        }
+    })();
+
+    const restoreScrollPosition = () => {
+        if (!pendingScrollPosition) {
+            return;
+        }
+        const savedScrollPosition = pendingScrollPosition;
+        pendingScrollPosition = null;
+
+        const anchor = savedScrollPosition.anchorId
+            ? document.getElementById(savedScrollPosition.anchorId)
+            : null;
+        const apply = () => {
+            if (anchor?.isConnected) {
+                const delta = anchor.getBoundingClientRect().top - savedScrollPosition.anchorOffset;
+                if (Math.abs(delta) > 0.5) {
+                    window.scrollTo(0, window.scrollY + delta);
+                }
+            } else {
+                window.scrollTo(0, savedScrollPosition.scrollY);
+            }
+        };
+
+        apply();
+
+        if (!("ResizeObserver" in window) || !anchor) {
+            return;
+        }
+
+        let frameId = 0;
+        const observer = new ResizeObserver(() => {
+            window.cancelAnimationFrame(frameId);
+            frameId = window.requestAnimationFrame(apply);
+        });
+        const column = document.querySelector("#column_one");
+        observer.observe(column || anchor);
+
+        let stopped = false;
+        const stop = () => {
+            if (stopped) {
+                return;
+            }
+            stopped = true;
+            observer.disconnect();
+            window.cancelAnimationFrame(frameId);
+            for (const eventName of ["pointerdown", "touchstart", "wheel", "keydown"]) {
+                window.removeEventListener(eventName, stop, true);
+            }
+        };
+        for (const eventName of ["pointerdown", "touchstart", "wheel", "keydown"]) {
+            window.addEventListener(eventName, stop, { capture: true, once: true });
+        }
+        window.setTimeout(stop, 5000);
+    };
+
+    window.addEventListener("pagehide", saveScrollPosition);
 
     const setBannerVisible = (visible) => {
         if (!banner) {
@@ -48,6 +177,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         if (appendFragmentContent && appendIntoCurrentFragment(template.content)) {
             refreshDynamicContent(document);
+            restoreScrollPosition();
             settleBannerState();
             return;
         }
@@ -58,6 +188,7 @@ document.addEventListener("DOMContentLoaded", () => {
             if (nextNode && currentNode) {
                 currentNode.replaceWith(nextNode);
                 refreshDynamicContent(document);
+                restoreScrollPosition();
                 settleBannerState();
                 return;
             }
@@ -65,6 +196,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         container.replaceWith(...template.content.childNodes);
         refreshDynamicContent(document);
+        restoreScrollPosition();
         settleBannerState();
     };
 
