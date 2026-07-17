@@ -8,6 +8,127 @@ let lazyImageObserver = null;
 let deferredSrcObserver = null;
 let autoUpgradeDecided = false;
 
+function originalImageUrl(img) {
+  const candidate = img.dataset.fullSrc || img.closest("a")?.getAttribute("href");
+  if (!candidate) {
+    return null;
+  }
+
+  try {
+    const url = new URL(candidate, window.location.href);
+    if (url.origin !== window.location.origin
+      || !["/img/", "/preview/pre/", "/preview/external-pre/"].some((prefix) => url.pathname.startsWith(prefix))) {
+      return null;
+    }
+    return url.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+function removeConfirmedDeletedImage(img) {
+  const post = img.closest(".post");
+  const gallery = img.closest(".gallery");
+
+  if (gallery) {
+    img.closest("figure")?.remove();
+    if (gallery.querySelector("img")) {
+      return;
+    }
+  }
+
+  const hasNonMediaContent = post && (
+    Array.from(post.querySelectorAll(".post_body, .post_cached_link")).some((element) => element.textContent.trim())
+    || Boolean(post.querySelector(".post_poll, [data-post-live-poll]"))
+  );
+  if (post && !hasNonMediaContent && !post.closest("#page_fragment[data-post-shell-id]")) {
+    post.remove();
+    return;
+  }
+
+  (gallery || img.closest(".post_media_content"))?.remove();
+}
+
+async function verifyFailedImage(img) {
+  if (img.dataset.deletedMediaCheck !== "pending") {
+    return;
+  }
+
+  const originalUrl = originalImageUrl(img);
+  if (!originalUrl) {
+    img.dataset.deletedMediaCheck = "unavailable";
+    return;
+  }
+
+  const previousVisibility = img.style.visibility;
+  img.style.visibility = "hidden";
+  const reveal = () => {
+    img.style.visibility = previousVisibility;
+  };
+
+  try {
+    const response = await fetch(originalUrl, {
+      cache: "reload",
+      credentials: "same-origin",
+      headers: { "Accept": "image/*" },
+    });
+    const deleted = response.status === 410 && response.headers.get("x-redlib-deleted-media") === "1";
+    if (deleted) {
+      img.dataset.deletedMediaCheck = "deleted";
+      removeConfirmedDeletedImage(img);
+      return;
+    }
+
+    const isImage = response.ok && (response.headers.get("content-type") || "").startsWith("image/");
+    if (!isImage) {
+      img.dataset.deletedMediaCheck = "failed";
+      reveal();
+      return;
+    }
+
+    // A resized preview can expire while the original remains valid. Drop the
+    // failed srcset and retry with the original, which the verification request
+    // has just put in the browser/server cache.
+    img.removeAttribute("srcset");
+    img.removeAttribute("sizes");
+    img.dataset.deletedMediaCheck = "fallback";
+    if (img.src !== originalUrl) {
+      img.addEventListener("load", reveal, { once: true });
+      img.addEventListener("error", reveal, { once: true });
+      img.src = originalUrl;
+    } else {
+      reveal();
+    }
+  } catch (_) {
+    img.dataset.deletedMediaCheck = "failed";
+    reveal();
+  }
+}
+
+function wireDeletedImageCheck(img) {
+  if (img.dataset.deletedMediaCheckWired === "true") {
+    return;
+  }
+  if (!originalImageUrl(img)) {
+    return;
+  }
+
+  img.dataset.deletedMediaCheckWired = "true";
+  img.addEventListener("error", () => {
+    if (["pending", "deleted", "failed", "fallback"].includes(img.dataset.deletedMediaCheck)) {
+      return;
+    }
+    img.dataset.deletedMediaCheck = "pending";
+    void verifyFailedImage(img);
+  });
+
+  // Deferred scripts can run after a cached image failure has already fired.
+  if (img.complete && img.currentSrc && img.naturalWidth === 0) {
+    img.dataset.deletedMediaCheck = "pending";
+    void verifyFailedImage(img);
+  }
+}
+
 function getImageMode() {
   return document.body?.dataset.imageQuality || AUTO_MODE;
 }
@@ -144,6 +265,8 @@ function primeLazyImages(root = document) {
   const deferredObserver = deferredSrcPreloadObserver();
 
   images.forEach((img, index) => {
+    wireDeletedImageCheck(img);
+
     if (img.dataset.networkImagePrimed === "true") {
       return;
     }
