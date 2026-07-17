@@ -1955,6 +1955,73 @@ mod tests {
 	}
 
 	#[test]
+	fn renders_deferred_cached_user_feed_as_user_link() {
+		let mut posts = (0..6)
+			.map(|index| {
+				test_post(
+					&format!("live-{index}"),
+					&format!("Live title {index}"),
+					"demo_sub",
+					"",
+					"image",
+					&format!("https://i.redd.it/live-{index}.jpg"),
+					&[],
+				)
+			})
+			.collect::<Vec<_>>();
+		let cached = test_post(
+			"cached-user-feed",
+			"Cached user-feed title",
+			"u_demo_user",
+			"",
+			"image",
+			"https://i.redd.it/cached-user-feed.jpg",
+			&[],
+		);
+		let cached_post_ids = vec![super::cached_post_identity(&cached)];
+		posts.push(cached);
+
+		let html = super::UserTemplate {
+			user: crate::utils::User {
+				name: "demo_user".to_string(),
+				..Default::default()
+			},
+			username: "demo_user".to_string(),
+			posts,
+			cached_post_ids,
+			user_subreddits: Vec::new(),
+			coomer_recent_posts: None,
+			fallback_notice: String::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".to_string(),
+			prefs: test_prefs(),
+			url: "/user/demo_user".to_string(),
+			redirect_url: "user/demo_user".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			avg_video_length: None,
+			no_posts: false,
+			shell_mode: false,
+			fragment_url: String::new(),
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			loading_message: String::new(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("user_cached_post_marker"));
+		assert!(html.contains("class=\"post post_component_wrapper"));
+		assert!(html.contains("<a class=\"post_subreddit\" href=\"/u/demo_user\">u/demo_user</a>"));
+		assert!(!html.contains(">r/u_demo_user</a>"));
+	}
+
+	#[test]
 	fn user_unavailable_notice_covers_private_not_found_and_rate_limit_separately() {
 		assert_eq!(
 			super::user_upstream_unavailable_notice("demo_user", "private").as_deref(),

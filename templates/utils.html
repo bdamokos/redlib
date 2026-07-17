@@ -713,7 +713,13 @@
 	data-allow-stable-media="{% if post_should_be_blurred %}false{% else %}true{% endif %}"
 	aria-busy="true">
 	<div class="post_header">
-		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
+		{% let community -%}
+		{% if post.community.starts_with("u_") -%}
+			{% let community = format!("u/{}", &post.community[2..]) -%}
+		{% else -%}
+			{% let community = format!("r/{}", post.community) -%}
+		{% endif -%}
+		<a class="post_subreddit" href="/{{ community }}">{{ community }}</a>
 		<span class="dot">&bull;</span>
 		<a class="post_author {{ post.author.distinguished }}" href="/u/{{ post.author.name }}">u/{{ post.author.name }}</a>
 		{% if show_followed_author_marker %}
