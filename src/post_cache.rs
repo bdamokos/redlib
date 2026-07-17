@@ -927,6 +927,7 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 		update_user_video_stats_from_posts(&entry.posts);
 		if materialized_catalog::source_is_supported(source) {
 			materialized_catalog::apply_source_refresh_with_observation(source, &entry.posts, crate::post_components::ObservationSource::Persisted);
+			materialized_catalog::apply_mixed_feed_source_refresh(source, &entry.posts);
 		}
 		if let Ok(mut cache) = SOURCE_CACHE.lock() {
 			cache.insert(cache_key, entry.clone());
@@ -1147,6 +1148,12 @@ pub(crate) fn prune_source_cache() {
 
 	let sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
 	materialized_catalog::remove_sources(&sources);
+	let removed_disk_sources = pruned_sources
+		.iter()
+		.filter(|(_, remove_disk_entry)| *remove_disk_entry)
+		.map(|(source, _)| source.clone())
+		.collect::<Vec<_>>();
+	materialized_catalog::remove_mixed_feed_sources(&removed_disk_sources);
 	for (source, remove_disk_entry) in &pruned_sources {
 		if *remove_disk_entry {
 			crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
@@ -1165,6 +1172,12 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	};
 	let pruned_catalog_sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
 	materialized_catalog::remove_sources(&pruned_catalog_sources);
+	let removed_disk_sources = pruned_sources
+		.iter()
+		.filter(|(_, remove_disk_entry)| *remove_disk_entry)
+		.map(|(source, _)| source.clone())
+		.collect::<Vec<_>>();
+	materialized_catalog::remove_mixed_feed_sources(&removed_disk_sources);
 	for (pruned_source, remove_disk_entry) in &pruned_sources {
 		if *remove_disk_entry {
 			crate::cache_persistence::remove_source_cache_entry(&pruned_source.cache_key());
@@ -1172,6 +1185,7 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 	}
 	if materialized_catalog::source_is_supported(source) {
 		materialized_catalog::apply_source_refresh(source, &posts);
+		materialized_catalog::apply_mixed_feed_source_refresh(source, &posts);
 	}
 	let new_signature = source_window_signature(&posts, &after);
 	let mut source_window_changed = true;
@@ -1356,6 +1370,7 @@ pub fn cleanup_decayed_remembered_subreddits() {
 	}
 	drop(cache);
 	materialized_catalog::remove_sources(&removed_sources);
+	materialized_catalog::remove_mixed_feed_sources(&removed_sources);
 	crate::cache_persistence::mark_dirty();
 }
 
@@ -1404,6 +1419,19 @@ pub(crate) fn snapshot_persisted_remembered_subreddits(now_unix: u64) -> Vec<Per
 			feedback_priority_last_update_unix: option_instant_to_unix(entry.feedback_priority_last_update_at, now_unix),
 		})
 		.collect()
+}
+
+#[cfg(not(test))]
+pub(crate) fn reset_persisted_mixed_feed_index() {
+	materialized_catalog::reset_mixed_feed_catalog();
+}
+
+#[cfg(not(test))]
+pub(crate) fn index_persisted_source_for_mixed_feed(entry: &PersistedSourceCacheEntry) {
+	let Some(source) = remembered_feed_source_from_key(&entry.subreddit) else {
+		return;
+	};
+	materialized_catalog::apply_mixed_feed_persisted_source_refresh(&source, &entry.posts);
 }
 
 pub(crate) fn restore_persisted_state(
@@ -1455,9 +1483,11 @@ pub(crate) fn restore_persisted_state(
 		let remember_kept = restored_remembered.get(&remembered_key).is_some();
 		if age_secs > CACHE_TTL_SECS && !remember_kept {
 			crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
+			materialized_catalog::remove_mixed_feed_sources(std::slice::from_ref(&source));
 			continue;
 		}
 
+		materialized_catalog::apply_mixed_feed_persisted_source_refresh(&source, &entry.posts);
 		write_persisted_source_entry_to_disk(&source, &entry);
 	}
 	rebuild_materialized_catalog_from_source_cache();
@@ -2045,8 +2075,10 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 
 fn reconcile_session_with_source_cache(session: &mut FeedSession) {
 	let mut changed = false;
+	let use_mixed_feed_index = session_uses_mixed_feed_catalog(session);
 	for entry in &mut session.sources {
-		if source_has_resident_servable_cache(&entry.source) && entry.state != SessionSourceState::Ready {
+		let cached_for_session = source_has_resident_servable_cache(&entry.source) || (use_mixed_feed_index && materialized_catalog::mixed_feed_source_is_cached(&entry.source));
+		if cached_for_session && entry.state != SessionSourceState::Ready {
 			entry.state = SessionSourceState::Ready;
 			entry.last_error = None;
 			changed = true;
@@ -2100,6 +2132,10 @@ fn session_uses_materialized_catalog(session: &FeedSession) -> bool {
 	matches!(session_merge_sort(session), FeedSort::New | FeedSort::Random)
 		&& !session.request.bundle_followed_user_comments
 		&& session.sources.iter().all(|entry| materialized_catalog::source_is_supported(&entry.source))
+}
+
+fn session_uses_mixed_feed_catalog(session: &FeedSession) -> bool {
+	session.sources.len() > 1 && session_uses_materialized_catalog(session)
 }
 
 fn parse_numeric_score(post: &Post) -> Option<i64> {
@@ -2232,7 +2268,7 @@ fn merged_posts_for_session_live(session: &FeedSession) -> Vec<Post> {
 	finalize_session_posts(session, all_posts)
 }
 
-fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Post> {
+fn finalize_session_posts_with_order(session: &FeedSession, all_posts: Vec<Post>, preserve_random_order: bool) -> Vec<Post> {
 	let merge_sort = session_merge_sort(session);
 	let mut merged = if session.request.bundle_followed_user_comments {
 		crate::user::bundle_followed_user_comments(all_posts)
@@ -2240,7 +2276,7 @@ fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Po
 		all_posts
 	};
 	merged = collapse_duplicate_submissions(merged);
-	if merge_sort == FeedSort::Random {
+	if merge_sort == FeedSort::Random && !preserve_random_order {
 		sort_posts_by_deterministic_random_with_seed(&mut merged, session.request.random_rotation_seed);
 		return merged;
 	}
@@ -2248,6 +2284,10 @@ fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Po
 		return interleave_followed_posts_by_actor(merged);
 	}
 	merged
+}
+
+fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Post> {
+	finalize_session_posts_with_order(session, all_posts, false)
 }
 
 fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
@@ -2259,6 +2299,23 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 		const CATALOG_MAX_CANDIDATES: usize = 5_000;
 		let target = background_target_posts(session);
 		let limit = target.saturating_mul(CATALOG_OVERFETCH_FACTOR).min(CATALOG_MAX_CANDIDATES);
+		if session_uses_mixed_feed_catalog(session) {
+			if let Some(mut posts) = materialized_catalog::query_mixed_feed_session_stream_limited(session, limit) {
+				let mut seen_ids = posts.iter().map(|post| post.id.clone()).collect::<HashSet<_>>();
+				for post in materialized_catalog::query_session_stream_limited(session, limit) {
+					if posts.len() >= limit {
+						break;
+					}
+					if seen_ids.insert(post.id.clone()) {
+						posts.push(post);
+					}
+				}
+				if session_merge_sort(session) == FeedSort::New {
+					posts.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.id.cmp(&left.id)));
+				}
+				return finalize_session_posts_with_order(session, posts, true);
+			}
+		}
 		return finalize_session_posts(session, materialized_catalog::query_session_stream_limited(session, limit));
 	}
 
@@ -2613,6 +2670,7 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 	for (cache_key, entry) in &updated_sources {
 		if materialized_catalog::source_is_supported(&entry.source) {
 			materialized_catalog::apply_source_refresh(&entry.source, &entry.posts);
+			materialized_catalog::apply_mixed_feed_source_refresh(&entry.source, &entry.posts);
 		}
 		write_source_entry_to_disk(cache_key, entry);
 	}
@@ -3271,7 +3329,12 @@ pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Ve
 		const METRICS_MAX_CANDIDATES: usize = 25_000;
 		let target_posts = METRICS_TARGET_PAGES.saturating_mul(per_page).max(background_target_posts(session));
 		let limit = target_posts.saturating_mul(METRICS_OVERFETCH_FACTOR).min(METRICS_MAX_CANDIDATES);
-		let candidates = materialized_catalog::query_session_page_metric_candidates_limited(session, limit);
+		let candidates = if session_uses_mixed_feed_catalog(session) {
+			materialized_catalog::query_mixed_feed_session_page_metric_candidates_limited(session, limit)
+				.unwrap_or_else(|| materialized_catalog::query_session_page_metric_candidates_limited(session, limit))
+		} else {
+			materialized_catalog::query_session_page_metric_candidates_limited(session, limit)
+		};
 		let mut metrics = Vec::new();
 		for (page, chunk) in candidates.chunks(per_page).enumerate() {
 			let full_page = chunk.len() == per_page;
@@ -3306,6 +3369,11 @@ pub fn catalog_source_candidates(sources: &[FeedSource], filters: &HashSet<Strin
 		// Video-mode and other aggregate listings only need a bounded candidate pool.
 		// Avoid scanning the full catalog for pages with many subscriptions.
 		const CATALOG_MAX_CANDIDATES: usize = 8_000;
+		if sources.len() > 1 {
+			if let Some(posts) = materialized_catalog::query_mixed_feed_source_candidates_limited(sources, filters, CATALOG_MAX_CANDIDATES) {
+				return Some(posts);
+			}
+		}
 		Some(materialized_catalog::query_source_candidates_limited(sources, filters, CATALOG_MAX_CANDIDATES))
 	} else {
 		None
@@ -3599,9 +3667,10 @@ mod tests {
 		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts,
 		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
 		RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
-		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, MIN_ESTIMATED_POST_INTERVAL_SECS,
-		MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS,
-		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS,
+		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS,
+		REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, SOURCE_CACHE,
+		SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4326,10 +4395,11 @@ mod tests {
 		let posts = (0..300)
 			.map(|index| test_post(&format!("catalog-random-{index:03}"), "rust", 10_000 - index as u64))
 			.collect::<Vec<_>>();
-		let newest_prefix_ids = posts.iter().take(POSTS_PER_PAGE * 9).map(|post| post.id.clone()).collect::<HashSet<_>>();
+		let candidate_limit = POSTS_PER_PAGE * (1 + BACKGROUND_LOOKAHEAD_PAGES) * 3;
+		let newest_prefix_ids = posts.iter().take(candidate_limit).map(|post| post.id.clone()).collect::<HashSet<_>>();
 		let mut expected = posts.clone();
 		sort_posts_by_deterministic_random(&mut expected);
-		expected.truncate(POSTS_PER_PAGE * 9);
+		expected.truncate(candidate_limit);
 		assert!(expected.iter().any(|post| !newest_prefix_ids.contains(&post.id)));
 		let expected_ids = expected.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
 		seed_source(&source, posts);
@@ -4358,6 +4428,50 @@ mod tests {
 	}
 
 	#[test]
+	fn compact_mixed_feed_index_admits_all_cached_sources_without_full_payloads() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let sources = (0..30)
+			.map(|source_index| {
+				let community = format!("mixed-{source_index:02}");
+				let source = new_source(&community);
+				let posts = (0..12)
+					.map(|post_index| test_post(&format!("mixed-{source_index:02}-{post_index:02}"), &community, 10_000 - post_index as u64))
+					.collect::<Vec<_>>();
+				crate::materialized_catalog::apply_mixed_feed_source_refresh(&source, &posts);
+				source
+			})
+			.collect::<Vec<_>>();
+
+		assert!(SOURCE_CACHE.lock().unwrap_or_else(|err| err.into_inner()).is_empty());
+		let mut session = FeedSession {
+			id: "compact-mixed-random".to_string(),
+			request: FeedSessionRequest {
+				sources: sources.clone(),
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "sort=random".to_string(),
+				merge_sort: Some(FeedSort::Random),
+				..Default::default()
+			},
+			sources: sources.into_iter().map(|source| session_entry(source, SessionSourceState::Unstarted)).collect(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		reconcile_session_with_source_cache(&mut session);
+		assert_eq!(count_sources_in_state(&session, SessionSourceState::Ready), 30);
+		let first_page = merged_posts_for_session(&session).into_iter().take(POSTS_PER_PAGE).collect::<Vec<_>>();
+		assert_eq!(first_page.len(), POSTS_PER_PAGE);
+		assert_eq!(first_page.iter().map(|post| post.community.as_str()).collect::<HashSet<_>>().len(), POSTS_PER_PAGE);
+	}
+
+	#[test]
 	fn random_rotation_seed_uses_fifteen_minute_buckets() {
 		assert_eq!(random_rotation_seed_for_time(0), 0);
 		assert_eq!(random_rotation_seed_for_time(899), 0);
@@ -4378,11 +4492,12 @@ mod tests {
 
 		let mut expected = posts.clone();
 		sort_posts_by_deterministic_random_with_seed(&mut expected, 42);
-		expected.truncate(POSTS_PER_PAGE * 9);
+		let candidate_limit = POSTS_PER_PAGE * (1 + BACKGROUND_LOOKAHEAD_PAGES) * 3;
+		expected.truncate(candidate_limit);
 
 		let mut unrotated = posts.clone();
 		sort_posts_by_deterministic_random(&mut unrotated);
-		unrotated.truncate(POSTS_PER_PAGE * 9);
+		unrotated.truncate(candidate_limit);
 		assert_ne!(
 			expected.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(),
 			unrotated.iter().map(|post| post.id.as_str()).collect::<Vec<_>>()

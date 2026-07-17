@@ -591,7 +591,11 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 #[cfg(not(test))]
 pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
 	let mut entries = Vec::new();
-	for_each_persisted_source_cache_file_with_options(false, |file| entries.push((file.key, file.entry.fetched_at_unix)))?;
+	post_cache::reset_persisted_mixed_feed_index();
+	for_each_persisted_source_cache_file_with_options(false, |file| {
+		post_cache::index_persisted_source_for_mixed_feed(&file.entry);
+		entries.push((file.key, file.entry.fetched_at_unix));
+	})?;
 	Ok(entries)
 }
 

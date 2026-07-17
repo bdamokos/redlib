@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::cache_persistence::PersistedPost;
 use crate::post_cache::{deterministic_random_post_sort_key_with_seed, session_random_rotation_seed, FeedSession, FeedSort, FeedSource, SessionSourceState};
 use crate::subreddit_content_semantics;
@@ -30,6 +29,12 @@ const RELATED_PROFILE_MIN_SIMILARITY: f64 = 0.15;
 const AUTHOR_HISTORY_MAX_POST_AGE_SECS: u64 = 180 * 24 * 60 * 60;
 const AUTHOR_HISTORY_MAX_POSTS_PER_AUTHOR: usize = 160;
 const AUTHOR_HISTORY_GLOBAL_MAX_POSTS: usize = 60_000;
+/// Keep a small, fair slice of every persisted feed in memory for aggregate front pages.
+/// This is intentionally much smaller than the full per-source cache window.
+const MIXED_FEED_POSTS_PER_SOURCE: usize = 8;
+/// Soft global bound. The newest post for each source is protected so even very large
+/// subscription sets retain broad source coverage.
+const MIXED_FEED_MAX_POSTS: usize = 4_096;
 pub const SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT: u8 = 50;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -262,6 +267,20 @@ struct MaterializedCatalog {
 
 static MATERIALIZED_CATALOG: LazyLock<Mutex<MaterializedCatalog>> = LazyLock::new(|| Mutex::new(MaterializedCatalog::default()));
 
+#[derive(Clone)]
+struct MixedFeedRecord {
+	post: Post,
+	source_keys: HashSet<CatalogSourceKey>,
+}
+
+#[derive(Default)]
+struct MixedFeedCatalog {
+	posts_by_id: HashMap<String, MixedFeedRecord>,
+	source_to_post_ids: HashMap<CatalogSourceKey, HashSet<String>>,
+}
+
+static MIXED_FEED_CATALOG: LazyLock<Mutex<MixedFeedCatalog>> = LazyLock::new(|| Mutex::new(MixedFeedCatalog::default()));
+
 fn normalize_catalog_source(source: &FeedSource) -> Option<CatalogSourceKey> {
 	match source {
 		FeedSource::Subreddit { name, sort } if *sort == FeedSort::New => {
@@ -290,6 +309,115 @@ fn catalog_record(post: &Post) -> CatalogRecord {
 		author_lc: post.author.name.trim().to_lowercase(),
 		source_keys: HashSet::new(),
 	}
+}
+
+fn mixed_feed_selected_posts(posts: &[Post]) -> Vec<Post> {
+	let mut selected = posts.iter().collect::<Vec<_>>();
+	selected.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.id.cmp(&left.id)));
+	selected.truncate(MIXED_FEED_POSTS_PER_SOURCE);
+	selected.into_iter().cloned().collect()
+}
+
+fn remove_mixed_feed_post(catalog: &mut MixedFeedCatalog, post_id: &str) {
+	let Some(record) = catalog.posts_by_id.remove(post_id) else {
+		return;
+	};
+	for source_key in record.source_keys {
+		if let Some(post_ids) = catalog.source_to_post_ids.get_mut(&source_key) {
+			post_ids.remove(post_id);
+		}
+	}
+}
+
+fn prune_mixed_feed_catalog(catalog: &mut MixedFeedCatalog) {
+	if catalog.posts_by_id.len() <= MIXED_FEED_MAX_POSTS {
+		return;
+	}
+
+	let protected = catalog
+		.source_to_post_ids
+		.values()
+		.filter_map(|post_ids| {
+			post_ids
+				.iter()
+				.filter_map(|post_id| catalog.posts_by_id.get(post_id).map(|record| (record.post.created_ts, post_id.clone())))
+				.max()
+				.map(|(_, post_id)| post_id)
+		})
+		.collect::<HashSet<_>>();
+	let mut removable = catalog
+		.posts_by_id
+		.iter()
+		.filter(|(post_id, _)| !protected.contains(*post_id))
+		.map(|(post_id, record)| (record.post.created_ts, post_id.clone()))
+		.collect::<Vec<_>>();
+	removable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+	let remove_count = catalog.posts_by_id.len().saturating_sub(MIXED_FEED_MAX_POSTS).min(removable.len());
+	for (_, post_id) in removable.into_iter().take(remove_count) {
+		remove_mixed_feed_post(catalog, &post_id);
+	}
+	catalog.source_to_post_ids.retain(|_, post_ids| !post_ids.is_empty());
+}
+
+/// Update the compact aggregate-feed index for one source. Unlike the full materialized
+/// catalog, this index survives resident source eviction because the source payload remains
+/// available on disk.
+pub(crate) fn apply_mixed_feed_source_refresh(source: &FeedSource, posts: &[Post]) {
+	let Some(source_key) = normalize_catalog_source(source) else {
+		return;
+	};
+	let selected = mixed_feed_selected_posts(posts);
+	let current_post_ids = selected.iter().map(|post| post.id.clone()).collect::<HashSet<_>>();
+
+	let mut catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let prior_post_ids = catalog.source_to_post_ids.get(&source_key).cloned().unwrap_or_default();
+	for post_id in prior_post_ids.difference(&current_post_ids) {
+		let should_remove = if let Some(record) = catalog.posts_by_id.get_mut(post_id) {
+			record.source_keys.remove(&source_key);
+			record.source_keys.is_empty()
+		} else {
+			false
+		};
+		if should_remove {
+			catalog.posts_by_id.remove(post_id);
+		}
+	}
+
+	for post in selected {
+		let record = catalog.posts_by_id.entry(post.id.clone()).or_insert_with(|| MixedFeedRecord {
+			post: post.clone(),
+			source_keys: HashSet::new(),
+		});
+		record.post = post;
+		record.source_keys.insert(source_key.clone());
+	}
+	catalog.source_to_post_ids.insert(source_key, current_post_ids);
+	prune_mixed_feed_catalog(&mut catalog);
+}
+
+pub(crate) fn apply_mixed_feed_persisted_source_refresh(source: &FeedSource, posts: &[PersistedPost]) {
+	let mut selected = posts.iter().collect::<Vec<_>>();
+	selected.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.id.cmp(&left.id)));
+	let selected = selected
+		.into_iter()
+		.take(MIXED_FEED_POSTS_PER_SOURCE)
+		.cloned()
+		.map(PersistedPost::into_runtime)
+		.collect::<Vec<_>>();
+	apply_mixed_feed_source_refresh(source, &selected);
+}
+
+pub(crate) fn mixed_feed_source_is_cached(source: &FeedSource) -> bool {
+	let Some(source_key) = normalize_catalog_source(source) else {
+		return false;
+	};
+	MIXED_FEED_CATALOG
+		.lock()
+		.unwrap_or_else(|err| err.into_inner())
+		.source_to_post_ids
+		.get(&source_key)
+		.is_some_and(|post_ids| !post_ids.is_empty())
 }
 
 fn sorted_subreddit_counts(counts: &HashMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
@@ -1211,6 +1339,10 @@ fn allowed_source_keys_for_session(session: &FeedSession) -> HashSet<CatalogSour
 		.collect()
 }
 
+fn requested_source_keys_for_session(session: &FeedSession) -> HashSet<CatalogSourceKey> {
+	session.sources.iter().filter_map(|entry| normalize_catalog_source(&entry.source)).collect()
+}
+
 fn catalog_record_is_visible(record: &CatalogRecord, allowed_keys: &HashSet<CatalogSourceKey>, filters: &HashSet<String>) -> bool {
 	if record.source_keys.is_disjoint(allowed_keys) {
 		return false;
@@ -1276,6 +1408,79 @@ fn query_posts_for_keys_limited(
 		}
 	}
 	posts
+}
+
+fn mixed_feed_record_is_visible(record: &MixedFeedRecord, allowed_keys: &HashSet<CatalogSourceKey>, filters: &HashSet<String>) -> bool {
+	if record.source_keys.is_disjoint(allowed_keys) {
+		return false;
+	}
+	if filters.contains(&record.post.community) || filters.contains(&format!("u_{}", record.post.author.name)) {
+		return false;
+	}
+	!crate::utils::is_deleted_reddit_placeholder_post(&record.post)
+}
+
+fn query_mixed_feed_for_keys_limited(
+	catalog: &MixedFeedCatalog,
+	allowed_keys: &HashSet<CatalogSourceKey>,
+	filters: &HashSet<String>,
+	limit: usize,
+	sort: FeedSort,
+	random_rotation_seed: u64,
+) -> Option<Vec<Post>> {
+	if allowed_keys.is_empty() || limit == 0 {
+		return Some(Vec::new());
+	}
+	let has_cached_source = allowed_keys
+		.iter()
+		.any(|source_key| catalog.source_to_post_ids.get(source_key).is_some_and(|post_ids| !post_ids.is_empty()));
+	if !has_cached_source {
+		return None;
+	}
+
+	if sort == FeedSort::Random {
+		// Randomize within source-sized rounds. This preserves random-looking output while
+		// ensuring one post from every cached feed is considered before a second post from
+		// any feed, instead of letting a few prolific sources dominate the random window.
+		let mut best_source_rank = HashMap::<String, usize>::new();
+		for source_key in allowed_keys {
+			let Some(post_ids) = catalog.source_to_post_ids.get(source_key) else {
+				continue;
+			};
+			let mut ranked = post_ids
+				.iter()
+				.filter_map(|post_id| {
+					let record = catalog.posts_by_id.get(post_id)?;
+					mixed_feed_record_is_visible(record, allowed_keys, filters)
+						.then_some((deterministic_random_post_sort_key_with_seed(&record.post, random_rotation_seed), post_id.clone()))
+				})
+				.collect::<Vec<_>>();
+			ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+			for (rank, (_, post_id)) in ranked.into_iter().enumerate() {
+				best_source_rank.entry(post_id).and_modify(|current| *current = (*current).min(rank)).or_insert(rank);
+			}
+		}
+		let mut posts = best_source_rank
+			.into_iter()
+			.filter_map(|(post_id, rank)| {
+				let record = catalog.posts_by_id.get(&post_id)?;
+				Some((rank, deterministic_random_post_sort_key_with_seed(&record.post, random_rotation_seed), record.post.clone()))
+			})
+			.collect::<Vec<_>>();
+		posts.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)).then_with(|| left.2.id.cmp(&right.2.id)));
+		posts.truncate(limit);
+		return Some(posts.into_iter().map(|(_, _, post)| post).collect());
+	}
+
+	let mut posts = catalog
+		.posts_by_id
+		.values()
+		.filter(|record| mixed_feed_record_is_visible(record, allowed_keys, filters))
+		.map(|record| record.post.clone())
+		.collect::<Vec<_>>();
+	posts.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.id.cmp(&left.id)));
+	posts.truncate(limit);
+	Some(posts)
 }
 
 fn query_page_metric_candidates_for_keys_limited(
@@ -1433,6 +1638,34 @@ pub(crate) fn remove_sources(sources: &[FeedSource]) {
 	rebuild_indexes(&mut catalog);
 }
 
+/// Remove sources from the compact persisted-feed mix only when their on-disk payload is
+/// actually deleted. Resident-cache eviction must leave this index intact.
+pub(crate) fn remove_mixed_feed_sources(sources: &[FeedSource]) {
+	let source_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
+	if source_keys.is_empty() {
+		return;
+	}
+
+	let mut catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let mut post_ids = HashSet::new();
+	for source_key in &source_keys {
+		if let Some(ids) = catalog.source_to_post_ids.remove(source_key) {
+			post_ids.extend(ids);
+		}
+	}
+	for post_id in post_ids {
+		let should_remove = if let Some(record) = catalog.posts_by_id.get_mut(&post_id) {
+			record.source_keys.retain(|source_key| !source_keys.contains(source_key));
+			record.source_keys.is_empty()
+		} else {
+			false
+		};
+		if should_remove {
+			catalog.posts_by_id.remove(&post_id);
+		}
+	}
+}
+
 #[cfg(test)]
 pub(crate) fn restore_catalog(snapshot: PersistedCatalogSnapshot) {
 	let mut catalog = MaterializedCatalog::default();
@@ -1498,6 +1731,40 @@ pub(crate) fn query_session_stream_limited(session: &FeedSession, limit: usize) 
 		session_merge_sort(session),
 		session_random_rotation_seed(session),
 	)
+}
+
+/// Query the compact persisted-feed mix using every requested cached source, not only the
+/// handful of full source payloads admitted to the current browser session.
+pub(crate) fn query_mixed_feed_session_stream_limited(session: &FeedSession, limit: usize) -> Option<Vec<Post>> {
+	let allowed_keys = requested_source_keys_for_session(session);
+	let catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	query_mixed_feed_for_keys_limited(
+		&catalog,
+		&allowed_keys,
+		&session.request.filters,
+		limit,
+		session_merge_sort(session),
+		session_random_rotation_seed(session),
+	)
+}
+
+pub(crate) fn query_mixed_feed_source_candidates_limited(sources: &[FeedSource], filters: &HashSet<String>, limit: usize) -> Option<Vec<Post>> {
+	let allowed_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
+	let catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	query_mixed_feed_for_keys_limited(&catalog, &allowed_keys, filters, limit, FeedSort::New, 0)
+}
+
+pub(crate) fn query_mixed_feed_session_page_metric_candidates_limited(session: &FeedSession, limit: usize) -> Option<Vec<CatalogPageMetricCandidate>> {
+	query_mixed_feed_session_stream_limited(session, limit).map(|posts| {
+		posts
+			.into_iter()
+			.map(|post| CatalogPageMetricCandidate {
+				created_ts: post.created_ts,
+				score: post.score.1.parse::<i64>().ok(),
+				stickied: post.flags.stickied,
+			})
+			.collect()
+	})
 }
 
 pub(crate) fn query_session_page_metric_candidates_limited(session: &FeedSession, limit: usize) -> Vec<CatalogPageMetricCandidate> {
@@ -2960,10 +3227,17 @@ pub(crate) fn reset_source_catalog_preserving_author_history() {
 	rebuild_indexes(&mut catalog);
 }
 
+pub(crate) fn reset_mixed_feed_catalog() {
+	let mut catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	*catalog = MixedFeedCatalog::default();
+}
+
 #[cfg(test)]
 pub(crate) fn reset_catalog() {
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	*catalog = MaterializedCatalog::default();
+	drop(catalog);
+	reset_mixed_feed_catalog();
 }
 
 #[cfg(test)]
