@@ -3926,6 +3926,8 @@ static HTML_HREF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="(
 static PLAIN_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
 static BARE_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\b(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>"']*)?"#).unwrap());
 static REDDIT_USER_MENTION_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(^|[^A-Za-z0-9_/])u/([A-Za-z0-9_-]{2,20})").unwrap());
+static SPLIT_REDDIT_USER_MENTION_REGEX: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r#"(?i)<a[^>]*href="/(?:u|user)/([A-Za-z0-9_-]{1,20})/?"[^>]*>(u/)([A-Za-z0-9_-]{1,20})</a>(_[A-Za-z0-9_-]+)"#).unwrap());
 static PROFILE_SOCIAL_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"data-faceplate-tracking-context="([^"]*social_link[^"]*)""#).unwrap());
 static LINKTREE_NEXT_DATA_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>"#).unwrap());
 static ALLMYLINKS_DATA_X_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bdata-x-url="([^"]+)""#).unwrap());
@@ -4007,6 +4009,43 @@ pub fn link_reddit_user_mentions_in_plain_text(input: &str) -> String {
 	link_reddit_user_mentions_in_text_segment(input, true)
 }
 
+fn repair_split_reddit_user_mentions_in_html(input: &str) -> String {
+	let mut output = String::with_capacity(input.len());
+	let mut last = 0;
+
+	for capture in SPLIT_REDDIT_USER_MENTION_REGEX.captures_iter(input) {
+		let Some(whole_match) = capture.get(0) else {
+			continue;
+		};
+		output.push_str(&input[last..whole_match.start()]);
+
+		let href_username = capture.get(1).map(|value| value.as_str()).unwrap_or_default();
+		let label_prefix = capture.get(2).map(|value| value.as_str()).unwrap_or("u/");
+		let label_username = capture.get(3).map(|value| value.as_str()).unwrap_or_default();
+		let suffix = capture.get(4).map(|value| value.as_str()).unwrap_or_default();
+		let full_username = format!("{label_username}{suffix}");
+
+		if href_username.eq_ignore_ascii_case(label_username) && (2..=20).contains(&full_username.len()) {
+			output.push_str(r#"<a class="user_mention" href="/user/"#);
+			output.push_str(&full_username);
+			output.push_str(r#"">"#);
+			output.push_str(label_prefix);
+			output.push_str(&full_username);
+			output.push_str("</a>");
+		} else {
+			output.push_str(whole_match.as_str());
+		}
+
+		last = whole_match.end();
+	}
+
+	if last == 0 {
+		return input.to_string();
+	}
+	output.push_str(&input[last..]);
+	output
+}
+
 fn html_tag_name(tag: &str) -> Option<(&str, bool)> {
 	let trimmed = tag.trim_start_matches('<').trim_start();
 	if trimmed.starts_with('!') || trimmed.starts_with('?') {
@@ -4028,6 +4067,8 @@ fn html_tag_name(tag: &str) -> Option<(&str, bool)> {
 }
 
 pub fn link_reddit_user_mentions_in_html(input: &str) -> String {
+	let repaired = repair_split_reddit_user_mentions_in_html(input);
+	let input = repaired.as_str();
 	let mut output = String::with_capacity(input.len());
 	let mut index = 0;
 	let mut anchor_depth = 0usize;
@@ -6409,6 +6450,14 @@ mod tests {
 		assert_eq!(
 			rewrite_urls(r#"<div class="md"><p>Thanks u/Alice and <a href="https://example.com/u/Bob">u/Bob</a>.</p></div>"#),
 			r#"<div class="md"><p>Thanks <a class="user_mention" href="/user/Alice">u/Alice</a> and <a href="https://example.com/u/Bob">u/Bob</a>.</p></div>"#
+		);
+	}
+
+	#[test]
+	fn rewrite_urls_repairs_reddit_mentions_split_at_escaped_underscore() {
+		assert_eq!(
+			rewrite_urls(r#"<p><a href="https://www.reddit.com/u/skye" rel="nofollow">u/skye</a>\_yasmin2 and u/OnlyAnastasia</p>"#),
+			r#"<p><a class="user_mention" href="/user/skye_yasmin2">u/skye_yasmin2</a> and <a class="user_mention" href="/user/OnlyAnastasia">u/OnlyAnastasia</a></p>"#
 		);
 	}
 

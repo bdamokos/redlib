@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, LazyLock, Mutex};
 
-const REVISION_SCHEMA: &[u8] = b"stable-post-v2";
+const REVISION_SCHEMA: &[u8] = b"stable-post-v3";
 const CARD_ETAG_SCHEMA: &str = "card-v2";
 const MAX_POST_ID_LEN: usize = 24;
 const MAX_CANONICAL_POSTS: usize = 10_000;
@@ -479,7 +479,7 @@ impl StablePostContentV1 {
 		Some(Self {
 			id,
 			title: post.title.clone(),
-			body: SanitizedHtml::from_reddit_html(&post.body),
+			body: SanitizedHtml::from_reddit_html(&crate::utils::link_reddit_user_mentions_in_html(&post.body)),
 			author_name: post.author.name.clone(),
 			author_flair: post.author.flair.clone(),
 			author_distinguished: post.author.distinguished.clone(),
@@ -1053,10 +1053,21 @@ mod tests {
 	}
 
 	#[test]
-	fn revision_schema_v2_invalidates_v1_card_urls() {
+	fn revision_schema_v3_invalidates_earlier_card_urls() {
 		let stable = StablePostContentV1::from_post(&sample_post()).unwrap();
-		assert_eq!(REVISION_SCHEMA, b"stable-post-v2");
+		assert_eq!(REVISION_SCHEMA, b"stable-post-v3");
 		assert_ne!(stable.revision(), stable.revision_with_schema(b"stable-post-v1"));
+		assert_ne!(stable.revision(), stable.revision_with_schema(b"stable-post-v2"));
+	}
+
+	#[test]
+	fn stable_content_repairs_persisted_split_user_mentions() {
+		let mut post = sample_post();
+		post.body = r#"<p><a href="/u/skye" rel="noopener noreferrer">u/skye</a>_yasmin2</p>"#.to_string();
+
+		let stable = StablePostContentV1::from_post(&post).unwrap();
+
+		assert_eq!(stable.body_html(), r#"<p><a href="/user/skye_yasmin2" rel="noopener noreferrer">u/skye_yasmin2</a></p>"#);
 	}
 
 	#[test]
