@@ -1236,11 +1236,6 @@ fn publish_remembered_source_refresh(source: &FeedSource, posts: Vec<Post>, afte
 	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
 		crate::video_preview::prewarm_listing_video_previews(&posts);
 	}
-	// Even when the listing itself came from a scrape/backup instance (DirectLiveFetch),
-	// we still want to populate cached author profile links so `hydrate_post_author_links_from_cache`
-	// has something to attach for the page render.
-	spawn_author_link_prefetch(&posts);
-
 	let Some(key) = remembered_feed_key_for_source(&source) else {
 		return;
 	};
@@ -1581,34 +1576,6 @@ pub async fn browser_session_release(req: Request<Body>) -> Result<Response<Body
 		sessions.remove(request.session_id.trim());
 	}
 	json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
-}
-
-fn post_author_names_for_prefetch(posts: &[Post]) -> Vec<String> {
-	let mut authors = posts
-		.iter()
-		.map(|post| post.author.name.trim())
-		.filter(|name| !name.is_empty() && *name != "[deleted]")
-		.map(ToString::to_string)
-		.collect::<HashSet<_>>()
-		.into_iter()
-		.collect::<Vec<_>>();
-	authors.sort_unstable();
-	authors
-}
-
-fn spawn_author_link_prefetch(posts: &[Post]) {
-	if tokio::runtime::Handle::try_current().is_err() {
-		return;
-	}
-
-	let authors = post_author_names_for_prefetch(posts);
-	if authors.is_empty() {
-		return;
-	}
-
-	tokio::spawn(async move {
-		crate::utils::prefetch_author_links(authors).await;
-	});
 }
 
 pub fn pick_next_remembered_feed_to_refresh() -> Option<FeedSource> {
@@ -2000,9 +1967,6 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 	} else {
 		crate::utils::store_post_flairs(&posts);
 		store_source_posts(&source, posts.clone(), after.clone());
-		if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
-			spawn_author_link_prefetch(&posts);
-		}
 	}
 
 	Ok(CachedSourcePosts {

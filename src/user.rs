@@ -1444,6 +1444,7 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<(Vec<Post>, b
 mod tests {
 	use super::{append_missing_following_link_posts, collapse_duplicate_submissions, show_successful_empty_state};
 	use askama::Template;
+	use hyper::{Body, Request};
 	use std::collections::HashSet;
 	use url::form_urlencoded;
 
@@ -3268,6 +3269,17 @@ mod tests {
 		assert!(html.contains("<button class=\"unfilter\">Unfilter</button>"));
 		assert!(!html.contains("action=\"/r/DemoSub/subscribe"));
 	}
+
+	#[tokio::test]
+	async fn author_link_cache_miss_returns_without_profile_enrichment() {
+		let req = Request::builder().uri("/author_links?names=definitely_missing_cached_author").body(Body::empty()).unwrap();
+		let response = super::author_links(req).await.unwrap();
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+		assert_eq!(payload["definitely_missing_cached_author"]["links"], serde_json::json!([]));
+		assert!(payload["definitely_missing_cached_author"]["avg_video_length"].is_null());
+	}
 }
 
 // FUNCTIONS
@@ -3910,7 +3922,9 @@ pub async fn author_links(req: Request<Body>) -> Result<Response<Body>, String> 
 
 		let author_name = author.to_string();
 		pending.spawn(async move {
-			let links = utils::external_links_with_coomer_flags(utils::author_external_links(&author_name).await).await;
+			// Cached pages must never turn a decorative author-link lookup into
+			// one Reddit profile API request per visible post.
+			let links = utils::external_links_with_coomer_flags(utils::cached_author_external_links(&author_name)).await;
 			let avg_video_length = cached_avg_video_length(&author_name);
 			(author_name, links, avg_video_length)
 		});
