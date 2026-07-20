@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, LazyLock, Mutex};
 use std::time::Instant;
 
-const DETECTOR_VERSION: &str = "snap-promo-v3";
+const DETECTOR_VERSION: &str = "snap-promo-v4";
 const MAX_ANALYSIS_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MEDIA_MAPPINGS: usize = 4096;
 const MAX_PERSISTED_MARKERS: usize = 100_000;

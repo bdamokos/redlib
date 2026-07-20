@@ -278,6 +278,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				scraped.post.bookmark_new_comments = Some(0);
 			}
 			let rendered_post = scraped.post.clone();
+			crate::client::preload_post_images(std::slice::from_ref(&rendered_post), &prefs);
 			instance_scrape::apply_comment_prefs(&mut scraped.comments, &prefs);
 			let body = PostFragmentTemplate {
 				comments: scraped.comments,
@@ -343,13 +344,18 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 				),
 			};
 
+			// Start the same bounded image analysis used by listings. This matters
+			// for direct RedGifs posters, which the browser otherwise loads from the
+			// CDN without passing through Redlib's image proxy.
+			let prefs = Preferences::new(&req);
+			crate::client::preload_post_images(std::slice::from_ref(&post), &prefs);
 			// Use the Post and Comment structs to generate a website to show users
 			let body = PostFragmentTemplate {
 				comments,
 				post: post.clone(),
 				fallback_notice: String::new(),
 				sort,
-				prefs: Preferences::new(&req),
+				prefs,
 				single_thread_str: if single_thread { "true" } else { "false" },
 				url: req_url,
 				url_without_query: url.clone().trim_end_matches(&format!("?q={comment_query}&type=comment")).to_string(),
@@ -384,6 +390,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 							scraped.post.bookmark_new_comments = Some(0);
 						}
 						let rendered_post = scraped.post.clone();
+						crate::client::preload_post_images(std::slice::from_ref(&rendered_post), &prefs);
 						instance_scrape::apply_comment_prefs(&mut scraped.comments, &prefs);
 						let body = PostFragmentTemplate {
 							comments: scraped.comments,

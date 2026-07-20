@@ -843,6 +843,23 @@ fn local_proxy_image_to_upstream(local_url: &str) -> Option<String> {
 	None
 }
 
+fn promo_image_to_upstream(url: &str) -> String {
+	local_proxy_image_to_upstream(url)
+		.or_else(|| crate::redgifs::direct_media_url_from_path(url))
+		.unwrap_or_else(|| url.to_string())
+}
+
+fn redgifs_poster_url(url: &str) -> bool {
+	let Some(filename) = url.strip_prefix("https://media.redgifs.com/") else {
+		return false;
+	};
+	filename.ends_with("-poster.jpg") && filename.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn promo_analyzable_image_url(url: &str) -> bool {
+	cacheable_image_url(url) || redgifs_poster_url(url)
+}
+
 fn collect_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) -> Vec<String> {
 	let mut urls = Vec::new();
 	let mut seen = HashSet::new();
@@ -852,8 +869,8 @@ fn collect_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) ->
 		if url.is_empty() {
 			return;
 		}
-		let upstream = local_proxy_image_to_upstream(url).unwrap_or_else(|| url.to_string());
-		if !cacheable_image_url(&upstream) {
+		let upstream = promo_image_to_upstream(url);
+		if !promo_analyzable_image_url(&upstream) {
 			return;
 		}
 		crate::promo_detection::register_media_post(&upstream, post_id);
@@ -889,6 +906,8 @@ fn collect_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) ->
 					return urls;
 				}
 			}
+		} else if matches!(post.post_type.as_str(), "video" | "gif") && !post.media.display_poster_url(prefs).is_empty() {
+			push_image_url(&mut urls, &mut seen, &post.media.display_poster_url(prefs), &post.id);
 		} else if !post.thumbnail.url.is_empty() {
 			push_image_url(&mut urls, &mut seen, &post.thumbnail.url, &post.id);
 		}
@@ -907,8 +926,8 @@ fn register_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) {
 		if url.is_empty() {
 			return;
 		}
-		let upstream = local_proxy_image_to_upstream(url).unwrap_or_else(|| url.to_string());
-		if cacheable_image_url(&upstream) {
+		let upstream = promo_image_to_upstream(url);
+		if promo_analyzable_image_url(&upstream) {
 			crate::promo_detection::register_media_post(&upstream, post_id);
 		}
 	};
@@ -929,6 +948,8 @@ fn register_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) {
 			for image in &post.gallery {
 				register(if prefer_full || image.preview_url.is_empty() { &image.url } else { &image.preview_url }, &post.id);
 			}
+		} else if matches!(post.post_type.as_str(), "video" | "gif") && !post.media.display_poster_url(prefs).is_empty() {
+			register(&post.media.display_poster_url(prefs), &post.id);
 		} else if !post.thumbnail.url.is_empty() {
 			register(&post.thumbnail.url, &post.id);
 		}
@@ -940,13 +961,15 @@ pub fn register_promo_post_media(post: &Post) {
 		if url.is_empty() {
 			return;
 		}
-		let upstream = local_proxy_image_to_upstream(url).unwrap_or_else(|| url.to_string());
-		if cacheable_image_url(&upstream) {
+		let upstream = promo_image_to_upstream(url);
+		if promo_analyzable_image_url(&upstream) {
 			crate::promo_detection::register_media_post(&upstream, &post.id);
 		}
 	};
 	register(&post.media.url);
 	register(&post.media.preview_url);
+	register(&post.media.poster);
+	register(&post.media.hd_poster);
 	for candidate in post.media.preview_srcset.split(',') {
 		if let Some(url) = candidate.split_whitespace().next() {
 			register(url);
@@ -1880,6 +1903,36 @@ fn test_local_proxy_image_to_upstream_preserves_query() {
 		Some("https://external-preview.redd.it/example.jpg".to_string())
 	);
 	assert_eq!(local_proxy_image_to_upstream("/vid/demo/DASH_720.mp4"), None);
+}
+
+#[test]
+fn test_redgifs_posters_are_promo_analyzable() {
+	let local = "/redgifs/ExemplarySlimGordonsetter-poster.jpg";
+	let direct = "https://media.redgifs.com/ExemplarySlimGordonsetter-poster.jpg";
+	assert_eq!(promo_image_to_upstream(local), direct);
+	assert!(promo_analyzable_image_url(direct));
+	assert!(promo_analyzable_image_url("https://media.redgifs.com/Example-hd-poster.jpg"));
+	assert!(!promo_analyzable_image_url("https://media.redgifs.com/Example.mp4"));
+	assert!(!promo_analyzable_image_url("https://example.com/Example-poster.jpg"));
+}
+
+#[test]
+fn test_video_poster_is_collected_before_thumbnail() {
+	let mut post = Post::default();
+	post.id = "poster123".to_string();
+	post.post_type = "video".to_string();
+	post.media.poster = "/redgifs/ExemplarySlimGordonsetter-poster.jpg".to_string();
+	post.thumbnail.url = "https://i.redd.it/fallback.jpg".to_string();
+	let prefs = crate::utils::Preferences {
+		direct_redgifs_media: "on".to_string(),
+		redgifs_poster_quality: "sd".to_string(),
+		show_nsfw: "on".to_string(),
+		..Default::default()
+	};
+	assert_eq!(
+		collect_post_image_urls(&[post], &prefs),
+		vec!["https://media.redgifs.com/ExemplarySlimGordonsetter-poster.jpg"]
+	);
 }
 
 #[test]

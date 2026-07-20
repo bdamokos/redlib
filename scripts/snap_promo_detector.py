@@ -128,6 +128,42 @@ def fast_features(image: np.ndarray) -> tuple[float, float, int, int, float]:
     return yellow_fraction, black_on_yellow_fraction, dark_component_count, square_marker_count, text_edge_fraction
 
 
+def _is_snapcode_geometry(yellow: float, black: float, components: int, markers: int) -> bool:
+    strong_geometry = yellow >= 0.22 and 0.055 <= black <= 0.48 and markers >= 2 and components >= 18
+    dense_geometry = yellow >= 0.20 and 0.07 <= black <= 0.42 and components >= 60
+    return strong_geometry or dense_geometry
+
+
+def _regional_snapcode(image: np.ndarray) -> bool:
+    """Inspect a few substantial yellow panels without scanning arbitrary tiles."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    yellow = cv2.inRange(hsv, (20, 125, 120), (40, 255, 255))
+    yellow = cv2.morphologyEx(yellow, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(yellow, 8)
+    image_area = image.shape[0] * image.shape[1]
+    candidates = sorted(stats[1:count], key=lambda stat: int(stat[cv2.CC_STAT_AREA]), reverse=True)[:3]
+
+    for stat in candidates:
+        x, y, width, height, area = (int(value) for value in stat)
+        if area < image_area * 0.012 or width < 24 or height < 24:
+            continue
+        aspect = width / height
+        if not 0.50 <= aspect <= 2.0 or area / (width * height) < 0.18:
+            continue
+        padding = max(4, round(min(width, height) * 0.11))
+        left, top = max(0, x - padding), max(0, y - padding)
+        right = min(image.shape[1], x + width + padding)
+        bottom = min(image.shape[0], y + height + padding)
+        crop = image[top:bottom, left:right]
+        crop_yellow, crop_black, crop_components, crop_markers, _ = fast_features(crop)
+        # Regional scans need a stricter corner-marker requirement than the
+        # full-frame path: yellow photographs can otherwise create one dense,
+        # QR-ish crop at an image edge.
+        if crop_yellow >= 0.22 and 0.055 <= crop_black <= 0.48 and crop_markers >= 3 and crop_components >= 30:
+            return True
+    return False
+
+
 def fast_classify(image: np.ndarray) -> Detection:
     started = time.perf_counter_ns()
     image = _normalize_image(image)
@@ -136,12 +172,14 @@ def fast_classify(image: np.ndarray) -> Detection:
     # Snapcodes have a large saturated-yellow field, dense black dots and at
     # least two square corner markers.  A dense component fallback covers
     # screenshots where the corner shapes have been clipped or decorated.
-    strong_geometry = yellow >= 0.22 and 0.055 <= black <= 0.48 and markers >= 2 and components >= 18
-    dense_geometry = yellow >= 0.20 and 0.07 <= black <= 0.42 and components >= 60
-    if strong_geometry or dense_geometry:
+    regional_geometry = False
+    full_geometry = _is_snapcode_geometry(yellow, black, components, markers)
+    if not full_geometry and yellow >= 0.012:
+        regional_geometry = _regional_snapcode(image)
+    if full_geometry or regional_geometry:
         marker_score = min(1.0, markers / 3)
         component_score = min(1.0, components / 70)
-        confidence = min(0.99, 0.50 + yellow * 0.25 + marker_score * 0.15 + component_score * 0.10)
+        confidence = min(0.99, max(0.88 if regional_geometry else 0.0, 0.50 + yellow * 0.25 + marker_score * 0.15 + component_score * 0.10))
         signal = "snapcode"
         reason = "yellow QR-like field"
     else:

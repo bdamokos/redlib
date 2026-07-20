@@ -23,6 +23,18 @@ class SnapPromoDetectorTests(unittest.TestCase):
         cv2.ellipse(image, (128, 128), (70, 105), 0, 0, 360, (20, 180, 230), -1)
         self.assertEqual(fast_classify(image).signal, "none")
 
+    def test_snapcode_panel_embedded_in_large_poster_is_flagged(self):
+        image = np.full((640, 360, 3), (150, 120, 105), dtype=np.uint8)
+        panel = np.full((150, 150, 3), (0, 255, 255), dtype=np.uint8)
+        rng = np.random.default_rng(43)
+        for x, y in rng.integers(18, 132, size=(95, 2)):
+            cv2.circle(panel, (int(x), int(y)), 2, (0, 0, 0), -1)
+        for x, y in ((18, 18), (105, 18), (18, 105)):
+            cv2.rectangle(panel, (x, y), (x + 22, y + 22), (0, 0, 0), 4)
+        image[60:210, 105:255] = panel
+        self.assertLess(cv2.countNonZero(cv2.inRange(cv2.cvtColor(image, cv2.COLOR_BGR2HSV), (20, 125, 120), (40, 255, 255))) / (640 * 360), 0.20)
+        self.assertEqual(fast_classify(image).signal, "snapcode")
+
     def test_telegram_qr_geometry_is_flagged(self):
         qr = cv2.QRCodeEncoder_create().encode("https://t.me/example")
         qr = cv2.resize(qr, (240, 240), interpolation=cv2.INTER_NEAREST)
