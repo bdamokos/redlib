@@ -1980,6 +1980,7 @@ a.search_subreddit_link:hover {
     transition: 0.2s background;
     grid-template:
         "post_score post_header post_thumbnail" auto
+        "post_score post_warning post_thumbnail" auto
         "post_score post_title  post_thumbnail" var(--post-title-row-height)
         "post_score post_media  post_thumbnail" auto
         "post_score post_body   post_thumbnail" auto
@@ -2861,6 +2862,7 @@ a.redgifs_uploader_mismatch {
 .post_page .post.highlighted {
     grid-template:
         "post_score post_header" auto
+        "post_score post_warning" auto
         "post_score post_title" auto
         "post_score post_media" auto
         "post_score post_body" auto
@@ -4820,6 +4822,7 @@ th {
     .post {
         grid-template:
             "post_header post_header post_thumbnail" auto
+            "post_warning post_warning post_thumbnail" auto
             "post_title  post_title  post_thumbnail" 1fr
             "post_media  post_media  post_thumbnail" auto
             "post_body   post_body   post_thumbnail" auto
@@ -4992,4 +4995,24 @@ th {
     width: 100%;
     height: 100%;
     border: none;
+}
+.post_promo_warning {
+	grid-area: post_warning;
+	margin: 0.45rem 0.75rem;
+	padding: 0.5rem 0.7rem;
+	border: 1px solid #d39b00;
+	border-left-width: 0.35rem;
+	border-radius: 0.3rem;
+	background: #fff4bf;
+	color: #5f4300;
+	font-size: 0.86rem;
+	font-weight: 650;
+}
+
+@media (prefers-color-scheme: dark) {
+	body:not(.light) .post_promo_warning {
+		background: #3b310f;
+		color: #ffe495;
+		border-color: #b8860b;
+	}
 }

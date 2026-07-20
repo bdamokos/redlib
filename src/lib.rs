@@ -19,6 +19,7 @@ pub mod post_cache;
 pub mod post_components;
 pub mod post_feedback;
 pub mod prefs_store;
+pub mod promo_detection;
 pub mod redgifs;
 pub mod search;
 pub mod seen_posts;

@@ -644,6 +644,7 @@ impl PostObservation {
 }
 
 pub fn observe_post(post: &Post, source: ObservationSource, source_key: impl Into<String>, observed_at: u64) -> Option<CanonicalPostSnapshot> {
+	crate::client::register_promo_post_media(post);
 	let observation = PostObservation::from_post(post, source, source_key, observed_at)?;
 	Some(observe(observation))
 }
@@ -751,6 +752,7 @@ pub fn exact(post_id: &str, revision: &str) -> Option<Arc<StablePostContentV1>> 
 /// Ensure a rendered submission has an exact local stable revision and return
 /// the revision used by its private context wrapper.
 pub fn revision_for_post(post: &Post) -> String {
+	crate::client::register_promo_post_media(post);
 	if post.kind != "t3" {
 		return String::new();
 	}

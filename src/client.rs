@@ -848,12 +848,16 @@ fn collect_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) ->
 	let mut seen = HashSet::new();
 	let prefer_full = prefs.image_quality == "best";
 
-	fn push_image_url(urls: &mut Vec<String>, seen: &mut HashSet<String>, url: &str) {
+	fn push_image_url(urls: &mut Vec<String>, seen: &mut HashSet<String>, url: &str, post_id: &str) {
 		if url.is_empty() {
 			return;
 		}
 		let upstream = local_proxy_image_to_upstream(url).unwrap_or_else(|| url.to_string());
-		if !cacheable_image_url(&upstream) || !seen.insert(upstream.clone()) {
+		if !cacheable_image_url(&upstream) {
+			return;
+		}
+		crate::promo_detection::register_media_post(&upstream, post_id);
+		if !seen.insert(upstream.clone()) {
 			return;
 		}
 		urls.push(upstream);
@@ -865,27 +869,28 @@ fn collect_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) ->
 		}
 		if post.post_type == "image" {
 			if prefer_full {
-				push_image_url(&mut urls, &mut seen, &post.media.url);
+				push_image_url(&mut urls, &mut seen, &post.media.url, &post.id);
 			} else {
 				push_image_url(
 					&mut urls,
 					&mut seen,
 					if post.media.preview_url.is_empty() { &post.media.url } else { &post.media.preview_url },
+					&post.id,
 				);
 			}
 		} else if post.post_type == "gallery" {
 			for image in &post.gallery {
 				if prefer_full {
-					push_image_url(&mut urls, &mut seen, &image.url);
+					push_image_url(&mut urls, &mut seen, &image.url, &post.id);
 				} else {
-					push_image_url(&mut urls, &mut seen, if image.preview_url.is_empty() { &image.url } else { &image.preview_url });
+					push_image_url(&mut urls, &mut seen, if image.preview_url.is_empty() { &image.url } else { &image.preview_url }, &post.id);
 				}
 				if urls.len() >= IMAGE_PRELOAD_MAX_URLS {
 					return urls;
 				}
 			}
 		} else if !post.thumbnail.url.is_empty() {
-			push_image_url(&mut urls, &mut seen, &post.thumbnail.url);
+			push_image_url(&mut urls, &mut seen, &post.thumbnail.url, &post.id);
 		}
 
 		if urls.len() >= IMAGE_PRELOAD_MAX_URLS {
@@ -896,10 +901,69 @@ fn collect_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) ->
 	urls
 }
 
+fn register_post_image_urls(posts: &[Post], prefs: &crate::utils::Preferences) {
+	let prefer_full = prefs.image_quality == "best";
+	let register = |url: &str, post_id: &str| {
+		if url.is_empty() {
+			return;
+		}
+		let upstream = local_proxy_image_to_upstream(url).unwrap_or_else(|| url.to_string());
+		if cacheable_image_url(&upstream) {
+			crate::promo_detection::register_media_post(&upstream, post_id);
+		}
+	};
+	for post in posts {
+		if post.flags.nsfw && prefs.show_nsfw != "on" {
+			continue;
+		}
+		if post.post_type == "image" {
+			register(
+				if prefer_full || post.media.preview_url.is_empty() {
+					&post.media.url
+				} else {
+					&post.media.preview_url
+				},
+				&post.id,
+			);
+		} else if post.post_type == "gallery" {
+			for image in &post.gallery {
+				register(if prefer_full || image.preview_url.is_empty() { &image.url } else { &image.preview_url }, &post.id);
+			}
+		} else if !post.thumbnail.url.is_empty() {
+			register(&post.thumbnail.url, &post.id);
+		}
+	}
+}
+
+pub fn register_promo_post_media(post: &Post) {
+	let register = |url: &str| {
+		if url.is_empty() {
+			return;
+		}
+		let upstream = local_proxy_image_to_upstream(url).unwrap_or_else(|| url.to_string());
+		if cacheable_image_url(&upstream) {
+			crate::promo_detection::register_media_post(&upstream, &post.id);
+		}
+	};
+	register(&post.media.url);
+	register(&post.media.preview_url);
+	for candidate in post.media.preview_srcset.split(',') {
+		if let Some(url) = candidate.split_whitespace().next() {
+			register(url);
+		}
+	}
+	register(&post.thumbnail.url);
+	for image in &post.gallery {
+		register(&image.url);
+		register(&image.preview_url);
+	}
+}
+
 pub fn preload_post_images(posts: &[Post], prefs: &crate::utils::Preferences) {
 	if cfg!(test) {
 		return;
 	}
+	register_post_image_urls(posts, prefs);
 
 	let Ok(handle) = tokio::runtime::Handle::try_current() else {
 		return;
@@ -971,6 +1035,7 @@ async fn preload_image_url(url: String) -> Result<(), String> {
 		crate::post_cache::mark_deleted_reddit_media_url(&url);
 		return Err("upstream image was Reddit's deleted placeholder".to_string());
 	}
+	crate::promo_detection::enqueue_image(&url, content_type.as_ref().and_then(|value| value.to_str().ok()).unwrap_or_default(), body.clone());
 	let entry = CachedImageResponse {
 		status,
 		content_type,
@@ -1159,6 +1224,7 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 			crate::post_cache::mark_deleted_reddit_media_url(url);
 			return deleted_media_response();
 		}
+		crate::promo_detection::enqueue_image(url, content_type.as_deref().unwrap_or_default(), body.clone());
 		return Ok(Response::from_parts(parts, Body::from(body)));
 	}
 
@@ -1170,17 +1236,34 @@ async fn stream(url: &str, req: &Request<Body>) -> Result<Response<Body>, String
 	// is dropped. This prevents many tabs from opening unbounded origin streams.
 	let (parts, mut upstream) = res.into_parts();
 	let (mut sender, downstream) = Body::channel();
+	let analysis_url = url.to_string();
+	let analysis_content_type = content_type.unwrap_or_default();
+	let capture_for_analysis = req.headers().get(header::RANGE).is_none()
+		&& parts.status == StatusCode::OK
+		&& analysis_content_type.starts_with("image/")
+		&& content_length.is_none_or(|length| length as usize <= crate::promo_detection::max_analysis_bytes());
 	tokio::spawn(async move {
 		let _permit = permit;
+		let mut analysis_body = capture_for_analysis.then(Vec::new);
 		while let Some(next) = upstream.data().await {
 			match next {
 				Ok(chunk) => {
+					if let Some(body) = analysis_body.as_mut() {
+						if body.len().saturating_add(chunk.len()) <= crate::promo_detection::max_analysis_bytes() {
+							body.extend_from_slice(&chunk);
+						} else {
+							analysis_body = None;
+						}
+					}
 					if sender.send_data(chunk).await.is_err() {
 						return;
 					}
 				}
 				Err(_) => return,
 			}
+		}
+		if let Some(body) = analysis_body {
+			crate::promo_detection::enqueue_image(&analysis_url, &analysis_content_type, body.into());
 		}
 		if let Ok(Some(trailers)) = upstream.trailers().await {
 			let _ = sender.send_trailers(trailers).await;

@@ -106,6 +106,7 @@
 <!-- POST CONTENT -->
 <div
 	class="post highlighted{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post_should_be_blurred %} post_blurred{% endif %}"
+	data-post-id="{{ post.id }}"
 	data-reddit-url="https://www.reddit.com{{ post.permalink }}">
 	<p class="post_header">
 		<a class="post_subreddit" href="/r/{{ post.community }}">r/{{ post.community }}</a>
@@ -406,6 +407,7 @@
 {% set component_revision = crate::post_components::revision_for_post(post) -%}
 <div
 	id="{{ post.id }}"
+	data-post-id="{{ post.id }}"
 	class="post{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post.following_comments.len() > 0 %} post_following_bundle{% endif %}"
 	data-post-type="{{ post.post_type }}"
 	data-created-ts="{{ post.created_ts }}"
@@ -700,6 +702,7 @@
 {% set show_followed_author_marker = auto_expand_preview -%}
 <div
 	id="{{ post.id }}"
+	data-post-id="{{ post.id }}"
 	class="post post_component_wrapper{{ crate::user::avg_video_length_rg_profile_class(post.author.avg_video_length) }}{% if post.flags.stickied %} stickied{% endif %}{% if post_should_be_blurred %} post_blurred{% endif %}"
 	data-post-type="{{ post.post_type }}"
 	data-created-ts="{{ post.created_ts }}"

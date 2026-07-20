@@ -8,6 +8,7 @@
 !static/**
 !templates/
 !templates/**
+!scripts/snap_promo_detector.py
 !Dockerfile
 !Dockerfile.alpine
 !Dockerfile.ubuntu

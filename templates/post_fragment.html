@@ -14,6 +14,7 @@
     {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") %}
     <div
         id="{{ post.id }}"
+        data-post-id="{{ post.id }}"
         class="post highlighted post_component_wrapper{% if post_should_be_blurred %} post_blurred{% endif %}"
         data-post-type="{{ post.post_type }}"
         data-reddit-url="https://www.reddit.com{{ post.permalink }}"

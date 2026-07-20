@@ -79,6 +79,7 @@
 				{% if let Some(cached) = cached_post_shell %}
 				<div
 					id="{{ cached.post_id }}"
+					data-post-id="{{ cached.post_id }}"
 					class="post highlighted post_component_wrapper{% if cached.blurred %} post_blurred{% endif %}"
 					data-post-component-id="{{ cached.post_id }}"
 					data-post-component-revision="{{ cached.revision }}"

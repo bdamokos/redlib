@@ -17,6 +17,7 @@ import statistics
 import subprocess
 import sys
 import time
+import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -238,14 +239,63 @@ def percentile(values: list[float], p: float) -> float:
     return float(np.percentile(np.asarray(values), p))
 
 
+def _read_exact(stream, size: int) -> bytes | None:
+    data = bytearray()
+    while len(data) < size:
+        chunk = stream.read(size - len(data))
+        if not chunk:
+            return None if not data else (_ for _ in ()).throw(EOFError("truncated worker request"))
+        data.extend(chunk)
+    return bytes(data)
+
+
+def worker_main() -> int:
+    stream = sys.stdin.buffer
+    fast_classify(np.zeros((64, 64, 3), dtype=np.uint8))
+    while True:
+        header = _read_exact(stream, 4)
+        if header is None:
+            return 0
+        metadata_size = struct.unpack(">I", header)[0]
+        metadata = json.loads((_read_exact(stream, metadata_size) or b"{}").decode("utf-8"))
+        image_size = struct.unpack(">Q", _read_exact(stream, 8))[0]
+        encoded = _read_exact(stream, image_size)
+        if encoded is None:
+            raise EOFError("missing worker image")
+        started = time.perf_counter_ns()
+        content_type = str(metadata.get("content_type", ""))
+        # libjpeg performs this reduction while decoding, avoiding a separate
+        # full-resolution decode and resize. Other codecs safely ignore it.
+        flag = cv2.IMREAD_REDUCED_COLOR_4 if "jpeg" in content_type or "jpg" in content_type else cv2.IMREAD_COLOR
+        image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), flag)
+        if image is None:
+            reply = {"flagged": False, "signal": "none", "fast_ms": 0.0, "error": "decode_failed"}
+        else:
+            detection = fast_classify(image)
+            reply = {
+                "flagged": detection.flagged,
+                "signal": detection.signal,
+                "confidence": detection.confidence,
+                "fast_ms": detection.fast_ms,
+            }
+        reply["total_ms"] = (time.perf_counter_ns() - started) / 1_000_000
+        print(json.dumps(reply, separators=(",", ":")), flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", type=Path, help="image or directory of images")
+    parser.add_argument("path", type=Path, nargs="?", help="image or directory of images")
+    parser.add_argument("--worker", action="store_true", help="serve the binary stdin worker protocol")
     parser.add_argument("--ocr", action="store_true", help="run conditional Tesseract OCR")
     parser.add_argument("--title", default="", help="post title/body text to score before OCR (single-image mode)")
     parser.add_argument("--jsonl", type=Path, help="write per-image results")
     parser.add_argument("--warmup", type=int, default=2, help="unreported fast-path warmup passes")
     args = parser.parse_args()
+
+    if args.worker:
+        return worker_main()
+    if args.path is None:
+        parser.error("path is required unless --worker is used")
 
     tesseract = shutil.which("tesseract") if args.ocr else None
     if args.ocr and not tesseract:

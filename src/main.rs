@@ -17,7 +17,7 @@ use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
 	bookmarks, cache_persistence, config, creator_links, duplicates, headers, instance_info, observed_semantic_backfill, post, post_cache, post_components, post_feedback,
-	search, settings, site_icon, subreddit, suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
+	promo_detection, search, settings, site_icon, subreddit, suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
 };
 use url::Url;
 
@@ -310,6 +310,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"network_image.js" => resource(include_str!("../static/network_image.js"), "text/javascript", false).await,
 		"post_preview.js" => resource(include_str!("../static/post_preview.js"), "text/javascript", false).await,
 		"post_feedback.js" => resource(include_str!("../static/post_feedback.js"), "text/javascript", false).await,
+		"promo_warning.js" => resource(include_str!("../static/promo_warning.js"), "text/javascript", false).await,
 		"relative_time.js" => resource(include_str!("../static/relative_time.js"), "text/javascript", false).await,
 		"browser_session.js" => resource(include_str!("../static/browser_session.js"), "text/javascript", false).await,
 		"author_links.js" => resource(include_str!("../static/author_links.js"), "text/javascript", false).await,
@@ -525,6 +526,9 @@ async fn main() {
 		.at("/browser_session.js")
 		.get(|_| resource(include_str!("../static/browser_session.js"), "text/javascript", false).boxed());
 	app
+		.at("/promo_warning.js")
+		.get(|_| resource(include_str!("../static/promo_warning.js"), "text/javascript", false).boxed());
+	app
 		.at("/author_links.js")
 		.get(|_| resource(include_str!("../static/author_links.js"), "text/javascript", false).boxed());
 	app
@@ -576,6 +580,7 @@ async fn main() {
 	app.at("/api/browser-sessions/heartbeat").post(|r| post_cache::browser_session_heartbeat(r).boxed());
 	app.at("/api/browser-sessions/release").post(|r| post_cache::browser_session_release(r).boxed());
 	app.at("/post-feedback").post(|r| post_feedback::update(r).boxed());
+	app.at("/api/promo-status").get(|r| promo_detection::status(r).boxed());
 	app
 		.at("/api/subreddit-embedding-activity/:sub")
 		.get(|r| observed_semantic_backfill::activity_api(r).boxed());

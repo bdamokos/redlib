@@ -47,8 +47,12 @@ ARG GIT_HASH=dev
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     ffmpeg \
+    python3-venv \
     wget \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/redlib-promo && \
+    /opt/redlib-promo/bin/pip install --no-cache-dir opencv-python-headless==5.0.0.93
 
 # Copy the binary from builder
 COPY --from=builder /tmp/redlib /usr/local/bin/redlib
@@ -58,6 +62,7 @@ COPY --from=builder /tmp/subreddit_content_semantic_backfill /usr/local/bin/subr
 # Copy the templates directory
 COPY --from=builder /usr/src/redlib/templates /templates
 COPY --from=builder /usr/src/redlib/static /static
+COPY scripts/snap_promo_detector.py /usr/local/lib/redlib/snap_promo_detector.py
 
 RUN mkdir -p /var/lib/redlib/cache /var/lib/redlib/state && \
     chown -R nobody:nogroup /var/lib/redlib
@@ -76,6 +81,8 @@ ENV REDLIB_DEFAULT_AUTOPLAY_VIDEOS=off
 ENV REDLIB_BANNER_TEXT=Redlib
 ENV REDLIB_CACHE_DIR=/var/lib/redlib/cache
 ENV REDLIB_PREFS_DB=/var/lib/redlib/state/preferences.sqlite3
+ENV REDLIB_PROMO_CLASSIFIER_PYTHON=/opt/redlib-promo/bin/python3
+ENV REDLIB_PROMO_CLASSIFIER_SCRIPT=/usr/local/lib/redlib/snap_promo_detector.py
 # Keep glibc from creating a large arena per Tokio/blocking worker. Runtime
 # environments may still override this for allocator A/B tests.
 ENV MALLOC_ARENA_MAX=2
