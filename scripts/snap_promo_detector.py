@@ -87,6 +87,18 @@ def _square_markers(mask: np.ndarray) -> int:
     return len(markers)
 
 
+def _qr_geometry(image: np.ndarray) -> bool:
+    detected, points = cv2.QRCodeDetector().detect(image)
+    if not detected or points is None:
+        return False
+    polygon = points.reshape(-1, 2).astype(np.float32)
+    sides = [float(np.linalg.norm(polygon[(index + 1) % 4] - polygon[index])) for index in range(4)]
+    if min(sides, default=0.0) <= 0.0 or max(sides) / min(sides) > 1.40:
+        return False
+    area_fraction = abs(float(cv2.contourArea(polygon))) / float(image.shape[0] * image.shape[1])
+    return area_fraction >= 0.04
+
+
 def fast_features(image: np.ndarray) -> tuple[float, float, int, int, float]:
     image = _normalize_image(image)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -118,13 +130,14 @@ def fast_features(image: np.ndarray) -> tuple[float, float, int, int, float]:
 
 def fast_classify(image: np.ndarray) -> Detection:
     started = time.perf_counter_ns()
+    image = _normalize_image(image)
     yellow, black, components, markers, text_edges = fast_features(image)
 
     # Snapcodes have a large saturated-yellow field, dense black dots and at
     # least two square corner markers.  A dense component fallback covers
     # screenshots where the corner shapes have been clipped or decorated.
     strong_geometry = yellow >= 0.22 and 0.055 <= black <= 0.48 and markers >= 2 and components >= 18
-    dense_geometry = yellow >= 0.38 and 0.07 <= black <= 0.42 and components >= 42
+    dense_geometry = yellow >= 0.20 and 0.07 <= black <= 0.42 and components >= 60
     if strong_geometry or dense_geometry:
         marker_score = min(1.0, markers / 3)
         component_score = min(1.0, components / 70)
@@ -132,9 +145,17 @@ def fast_classify(image: np.ndarray) -> Detection:
         signal = "snapcode"
         reason = "yellow QR-like field"
     else:
-        confidence = 0.0
-        signal = "none"
-        reason = ""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        mid_dark_fraction = float(cv2.countNonZero(cv2.inRange(gray, 0, 150)) / gray.size)
+        qr_detected = 0.015 <= mid_dark_fraction <= 0.65 and _qr_geometry(image)
+        if qr_detected:
+            confidence = 0.90
+            signal = "telegram_qr"
+            reason = "QR code field"
+        else:
+            confidence = 0.0
+            signal = "none"
+            reason = ""
 
     elapsed = (time.perf_counter_ns() - started) / 1_000_000
     return Detection(signal, confidence, reason, yellow, black, components, markers, text_edges, fast_ms=elapsed)
@@ -240,13 +261,31 @@ def percentile(values: list[float], p: float) -> float:
 
 
 def decode_image(encoded: bytes) -> np.ndarray | None:
-    """Decode at source resolution before extracting Snapcode geometry.
-
-    JPEG reduced-decode modes can alias ordinary photographic edges into small
-    square contours.  The feature pass already bounds its input to 320px, so
-    preserving the source geometry here costs only the full JPEG decode.
-    """
+    """Decode at source resolution for confirmation of positive candidates."""
     return cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def decode_candidate(encoded: bytes, content_type: str) -> np.ndarray | None:
+    if "jpeg" not in content_type and "jpg" not in content_type:
+        return cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+    buffer = np.frombuffer(encoded, dtype=np.uint8)
+    candidate = cv2.imdecode(buffer, cv2.IMREAD_REDUCED_COLOR_8)
+    if candidate is not None and max(candidate.shape[:2]) < 160:
+        candidate = cv2.imdecode(buffer, cv2.IMREAD_REDUCED_COLOR_4)
+    return candidate
+
+
+def classify_encoded(encoded: bytes, content_type: str) -> Detection | None:
+    """Fast reduced JPEG scan with full-resolution confirmation on positives."""
+    candidate = decode_candidate(encoded, content_type)
+    if candidate is None:
+        return None
+    detection = fast_classify(candidate)
+    is_jpeg = "jpeg" in content_type or "jpg" in content_type
+    if not detection.flagged or not is_jpeg:
+        return detection
+    full_image = decode_image(encoded)
+    return None if full_image is None else fast_classify(full_image)
 
 
 def _read_exact(stream, size: int) -> bytes | None:
@@ -273,11 +312,11 @@ def worker_main() -> int:
         if encoded is None:
             raise EOFError("missing worker image")
         started = time.perf_counter_ns()
-        image = decode_image(encoded)
-        if image is None:
+        content_type = str(_metadata.get("content_type", ""))
+        detection = classify_encoded(encoded, content_type)
+        if detection is None:
             reply = {"flagged": False, "signal": "none", "fast_ms": 0.0, "error": "decode_failed"}
         else:
-            detection = fast_classify(image)
             reply = {
                 "flagged": detection.flagged,
                 "signal": detection.signal,

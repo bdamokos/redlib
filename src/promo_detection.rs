@@ -77,7 +77,18 @@ struct MediaMapping {
 enum MediaState {
 	Pending,
 	Negative,
-	Positive,
+	PositiveSnapcode,
+	PositiveTelegramQr,
+}
+
+impl MediaState {
+	fn signal(self) -> Option<&'static str> {
+		match self {
+			Self::PositiveSnapcode => Some("snapcode"),
+			Self::PositiveTelegramQr => Some("telegram_qr"),
+			Self::Pending | Self::Negative => None,
+		}
+	}
 }
 
 struct ImageJob {
@@ -342,9 +353,19 @@ pub fn register_media_post(url: &str, post_id: &str) {
 	});
 	mapping.last_seen = Instant::now();
 	mapping.post_ids.insert(post_id.to_string());
-	if matches!(MEDIA_STATES.lock().ok().and_then(|states| states.get(url).copied()), Some(MediaState::Positive)) {
-		mark(post_id, "snapcode");
+	if let Some(signal) = MEDIA_STATES.lock().ok().and_then(|states| states.get(url).copied()).and_then(MediaState::signal) {
+		mark(post_id, signal);
 	}
+}
+
+fn media_has_unmarked_post(url: &str) -> bool {
+	let post_ids = MEDIA_POSTS
+		.lock()
+		.ok()
+		.and_then(|mappings| mappings.get(url).map(|mapping| mapping.post_ids.iter().cloned().collect::<Vec<_>>()))
+		.unwrap_or_default();
+	let Ok(state) = STATE.lock() else { return true };
+	post_ids.iter().any(|post_id| !state.markers.contains_key(post_id))
 }
 
 pub fn enqueue_image(url: &str, content_type: &str, body: hyper::body::Bytes) {
@@ -374,24 +395,32 @@ pub fn enqueue_image(url: &str, content_type: &str, body: hyper::body::Bytes) {
 
 fn worker_loop(receiver: mpsc::Receiver<ImageJob>) {
 	for job in receiver {
+		// Do not attempt to cancel an OpenCV call already in progress. Once a
+		// gallery image flags every mapped post, cheaply skip later queued media.
+		if !media_has_unmarked_post(&job.url) {
+			if let Ok(mut states) = MEDIA_STATES.lock() {
+				states.remove(&job.url);
+			}
+			continue;
+		}
 		match run_worker_job(&job) {
 			Ok(reply) => {
-				let state = if reply.flagged && reply.signal == "snapcode" {
-					MediaState::Positive
-				} else {
-					MediaState::Negative
+				let state = match (reply.flagged, reply.signal.as_str()) {
+					(true, "snapcode") => MediaState::PositiveSnapcode,
+					(true, "telegram_qr") => MediaState::PositiveTelegramQr,
+					_ => MediaState::Negative,
 				};
 				if let Ok(mut states) = MEDIA_STATES.lock() {
 					states.insert(job.url.clone(), state);
 				}
-				if matches!(state, MediaState::Positive) {
+				if let Some(signal) = state.signal() {
 					let ids = MEDIA_POSTS
 						.lock()
 						.ok()
 						.and_then(|mappings| mappings.get(&job.url).map(|mapping| mapping.post_ids.iter().cloned().collect::<Vec<_>>()))
 						.unwrap_or_default();
 					for id in ids {
-						mark(&id, "snapcode");
+						mark(&id, signal);
 					}
 				}
 				log::debug!(
@@ -414,7 +443,7 @@ fn worker_loop(receiver: mpsc::Receiver<ImageJob>) {
 
 fn run_worker_job(job: &ImageJob) -> Result<WorkerReply, String> {
 	// Starting once per image is deliberately avoided: the helper stays alive
-	// and uses OpenCV's own reduced JPEG decode. It is restarted after a crash.
+	// and is restarted after a crash.
 	static PROCESS: LazyLock<Mutex<Option<WorkerProcess>>> = LazyLock::new(|| Mutex::new(None));
 	let mut guard = PROCESS.lock().map_err(|_| "worker process lock poisoned".to_string())?;
 	if guard.is_none() {
@@ -635,8 +664,9 @@ pub fn snapshot_markers() -> Vec<PersistedPromoMarker> {
 }
 
 fn marker_is_restorable(marker: &PersistedPromoMarker) -> bool {
-	let stale_snapcode = marker.signal == "snapcode" && marker.detector_version != DETECTOR_VERSION;
-	!stale_snapcode && crate::post_components::PostId::parse(&marker.post_id).is_some()
+	let image_signal = matches!(marker.signal.as_str(), "snapcode" | "telegram_qr");
+	let stale_image_signal = image_signal && marker.detector_version != DETECTOR_VERSION;
+	!stale_image_signal && crate::post_components::PostId::parse(&marker.post_id).is_some()
 }
 
 pub fn restore_markers(markers: Vec<PersistedPromoMarker>) {
@@ -726,7 +756,14 @@ mod tests {
 			detector_version: "snap-promo-v2".to_string(),
 			detected_at_unix: 1,
 		};
+		let stale_telegram_qr = PersistedPromoMarker {
+			post_id: "staletgqr1".to_string(),
+			signal: "telegram_qr".to_string(),
+			detector_version: "snap-promo-v2".to_string(),
+			detected_at_unix: 1,
+		};
 		assert!(!marker_is_restorable(&stale_snapcode));
+		assert!(!marker_is_restorable(&stale_telegram_qr));
 		assert!(marker_is_restorable(&old_title_marker));
 	}
 

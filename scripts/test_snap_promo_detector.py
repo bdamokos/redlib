@@ -5,7 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
-from snap_promo_detector import decode_image, fast_classify, text_signal
+from snap_promo_detector import classify_encoded, decode_candidate, decode_image, fast_classify, text_signal
 
 
 class SnapPromoDetectorTests(unittest.TestCase):
@@ -23,13 +23,28 @@ class SnapPromoDetectorTests(unittest.TestCase):
         cv2.ellipse(image, (128, 128), (70, 105), 0, 0, 360, (20, 180, 230), -1)
         self.assertEqual(fast_classify(image).signal, "none")
 
-    def test_jpeg_decode_preserves_source_geometry(self):
+    def test_telegram_qr_geometry_is_flagged(self):
+        qr = cv2.QRCodeEncoder_create().encode("https://t.me/example")
+        qr = cv2.resize(qr, (240, 240), interpolation=cv2.INTER_NEAREST)
+        image = np.full((320, 320, 3), (235, 220, 200), dtype=np.uint8)
+        image[40:280, 40:280] = cv2.cvtColor(qr, cv2.COLOR_GRAY2BGR)
+        self.assertEqual(fast_classify(image).signal, "telegram_qr")
+
+    def test_positive_jpeg_candidate_is_confirmed_at_source_geometry(self):
         image = np.full((416, 750, 3), (25, 170, 205), dtype=np.uint8)
+        qr = cv2.QRCodeEncoder_create().encode("https://t.me/example")
+        qr = cv2.resize(qr, (240, 240), interpolation=cv2.INTER_NEAREST)
+        image[80:320, 255:495] = cv2.cvtColor(qr, cv2.COLOR_GRAY2BGR)
         ok, encoded = cv2.imencode(".jpeg", image)
         self.assertTrue(ok)
+        candidate = decode_candidate(encoded.tobytes(), "image/jpeg")
         decoded = decode_image(encoded.tobytes())
+        detection = classify_encoded(encoded.tobytes(), "image/jpeg")
+        self.assertIsNotNone(candidate)
         self.assertIsNotNone(decoded)
+        self.assertLess(candidate.shape[0], decoded.shape[0])
         self.assertEqual(decoded.shape, image.shape)
+        self.assertEqual(detection.signal, "telegram_qr")
 
     def test_unlabelled_username_is_neutral(self):
         self.assertIsNone(text_signal("@ordinary_username"))
