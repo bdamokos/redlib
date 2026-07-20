@@ -137,6 +137,9 @@ pub struct Config {
 	#[serde(rename = "REDLIB_PREFS_TOUCH_INTERVAL_SECS")]
 	pub(crate) prefs_touch_interval_secs: Option<String>,
 
+	#[serde(rename = "REDLIB_TRUSTED_PREFS_PROFILE_IDS")]
+	pub(crate) trusted_prefs_profile_ids: Option<String>,
+
 	#[serde(rename = "REDLIB_INSTANCE_SCRAPE_ENABLED")]
 	pub(crate) instance_scrape_enabled: Option<String>,
 
@@ -218,6 +221,7 @@ impl Config {
 			prefs_db: parse("REDLIB_PREFS_DB"),
 			prefs_max_age_days: parse("REDLIB_PREFS_MAX_AGE_DAYS"),
 			prefs_touch_interval_secs: parse("REDLIB_PREFS_TOUCH_INTERVAL_SECS"),
+			trusted_prefs_profile_ids: parse("REDLIB_TRUSTED_PREFS_PROFILE_IDS"),
 			instance_scrape_enabled: parse("REDLIB_INSTANCE_SCRAPE_ENABLED"),
 			instance_scrape_sources: parse("REDLIB_INSTANCE_SCRAPE_SOURCES"),
 			instance_scrape_timeout_secs: parse("REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS"),
@@ -264,6 +268,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_PREFS_DB" => config.prefs_db.clone(),
 		"REDLIB_PREFS_MAX_AGE_DAYS" => config.prefs_max_age_days.clone(),
 		"REDLIB_PREFS_TOUCH_INTERVAL_SECS" => config.prefs_touch_interval_secs.clone(),
+		"REDLIB_TRUSTED_PREFS_PROFILE_IDS" => config.trusted_prefs_profile_ids.clone(),
 		"REDLIB_INSTANCE_SCRAPE_ENABLED" => config.instance_scrape_enabled.clone(),
 		"REDLIB_INSTANCE_SCRAPE_SOURCES" => config.instance_scrape_sources.clone(),
 		"REDLIB_INSTANCE_SCRAPE_TIMEOUT_SECS" => config.instance_scrape_timeout_secs.clone(),

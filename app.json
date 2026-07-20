@@ -89,6 +89,9 @@
     "REDLIB_PREFS_TOUCH_INTERVAL_SECS": {
       "required": false
     },
+    "REDLIB_TRUSTED_PREFS_PROFILE_IDS": {
+      "required": false
+    },
     "REDLIB_INSTANCE_SCRAPE_ENABLED": {
       "required": false
     },

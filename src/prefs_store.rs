@@ -94,7 +94,11 @@ pub(crate) fn prepare_request(req: &mut Request<Body>) -> PreferenceCookieAction
 	let cookie_id = session_cookie_id(req);
 	let legacy_present = has_legacy_preferences(req);
 
-	if let Some(id) = cookie_id {
+	if let Some(cookie_id) = cookie_id {
+		let id = trusted_profile_canonical_id(&cookie_id);
+		if id != cookie_id {
+			actions.set_session_id = Some(id.clone());
+		}
 		match load_record(&id) {
 			Ok(Some(mut record)) => {
 				touch_record(&id, &mut record);
@@ -193,6 +197,24 @@ fn valid_session_id(id: &str) -> bool {
 
 fn new_session_id() -> String {
 	Uuid::new_v4().to_string()
+}
+
+/// Resolve explicitly allowlisted browser profiles to one canonical row. The
+/// first UUID in the private server setting is canonical; unrelated profile
+/// IDs retain the normal per-browser isolation behavior.
+fn trusted_profile_canonical_id(id: &str) -> String {
+	let configured = config::get_setting("REDLIB_TRUSTED_PREFS_PROFILE_IDS").unwrap_or_default();
+	trusted_profile_canonical_id_from(id, &configured).unwrap_or_else(|| id.to_string())
+}
+
+fn trusted_profile_canonical_id_from(id: &str, configured: &str) -> Option<String> {
+	let mut ids = configured.split([',', '+']).map(str::trim).filter(|candidate| valid_session_id(candidate));
+	let canonical = ids.next()?;
+	if canonical == id || ids.any(|candidate| candidate == id) {
+		Some(canonical.to_string())
+	} else {
+		None
+	}
 }
 
 fn now_unix() -> u64 {
@@ -562,6 +584,7 @@ fn clear_legacy_preference_cookies(response: &mut Response<Body>, names: &[Strin
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use sealed_test::prelude::*;
 
 	fn prefs(subscriptions: &[&str], filters: &[&str]) -> Preferences {
 		let mut prefs = Preferences {
@@ -631,5 +654,58 @@ mod tests {
 		};
 
 		assert!(!legacy_preferences_look_partial(&legacy));
+	}
+
+	#[test]
+	fn trusted_profiles_resolve_to_first_allowlisted_id() {
+		let canonical = "00000000-0000-4000-8000-000000000001";
+		let member = "00000000-0000-4000-8000-000000000002";
+		let outsider = "00000000-0000-4000-8000-000000000003";
+		let configured = format!("{canonical},{member}");
+
+		assert_eq!(trusted_profile_canonical_id_from(canonical, &configured), Some(canonical.to_string()));
+		assert_eq!(trusted_profile_canonical_id_from(member, &configured), Some(canonical.to_string()));
+		assert_eq!(trusted_profile_canonical_id_from(outsider, &configured), None);
+	}
+
+	#[test]
+	fn trusted_profiles_ignore_invalid_ids() {
+		let member = "00000000-0000-4000-8000-000000000002";
+		assert_eq!(trusted_profile_canonical_id_from(member, "not-a-uuid,also-invalid"), None);
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		(
+			"REDLIB_TRUSTED_PREFS_PROFILE_IDS",
+			"00000000-0000-4000-8000-000000000001,00000000-0000-4000-8000-000000000002"
+		)
+	])]
+	fn trusted_member_request_loads_canonical_profile_and_migrates_cookie() {
+		let db_path = PathBuf::from(format!("/tmp/redlib-trusted-prefs-profile-alias-test-{}.sqlite3", std::process::id()));
+		std::env::set_var("REDLIB_PREFS_DB", &db_path);
+		for suffix in ["", "-wal", "-shm"] {
+			let _ = fs::remove_file(format!("{}{}", db_path.display(), suffix));
+		}
+
+		let canonical = "00000000-0000-4000-8000-000000000001";
+		let member = "00000000-0000-4000-8000-000000000002";
+		let canonical_prefs = prefs(&["rust"], &["news"]);
+		let mut member_prefs = prefs(&["programming"], &["sports"]);
+		member_prefs.theme = "light".to_string();
+		save_record(canonical, &canonical_prefs).unwrap();
+		save_record(member, &member_prefs).unwrap();
+
+		let mut req = request_with_cookie(&format!("{PREFS_COOKIE}={member}"));
+		let actions = prepare_request(&mut req);
+		let loaded = req.extensions().get::<RequestPreferences>().unwrap();
+		assert_eq!(loaded.id, canonical);
+		assert_eq!(loaded.prefs.theme, "dark");
+		assert_eq!(loaded.prefs.subscriptions, ["rust"]);
+		assert_eq!(actions.set_session_id.as_deref(), Some(canonical));
+
+		for suffix in ["", "-wal", "-shm"] {
+			let _ = fs::remove_file(format!("{}{}", db_path.display(), suffix));
+		}
 	}
 }

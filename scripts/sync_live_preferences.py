@@ -15,6 +15,7 @@ import sys
 
 
 REMOTE_CODE = r'''
+import base64
 import copy
 import datetime
 import hashlib
@@ -93,6 +94,51 @@ def ordered_union(records, field):
     return merged
 
 
+def decode_json_list(value):
+    if not value:
+        return []
+    padded = str(value) + "=" * (-len(str(value)) % 4)
+    decoded = base64.urlsafe_b64decode(padded.encode())
+    parsed = json.loads(decoded)
+    if not isinstance(parsed, list):
+        raise RuntimeError("encoded preference collection is not a list")
+    return parsed
+
+
+def encode_json_list(values):
+    if not values:
+        return ""
+    encoded = base64.urlsafe_b64encode(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode()).decode()
+    return encoded.rstrip("=")
+
+
+def ordered_flair_union(records):
+    merged = []
+    seen = set()
+    for record in records:
+        for item in decode_json_list(record["prefs"].get("flair_subscriptions")):
+            key = (str(item.get("subreddit", "")).casefold(), str(item.get("flair", "")).casefold())
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def merged_post_feedback(records):
+    merged = {}
+    for record in records:
+        for item in decode_json_list(record["prefs"].get("post_feedback")):
+            key = (str(item.get("post_id", "")).casefold(), str(item.get("model", "")).casefold())
+            if not all(key):
+                continue
+            existing = merged.get(key)
+            if existing is None or int(item.get("created_at_unix", 0)) > int(existing.get("created_at_unix", 0)):
+                merged[key] = item
+    ordered = sorted(merged.values(), key=lambda item: int(item.get("created_at_unix", 0)))
+    return ordered[-1000:]
+
+
 def human(ts):
     return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).isoformat(timespec="seconds")
 
@@ -106,14 +152,18 @@ def summarize_prefs(prefs):
     filters = split_plus(prefs.get("filters"))
     users = [item for item in subs if item.casefold().startswith("u_")]
     subreddits = [item for item in subs if not item.casefold().startswith("u_")]
+    flair_subscriptions = decode_json_list(prefs.get("flair_subscriptions"))
+    post_feedback = decode_json_list(prefs.get("post_feedback"))
     scalar = copy.deepcopy(prefs)
-    scalar["subscriptions"] = ""
-    scalar["filters"] = ""
+    for field in ("subscriptions", "filters", "flair_subscriptions", "post_feedback"):
+        scalar[field] = ""
     return {
         "subscriptions": len(subs),
         "users": len(users),
         "subreddits": len(subreddits),
         "filters": len(filters),
+        "flair_subscriptions": len(flair_subscriptions),
+        "post_feedback": len(post_feedback),
         "subscription_hash": hash_values(subs),
         "filter_hash": hash_values(filters),
         "scalar_hash": hashlib.sha1(json.dumps(scalar, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12],
@@ -341,9 +391,13 @@ def main():
 
         merged_subscriptions = ordered_union(targets, "subscriptions")
         merged_filters = ordered_union(targets, "filters")
+        merged_flair_subscriptions = ordered_flair_union(targets)
+        merged_feedback = merged_post_feedback(targets)
         merged_prefs = copy.deepcopy(source["prefs"])
         merged_prefs["subscriptions"] = plus_join(merged_subscriptions)
         merged_prefs["filters"] = plus_join(merged_filters)
+        merged_prefs["flair_subscriptions"] = encode_json_list(merged_flair_subscriptions)
+        merged_prefs["post_feedback"] = encode_json_list(merged_feedback)
         merged_json = json.dumps(merged_prefs, separators=(",", ":"), ensure_ascii=False)
         now = int(time.time())
 
@@ -353,6 +407,8 @@ def main():
             f"users={sum(1 for item in merged_subscriptions if item.casefold().startswith('u_'))}",
             f"subreddits={sum(1 for item in merged_subscriptions if not item.casefold().startswith('u_'))}",
             f"filters={len(merged_filters)}",
+            f"flair_subscriptions={len(merged_flair_subscriptions)}",
+            f"post_feedback={len(merged_feedback)}",
             flush=True,
         )
 

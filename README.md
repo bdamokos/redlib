@@ -455,6 +455,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `PREFS_DB`                | String          | `/var/lib/redlib/state/preferences.sqlite3` | SQLite database used for server-side preference storage.                                      |
 | `PREFS_MAX_AGE_DAYS`      | Integer         | `365`                  | Evicts server-side preference records that have not been visited for this many days.                       |
 | `PREFS_TOUCH_INTERVAL_SECS` | Integer       | `3600`                 | Minimum interval between persisted `last_visit` updates for an active preference record.                   |
+| `TRUSTED_PREFS_PROFILE_IDS` | String        |                        | Comma-separated server-side preference profile UUIDs that should share the first profile; other visitors remain isolated. |
 | `INSTANCE_SCRAPE_ENABLED` | `["on", "off"]` | `off`                  | Enables direct-request fallback scraping from public stock Redlib instances when Reddit rate limits apply. |
 | `INSTANCE_SCRAPE_SOURCES` | CSV of origins  | (empty)                | Optional override list of Redlib origins. If unset, Redlib uses the public `redlib-instances` JSON catalog and refreshes health every 3 days. |
 | `INSTANCE_SCRAPE_TIMEOUT_SECS` | Integer     | `6`                    | Per-request timeout for external Redlib scrape fallback and instance-health probes.                        |

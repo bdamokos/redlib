@@ -131,6 +131,14 @@ impl InstanceInfo {
 				["Full URL", &convert(&self.config.full_url)],
 				["Remove default feeds", &convert(&self.config.default_remove_default_feeds)],
 				["Cache dir", &convert(&self.config.cache_dir)],
+				[
+					"Trusted preference profiles",
+					if self.config.trusted_prefs_profile_ids.is_some() {
+						"<span>Configured</span>"
+					} else {
+						"<span class=\"unset\"><i>Unset</i></span>"
+					},
+				],
 				["Instance scrape enabled", &convert(&self.config.instance_scrape_enabled)],
 				[
 					"Instance scrape sources",
@@ -196,6 +204,7 @@ impl InstanceInfo {
 				Full URL: {:?}\n
 				Remove default feeds: {:?}\n
 				Cache dir: {:?}\n
+				Trusted preference profiles: {}\n
 				Instance scrape enabled: {:?}\n
 				Instance scrape sources: {}\n
 				Instance scrape timeout: {:?}\n
@@ -233,6 +242,7 @@ impl InstanceInfo {
 					self.config.full_url,
 					self.config.default_remove_default_feeds,
 					self.config.cache_dir,
+					if self.config.trusted_prefs_profile_ids.is_some() { "Configured" } else { "Unset" },
 					self.config.instance_scrape_enabled,
 					if self.config.instance_scrape_sources.is_some() { "Configured" } else { "Unset" },
 					self.config.instance_scrape_timeout_secs,
