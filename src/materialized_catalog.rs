@@ -485,6 +485,23 @@ fn suggested_profile_feedback_adjusted_score(score: f64, summary: Option<&PostFe
 	(score + post_feedback_score_adjustment(summary, SUGGESTED_PROFILE_FEEDBACK_MAX_SCORE_ADJUSTMENT)).clamp(0.01, 1.0)
 }
 
+fn suggested_profile_promotion_quality_factor(counts: &HashMap<String, usize>) -> f64 {
+	let mut weighted_quality = 0.0;
+	let mut total = 0usize;
+	for (subreddit, count) in counts {
+		if *count == 0 {
+			continue;
+		}
+		weighted_quality += crate::promo_detection::promotion_quality_factor(subreddit) * *count as f64;
+		total = total.saturating_add(*count);
+	}
+	if total == 0 {
+		1.0
+	} else {
+		weighted_quality / total as f64
+	}
+}
+
 fn suggested_profile_has_positive_feedback(summary: Option<&PostFeedbackSummary>) -> bool {
 	post_feedback_summary_affinity(summary) > 0.0
 }
@@ -1347,7 +1364,13 @@ fn catalog_record_is_visible(record: &CatalogRecord, allowed_keys: &HashSet<Cata
 	if record.source_keys.is_disjoint(allowed_keys) {
 		return false;
 	}
-	if filters.contains(&record.post.community) || filters.contains(&format!("u_{}", record.post.author.name)) {
+	if crate::promo_detection::post_is_promotional(&record.post.id) {
+		return false;
+	}
+	if filters
+		.iter()
+		.any(|filter| filter.eq_ignore_ascii_case(&record.post.community) || filter.eq_ignore_ascii_case(&format!("u_{}", record.post.author.name)))
+	{
 		return false;
 	}
 	if crate::utils::is_deleted_reddit_placeholder_post(&record.post) {
@@ -1913,7 +1936,11 @@ fn related_profile_signals(counts: &HashMap<String, usize>, current_embedding: &
 		.filter_map(|(subreddit, count)| {
 			let embedding = embeddings.get(&subreddit)?;
 			let similarity = embedding_cosine(current_embedding, embedding);
-			(similarity > 0.0).then_some((subreddit, similarity * suggested_profile_vector_count_weight(count), count))
+			(similarity > 0.0).then_some((
+				subreddit.clone(),
+				similarity * suggested_profile_vector_count_weight(count) * crate::promo_detection::promotion_quality_factor(&subreddit),
+				count,
+			))
 		})
 		.collect::<Vec<_>>();
 	signals.sort_by(|left, right| {
@@ -1999,8 +2026,8 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 			Some((
 				followed_subreddits.contains(&candidate),
 				RelatedSubredditEntry {
-					name: candidate,
-					score_percent: related_score_percent(similarity),
+					name: candidate.clone(),
+					score_percent: related_score_percent(similarity * crate::promo_detection::promotion_quality_factor(&candidate)),
 					cached_profile_count,
 					cached_post_count,
 				},
@@ -2075,7 +2102,7 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 				followed_profiles.contains(&profile),
 				RelatedProfileEntry {
 					name: profile,
-					score_percent: related_score_percent(similarity * confidence),
+					score_percent: related_score_percent(similarity * confidence * suggested_profile_promotion_quality_factor(&counts)),
 					cached_posts,
 					current_subreddit_posts: counts.get(&subreddit).copied().unwrap_or_default(),
 					signal_subreddits: related_profile_signals(&counts, &current_embedding, &profile_embeddings, 3),
@@ -2386,7 +2413,10 @@ fn suggested_profiles_overlap(
 
 			let similarity = dot / (followed_norm * candidate_norm_sq.sqrt());
 			let confidence = (cached_posts as f64 / 8.0).min(1.0);
-			let score = suggested_profile_feedback_adjusted_score(similarity * confidence * suggested_profile_overlap_factor(overlap_count), feedback_summary);
+			let score = suggested_profile_feedback_adjusted_score(
+				similarity * confidence * suggested_profile_overlap_factor(overlap_count) * suggested_profile_promotion_quality_factor(&counts),
+				feedback_summary,
+			);
 			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
 
 			suggestions.push(SuggestedProfileEntry {
@@ -2666,7 +2696,10 @@ fn suggested_profiles_vector_mode(
 			overlap_subreddits.truncate(SUGGESTED_PROFILE_REASON_LIMIT);
 
 			let confidence = (cached_posts as f64 / 12.0).sqrt().min(1.0);
-			let score = suggested_profile_feedback_adjusted_score(similarity * confidence * suggested_profile_vector_breadth_factor(overlap_count), feedback_summary);
+			let score = suggested_profile_feedback_adjusted_score(
+				similarity * confidence * suggested_profile_vector_breadth_factor(overlap_count) * suggested_profile_promotion_quality_factor(&counts),
+				feedback_summary,
+			);
 			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
 
 			suggestions.push(SuggestedProfileEntry {
@@ -3004,7 +3037,10 @@ fn suggested_profiles_semantic_mode(
 
 			let overlap_count = overlap_subreddits.len();
 			let confidence = (cached_posts as f64 / 12.0).sqrt().min(1.0);
-			let score = suggested_profile_feedback_adjusted_score(similarity * confidence * suggested_profile_vector_breadth_factor(overlap_count), feedback_summary);
+			let score = suggested_profile_feedback_adjusted_score(
+				similarity * confidence * suggested_profile_vector_breadth_factor(overlap_count) * suggested_profile_promotion_quality_factor(&counts),
+				feedback_summary,
+			);
 			let score_percent = (score * 100.0).round().clamp(1.0, 100.0) as u32;
 
 			suggestions.push(SuggestedProfileEntry {

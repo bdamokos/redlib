@@ -1840,6 +1840,20 @@ pub struct Subreddit {
 	pub nsfw: bool,
 }
 
+impl Subreddit {
+	pub fn promotion_seen_posts(&self) -> usize {
+		crate::promo_detection::subreddit_promotion_stats(&self.name).seen_posts
+	}
+
+	pub fn promotion_filtered_posts(&self) -> usize {
+		crate::promo_detection::subreddit_promotion_stats(&self.name).filtered_posts
+	}
+
+	pub fn promotion_filtered_percent(&self) -> u32 {
+		crate::promo_detection::subreddit_promotion_stats(&self.name).filtered_percent
+	}
+}
+
 /// Parser for query params, used in sorting (eg. /r/rust/?sort=hot)
 #[derive(serde::Deserialize, PartialEq)]
 pub struct Params {
@@ -2938,7 +2952,15 @@ pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, b
 	if posts.is_empty() {
 		(0, false)
 	} else {
-		posts.retain(|p| !(filters.contains(&p.community) || filters.contains(&["u_", &p.author.name].concat())));
+		let filters_lc = filters.iter().map(|value| value.to_ascii_lowercase()).collect::<HashSet<_>>();
+		for post in posts.iter() {
+			crate::promo_detection::observe_post(post);
+		}
+		posts.retain(|p| {
+			!crate::promo_detection::post_is_promotional(&p.id)
+				&& !filters_lc.contains(&p.community.to_ascii_lowercase())
+				&& !filters_lc.contains(&format!("u_{}", p.author.name.to_ascii_lowercase()))
+		});
 
 		// Get the length of the Vec<Post> after applying the filter.
 		// If lb > la, then at least one post was removed.
@@ -6104,12 +6126,12 @@ mod tests {
 	use super::{
 		cache_author_watched_links_from_posts, cached_subreddit_users, clear_sharded_cookie, clear_test_caches, coomer_lookup_candidates_from_links,
 		coomer_lookup_links_with_checker, decode_flair_subscriptions, dedupe_external_links_by_host, encode_flair_subscriptions, extract_allmylinks_creator_links,
-		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, footer_ratelimit_parts_for_status,
-		footer_ratelimit_parts_for_status_and_peers, footer_ratelimit_parts_for_status_peers_and_configured, format_num, format_url, format_video_duration,
-		hydrate_post_author_links_from_cache, is_creator_archive_link, is_creator_profile_overview_link, post_feedback_score_adjustment, post_feedback_summary_affinity,
-		read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links, store_subreddit_users, time,
-		user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair, FlairSubscription, GalleryMedia, Media,
-		Post, PostFeedbackEntry, PostFeedbackSummary, Preferences, User,
+		extract_beacons_creator_links, extract_linktree_creator_links, extract_profile_social_links, extract_watched_creator_links, filter_posts,
+		footer_ratelimit_parts_for_status, footer_ratelimit_parts_for_status_and_peers, footer_ratelimit_parts_for_status_peers_and_configured, format_num, format_url,
+		format_video_duration, hydrate_post_author_links_from_cache, is_creator_archive_link, is_creator_profile_overview_link, post_feedback_score_adjustment,
+		post_feedback_summary_affinity, read_sharded_cookie, redgifs_uploader_matches_author, refresh_post_times, restore_persisted_state, rewrite_urls, store_author_links,
+		store_subreddit_users, time, user_profile_details, write_sharded_cookie, Author, Awards, CoomerListingFile, CoomerListingPost, ExternalLink, Flags, Flair,
+		FlairSubscription, GalleryMedia, Media, Post, PostFeedbackEntry, PostFeedbackSummary, Preferences, User,
 	};
 	use crate::cache_persistence::PersistedSubredditUsersEntry;
 	use crate::client::{PeerRateLimitStatus, RedditRateLimitState, RedditRateLimitStatus};
@@ -6121,6 +6143,34 @@ mod tests {
 	use std::collections::HashSet;
 	use std::io::Write;
 	use time::OffsetDateTime;
+
+	#[test]
+	fn filter_posts_eliminates_detected_promotions_and_matches_author_filters_case_insensitively() {
+		let mut promotional = Post::default();
+		promotional.id = "phase2promo1".to_string();
+		promotional.title = "first 50 to say yes gets my free nudes no joke".to_string();
+		promotional.community = "ExampleSub".to_string();
+		promotional.author.name = "PromoUser".to_string();
+
+		let mut filtered_author = Post::default();
+		filtered_author.id = "phase2normal1".to_string();
+		filtered_author.title = "ordinary title".to_string();
+		filtered_author.community = "ExampleSub".to_string();
+		filtered_author.author.name = "MixedCaseUser".to_string();
+
+		let mut retained = Post::default();
+		retained.id = "phase2normal2".to_string();
+		retained.title = "ordinary title".to_string();
+		retained.community = "ExampleSub".to_string();
+		retained.author.name = "KeptUser".to_string();
+
+		let mut posts = vec![promotional, filtered_author, retained];
+		let filters = HashSet::from(["u_mixedcaseuser".to_string()]);
+		let (removed, all_removed) = filter_posts(&mut posts, &filters);
+		assert_eq!(removed, 2);
+		assert!(!all_removed);
+		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), ["phase2normal2"]);
+	}
 
 	async fn always_exists(_: String) -> bool {
 		true

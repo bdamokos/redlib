@@ -14,7 +14,8 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-const SNAPSHOT_VERSION: u8 = 7;
+const SNAPSHOT_VERSION: u8 = 8;
+const LEGACY_SNAPSHOT_VERSION_V7: u8 = 7;
 const LEGACY_SNAPSHOT_VERSION_V6: u8 = 6;
 const LEGACY_SNAPSHOT_VERSION_V5: u8 = 5;
 const LEGACY_SNAPSHOT_VERSION_V4: u8 = 4;
@@ -353,6 +354,23 @@ pub(crate) struct PersistedSubredditUsersEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCacheSnapshot {
+	version: u8,
+	saved_at_unix: u64,
+	source_entries: Vec<PersistedSourceCacheEntry>,
+	remembered_subreddits: Vec<PersistedRememberedSubredditEntry>,
+	subreddit_metadata: Vec<PersistedSubredditMetadataEntry>,
+	subreddit_nsfw: Vec<PersistedSubredditNsfwEntry>,
+	subreddit_flairs: Vec<PersistedSubredditFlairsEntry>,
+	subreddit_users: Vec<PersistedSubredditUsersEntry>,
+	author_history: Vec<crate::materialized_catalog::PersistedAuthorHistoryEntry>,
+	rejected_author_redgifs_profiles: Vec<crate::materialized_catalog::PersistedRejectedAuthorRedgifsProfileEntry>,
+	subreddit_semantic_embeddings: Vec<crate::subreddit_semantics::PersistedSubredditSemanticEmbedding>,
+	promo_markers: Vec<crate::promo_detection::PersistedPromoMarker>,
+	content_filter_observations: Vec<crate::promo_detection::PersistedContentFilterObservation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCacheSnapshotV7 {
 	version: u8,
 	saved_at_unix: u64,
 	source_entries: Vec<PersistedSourceCacheEntry>,
@@ -753,6 +771,7 @@ fn load_snapshot() -> Result<(), String> {
 	subreddit_semantics::restore_persisted_embeddings(snapshot.subreddit_semantic_embeddings, snapshot.saved_at_unix, now_unix);
 	utils::restore_persisted_state(snapshot.subreddit_flairs, snapshot.subreddit_users, snapshot.saved_at_unix, now_unix);
 	crate::promo_detection::restore_markers(snapshot.promo_markers);
+	crate::promo_detection::restore_observations(snapshot.content_filter_observations);
 	Ok(())
 }
 
@@ -772,6 +791,7 @@ fn write_snapshot() -> Result<(), String> {
 		rejected_author_redgifs_profiles,
 		subreddit_semantic_embeddings: subreddit_semantics::snapshot_persisted_embeddings(now_unix),
 		promo_markers: crate::promo_detection::snapshot_markers(),
+		content_filter_observations: crate::promo_detection::snapshot_observations(),
 	};
 
 	let final_path = &*PERSISTENCE_PATH;
@@ -817,6 +837,26 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 		Err(error) => error.to_string(),
 	};
 
+	if let Ok(legacy) = bincode::deserialize::<PersistedCacheSnapshotV7>(bytes) {
+		if legacy.version == LEGACY_SNAPSHOT_VERSION_V7 {
+			return Ok(PersistedCacheSnapshot {
+				version: SNAPSHOT_VERSION,
+				saved_at_unix: legacy.saved_at_unix,
+				source_entries: legacy.source_entries,
+				remembered_subreddits: legacy.remembered_subreddits,
+				subreddit_metadata: legacy.subreddit_metadata,
+				subreddit_nsfw: legacy.subreddit_nsfw,
+				subreddit_flairs: legacy.subreddit_flairs,
+				subreddit_users: legacy.subreddit_users,
+				author_history: legacy.author_history,
+				rejected_author_redgifs_profiles: legacy.rejected_author_redgifs_profiles,
+				subreddit_semantic_embeddings: legacy.subreddit_semantic_embeddings,
+				promo_markers: legacy.promo_markers,
+				content_filter_observations: Vec::new(),
+			});
+		}
+	}
+
 	if let Ok(legacy) = bincode::deserialize::<PersistedCacheSnapshotV6>(bytes) {
 		if legacy.version == LEGACY_SNAPSHOT_VERSION_V6 {
 			return Ok(PersistedCacheSnapshot {
@@ -832,6 +872,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				rejected_author_redgifs_profiles: legacy.rejected_author_redgifs_profiles,
 				subreddit_semantic_embeddings: legacy.subreddit_semantic_embeddings,
 				promo_markers: Vec::new(),
+				content_filter_observations: Vec::new(),
 			});
 		}
 	}
@@ -851,6 +892,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				rejected_author_redgifs_profiles: legacy.rejected_author_redgifs_profiles,
 				subreddit_semantic_embeddings: Vec::new(),
 				promo_markers: Vec::new(),
+				content_filter_observations: Vec::new(),
 			});
 		}
 	}
@@ -870,6 +912,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				rejected_author_redgifs_profiles: legacy.rejected_author_redgifs_profiles,
 				subreddit_semantic_embeddings: Vec::new(),
 				promo_markers: Vec::new(),
+				content_filter_observations: Vec::new(),
 			});
 		}
 	}
@@ -889,6 +932,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				rejected_author_redgifs_profiles: Vec::new(),
 				subreddit_semantic_embeddings: Vec::new(),
 				promo_markers: Vec::new(),
+				content_filter_observations: Vec::new(),
 			});
 		}
 	}
@@ -910,6 +954,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 		rejected_author_redgifs_profiles: Vec::new(),
 		subreddit_semantic_embeddings: Vec::new(),
 		promo_markers: Vec::new(),
+		content_filter_observations: Vec::new(),
 	})
 }
 
@@ -950,8 +995,9 @@ impl PersistedRefreshOrigin {
 mod tests {
 	use super::{
 		deserialize_catalog_snapshot, deserialize_snapshot, serialize_catalog_snapshot, serialize_snapshot, PersistedCacheSnapshot, PersistedCacheSnapshotV2,
-		PersistedCacheSnapshotV3, PersistedCacheSnapshotV4WithoutFeedback, PersistedCacheSnapshotV6, PersistedCatalogSnapshotFile, PersistedRememberedSubredditEntry,
-		PersistedRememberedSubredditEntryWithoutFeedback, LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3, LEGACY_SNAPSHOT_VERSION_V4, SNAPSHOT_VERSION,
+		PersistedCacheSnapshotV3, PersistedCacheSnapshotV4WithoutFeedback, PersistedCacheSnapshotV6, PersistedCacheSnapshotV7, PersistedCatalogSnapshotFile,
+		PersistedRememberedSubredditEntry, PersistedRememberedSubredditEntryWithoutFeedback, LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3, LEGACY_SNAPSHOT_VERSION_V4,
+		LEGACY_SNAPSHOT_VERSION_V7, SNAPSHOT_VERSION,
 	};
 	use crate::materialized_catalog::PersistedCatalogSnapshot;
 
@@ -969,6 +1015,7 @@ mod tests {
 			rejected_author_redgifs_profiles: Vec::new(),
 			subreddit_semantic_embeddings: Vec::new(),
 			promo_markers: Vec::new(),
+			content_filter_observations: Vec::new(),
 		}
 	}
 
@@ -1102,6 +1149,34 @@ mod tests {
 		let decoded = deserialize_snapshot(&bytes).expect("migrate v6 snapshot");
 		assert_eq!(decoded.version, SNAPSHOT_VERSION);
 		assert!(decoded.promo_markers.is_empty());
+	}
+
+	#[test]
+	fn legacy_v7_snapshot_preserves_promo_markers_and_starts_observations_empty() {
+		let legacy = PersistedCacheSnapshotV7 {
+			version: LEGACY_SNAPSHOT_VERSION_V7,
+			saved_at_unix: 1_000_000,
+			source_entries: Vec::new(),
+			remembered_subreddits: Vec::new(),
+			subreddit_metadata: Vec::new(),
+			subreddit_nsfw: Vec::new(),
+			subreddit_flairs: Vec::new(),
+			subreddit_users: Vec::new(),
+			author_history: Vec::new(),
+			rejected_author_redgifs_profiles: Vec::new(),
+			subreddit_semantic_embeddings: Vec::new(),
+			promo_markers: vec![crate::promo_detection::PersistedPromoMarker {
+				post_id: "abc123".to_string(),
+				signal: "snapcode".to_string(),
+				detector_version: "snap-promo-v1".to_string(),
+				detected_at_unix: 999_999,
+			}],
+		};
+		let bytes = bincode::serialize(&legacy).expect("serialize v7 snapshot");
+		let decoded = deserialize_snapshot(&bytes).expect("migrate v7 snapshot");
+		assert_eq!(decoded.version, SNAPSHOT_VERSION);
+		assert_eq!(decoded.promo_markers.len(), 1);
+		assert!(decoded.content_filter_observations.is_empty());
 	}
 
 	#[test]

@@ -2073,8 +2073,12 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 			.posts
 			.iter()
 			.filter(|post| {
-				!session.request.filters.contains(&post.community)
-					&& !session.request.filters.contains(&format!("u_{}", post.author.name))
+				!crate::promo_detection::post_is_promotional(&post.id)
+					&& !session
+						.request
+						.filters
+						.iter()
+						.any(|filter| filter.eq_ignore_ascii_case(&post.community) || filter.eq_ignore_ascii_case(&format!("u_{}", post.author.name)))
 					&& !crate::utils::is_deleted_reddit_placeholder_post(post)
 			})
 			.cloned()

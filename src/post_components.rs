@@ -645,6 +645,7 @@ impl PostObservation {
 
 pub fn observe_post(post: &Post, source: ObservationSource, source_key: impl Into<String>, observed_at: u64) -> Option<CanonicalPostSnapshot> {
 	crate::client::register_promo_post_media(post);
+	crate::promo_detection::observe_post(post);
 	let observation = PostObservation::from_post(post, source, source_key, observed_at)?;
 	Some(observe(observation))
 }

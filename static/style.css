@@ -809,6 +809,13 @@ aside {
     color: var(--accent);
 }
 
+.subreddit_promotion_stats {
+    color: var(--visited);
+    font-size: 12px;
+    margin: 14px 15px 0;
+    text-align: left;
+}
+
 .user_detail_meta {
     color: var(--visited);
     font-size: 12px;

@@ -32,6 +32,12 @@
 		<p><strong>Blocked feeds:</strong> {{ summary.blocked_sources }}</p>
 	</div>
 
+	<div class="panel">
+		<h2>Automatic Content Filters</h2>
+		<p><strong>Promotion-spam accounts:</strong> {{ promotion_filtered_users }} (five unique detected promotional posts; used for subreddit quality penalties)</p>
+		<p><strong>RedGIF-reposter accounts:</strong> {{ redgifs_filtered_users }} (ten distinct RedGIF uploader profiles; tracked separately and not used for recommendation penalties)</p>
+	</div>
+
 	<div class="panel semantic_database_status">
 		<h2>Semantic Embedding Database</h2>
 		<div class="cache_status_metric_grid">

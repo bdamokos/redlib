@@ -24,6 +24,11 @@
 				<div title="{{ sub.members.1 }}">{{ sub.members.0 }}</div>
 				<div title="{{ sub.active.1 }}">{{ sub.active.0 }}</div>
 			</div>
+			{% if sub.promotion_seen_posts() > 0 %}
+			<p class="subreddit_promotion_stats">
+				Promotion spam filtered: {{ sub.promotion_filtered_posts() }} of {{ sub.promotion_seen_posts() }} posts seen ({{ sub.promotion_filtered_percent() }}%)
+			</p>
+			{% endif %}
 			{% if flair_filters.len() > 0 %}
 			<div id="sub_flairs">
 				<div class="sub_flairs_header">

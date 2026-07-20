@@ -339,6 +339,8 @@ pub struct CacheStatusTemplate {
 	recent_sources: Vec<crate::post_cache::CacheStatusSource>,
 	semantic_database: crate::subreddit_semantics::SubredditSemanticDatabaseStatus,
 	content_semantic_database: crate::subreddit_content_semantics::SubredditContentSemanticDatabaseStatus,
+	promotion_filtered_users: usize,
+	redgifs_filtered_users: usize,
 }
 
 crate::impl_template_str_eq!(CacheStatusTemplate);
@@ -5385,6 +5387,7 @@ pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, Str
 	let semantic_database = crate::subreddit_semantics::embedding_database_status();
 	let content_semantic_database = crate::subreddit_content_semantics::embedding_database_status();
 	let seconds_until_daemon_tick = crate::post_cache::cache_status_seconds_until_daemon_tick();
+	let (promotion_filtered_users, redgifs_filtered_users) = crate::promo_detection::viewer_auto_filter_counts(&prefs);
 	let mut upcoming_sources = status
 		.sources
 		.iter()
@@ -5412,6 +5415,8 @@ pub async fn cache_status_page(req: Request<Body>) -> Result<Response<Body>, Str
 		recent_sources,
 		semantic_database,
 		content_semantic_database,
+		promotion_filtered_users,
+		redgifs_filtered_users,
 	}))
 }
 
