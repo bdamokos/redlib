@@ -5,7 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
-from snap_promo_detector import fast_classify, text_signal
+from snap_promo_detector import decode_image, fast_classify, text_signal
 
 
 class SnapPromoDetectorTests(unittest.TestCase):
@@ -22,6 +22,14 @@ class SnapPromoDetectorTests(unittest.TestCase):
         image = np.full((256, 256, 3), (0, 255, 255), dtype=np.uint8)
         cv2.ellipse(image, (128, 128), (70, 105), 0, 0, 360, (20, 180, 230), -1)
         self.assertEqual(fast_classify(image).signal, "none")
+
+    def test_jpeg_decode_preserves_source_geometry(self):
+        image = np.full((416, 750, 3), (25, 170, 205), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpeg", image)
+        self.assertTrue(ok)
+        decoded = decode_image(encoded.tobytes())
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.shape, image.shape)
 
     def test_unlabelled_username_is_neutral(self):
         self.assertIsNone(text_signal("@ordinary_username"))

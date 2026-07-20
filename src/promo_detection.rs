@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, LazyLock, Mutex};
 use std::time::Instant;
 
-const DETECTOR_VERSION: &str = "snap-promo-v2";
+const DETECTOR_VERSION: &str = "snap-promo-v3";
 const MAX_ANALYSIS_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MEDIA_MAPPINGS: usize = 4096;
 const MAX_PERSISTED_MARKERS: usize = 100_000;
@@ -634,11 +634,16 @@ pub fn snapshot_markers() -> Vec<PersistedPromoMarker> {
 	values
 }
 
+fn marker_is_restorable(marker: &PersistedPromoMarker) -> bool {
+	let stale_snapcode = marker.signal == "snapcode" && marker.detector_version != DETECTOR_VERSION;
+	!stale_snapcode && crate::post_components::PostId::parse(&marker.post_id).is_some()
+}
+
 pub fn restore_markers(markers: Vec<PersistedPromoMarker>) {
 	let Ok(mut state) = STATE.lock() else { return };
 	state.markers.clear();
 	for marker in markers.into_iter().take(MAX_PERSISTED_MARKERS) {
-		if crate::post_components::PostId::parse(&marker.post_id).is_some() {
+		if marker_is_restorable(&marker) {
 			state.markers.insert(marker.post_id.clone(), marker);
 		}
 	}
@@ -666,8 +671,8 @@ pub fn restore_observations(observations: Vec<PersistedContentFilterObservation>
 #[cfg(test)]
 mod tests {
 	use super::{
-		observe_post, promotion_quality_factor_from_counts, qualifying_filter_reasons, title_signal, DetectionState, PROMOTION_AUTO_FILTER_THRESHOLD,
-		REDGIFS_AUTO_FILTER_THRESHOLD, STATE,
+		marker_is_restorable, observe_post, promotion_quality_factor_from_counts, qualifying_filter_reasons, title_signal, DetectionState, PersistedPromoMarker,
+		PROMOTION_AUTO_FILTER_THRESHOLD, REDGIFS_AUTO_FILTER_THRESHOLD, STATE,
 	};
 	use crate::utils::Post;
 	use std::collections::{HashMap, HashSet};
@@ -705,6 +710,24 @@ mod tests {
 		assert_eq!(title_signal("echoonayxis"), None);
 		assert_eq!(title_signal("@yadiraskde"), None);
 		assert_eq!(title_signal("my first 10 pictures from vacation"), None);
+	}
+
+	#[test]
+	fn restore_invalidates_only_snapcodes_from_older_detector_versions() {
+		let stale_snapcode = PersistedPromoMarker {
+			post_id: "stalesnap1".to_string(),
+			signal: "snapcode".to_string(),
+			detector_version: "snap-promo-v2".to_string(),
+			detected_at_unix: 1,
+		};
+		let old_title_marker = PersistedPromoMarker {
+			post_id: "titlebait1".to_string(),
+			signal: "engagement_bait".to_string(),
+			detector_version: "snap-promo-v2".to_string(),
+			detected_at_unix: 1,
+		};
+		assert!(!marker_is_restorable(&stale_snapcode));
+		assert!(marker_is_restorable(&old_title_marker));
 	}
 
 	#[test]

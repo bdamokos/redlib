@@ -239,6 +239,16 @@ def percentile(values: list[float], p: float) -> float:
     return float(np.percentile(np.asarray(values), p))
 
 
+def decode_image(encoded: bytes) -> np.ndarray | None:
+    """Decode at source resolution before extracting Snapcode geometry.
+
+    JPEG reduced-decode modes can alias ordinary photographic edges into small
+    square contours.  The feature pass already bounds its input to 320px, so
+    preserving the source geometry here costs only the full JPEG decode.
+    """
+    return cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
 def _read_exact(stream, size: int) -> bytes | None:
     data = bytearray()
     while len(data) < size:
@@ -257,17 +267,13 @@ def worker_main() -> int:
         if header is None:
             return 0
         metadata_size = struct.unpack(">I", header)[0]
-        metadata = json.loads((_read_exact(stream, metadata_size) or b"{}").decode("utf-8"))
+        _metadata = json.loads((_read_exact(stream, metadata_size) or b"{}").decode("utf-8"))
         image_size = struct.unpack(">Q", _read_exact(stream, 8))[0]
         encoded = _read_exact(stream, image_size)
         if encoded is None:
             raise EOFError("missing worker image")
         started = time.perf_counter_ns()
-        content_type = str(metadata.get("content_type", ""))
-        # libjpeg performs this reduction while decoding, avoiding a separate
-        # full-resolution decode and resize. Other codecs safely ignore it.
-        flag = cv2.IMREAD_REDUCED_COLOR_4 if "jpeg" in content_type or "jpg" in content_type else cv2.IMREAD_COLOR
-        image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), flag)
+        image = decode_image(encoded)
         if image is None:
             reply = {"flagged": False, "signal": "none", "fast_ms": 0.0, "error": "decode_failed"}
         else:
