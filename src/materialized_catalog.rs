@@ -35,6 +35,11 @@ const MIXED_FEED_POSTS_PER_SOURCE: usize = 8;
 /// Soft global bound. The newest post for each source is protected so even very large
 /// subscription sets retain broad source coverage.
 const MIXED_FEED_MAX_POSTS: usize = 4_096;
+// Keep the complete practical followed-profile history independently of the compact
+// homepage catalog. This is intentionally aligned with the discovery index bound so
+// deep `/following` pages can reach every cached post up to the durable safety cap.
+const FOLLOWING_FEED_MAX_POSTS: usize = 100_000;
+const FOLLOWING_DISCOVERY_MAX_POSTS: usize = 100_000;
 pub const SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT: u8 = 50;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +95,35 @@ pub struct CatalogRecord {
 	pub community_lc: String,
 	pub author_lc: String,
 	pub source_keys: HashSet<CatalogSourceKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PersistedFollowingDiscoveryEntry {
+	pub post_id: String,
+	pub discovered_at_unix: u64,
+	pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FollowingDiscoveryStamp {
+	discovered_at_unix: u64,
+	sequence: u64,
+}
+
+struct FollowingDiscoveryState {
+	posts: HashMap<String, FollowingDiscoveryStamp>,
+	next_sequence: u64,
+	bootstrap_at_unix: Option<u64>,
+}
+
+impl Default for FollowingDiscoveryState {
+	fn default() -> Self {
+		Self {
+			posts: HashMap::new(),
+			next_sequence: 0,
+			bootstrap_at_unix: Some(crate::cache_persistence::unix_now()),
+		}
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +314,8 @@ struct MixedFeedCatalog {
 }
 
 static MIXED_FEED_CATALOG: LazyLock<Mutex<MixedFeedCatalog>> = LazyLock::new(|| Mutex::new(MixedFeedCatalog::default()));
+static FOLLOWING_FEED_CATALOG: LazyLock<Mutex<MixedFeedCatalog>> = LazyLock::new(|| Mutex::new(MixedFeedCatalog::default()));
+static FOLLOWING_DISCOVERY: LazyLock<Mutex<FollowingDiscoveryState>> = LazyLock::new(|| Mutex::new(FollowingDiscoveryState::default()));
 
 fn normalize_catalog_source(source: &FeedSource) -> Option<CatalogSourceKey> {
 	match source {
@@ -298,6 +334,111 @@ fn normalize_catalog_source(source: &FeedSource) -> Option<CatalogSourceKey> {
 		}
 		_ => None,
 	}
+}
+
+fn is_followed_user_source(source: &FeedSource) -> bool {
+	matches!(source, FeedSource::Subreddit { name, sort: FeedSort::New } if name.to_lowercase().starts_with("u_"))
+		|| matches!(source, FeedSource::UserComments { name, sort: FeedSort::New } if name.to_lowercase().starts_with("u_"))
+}
+
+fn insert_following_discovery_if_missing(state: &mut FollowingDiscoveryState, post_id: &str, discovered_at_unix: u64) {
+	if post_id.is_empty() || state.posts.contains_key(post_id) {
+		return;
+	}
+	state.next_sequence = state.next_sequence.saturating_add(1);
+	state.posts.insert(
+		post_id.to_string(),
+		FollowingDiscoveryStamp {
+			discovered_at_unix,
+			sequence: state.next_sequence,
+		},
+	);
+}
+
+pub(crate) fn record_following_discoveries(source: &FeedSource, posts: &[Post]) {
+	if !is_followed_user_source(source) || posts.is_empty() {
+		return;
+	}
+	let now_unix = crate::cache_persistence::unix_now();
+	let mut state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	for post in posts.iter().rev() {
+		insert_following_discovery_if_missing(&mut state, &post.id, now_unix);
+	}
+}
+
+pub(crate) fn mark_following_posts_seen(source: &FeedSource, posts: &[Post]) {
+	if !is_followed_user_source(source) || posts.is_empty() {
+		return;
+	}
+	let mut state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	for post in posts.iter().rev() {
+		insert_following_discovery_if_missing(&mut state, &post.id, 0);
+	}
+}
+
+pub(crate) fn seed_following_discovery_baseline(source: &FeedSource, posts: &[PersistedPost], fetched_at_unix: u64) {
+	if !is_followed_user_source(source) || posts.is_empty() {
+		return;
+	}
+	let mut ordered = posts.iter().collect::<Vec<_>>();
+	ordered.sort_by(|left, right| left.created_ts.cmp(&right.created_ts).then_with(|| left.id.cmp(&right.id)));
+	let mut state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let baseline_unix = state.bootstrap_at_unix.unwrap_or(fetched_at_unix);
+	for post in ordered {
+		insert_following_discovery_if_missing(&mut state, &post.id, baseline_unix);
+	}
+}
+
+pub(crate) fn restore_following_discoveries(entries: Vec<PersistedFollowingDiscoveryEntry>) {
+	let mut state = FollowingDiscoveryState::default();
+	if !entries.is_empty() {
+		state.bootstrap_at_unix = None;
+	}
+	for entry in entries {
+		state.next_sequence = state.next_sequence.max(entry.sequence);
+		state.posts.insert(
+			entry.post_id,
+			FollowingDiscoveryStamp {
+				discovered_at_unix: entry.discovered_at_unix,
+				sequence: entry.sequence,
+			},
+		);
+	}
+	*FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner()) = state;
+}
+
+pub(crate) fn snapshot_following_discoveries() -> Vec<PersistedFollowingDiscoveryEntry> {
+	let state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let mut entries = state
+		.posts
+		.iter()
+		.map(|(post_id, stamp)| PersistedFollowingDiscoveryEntry {
+			post_id: post_id.clone(),
+			discovered_at_unix: stamp.discovered_at_unix,
+			sequence: stamp.sequence,
+		})
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| right.discovered_at_unix.cmp(&left.discovered_at_unix).then_with(|| right.sequence.cmp(&left.sequence)));
+	entries.truncate(FOLLOWING_DISCOVERY_MAX_POSTS);
+	entries
+}
+
+pub(crate) fn sort_following_posts_by_discovery(posts: &mut [Post]) {
+	let state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let rank = |post: &Post| {
+		std::iter::once(post.id.as_str())
+			.chain(post.following_comments.iter().map(|comment| comment.id.as_str()))
+			.filter_map(|post_id| state.posts.get(post_id))
+			.map(|stamp| (stamp.discovered_at_unix, stamp.sequence))
+			.max()
+			.unwrap_or_default()
+	};
+	posts.sort_by(|left, right| {
+		rank(right)
+			.cmp(&rank(left))
+			.then_with(|| crate::user::post_feed_activity_ts(right).cmp(&crate::user::post_feed_activity_ts(left)))
+			.then_with(|| right.id.cmp(&left.id))
+	});
 }
 
 fn catalog_record(post: &Post) -> CatalogRecord {
@@ -330,7 +471,15 @@ fn remove_mixed_feed_post(catalog: &mut MixedFeedCatalog, post_id: &str) {
 }
 
 fn prune_mixed_feed_catalog(catalog: &mut MixedFeedCatalog) {
-	if catalog.posts_by_id.len() <= MIXED_FEED_MAX_POSTS {
+	prune_feed_catalog(catalog, MIXED_FEED_MAX_POSTS);
+}
+
+fn prune_following_feed_catalog(catalog: &mut MixedFeedCatalog) {
+	prune_feed_catalog(catalog, FOLLOWING_FEED_MAX_POSTS);
+}
+
+fn prune_feed_catalog(catalog: &mut MixedFeedCatalog, max_posts: usize) {
+	if catalog.posts_by_id.len() <= max_posts {
 		return;
 	}
 
@@ -353,7 +502,7 @@ fn prune_mixed_feed_catalog(catalog: &mut MixedFeedCatalog) {
 		.collect::<Vec<_>>();
 	removable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
-	let remove_count = catalog.posts_by_id.len().saturating_sub(MIXED_FEED_MAX_POSTS).min(removable.len());
+	let remove_count = catalog.posts_by_id.len().saturating_sub(max_posts).min(removable.len());
 	for (_, post_id) in removable.into_iter().take(remove_count) {
 		remove_mixed_feed_post(catalog, &post_id);
 	}
@@ -364,6 +513,11 @@ fn prune_mixed_feed_catalog(catalog: &mut MixedFeedCatalog) {
 /// catalog, this index survives resident source eviction because the source payload remains
 /// available on disk.
 pub(crate) fn apply_mixed_feed_source_refresh(source: &FeedSource, posts: &[Post]) {
+	apply_following_feed_source_refresh(source, posts);
+	apply_compact_mixed_feed_source_refresh(source, posts);
+}
+
+fn apply_compact_mixed_feed_source_refresh(source: &FeedSource, posts: &[Post]) {
 	let Some(source_key) = normalize_catalog_source(source) else {
 		return;
 	};
@@ -396,7 +550,44 @@ pub(crate) fn apply_mixed_feed_source_refresh(source: &FeedSource, posts: &[Post
 	prune_mixed_feed_catalog(&mut catalog);
 }
 
+fn apply_following_feed_source_refresh(source: &FeedSource, posts: &[Post]) {
+	if !is_followed_user_source(source) {
+		return;
+	}
+	let Some(source_key) = normalize_catalog_source(source) else {
+		return;
+	};
+	let current_post_ids = posts.iter().map(|post| post.id.clone()).collect::<HashSet<_>>();
+	let mut catalog = FOLLOWING_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let prior_post_ids = catalog.source_to_post_ids.get(&source_key).cloned().unwrap_or_default();
+	for post_id in prior_post_ids.difference(&current_post_ids) {
+		let should_remove = if let Some(record) = catalog.posts_by_id.get_mut(post_id) {
+			record.source_keys.remove(&source_key);
+			record.source_keys.is_empty()
+		} else {
+			false
+		};
+		if should_remove {
+			catalog.posts_by_id.remove(post_id);
+		}
+	}
+	for post in posts {
+		let record = catalog.posts_by_id.entry(post.id.clone()).or_insert_with(|| MixedFeedRecord {
+			post: post.clone(),
+			source_keys: HashSet::new(),
+		});
+		record.post = post.clone();
+		record.source_keys.insert(source_key.clone());
+	}
+	catalog.source_to_post_ids.insert(source_key, current_post_ids);
+	prune_following_feed_catalog(&mut catalog);
+}
+
 pub(crate) fn apply_mixed_feed_persisted_source_refresh(source: &FeedSource, posts: &[PersistedPost]) {
+	if is_followed_user_source(source) {
+		let following_posts = posts.iter().cloned().map(PersistedPost::into_runtime).collect::<Vec<_>>();
+		apply_following_feed_source_refresh(source, &following_posts);
+	}
 	let mut selected = posts.iter().collect::<Vec<_>>();
 	selected.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.id.cmp(&left.id)));
 	let selected = selected
@@ -405,7 +596,7 @@ pub(crate) fn apply_mixed_feed_persisted_source_refresh(source: &FeedSource, pos
 		.cloned()
 		.map(PersistedPost::into_runtime)
 		.collect::<Vec<_>>();
-	apply_mixed_feed_source_refresh(source, &selected);
+	apply_compact_mixed_feed_source_refresh(source, &selected);
 }
 
 pub(crate) fn mixed_feed_source_is_cached(source: &FeedSource) -> bool {
@@ -1450,6 +1641,8 @@ fn query_mixed_feed_for_keys_limited(
 	limit: usize,
 	sort: FeedSort,
 	random_rotation_seed: u64,
+	following_discovery_order: bool,
+	following_activity_order: bool,
 ) -> Option<Vec<Post>> {
 	if allowed_keys.is_empty() || limit == 0 {
 		return Some(Vec::new());
@@ -1494,6 +1687,36 @@ fn query_mixed_feed_for_keys_limited(
 		posts.truncate(limit);
 		return Some(posts.into_iter().map(|(_, _, post)| post).collect());
 	}
+	if following_discovery_order {
+		let discovery = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+		let mut posts = catalog
+			.posts_by_id
+			.values()
+			.filter(|record| mixed_feed_record_is_visible(record, allowed_keys, filters))
+			.map(|record| {
+				let stamp = std::iter::once(record.post.id.as_str())
+					.chain(record.post.following_comments.iter().map(|comment| comment.id.as_str()))
+					.filter_map(|post_id| discovery.posts.get(post_id).copied())
+					.max_by_key(|stamp| (stamp.discovered_at_unix, stamp.sequence))
+					.unwrap_or(FollowingDiscoveryStamp {
+						discovered_at_unix: 0,
+						sequence: 0,
+					});
+				(stamp, record.post.clone())
+			})
+			.collect::<Vec<_>>();
+		posts.sort_by(|left, right| {
+			right
+				.0
+				.discovered_at_unix
+				.cmp(&left.0.discovered_at_unix)
+				.then_with(|| right.0.sequence.cmp(&left.0.sequence))
+				.then_with(|| right.1.created_ts.cmp(&left.1.created_ts))
+				.then_with(|| right.1.id.cmp(&left.1.id))
+		});
+		posts.truncate(limit);
+		return Some(posts.into_iter().map(|(_, post)| post).collect());
+	}
 
 	let mut posts = catalog
 		.posts_by_id
@@ -1501,7 +1724,19 @@ fn query_mixed_feed_for_keys_limited(
 		.filter(|record| mixed_feed_record_is_visible(record, allowed_keys, filters))
 		.map(|record| record.post.clone())
 		.collect::<Vec<_>>();
-	posts.sort_by(|left, right| right.created_ts.cmp(&left.created_ts).then_with(|| right.id.cmp(&left.id)));
+	posts.sort_by(|left, right| {
+		let left_ts = if following_activity_order {
+			crate::user::post_feed_activity_ts(left)
+		} else {
+			left.created_ts
+		};
+		let right_ts = if following_activity_order {
+			crate::user::post_feed_activity_ts(right)
+		} else {
+			right.created_ts
+		};
+		right_ts.cmp(&left_ts).then_with(|| right.id.cmp(&left.id))
+	});
 	posts.truncate(limit);
 	Some(posts)
 }
@@ -1664,12 +1899,17 @@ pub(crate) fn remove_sources(sources: &[FeedSource]) {
 /// Remove sources from the compact persisted-feed mix only when their on-disk payload is
 /// actually deleted. Resident-cache eviction must leave this index intact.
 pub(crate) fn remove_mixed_feed_sources(sources: &[FeedSource]) {
+	remove_sources_from_feed_catalog(&FOLLOWING_FEED_CATALOG, sources);
+	remove_sources_from_feed_catalog(&MIXED_FEED_CATALOG, sources);
+}
+
+fn remove_sources_from_feed_catalog(catalog: &Mutex<MixedFeedCatalog>, sources: &[FeedSource]) {
 	let source_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
 	if source_keys.is_empty() {
 		return;
 	}
 
-	let mut catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let mut catalog = catalog.lock().unwrap_or_else(|err| err.into_inner());
 	let mut post_ids = HashSet::new();
 	for source_key in &source_keys {
 		if let Some(ids) = catalog.source_to_post_ids.remove(source_key) {
@@ -1760,7 +2000,11 @@ pub(crate) fn query_session_stream_limited(session: &FeedSession, limit: usize) 
 /// handful of full source payloads admitted to the current browser session.
 pub(crate) fn query_mixed_feed_session_stream_limited(session: &FeedSession, limit: usize) -> Option<Vec<Post>> {
 	let allowed_keys = requested_source_keys_for_session(session);
-	let catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let catalog = if session.request.bundle_followed_user_comments {
+		FOLLOWING_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner())
+	} else {
+		MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner())
+	};
 	query_mixed_feed_for_keys_limited(
 		&catalog,
 		&allowed_keys,
@@ -1768,13 +2012,15 @@ pub(crate) fn query_mixed_feed_session_stream_limited(session: &FeedSession, lim
 		limit,
 		session_merge_sort(session),
 		session_random_rotation_seed(session),
+		session.request.following_discovery_order,
+		session.request.bundle_followed_user_comments,
 	)
 }
 
 pub(crate) fn query_mixed_feed_source_candidates_limited(sources: &[FeedSource], filters: &HashSet<String>, limit: usize) -> Option<Vec<Post>> {
 	let allowed_keys = sources.iter().filter_map(normalize_catalog_source).collect::<HashSet<_>>();
 	let catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
-	query_mixed_feed_for_keys_limited(&catalog, &allowed_keys, filters, limit, FeedSort::New, 0)
+	query_mixed_feed_for_keys_limited(&catalog, &allowed_keys, filters, limit, FeedSort::New, 0, false, false)
 }
 
 pub(crate) fn query_mixed_feed_session_page_metric_candidates_limited(session: &FeedSession, limit: usize) -> Option<Vec<CatalogPageMetricCandidate>> {
@@ -3266,6 +3512,9 @@ pub(crate) fn reset_source_catalog_preserving_author_history() {
 pub(crate) fn reset_mixed_feed_catalog() {
 	let mut catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	*catalog = MixedFeedCatalog::default();
+	drop(catalog);
+	let mut following = FOLLOWING_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	*following = MixedFeedCatalog::default();
 }
 
 #[cfg(test)]
@@ -3274,6 +3523,7 @@ pub(crate) fn reset_catalog() {
 	*catalog = MaterializedCatalog::default();
 	drop(catalog);
 	reset_mixed_feed_catalog();
+	*FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner()) = FollowingDiscoveryState::default();
 }
 
 #[cfg(test)]

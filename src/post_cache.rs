@@ -401,6 +401,7 @@ pub struct FeedSessionRequest {
 	pub query_fingerprint: String,
 	pub cache_revision: u64,
 	pub bundle_followed_user_comments: bool,
+	pub following_discovery_order: bool,
 	pub random_rotation_seed: u64,
 	/// When set, merge / finalize use this sort while [`FeedSource::sort`] may differ (e.g. `/following/hot`
 	/// loads `New` listings to match daemon-cached `u_` keys).
@@ -416,6 +417,7 @@ impl Default for FeedSessionRequest {
 			query_fingerprint: String::new(),
 			cache_revision: 0,
 			bundle_followed_user_comments: false,
+			following_discovery_order: false,
 			random_rotation_seed: 0,
 			merge_sort: None,
 		}
@@ -1184,6 +1186,13 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 		}
 	}
 	if materialized_catalog::source_is_supported(source) {
+		if refresh_origin == Some(RefreshOrigin::Daemon) {
+			materialized_catalog::record_following_discoveries(source, &posts);
+		} else {
+			// A later daemon refresh must not promote posts already seen through an
+			// interactive fetch; only genuinely new daemon discoveries rise to the top.
+			materialized_catalog::mark_following_posts_seen(source, &posts);
+		}
 		materialized_catalog::apply_source_refresh(source, &posts);
 		materialized_catalog::apply_mixed_feed_source_refresh(source, &posts);
 	}
@@ -1426,6 +1435,7 @@ pub(crate) fn index_persisted_source_for_mixed_feed(entry: &PersistedSourceCache
 	let Some(source) = remembered_feed_source_from_key(&entry.subreddit) else {
 		return;
 	};
+	materialized_catalog::seed_following_discovery_baseline(&source, &entry.posts, entry.fetched_at_unix);
 	materialized_catalog::apply_mixed_feed_persisted_source_refresh(&source, &entry.posts);
 }
 
@@ -1483,6 +1493,7 @@ pub(crate) fn restore_persisted_state(
 		}
 
 		materialized_catalog::apply_mixed_feed_persisted_source_refresh(&source, &entry.posts);
+		materialized_catalog::seed_following_discovery_baseline(&source, &entry.posts, entry.fetched_at_unix);
 		write_persisted_source_entry_to_disk(&source, &entry);
 	}
 	rebuild_materialized_catalog_from_source_cache();
@@ -1875,9 +1886,10 @@ fn resident_cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
 	let Ok(cache) = SOURCE_CACHE.lock() else {
 		return None;
 	};
-	cache
-		.get(&source.cache_key())
-		.and_then(|entry| if source_cache_is_servable(source, entry) { entry.refresh_origin } else { None })
+	// Catalog-backed feeds can intentionally serve a persisted daemon window after its
+	// live-fetch TTL has elapsed, so retain the provenance even when that resident entry
+	// would no longer satisfy a direct source request.
+	cache.get(&source.cache_key()).and_then(|entry| entry.refresh_origin)
 }
 
 fn cached_source_posts_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<CachedSourcePosts> {
@@ -1985,6 +1997,7 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	request.query_fingerprint.hash(&mut hasher);
 	request.cache_revision.hash(&mut hasher);
 	request.bundle_followed_user_comments.hash(&mut hasher);
+	request.following_discovery_order.hash(&mut hasher);
 	request.random_rotation_seed.hash(&mut hasher);
 	request.merge_sort.hash(&mut hasher);
 
@@ -2097,9 +2110,7 @@ fn filtered_source_queues(session: &FeedSession) -> Vec<ReadySourceQueue> {
 }
 
 fn session_uses_materialized_catalog(session: &FeedSession) -> bool {
-	matches!(session_merge_sort(session), FeedSort::New | FeedSort::Random)
-		&& !session.request.bundle_followed_user_comments
-		&& session.sources.iter().all(|entry| materialized_catalog::source_is_supported(&entry.source))
+	matches!(session_merge_sort(session), FeedSort::New | FeedSort::Random) && session.sources.iter().all(|entry| materialized_catalog::source_is_supported(&entry.source))
 }
 
 fn session_uses_mixed_feed_catalog(session: &FeedSession) -> bool {
@@ -2248,8 +2259,17 @@ fn finalize_session_posts_with_order(session: &FeedSession, all_posts: Vec<Post>
 		sort_posts_by_deterministic_random_with_seed(&mut merged, session.request.random_rotation_seed);
 		return merged;
 	}
+	if session.request.following_discovery_order {
+		materialized_catalog::sort_following_posts_by_discovery(&mut merged);
+		return merged;
+	}
 	if session.request.bundle_followed_user_comments && merge_sort == FeedSort::New {
-		return interleave_followed_posts_by_actor(merged);
+		merged.sort_by(|left, right| {
+			crate::user::post_feed_activity_ts(right)
+				.cmp(&crate::user::post_feed_activity_ts(left))
+				.then_with(|| right.id.cmp(&left.id))
+		});
+		return merged;
 	}
 	merged
 }
@@ -2266,7 +2286,12 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 		const CATALOG_OVERFETCH_FACTOR: usize = 3;
 		const CATALOG_MAX_CANDIDATES: usize = 5_000;
 		let target = background_target_posts(session);
-		let limit = target.saturating_mul(CATALOG_OVERFETCH_FACTOR).min(CATALOG_MAX_CANDIDATES);
+		let max_candidates = if session.request.bundle_followed_user_comments {
+			100_000
+		} else {
+			CATALOG_MAX_CANDIDATES
+		};
+		let limit = target.saturating_mul(CATALOG_OVERFETCH_FACTOR).min(max_candidates);
 		if session_uses_mixed_feed_catalog(session) {
 			if let Some(mut posts) = materialized_catalog::query_mixed_feed_session_stream_limited(session, limit) {
 				let mut seen_ids = posts.iter().map(|post| post.id.clone()).collect::<HashSet<_>>();
@@ -2315,7 +2340,11 @@ fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per
 	tail.len() >= per_page || session.background_complete
 }
 
-fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, mut posts: Vec<Post>) -> Vec<Post> {
+fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, following_discovery_order: bool, mut posts: Vec<Post>) -> Vec<Post> {
+	if following_discovery_order {
+		materialized_catalog::sort_following_posts_by_discovery(&mut posts);
+		return posts;
+	}
 	match sort {
 		FeedSort::New => {
 			if bundle_activity_sort {
@@ -2328,56 +2357,6 @@ fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, mut posts: Ve
 		FeedSort::Hot => posts,
 		FeedSort::Random => posts,
 	}
-}
-
-fn followed_post_actor_key(post: &Post) -> String {
-	post
-		.following_comments
-		.first()
-		.map(|comment| comment.author.trim())
-		.filter(|author| !author.is_empty())
-		.unwrap_or_else(|| post.author.name.trim())
-		.to_lowercase()
-}
-
-fn interleave_followed_posts_by_actor(mut posts: Vec<Post>) -> Vec<Post> {
-	if posts.len() < 2 {
-		return posts;
-	}
-
-	posts.sort_by(|a, b| {
-		crate::user::post_feed_activity_ts(b)
-			.cmp(&crate::user::post_feed_activity_ts(a))
-			.then_with(|| followed_post_actor_key(a).cmp(&followed_post_actor_key(b)))
-			.then_with(|| a.id.cmp(&b.id))
-	});
-
-	let mut groups: Vec<(String, VecDeque<Post>)> = Vec::new();
-	let mut group_indexes = HashMap::new();
-	for post in posts {
-		let actor = followed_post_actor_key(&post);
-		let actor = if actor.is_empty() { post.id.clone() } else { actor };
-		let index = *group_indexes.entry(actor.clone()).or_insert_with(|| {
-			groups.push((actor, VecDeque::new()));
-			groups.len() - 1
-		});
-		groups[index].1.push_back(post);
-	}
-
-	let mut interleaved = Vec::new();
-	loop {
-		let mut emitted = false;
-		for (_, queue) in &mut groups {
-			if let Some(post) = queue.pop_front() {
-				interleaved.push(post);
-				emitted = true;
-			}
-		}
-		if !emitted {
-			break;
-		}
-	}
-	interleaved
 }
 
 /// `/following` uses two session sources per person (submitted + comments). For status text and
@@ -3183,7 +3162,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		frozen_posts.clone()
 	} else {
 		let chunk: Vec<Post> = tail_for_page.iter().take(per_page).cloned().collect();
-		let finalized = finalize_page_posts(sort, bundle_activity, chunk);
+		let finalized = finalize_page_posts(sort, bundle_activity, session.request.following_discovery_order, chunk);
 		if page_ready {
 			session.frozen_pages.insert(page, finalized.clone());
 		}
@@ -3218,7 +3197,7 @@ fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: u
 	if chunk.is_empty() {
 		return;
 	}
-	let finalized = finalize_page_posts(sort, bundle_activity, chunk);
+	let finalized = finalize_page_posts(sort, bundle_activity, session.request.following_discovery_order, chunk);
 	session.frozen_pages.insert(page, finalized);
 	touch_session(session);
 }
@@ -4008,7 +3987,7 @@ mod tests {
 	}
 
 	#[test]
-	fn following_new_interleaves_cached_followed_accounts() {
+	fn following_new_is_strictly_chronological_even_for_prolific_accounts() {
 		let _guard = test_lock();
 		reset_test_caches();
 
@@ -4048,9 +4027,91 @@ mod tests {
 			revision: 0,
 		};
 
-		let first_ten_authors = merged_posts_for_session(&session).into_iter().take(10).map(|post| post.author.name).collect::<HashSet<_>>();
+		let merged = merged_posts_for_session(&session);
+		assert_eq!(merged.len(), 68, "the full followed-profile cache should remain reachable");
+		assert!(merged
+			.windows(2)
+			.all(|pair| crate::user::post_feed_activity_ts(&pair[0]) >= crate::user::post_feed_activity_ts(&pair[1])));
+		assert_eq!(merged.first().map(|post| post.author.name.as_str()), Some("followed_0"));
+		assert_eq!(merged.get(1).map(|post| post.author.name.as_str()), Some("followed_0"));
+	}
 
-		assert_eq!(first_ten_authors.len(), 10);
+	#[test]
+	fn following_new_uses_cached_posts_from_all_requested_profiles_before_warmup() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let mut sources = Vec::new();
+		for index in 0..40 {
+			let username = format!("profile_{index:02}");
+			let source = FeedSource::subreddit(format!("u_{username}"), FeedSort::New);
+			let mut post = test_post(&format!("post-{index:02}"), "community", 10_000 - index);
+			post.author.name = username;
+			seed_source(&source, vec![post]);
+			sources.push(source);
+		}
+
+		let session = FeedSession {
+			id: "following-all-profile-catalog".to_string(),
+			request: FeedSessionRequest {
+				sources: sources.clone(),
+				bundle_followed_user_comments: true,
+				..Default::default()
+			},
+			sources: sources.into_iter().map(|source| session_entry(source, SessionSourceState::Unstarted)).collect(),
+			frozen_pages: HashMap::new(),
+			background_active: true,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let authors = merged_posts_for_session(&session)
+			.into_iter()
+			.take(POSTS_PER_PAGE)
+			.map(|post| post.author.name)
+			.collect::<HashSet<_>>();
+		assert_eq!(authors.len(), POSTS_PER_PAGE);
+	}
+
+	#[test]
+	fn following_discovery_order_only_promotes_newly_seen_posts() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let source = FeedSource::subreddit("u_demo", FeedSort::New);
+		let old = test_post("old", "community", 200);
+		let newly_found = test_post("newly-found", "community", 100);
+		crate::materialized_catalog::mark_following_posts_seen(&source, std::slice::from_ref(&old));
+		crate::materialized_catalog::record_following_discoveries(&source, &[old.clone(), newly_found.clone()]);
+
+		let mut posts = vec![old.clone(), newly_found.clone()];
+		crate::materialized_catalog::sort_following_posts_by_discovery(&mut posts);
+		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["newly-found", "old"]);
+
+		crate::materialized_catalog::record_following_discoveries(&source, &[old, newly_found]);
+		crate::materialized_catalog::sort_following_posts_by_discovery(&mut posts);
+		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["newly-found", "old"]);
+	}
+
+	#[test]
+	fn following_discovery_migration_uses_one_deployment_baseline_without_dropping_posts() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let first_source = FeedSource::subreddit("u_first", FeedSort::New);
+		let second_source = FeedSource::subreddit("u_second", FeedSort::New);
+		let first = crate::cache_persistence::PersistedPost::from_runtime(&test_post("first", "community", 100));
+		let second = crate::cache_persistence::PersistedPost::from_runtime(&test_post("second", "community", 200));
+		crate::materialized_catalog::seed_following_discovery_baseline(&first_source, &[first], 111);
+		crate::materialized_catalog::seed_following_discovery_baseline(&second_source, &[second], 222);
+
+		let entries = crate::materialized_catalog::snapshot_following_discoveries();
+		assert_eq!(entries.len(), 2);
+		assert_eq!(entries[0].discovered_at_unix, entries[1].discovered_at_unix);
+		assert_ne!(entries[0].discovered_at_unix, 111);
+		assert_ne!(entries[0].discovered_at_unix, 222);
 	}
 
 	#[test]
@@ -6142,6 +6203,7 @@ mod tests {
 					query_fingerprint: "demo".to_string(),
 					cache_revision: 0,
 					bundle_followed_user_comments: true,
+					following_discovery_order: false,
 					random_rotation_seed: 0,
 					merge_sort: None,
 				},

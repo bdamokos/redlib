@@ -663,6 +663,10 @@ fn is_random_sort(sort: &str) -> bool {
 	sort == "random"
 }
 
+fn is_following_discovery_sort(sort: &str) -> bool {
+	sort == "discovered"
+}
+
 fn canonical_new_sort_url(path: &str, query: Option<&str>) -> String {
 	let path = path.strip_suffix("/random").map(|base| format!("{base}/new")).unwrap_or_else(|| path.to_string());
 	match query {
@@ -683,6 +687,7 @@ fn sort_option_label(method: &str) -> String {
 	match method {
 		"video-length" => "Video Length".to_string(),
 		"random" => "Random".to_string(),
+		"discovered" => "Discovered".to_string(),
 		_ => format!("{}{}", method.get(0..1).unwrap_or_default().to_uppercase(), method.get(1..).unwrap_or_default()),
 	}
 }
@@ -1080,7 +1085,9 @@ async fn render_peer_api_subreddit_fragment(
 
 fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &str, flair_filter: &str) -> Vec<SortOption> {
 	let (_, query) = current_url_parts(current_query_url);
-	let methods = if base_path.is_empty() || base_path == FOLLOWING_ROUTE {
+	let methods = if base_path == FOLLOWING_ROUTE {
+		vec!["new", "discovered", "hot", "random", "top", "rising", "controversial", "video-length"]
+	} else if base_path.is_empty() {
 		vec!["hot", "new", "random", "top", "rising", "controversial", "video-length"]
 	} else {
 		vec!["hot", "new", "top", "rising", "controversial", "video-length"]
@@ -1088,7 +1095,11 @@ fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &
 	methods
 		.into_iter()
 		.map(|method| SortOption {
-			label: sort_option_label(method),
+			label: if base_path == FOLLOWING_ROUTE && method == "new" {
+				"Chronological".to_string()
+			} else {
+				sort_option_label(method)
+			},
 			url: {
 				let mut query_pairs = video_mode::query_pairs(query);
 				query_pairs.retain(|(key, _)| key != "before" && key != "after" && key != FRONT_CURSOR_PARAM && key != "cache_page" && key != FEED_SESSION_PARAM);
@@ -1484,7 +1495,7 @@ fn build_video_mode_front_page_sources(preferences: &Preferences, front_page: &s
 }
 
 fn front_page_uses_contextual_session(is_subreddit_route: bool, sort: &str) -> bool {
-	!is_subreddit_route && matches!(sort, "new" | "hot" | "random")
+	!is_subreddit_route && matches!(sort, "new" | "hot" | "random" | "discovered")
 }
 
 fn build_front_page_session_sources(
@@ -2039,7 +2050,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let front_page_is_following = is_following_front_page(&front_page);
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
-	let post_sort = default_post_sort_setting(&prefs);
+	let post_sort = if front_page_is_following {
+		"new".to_string()
+	} else {
+		default_post_sort_setting(&prefs)
+	};
 	let requested_sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 	if req.param("sub").is_some() && is_random_sort(&requested_sort) {
 		return Ok(redirect(&canonical_new_sort_url(&path, req.uri().query())));
@@ -2198,6 +2213,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
+				following_discovery_order: is_following_front_page(&front_page) && is_following_discovery_sort(&sort),
 				random_rotation_seed: random_rotation_seed_for_sort(&sort),
 				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
@@ -2360,7 +2376,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let front_page_is_following = is_following_front_page(&front_page);
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
-	let post_sort = default_post_sort_setting(&prefs);
+	let post_sort = if front_page_is_following {
+		"new".to_string()
+	} else {
+		default_post_sort_setting(&prefs)
+	};
 	let requested_sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 	if is_subreddit_route && is_random_sort(&requested_sort) {
 		return Ok(redirect(&canonical_new_sort_url(&request_path, req.uri().query())));
@@ -2874,6 +2894,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
+				following_discovery_order: is_following_front_page(&front_page) && is_following_discovery_sort(&sort),
 				random_rotation_seed: random_rotation_seed_for_sort(&sort),
 				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
@@ -4764,10 +4785,14 @@ mod tests {
 	#[test]
 	fn following_sort_links_use_following_routes() {
 		let options = super::build_sort_options("/following", "/following/hot?front_cursor=abc&after=t3_demo&t=day", "hot", "");
+		let chronological = options.iter().find(|option| option.label == "Chronological").unwrap();
+		let discovered = options.iter().find(|option| option.label == "Discovered").unwrap();
 		let random = options.iter().find(|option| option.label == "Random").unwrap();
 		let top = options.iter().find(|option| option.label == "Top").unwrap();
 		let video_length = options.iter().find(|option| option.label == "Video Length").unwrap();
 
+		assert_eq!(chronological.url, "/following/new?t=day");
+		assert_eq!(discovered.url, "/following/discovered?t=day");
 		assert_eq!(random.url, "/following/random?t=day");
 		assert_eq!(top.url, "/following/top?t=day");
 		assert_eq!(video_length.url, "/following/video-length?t=day");
