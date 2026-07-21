@@ -735,13 +735,13 @@ fn remember_followed_user_comment_source(name: &str) {
 	remember_source_request(&source);
 }
 
-pub fn remember_frontpage_subreddits(preferences: &Preferences) {
+pub fn remember_frontpage_subreddits(preferences: &Preferences, include_followed_user_comments: bool) {
 	for subreddit in &preferences.subscriptions {
 		if let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) {
 			remember_source_request(&source);
 			record_remembered_feed_visit_signal(&source);
 		}
-		if subreddit.starts_with("u_") {
+		if include_followed_user_comments && subreddit.starts_with("u_") {
 			if let Some(source) = normalize_remembered_source(&FeedSource::user_comments(subreddit.to_string(), FeedSort::New)) {
 				remember_followed_user_comment_source(subreddit);
 				record_remembered_feed_visit_signal(&source);
@@ -3490,7 +3490,7 @@ fn predicted_next_fetch_secs_for_position(seconds_until_tick: u64, position: usi
 }
 
 pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusResponse {
-	remember_frontpage_subreddits(preferences);
+	remember_frontpage_subreddits(preferences, false);
 	let now = Instant::now();
 	let generated_at_unix = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -4674,15 +4674,26 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		remember_frontpage_subreddits(&test_prefs_with_saved_feeds());
+		remember_frontpage_subreddits(&test_prefs_with_saved_feeds(), false);
 
 		let programming_flair_key = format!("flair:programming:{}", URL_SAFE_NO_PAD.encode("News".as_bytes()));
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 		assert!(remembered.contains_key("rust"));
 		assert!(remembered.contains_key(&programming_flair_key));
 		assert!(remembered.contains_key("u_demo"));
+		assert!(!remembered.contains_key("user_comments:u_demo"));
+		assert_eq!(remembered.len(), 3);
+	}
+
+	#[test]
+	fn following_frontpage_tracks_followed_user_comment_sources() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_frontpage_subreddits(&test_prefs_with_saved_feeds(), true);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 		assert!(remembered.contains_key("user_comments:u_demo"));
-		assert_eq!(remembered.len(), 4);
 	}
 
 	#[test]

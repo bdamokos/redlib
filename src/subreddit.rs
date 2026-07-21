@@ -30,7 +30,6 @@ const FRONT_CURSOR_PARAM: &str = "front_cursor";
 const FEED_SESSION_PARAM: &str = "feed_session";
 const FOLLOWING_FRONT_PAGE: &str = "following";
 const FOLLOWING_ROUTE: &str = "/following";
-const FOLLOWED_USER_FRONT_PAGE_BIAS_STRIDE: usize = 4;
 const REDDIT_LISTING_PATH_SOFT_LIMIT: usize = 7_000;
 const TARGET_POST_COUNT: usize = 25;
 const MAX_FILTERED_PAGE_ADVANCE: usize = 3;
@@ -1380,26 +1379,35 @@ fn ordered_front_page_subscriptions(subscriptions: &[String]) -> Vec<String> {
 		return followed_users;
 	}
 
-	let mut ordered = Vec::with_capacity(subscriptions.len());
+	let user_count = followed_users.len();
+	let subreddit_count = followed_subreddits.len();
+	let total_count = subscriptions.len();
+	let mut ordered = Vec::with_capacity(total_count);
 	let mut user_index = 0;
 	let mut subreddit_index = 0;
+	let mut user_credit = 0;
+	let mut subreddit_credit = 0;
 	while user_index < followed_users.len() || subreddit_index < followed_subreddits.len() {
-		if user_index < followed_users.len() {
+		user_credit += user_count;
+		subreddit_credit += subreddit_count;
+		let choose_user = if user_index >= followed_users.len() {
+			false
+		} else if subreddit_index >= followed_subreddits.len() {
+			true
+		} else if user_credit == subreddit_credit {
+			followed_users[user_index].to_lowercase() < followed_subreddits[subreddit_index].to_lowercase()
+		} else {
+			user_credit > subreddit_credit
+		};
+
+		if choose_user {
 			ordered.push(followed_users[user_index].clone());
 			user_index += 1;
-		}
-
-		for _ in 1..FOLLOWED_USER_FRONT_PAGE_BIAS_STRIDE {
-			if subreddit_index >= followed_subreddits.len() {
-				break;
-			}
+			user_credit = user_credit.saturating_sub(total_count);
+		} else {
 			ordered.push(followed_subreddits[subreddit_index].clone());
 			subreddit_index += 1;
-		}
-
-		if subreddit_index >= followed_subreddits.len() {
-			ordered.extend(followed_users[user_index..].iter().cloned());
-			break;
+			subreddit_credit = subreddit_credit.saturating_sub(total_count);
 		}
 	}
 
@@ -2040,7 +2048,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let aggregate_front_page = req.param("sub").is_none() && ((front_page_is_default && has_default_saved_feeds) || (front_page_is_following && has_followed_users));
 	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
 	if aggregate_front_page {
-		crate::post_cache::remember_frontpage_subreddits(&prefs);
+		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
 	}
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
@@ -2460,7 +2468,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 		}
 	}
 	if aggregate_saved_feeds {
-		crate::post_cache::remember_frontpage_subreddits(&prefs);
+		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
 	}
 	let cached_subreddit_page = if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
 		crate::post_cache::get_cached_subreddit_page(&sub_name, cache_page, crate::post_cache::POSTS_PER_PAGE)
@@ -4818,7 +4826,7 @@ mod tests {
 	}
 
 	#[test]
-	fn default_front_page_reduces_followed_user_source_bias() {
+	fn default_front_page_uses_the_actual_follow_ratio() {
 		let subscriptions = vec![
 			"u_charlie".to_string(),
 			"rust".to_string(),
@@ -4833,20 +4841,20 @@ mod tests {
 		assert_eq!(
 			super::ordered_front_page_subscriptions(&subscriptions),
 			vec![
-				"u_alpha".to_string(),
 				"askreddit".to_string(),
+				"u_alpha".to_string(),
 				"programming".to_string(),
 				"rust".to_string(),
 				"u_bravo".to_string(),
 				"science".to_string(),
-				"webdev".to_string(),
 				"u_charlie".to_string(),
+				"webdev".to_string(),
 			]
 		);
 	}
 
 	#[test]
-	fn default_front_page_sources_keep_followed_users_to_one_in_four() {
+	fn default_front_page_sources_do_not_give_followed_users_precedence() {
 		let mut prefs = test_prefs();
 		prefs.subscriptions = vec![
 			"u_charlie".to_string(),
@@ -4870,8 +4878,20 @@ mod tests {
 
 		assert_eq!(
 			source_names,
-			vec!["u_alpha", "askreddit", "programming", "rust", "u_bravo", "science", "webdev", "u_charlie"]
+			vec!["askreddit", "u_alpha", "programming", "rust", "u_bravo", "science", "u_charlie", "webdev"]
 		);
+	}
+
+	#[test]
+	fn default_front_page_prefix_matches_a_twenty_five_percent_user_follow_ratio() {
+		let mut subscriptions = (0..75).map(|index| format!("subreddit{index:02}")).collect::<Vec<_>>();
+		subscriptions.extend((0..25).map(|index| format!("u_profile{index:02}")));
+
+		let ordered = super::ordered_front_page_subscriptions(&subscriptions);
+		let first_window = &ordered[..32];
+
+		assert!(!super::is_followed_user_subscription(&first_window[0]));
+		assert_eq!(first_window.iter().filter(|name| super::is_followed_user_subscription(name)).count(), 8);
 	}
 
 	#[test]
