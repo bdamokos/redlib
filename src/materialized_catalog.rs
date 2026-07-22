@@ -182,8 +182,11 @@ pub struct SuggestedProfileMediaPost {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RelatedSubredditReport {
 	pub semantic_embedding_count: usize,
+	pub vibe_embedding_count: usize,
 	pub followed_subreddits: Vec<RelatedSubredditEntry>,
 	pub cached_subreddits: Vec<RelatedSubredditEntry>,
+	pub vibe_followed_subreddits: Vec<RelatedSubredditEntry>,
+	pub vibe_cached_subreddits: Vec<RelatedSubredditEntry>,
 	pub followed_profiles: Vec<RelatedProfileEntry>,
 	pub cached_profiles: Vec<RelatedProfileEntry>,
 }
@@ -2201,6 +2204,75 @@ fn related_profile_signals(counts: &HashMap<String, usize>, current_embedding: &
 	signals.into_iter().map(|(subreddit, _, _)| subreddit).collect()
 }
 
+fn rank_related_subreddits(
+	candidate_subreddits: &HashSet<String>,
+	current_embedding: Option<&[f32]>,
+	followed_subreddits: &HashSet<String>,
+	normalized_filters: &HashSet<String>,
+	subreddit_stats: &HashMap<String, (usize, usize)>,
+	content_post_counts: &HashMap<String, usize>,
+	embedding_for_candidate: impl Fn(&str) -> Option<Vec<f32>>,
+	use_content_post_count: bool,
+	limit: usize,
+) -> (Vec<RelatedSubredditEntry>, Vec<RelatedSubredditEntry>) {
+	let Some(current_embedding) = current_embedding else {
+		return (Vec::new(), Vec::new());
+	};
+	let mut related_subreddits = candidate_subreddits
+		.iter()
+		.filter(|candidate| !normalized_filters.contains(*candidate))
+		.filter_map(|candidate| {
+			let embedding = embedding_for_candidate(candidate)?;
+			let similarity = embedding_cosine(current_embedding, &embedding);
+			if similarity < RELATED_SUBREDDIT_MIN_SIMILARITY {
+				return None;
+			}
+			let (cached_profile_count, cached_post_count) = subreddit_stats
+				.get(candidate)
+				.copied()
+				.unwrap_or_else(|| (0, content_post_counts.get(candidate).copied().unwrap_or_default()));
+			let cached_post_count = if use_content_post_count {
+				content_post_counts.get(candidate).copied().unwrap_or(cached_post_count)
+			} else {
+				cached_post_count
+			};
+			Some((
+				followed_subreddits.contains(candidate),
+				RelatedSubredditEntry {
+					name: candidate.clone(),
+					score_percent: related_score_percent(similarity * crate::promo_detection::promotion_quality_factor(candidate)),
+					cached_profile_count,
+					cached_post_count,
+				},
+			))
+		})
+		.collect::<Vec<_>>();
+	related_subreddits.sort_by(|left, right| {
+		right
+			.1
+			.score_percent
+			.cmp(&left.1.score_percent)
+			.then_with(|| right.1.cached_profile_count.cmp(&left.1.cached_profile_count))
+			.then_with(|| right.1.cached_post_count.cmp(&left.1.cached_post_count))
+			.then_with(|| left.1.name.cmp(&right.1.name))
+	});
+	let mut followed = Vec::new();
+	let mut cached = Vec::new();
+	for (is_followed, entry) in related_subreddits {
+		if is_followed {
+			if followed.len() < limit {
+				followed.push(entry);
+			}
+		} else if cached.len() < limit {
+			cached.push(entry);
+		}
+		if followed.len() >= limit && cached.len() >= limit {
+			break;
+		}
+	}
+	(followed, cached)
+}
+
 pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String], filters: &HashSet<String>, limit: usize) -> RelatedSubredditReport {
 	let subreddit = subreddit_semantics::normalize_subreddit_name(subreddit);
 	if subreddit.is_empty() || subreddit == "all" || subreddit == "popular" || subreddit.contains('+') || limit == 0 {
@@ -2213,18 +2285,17 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 		warn!("related subreddits: failed to refresh subreddit content semantic embeddings sidecar: {error}");
 	}
 	let semantic_model = subreddit_semantics::embedding_model();
-	let Some(current_embedding) = blended_subreddit_semantic_embedding(&subreddit, &semantic_model) else {
+	let metadata_embedding = subreddit_semantics::embedding_for_subreddit_model(&subreddit, &semantic_model);
+	let vibe_embedding = subreddit_content_semantics::embedding_for_subreddit_model(&subreddit, &semantic_model);
+	let profile_embedding = blended_subreddit_semantic_embedding(&subreddit, &semantic_model);
+	if metadata_embedding.is_none() && vibe_embedding.is_none() && profile_embedding.is_none() {
 		return RelatedSubredditReport {
-			semantic_embedding_count: active_semantic_embedding_count(),
+			semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+			vibe_embedding_count: subreddit_content_semantics::active_usable_embedding_count(),
 			..RelatedSubredditReport::default()
 		};
-	};
-	let Some(current_vector) = normalized_f32_embedding(&current_embedding) else {
-		return RelatedSubredditReport {
-			semantic_embedding_count: active_semantic_embedding_count(),
-			..RelatedSubredditReport::default()
-		};
-	};
+	}
+	let current_vector = profile_embedding.as_deref().and_then(normalized_f32_embedding);
 
 	let (followed_subreddits, followed_profiles) = normalized_followed_sets(subscriptions);
 	let normalized_filters = filters.iter().map(|filter| filter.trim().to_lowercase()).collect::<HashSet<_>>();
@@ -2255,54 +2326,29 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 	let mut candidate_subreddits = subreddit_stats.keys().cloned().collect::<HashSet<_>>();
 	candidate_subreddits.extend(followed_subreddits.iter().cloned());
 	candidate_subreddits.extend(content_entries.into_iter().map(|entry| entry.subreddit));
-	candidate_subreddits.retain(|candidate| !candidate.starts_with("u_"));
-	let mut related_subreddits = candidate_subreddits
-		.into_iter()
-		.filter(|candidate| candidate != &subreddit && !normalized_filters.contains(candidate))
-		.filter_map(|candidate| {
-			let embedding = blended_subreddit_semantic_embedding(&candidate, &semantic_model)?;
-			let similarity = embedding_cosine(&current_embedding, &embedding);
-			if similarity < RELATED_SUBREDDIT_MIN_SIMILARITY {
-				return None;
-			}
-			let (cached_profile_count, cached_post_count) = subreddit_stats
-				.get(&candidate)
-				.copied()
-				.unwrap_or_else(|| (0, content_post_counts.get(&candidate).copied().unwrap_or_default()));
-			Some((
-				followed_subreddits.contains(&candidate),
-				RelatedSubredditEntry {
-					name: candidate.clone(),
-					score_percent: related_score_percent(similarity * crate::promo_detection::promotion_quality_factor(&candidate)),
-					cached_profile_count,
-					cached_post_count,
-				},
-			))
-		})
-		.collect::<Vec<_>>();
-	related_subreddits.sort_by(|left, right| {
-		right
-			.1
-			.score_percent
-			.cmp(&left.1.score_percent)
-			.then_with(|| right.1.cached_profile_count.cmp(&left.1.cached_profile_count))
-			.then_with(|| right.1.cached_post_count.cmp(&left.1.cached_post_count))
-			.then_with(|| left.1.name.cmp(&right.1.name))
-	});
-	let mut followed_related_subreddits = Vec::new();
-	let mut cached_related_subreddits = Vec::new();
-	for (followed, entry) in related_subreddits {
-		if followed {
-			if followed_related_subreddits.len() < limit {
-				followed_related_subreddits.push(entry);
-			}
-		} else if cached_related_subreddits.len() < limit {
-			cached_related_subreddits.push(entry);
-		}
-		if followed_related_subreddits.len() >= limit && cached_related_subreddits.len() >= limit {
-			break;
-		}
-	}
+	candidate_subreddits.retain(|candidate| candidate != &subreddit && !candidate.starts_with("u_"));
+	let (followed_related_subreddits, cached_related_subreddits) = rank_related_subreddits(
+		&candidate_subreddits,
+		metadata_embedding.as_deref(),
+		&followed_subreddits,
+		&normalized_filters,
+		&subreddit_stats,
+		&content_post_counts,
+		|candidate| subreddit_semantics::embedding_for_subreddit_model(candidate, &semantic_model),
+		false,
+		limit,
+	);
+	let (vibe_followed_subreddits, vibe_cached_subreddits) = rank_related_subreddits(
+		&candidate_subreddits,
+		vibe_embedding.as_deref(),
+		&followed_subreddits,
+		&normalized_filters,
+		&subreddit_stats,
+		&content_post_counts,
+		|candidate| subreddit_content_semantics::embedding_for_subreddit_model(candidate, &semantic_model),
+		true,
+		limit,
+	);
 
 	let mut profile_signal_subreddits = HashSet::from([subreddit.clone()]);
 	profile_signal_subreddits.extend(followed_related_subreddits.iter().map(|entry| entry.name.clone()));
@@ -2333,6 +2379,8 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 		.into_iter()
 		.filter(|(profile, _)| !profile.is_empty() && profile != "[deleted]" && !normalized_filters.contains(&format!("u_{profile}")))
 		.filter_map(|(profile, counts)| {
+			let current_vector = current_vector.as_deref()?;
+			let current_embedding = profile_embedding.as_deref()?;
 			let profile_counts = sorted_subreddit_counts(&counts, SUGGESTED_PROFILE_VECTOR_SUBREDDITS);
 			let cached_posts = profile_counts.iter().map(|(_, count)| *count).sum::<usize>();
 			if cached_posts < SUGGESTED_PROFILE_MIN_POSTS {
@@ -2381,9 +2429,12 @@ pub(crate) fn related_subreddit_report(subreddit: &str, subscriptions: &[String]
 	}
 
 	RelatedSubredditReport {
-		semantic_embedding_count: active_semantic_embedding_count(),
+		semantic_embedding_count: subreddit_semantics::active_embedding_count(),
+		vibe_embedding_count: subreddit_content_semantics::active_usable_embedding_count(),
 		followed_subreddits: followed_related_subreddits,
 		cached_subreddits: cached_related_subreddits,
+		vibe_followed_subreddits,
+		vibe_cached_subreddits,
 		followed_profiles: followed_related_profiles,
 		cached_profiles: cached_related_profiles,
 	}
@@ -4107,6 +4158,10 @@ mod tests {
 		crate::subreddit_semantics::store_embedding("cake", "nomic-embed-text", "cake-hash", vec![0.95, 0.05], 1).unwrap();
 		crate::subreddit_semantics::store_embedding("rust", "nomic-embed-text", "rust-hash", vec![0.0, 1.0], 1).unwrap();
 		crate::subreddit_content_semantics::clear_test_cache();
+		crate::subreddit_content_semantics::store_embedding("baking", "nomic-embed-text", "baking-vibe-hash", vec![0.0, 1.0], 1, 12, 1, 400).unwrap();
+		crate::subreddit_content_semantics::store_embedding("sourdough", "nomic-embed-text", "sourdough-vibe-hash", vec![0.9, 0.1], 1, 12, 1, 400).unwrap();
+		crate::subreddit_content_semantics::store_embedding("cake", "nomic-embed-text", "cake-vibe-hash", vec![1.0, 0.0], 1, 12, 1, 400).unwrap();
+		crate::subreddit_content_semantics::store_embedding("rust", "nomic-embed-text", "rust-vibe-hash", vec![0.02, 0.98], 1, 12, 1, 400).unwrap();
 		crate::subreddit_content_semantics::store_embedding("u_cached_profile", "nomic-embed-text", "profile-hash", vec![1.0, 0.0], 1, 25, 1, 400).unwrap();
 
 		apply_source_refresh(
@@ -4122,6 +4177,11 @@ mod tests {
 		assert!(report.cached_subreddits.iter().any(|entry| entry.name == "cake"));
 		assert!(!report.cached_subreddits.iter().any(|entry| entry.name == "rust"));
 		assert!(!report.cached_subreddits.iter().any(|entry| entry.name == "u_cached_profile"));
+		assert!(report.vibe_cached_subreddits.iter().any(|entry| entry.name == "rust" && entry.cached_post_count == 12));
+		assert!(!report.vibe_cached_subreddits.iter().any(|entry| entry.name == "cake"));
+		assert!(report.vibe_followed_subreddits.is_empty());
+		assert_eq!(report.semantic_embedding_count, 4);
+		assert_eq!(report.vibe_embedding_count, 5);
 		assert_eq!(report.followed_profiles[0].name, "baker");
 		assert!(report.cached_profiles.iter().any(|entry| entry.name == "cake_author"));
 		crate::subreddit_semantics::clear_test_cache();

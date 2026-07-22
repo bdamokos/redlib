@@ -66,22 +66,22 @@
 				</ul>
 			</div>
 			{% endif %}
-			{% if related_subreddits.followed_subreddits.len() > 0 || related_subreddits.cached_subreddits.len() > 0 || related_subreddits.followed_profiles.len() > 0 || related_subreddits.cached_profiles.len() > 0 %}
+			{% if related_subreddits.followed_subreddits.len() > 0 || related_subreddits.cached_subreddits.len() > 0 || related_subreddits.vibe_followed_subreddits.len() > 0 || related_subreddits.vibe_cached_subreddits.len() > 0 || related_subreddits.followed_profiles.len() > 0 || related_subreddits.cached_profiles.len() > 0 %}
 			<div id="sub_related">
 				<div class="sub_flairs_header">
 					<label>Related</label>
-					{% if related_subreddits.semantic_embedding_count > 0 %}
-					<span>{{ related_subreddits.semantic_embedding_count }} embeddings</span>
+					{% if related_subreddits.semantic_embedding_count > 0 || related_subreddits.vibe_embedding_count > 0 %}
+					<span>{% if related_subreddits.semantic_embedding_count > 0 %}{{ related_subreddits.semantic_embedding_count }} description vectors{% endif %}{% if related_subreddits.semantic_embedding_count > 0 && related_subreddits.vibe_embedding_count > 0 %} · {% endif %}{% if related_subreddits.vibe_embedding_count > 0 %}{{ related_subreddits.vibe_embedding_count }} vibe vectors{% endif %}</span>
 					{% endif %}
 				</div>
 				{% if related_subreddits.followed_subreddits.len() > 0 %}
 				<div class="sub_related_group">
-					<p>Following nearby</p>
+					<p>Following by description</p>
 					<ul class="sub_related_list">
 						{% for related in related_subreddits.followed_subreddits %}
 						<li>
 							<a href="/r/{{ related.name }}">r/{{ related.name }}</a>
-							<span>{{ related.score_percent }}% semantic{% if related.cached_post_count > 0 %} · {{ related.cached_post_count }} cached posts{% endif %}</span>
+							<span>{{ related.score_percent }}% description{% if related.cached_post_count > 0 %} · {{ related.cached_post_count }} cached posts{% endif %}</span>
 						</li>
 						{% endfor %}
 					</ul>
@@ -89,12 +89,38 @@
 				{% endif %}
 				{% if related_subreddits.cached_subreddits.len() > 0 %}
 				<div class="sub_related_group">
-					<p>Known from cache</p>
+					<p>Known by description</p>
 					<ul class="sub_related_list">
 						{% for related in related_subreddits.cached_subreddits %}
 						<li>
 							<a href="/r/{{ related.name }}">r/{{ related.name }}</a>
-							<span>{{ related.score_percent }}% semantic · {{ related.cached_profile_count }} profiles · {{ related.cached_post_count }} posts</span>
+							<span>{{ related.score_percent }}% description · {{ related.cached_profile_count }} profiles · {{ related.cached_post_count }} posts</span>
+						</li>
+						{% endfor %}
+					</ul>
+				</div>
+				{% endif %}
+				{% if related_subreddits.vibe_followed_subreddits.len() > 0 %}
+				<div class="sub_related_group">
+					<p>Following by vibe</p>
+					<ul class="sub_related_list">
+						{% for related in related_subreddits.vibe_followed_subreddits %}
+						<li>
+							<a href="/r/{{ related.name }}">r/{{ related.name }}</a>
+							<span>{{ related.score_percent }}% vibe{% if related.cached_post_count > 0 %} · {{ related.cached_post_count }} embedded posts{% endif %}</span>
+						</li>
+						{% endfor %}
+					</ul>
+				</div>
+				{% endif %}
+				{% if related_subreddits.vibe_cached_subreddits.len() > 0 %}
+				<div class="sub_related_group">
+					<p>Known by vibe</p>
+					<ul class="sub_related_list">
+						{% for related in related_subreddits.vibe_cached_subreddits %}
+						<li>
+							<a href="/r/{{ related.name }}">r/{{ related.name }}</a>
+							<span>{{ related.score_percent }}% vibe · {{ related.cached_post_count }} embedded posts</span>
 						</li>
 						{% endfor %}
 					</ul>

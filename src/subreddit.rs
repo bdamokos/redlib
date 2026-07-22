@@ -3870,11 +3870,18 @@ mod tests {
 			}],
 			related_subreddits: crate::materialized_catalog::RelatedSubredditReport {
 				semantic_embedding_count: 42,
+				vibe_embedding_count: 17,
 				cached_subreddits: vec![crate::materialized_catalog::RelatedSubredditEntry {
 					name: "rustlang".to_string(),
 					score_percent: 91,
 					cached_profile_count: 4,
 					cached_post_count: 12,
+				}],
+				vibe_cached_subreddits: vec![crate::materialized_catalog::RelatedSubredditEntry {
+					name: "systems".to_string(),
+					score_percent: 87,
+					cached_profile_count: 3,
+					cached_post_count: 10,
 				}],
 				..Default::default()
 			},
@@ -3918,9 +3925,13 @@ mod tests {
 		assert!(users_index < related_index, "user stats should remain above related recommendations");
 		assert!(html.contains("/user/demo_user\">u/demo_user</a>"));
 		assert!(html.contains(">3</span>"));
-		assert!(html.contains("42 embeddings"));
+		assert!(html.contains("42 description vectors · 17 vibe vectors"));
 		assert!(html.contains("/r/rustlang"));
-		assert!(html.contains("91% semantic"));
+		assert!(html.contains("Known by description"));
+		assert!(html.contains("91% description"));
+		assert!(html.contains("/r/systems"));
+		assert!(html.contains("Known by vibe"));
+		assert!(html.contains("87% vibe"));
 	}
 
 	#[test]
