@@ -2,10 +2,10 @@
 //!
 //! This module is compiled only with `--features cache-sqlite-bench`. It is not
 //! used by the Redlib server and deliberately writes only to an explicit test DB.
-//! Its text-key, separate-payload and global-card tables reproduce the rejected
-//! baseline; the reviewed production shape is documented in
-//! `docs/cache-sqlite-architecture.md` and deliberately uses ordinary ROWID
-//! canonical object rows with profile-local materialization.
+//! Its canonical ROWID objects exercise the proposed storage shape while its
+//! global-card tables retain the rejected aggregation comparator. The reviewed
+//! production shape is documented in `docs/cache-sqlite-architecture.md` and
+//! deliberately uses profile-local materialization instead.
 
 use crate::cache_persistence::{PersistedPost, PersistedSourceCacheEntry};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -413,10 +413,7 @@ fn upsert_item(tx: &Transaction<'_>, post: &PersistedPost, observed_at: u64, com
 	let object_pk: i64 = tx
 		.query_row("SELECT object_pk FROM items WHERE item_id=?1", [&post.id], |row| row.get(0))
 		.map_err(|error| error.to_string())?;
-	tx.execute(
-		"INSERT OR IGNORE INTO duplicate_members(group_id,object_pk) VALUES(?1,?2)",
-		params![group_id, object_pk],
-	)
+	tx.execute("INSERT OR IGNORE INTO duplicate_members(group_id,object_pk) VALUES(?1,?2)", params![group_id, object_pk])
 		.map_err(|error| error.to_string())?;
 	Ok(object_pk)
 }
@@ -501,36 +498,36 @@ END;
 
 DELETE FROM thread_members;
 DELETE FROM thread_groups;
-INSERT INTO thread_groups(submission_id,representative_id,created_sort,activity_sort,discovery_sort,member_count)
+INSERT INTO thread_groups(submission_id,representative_pk,created_sort,activity_sort,discovery_sort,member_count)
 SELECT submission_id,
-       COALESCE(MAX(CASE WHEN kind=3 THEN item_id END),MIN(item_id)),
+       COALESCE(MAX(CASE WHEN kind=3 THEN object_pk END),MIN(object_pk)),
        MAX(CASE WHEN kind=3 THEN created_utc ELSE link_created_utc END),
        MAX(created_utc),MAX(discovery_seq),COUNT(*)
 FROM items GROUP BY submission_id;
-INSERT INTO thread_members(submission_id,item_id)
-SELECT submission_id,item_id FROM items;
+INSERT INTO thread_members(submission_id,object_pk)
+SELECT submission_id,object_pk FROM items;
 
 DELETE FROM feed_entries;
-INSERT INTO feed_entries(feed_id,card_key,representative_id,created_sort,activity_sort,discovery_sort,duration_seconds,
+INSERT INTO feed_entries(feed_id,card_key,representative_pk,created_sort,activity_sort,discovery_sort,duration_seconds,
                          random_epoch,random_round,random_rank,member_count)
 SELECT 1,i.card_key,
-       COALESCE(MAX(CASE WHEN i.kind=3 THEN i.item_id END),MIN(i.item_id)),
+       COALESCE(MAX(CASE WHEN i.kind=3 THEN i.object_pk END),MIN(i.object_pk)),
        MAX(CASE WHEN i.kind=3 THEN i.created_utc ELSE i.link_created_utc END),
        MAX(i.created_utc),MAX(i.discovery_seq),MAX(i.duration_seconds),1,MIN(sm.source_position),
        ABS((COALESCE(MIN(i.group_id),0)*1103515245 + MAX(i.created_utc)*12345) % 9223372036854775807),
-       COUNT(DISTINCT i.item_id)
-FROM items i JOIN source_memberships sm ON sm.item_id=i.item_id
+       COUNT(DISTINCT i.object_pk)
+FROM items i JOIN source_memberships sm ON sm.object_pk=i.object_pk
 GROUP BY i.card_key;
 
 DELETE FROM profile_feed_entries;
-INSERT INTO profile_feed_entries(profile_id,card_key,representative_id,created_sort,activity_sort,discovery_sort,duration_seconds)
+INSERT INTO profile_feed_entries(profile_id,card_key,representative_pk,created_sort,activity_sort,discovery_sort,duration_seconds)
 SELECT sp.profile_id,i.card_key,
-       COALESCE(MAX(CASE WHEN i.kind=3 THEN i.item_id END),MIN(i.item_id)),
+       COALESCE(MAX(CASE WHEN i.kind=3 THEN i.object_pk END),MIN(i.object_pk)),
        MAX(CASE WHEN i.kind=3 THEN i.created_utc ELSE i.link_created_utc END),
        MAX(i.created_utc),MAX(i.discovery_seq),MAX(i.duration_seconds)
 FROM source_profiles sp
 JOIN source_memberships sm ON sm.source_id=sp.source_id
-JOIN items i ON i.item_id=sm.item_id
+JOIN items i ON i.object_pk=sm.object_pk
 GROUP BY sp.profile_id,i.card_key;
 "#,
 	)
@@ -563,11 +560,11 @@ fn bench_queries(conn: &Connection, args: &Args) -> Result<(), String> {
 			let Some((value, key)) = cursor else {
 				continue;
 			};
-			let sql = format!("SELECT representative_id FROM feed_entries WHERE feed_id=1 {extra} AND ({column},card_key)<(?1,?2) ORDER BY {column} DESC,card_key DESC LIMIT ?3");
+			let sql = format!("SELECT representative_pk FROM feed_entries WHERE feed_id=1 {extra} AND ({column},card_key)<(?1,?2) ORDER BY {column} DESC,card_key DESC LIMIT ?3");
 			let timings = time_query(args.iterations, || {
 				let mut statement = conn.prepare_cached(&sql).map_err(|error| error.to_string())?;
 				let rows = statement
-					.query_map(params![value, key, args.page_size as i64], |row| row.get::<_, String>(0))
+					.query_map(params![value, key, args.page_size as i64], |row| row.get::<_, i64>(0))
 					.map_err(|error| error.to_string())?;
 				let ids = rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
 				black_box(ids);
@@ -593,13 +590,13 @@ fn bench_queries(conn: &Connection, args: &Args) -> Result<(), String> {
 		let timings = time_query(args.iterations, || {
 			let mut statement = conn
 				.prepare_cached(
-					"SELECT representative_id FROM feed_entries WHERE feed_id=1 AND duration_seconds>0
+					"SELECT representative_pk FROM feed_entries WHERE feed_id=1 AND duration_seconds>0
 					 AND (duration_seconds,created_sort,card_key)<(?1,?2,?3)
 					 ORDER BY duration_seconds DESC,created_sort DESC,card_key DESC LIMIT ?4",
 				)
 				.map_err(|error| error.to_string())?;
 			let rows = statement
-				.query_map(params![duration, created, key, args.page_size as i64], |row| row.get::<_, String>(0))
+				.query_map(params![duration, created, key, args.page_size as i64], |row| row.get::<_, i64>(0))
 				.map_err(|error| error.to_string())?;
 			black_box(rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?);
 			Ok(())
@@ -619,12 +616,12 @@ fn bench_queries(conn: &Connection, args: &Args) -> Result<(), String> {
 		let timings = time_query(args.iterations, || {
 			let mut statement = conn
 				.prepare_cached(
-					"SELECT representative_id FROM feed_entries WHERE feed_id=1 AND random_epoch=1 AND (random_round,random_rank,card_key)>(?1,?2,?3)
+					"SELECT representative_pk FROM feed_entries WHERE feed_id=1 AND random_epoch=1 AND (random_round,random_rank,card_key)>(?1,?2,?3)
 					 ORDER BY random_round,random_rank,card_key LIMIT ?4",
 				)
 				.map_err(|error| error.to_string())?;
 			let rows = statement
-				.query_map(params![round, rank, key, args.page_size as i64], |row| row.get::<_, String>(0))
+				.query_map(params![round, rank, key, args.page_size as i64], |row| row.get::<_, i64>(0))
 				.map_err(|error| error.to_string())?;
 			black_box(rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?);
 			Ok(())
@@ -643,10 +640,10 @@ fn bench_queries(conn: &Connection, args: &Args) -> Result<(), String> {
 	if let Some(profile_id) = profile_id {
 		let timings = time_query(args.iterations, || {
 			let mut statement = conn
-				.prepare_cached("SELECT representative_id FROM profile_feed_entries WHERE profile_id=?1 ORDER BY created_sort DESC,card_key DESC LIMIT ?2")
+				.prepare_cached("SELECT representative_pk FROM profile_feed_entries WHERE profile_id=?1 ORDER BY created_sort DESC,card_key DESC LIMIT ?2")
 				.map_err(|error| error.to_string())?;
 			let rows = statement
-				.query_map(params![profile_id, args.page_size as i64], |row| row.get::<_, String>(0))
+				.query_map(params![profile_id, args.page_size as i64], |row| row.get::<_, i64>(0))
 				.map_err(|error| error.to_string())?;
 			black_box(rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?);
 			Ok(())
@@ -666,12 +663,12 @@ fn bench_queries(conn: &Connection, args: &Args) -> Result<(), String> {
 	let timings = time_query(args.iterations.min(50), || {
 		let mut statement = conn
 			.prepare_cached(
-				"SELECT MAX(i.created_utc),MIN(i.item_id) FROM selected_sources ss JOIN source_memberships sm ON sm.source_id=ss.source_id
-				 JOIN items i ON i.item_id=sm.item_id GROUP BY i.card_key ORDER BY MAX(i.created_utc) DESC,i.card_key DESC LIMIT ?1",
+				"SELECT MAX(i.created_utc),MIN(i.object_pk) FROM selected_sources ss JOIN source_memberships sm ON sm.source_id=ss.source_id
+					 JOIN items i ON i.object_pk=sm.object_pk GROUP BY i.card_key ORDER BY MAX(i.created_utc) DESC,i.card_key DESC LIMIT ?1",
 			)
 			.map_err(|error| error.to_string())?;
 		let rows = statement
-			.query_map([args.page_size as i64], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+			.query_map([args.page_size as i64], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
 			.map_err(|error| error.to_string())?;
 		black_box(rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?);
 		Ok(())
@@ -684,12 +681,12 @@ fn bench_hydration(conn: &Connection, page_size: usize, iterations: usize, compr
 	let ids = conn
 		.prepare(
 			"WITH page AS (
-			 SELECT representative_id,created_sort FROM feed_entries WHERE feed_id=1 ORDER BY created_sort DESC,card_key DESC LIMIT ?1
-			) SELECT DISTINCT tm.item_id FROM page JOIN items rep ON rep.item_id=page.representative_id
-			 JOIN thread_members tm ON tm.submission_id=rep.submission_id ORDER BY page.created_sort DESC",
+				 SELECT representative_pk,created_sort FROM feed_entries WHERE feed_id=1 ORDER BY created_sort DESC,card_key DESC LIMIT ?1
+			) SELECT DISTINCT tm.object_pk FROM page JOIN items rep ON rep.object_pk=page.representative_pk
+				 JOIN thread_members tm ON tm.submission_id=rep.submission_id ORDER BY page.created_sort DESC",
 		)
 		.map_err(|error| error.to_string())?
-		.query_map([page_size as i64], |row| row.get::<_, String>(0))
+		.query_map([page_size as i64], |row| row.get::<_, i64>(0))
 		.map_err(|error| error.to_string())?
 		.collect::<Result<Vec<_>, _>>()
 		.map_err(|error| error.to_string())?;
@@ -699,9 +696,7 @@ fn bench_hydration(conn: &Connection, page_size: usize, iterations: usize, compr
 	let timings = time_query(iterations, || {
 		let mut bytes = 0usize;
 		let mut decoded = 0usize;
-		let mut statement = conn
-			.prepare_cached("SELECT payload FROM item_payloads WHERE item_id=?1")
-			.map_err(|error| error.to_string())?;
+		let mut statement = conn.prepare_cached("SELECT payload FROM items WHERE object_pk=?1").map_err(|error| error.to_string())?;
 		for id in &ids {
 			let stored_payload: Vec<u8> = statement.query_row([id], |row| row.get(0)).map_err(|error| error.to_string())?;
 			bytes += stored_payload.len();

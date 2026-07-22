@@ -20,7 +20,11 @@ No live blob, cache volume, container or deployment state was modified.
 
 ### Initial comparator
 
-The feature-gated Rust harness first imported the real files into the earlier text-key, separate-payload, global-card design. This design is retained only as a comparator and is not the recommendation.
+The first feature-gated Rust harness imported the real files into the earlier
+text-key, separate-payload, global-card design. Those measurements are retained
+as a historical rejection result. The committed harness now uses canonical
+ROWID objects while retaining global cards only as the aggregation comparator;
+neither harness is production implementation.
 
 - import with one `synchronous=FULL` transaction per source: 81.77 s;
 - materialization: 5.38 s;
@@ -81,6 +85,28 @@ Eight-kibibyte pages saved about 52.8 MiB versus the equivalent four-kibibyte co
 
 The remaining gap above the 119 MiB unique payload sum is SQLite page/overflow overhead plus metadata, indexes and relationships. It replaces the current 119 MiB source files only after rollback retention ends; during migration both stores intentionally coexist.
 
+### Direct corrected-ROWID harness
+
+After the schema/runtime mismatch found by exact-SHA review was corrected, the
+feature-gated harness imported the same 1,411 real files directly into canonical
+ROWID object rows. It retains global feed cards only to compare the rejected
+aggregation strategy; it is still not the production profile-local design.
+
+| Payload | DB bytes | Import | Materialize | Hydrate 25 p50/p95/p99 |
+|---|---:|---:|---:|---:|
+| raw bincode | 171,032,576 | 27.55 s | 3.64 s | 0.895/1.033/1.204 ms |
+| zstd level 1 | 76,570,624 | 34.36 s | 2.01 s | 1.706/1.857/1.860 ms |
+
+Raw New/Activity/Discovered/Video keyset reads through page 1,000 remained
+roughly 0.03-0.05 ms p50. Four concurrent readers had 0.035/0.128/0.198 ms
+p50/p95/p99 and no errors. Both raw and compressed runs passed killed
+pre/post-commit recovery and `PRAGMA quick_check`.
+
+Even with compact integer relationships, request-time aggregation over 100
+selected sources cost 20.1/23.8/26.1 ms p50/p95/p99 in the raw run. This
+independently preserves the decision to materialize active-profile cards during
+bounded refresh transactions.
+
 ## Raspberry Server 2 arm64 synthetic experiment
 
 Environment: Python 3.13.5, SQLite 3.46.1, aarch64, WAL, `synchronous=NORMAL`, 8 MiB cache, mmap disabled. Fixture: 1,400 sources x 50 memberships, 64,400 canonical objects, 1.7 KiB payloads, exact/shared duplicates, comment/submission bundles and four active profiles.
@@ -108,9 +134,9 @@ The cold-ish test reset SQLite caches but did not force cold storage reads. Linu
 
 ## Remaining gates
 
-- Rebuild the real-cache importer directly into the corrected ROWID schema rather than transform the comparator DB.
-- Compare raw and zstd level-1 payloads in that corrected ROWID schema, including
-  end-to-end page rendering CPU and a versioned payload-codec column.
+- Compare 8 KiB and 16 KiB pages in the direct corrected-ROWID importer.
+- Measure zstd level-1 through actual end-to-end page rendering, not only
+  payload hydration, before choosing the production payload codec.
 - Batch migration checkpoints so `FULL` durability does not require 1,411 fsync-bound commits; measure 16/32/64-source batches and crash redo bounds.
 - Compare `FULL` and `NORMAL` on the target filesystem. Production defaults to `FULL` until discovery durability is explicitly proven equivalent.
 - Exercise exact current duplicate-key normalization, promotion/deleted filters and profile-local representative choice.
