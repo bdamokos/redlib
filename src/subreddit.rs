@@ -2155,7 +2155,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			cached_posts
 		} else {
 			collect_front_page_video_candidates(
-				&prefs_store::request_session_id(&req).unwrap_or_default(),
+				&crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
 				if front_page_is_following { 2 } else { 1 },
 				&build_video_mode_front_page_sources(&prefs, &front_page),
 				&get_filters(&req),
@@ -2207,7 +2207,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				filters: get_filters(&req),
 				quarantine: true,
 				query_fingerprint,
-				profile_id: prefs_store::request_session_id(&req).unwrap_or_default(),
+				profile_id: crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
 				// Keep plain homepage reloads on the same contextual session while
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
@@ -2858,7 +2858,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			posts
 		} else if !is_subreddit_route {
 			collect_front_page_video_candidates(
-				&prefs_store::request_session_id(&req).unwrap_or_default(),
+				&crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
 				if front_page_is_following { 2 } else { 1 },
 				&build_video_mode_front_page_sources(&prefs, &front_page),
 				&filters,
@@ -2897,7 +2897,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				filters: filters.clone(),
 				quarantine: quarantined,
 				query_fingerprint,
-				profile_id: prefs_store::request_session_id(&req).unwrap_or_default(),
+				profile_id: crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
 				// Keep plain homepage reloads on the same contextual session while
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,

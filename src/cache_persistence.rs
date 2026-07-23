@@ -641,9 +641,10 @@ pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &Persisted
 	drop(file);
 	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())?;
 	if let Some(parent) = final_path.parent() {
-		File::open(parent)
-			.and_then(|directory| directory.sync_all())
-			.map_err(|error| format!("failed to sync source-cache directory {}: {error}", parent.display()))?;
+		if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+			crate::cache_sqlite::mark_reads_unhealthy();
+			return Err(format!("failed to sync source-cache directory {}: {error}", parent.display()));
+		}
 	}
 	crate::cache_sqlite::shadow_source_after_legacy_write(source_cache_key, entry, &bytes, &final_path);
 	Ok(())

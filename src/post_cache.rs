@@ -843,7 +843,7 @@ pub(crate) fn schedule_sqlite_active_profile_sync(preferences: &Preferences, pro
 		.collect::<Vec<_>>();
 	filters.sort();
 	filters.dedup();
-	let profile_id = profile_id.to_string();
+	let profile_id = sqlite_active_profile_id(preferences, profile_id);
 	let should_spawn = {
 		let Ok(mut desired) = SQLITE_PROFILE_SYNC_DESIRED.lock() else {
 			warn!("cache_sqlite: active profile scheduler lock poisoned");
@@ -880,6 +880,26 @@ pub(crate) fn schedule_sqlite_active_profile_sync(preferences: &Preferences, pro
 			return;
 		}
 	});
+}
+
+pub(crate) fn sqlite_active_profile_id(preferences: &Preferences, profile_id: &str) -> String {
+	if profile_id.is_empty() {
+		return String::new();
+	}
+	let sources = sqlite_active_profile_sources(preferences);
+	let mut filters = preferences
+		.filters
+		.iter()
+		.map(|value| value.trim().to_ascii_lowercase())
+		.filter(|value| !value.is_empty())
+		.collect::<Vec<_>>();
+	filters.sort();
+	filters.dedup();
+	let mut hasher = DefaultHasher::new();
+	profile_id.hash(&mut hasher);
+	sources.hash(&mut hasher);
+	filters.hash(&mut hasher);
+	format!("{profile_id}:{:016x}", hasher.finish())
 }
 
 pub(crate) fn seed_remembered_feeds_from_source_cache_entries<I, S>(entries: I, now_unix: u64) -> usize
@@ -3933,15 +3953,16 @@ mod tests {
 		followup_source_budget, freeze_feed_page, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url,
 		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live, pick_next_remembered_feed_to_refresh,
 		pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position,
-		prune_source_cache, publish_plain_subreddit_refresh, random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
-		record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request,
-		remembered_refresh_priority_at, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys,
-		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random,
-		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_timeline_selection,
-		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession, FeedSessionRequest,
-		FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry,
-		SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS,
-		FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE,
+		prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh, random_rotation_seed_for_time, reconcile_session_with_source_cache,
+		record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal, remember_flair_request,
+		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries,
+		seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
+		snapshot_persisted_source_entries, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target,
+		source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin,
+		sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
+		RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
+		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS,
+		MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE,
 		RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK,
 		REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
 	};
@@ -6268,6 +6289,21 @@ mod tests {
 	}
 
 	#[test]
+	fn sqlite_profile_identity_tracks_sources_and_normalized_filters() {
+		let mut preferences = Preferences::default();
+		preferences.subscriptions = vec!["rust".to_string(), "u_alice".to_string()];
+		preferences.filters = vec!["Programming".to_string(), " programming ".to_string()];
+		let first = sqlite_active_profile_id(&preferences, "prefs-cookie");
+		assert_eq!(first, sqlite_active_profile_id(&preferences, "prefs-cookie"));
+
+		preferences.filters = vec!["programming".to_string()];
+		assert_eq!(first, sqlite_active_profile_id(&preferences, "prefs-cookie"));
+		preferences.filters.push("u_blocked".to_string());
+		assert_ne!(first, sqlite_active_profile_id(&preferences, "prefs-cookie"));
+		assert_ne!(first, sqlite_active_profile_id(&preferences, "other-cookie"));
+	}
+
+	#[test]
 	fn frozen_feed_pages_have_a_hard_nearest_page_cap() {
 		let mut session = FeedSession {
 			id: "frozen-cap".to_string(),
@@ -6286,6 +6322,31 @@ mod tests {
 		assert_eq!(session.frozen_pages.len(), MAX_FROZEN_FEED_PAGES);
 		assert!(session.frozen_pages.contains_key(&(MAX_FROZEN_FEED_PAGES + 7)));
 		assert!(!session.frozen_pages.contains_key(&0));
+	}
+
+	#[test]
+	fn feed_sessions_have_a_hard_lru_cap() {
+		let mut sessions = HashMap::new();
+		for index in 0..MAX_FEED_SESSIONS {
+			sessions.insert(
+				format!("session-{index}"),
+				FeedSession {
+					id: format!("session-{index}"),
+					request: FeedSessionRequest::default(),
+					sources: Vec::new(),
+					frozen_pages: HashMap::new(),
+					background_active: false,
+					background_complete: true,
+					requested_page: 0,
+					last_updated: Instant::now() - Duration::from_secs((MAX_FEED_SESSIONS - index) as u64),
+					revision: 0,
+				},
+			);
+		}
+		prune_feed_sessions_locked(&mut sessions, "incoming");
+		assert_eq!(sessions.len(), MAX_FEED_SESSIONS - 1);
+		assert!(!sessions.contains_key("session-0"));
+		assert!(sessions.contains_key(&format!("session-{}", MAX_FEED_SESSIONS - 1)));
 	}
 
 	#[test]

@@ -375,7 +375,9 @@ pub(crate) fn pin_profile_generation(fingerprint: &[u8], session_id: &str, gener
 
 fn pinned_generation_floor(fingerprint: &[u8], default_floor: i64) -> i64 {
 	let Ok(mut pins) = PINNED_PROFILE_GENERATIONS.lock() else {
-		return default_floor;
+		// Fail closed: retaining history is safer than invalidating a live
+		// cursor when the in-process pin registry is unavailable.
+		return i64::MIN;
 	};
 	pins.retain(|_, (_, touched)| touched.elapsed().as_secs() <= PROFILE_CURSOR_PIN_TTL_SECS);
 	pins
@@ -410,6 +412,10 @@ pub(crate) fn reads_enabled() -> bool {
 		&& env_bool("REDLIB_CACHE_SQLITE_READS_ENABLED")
 		&& !env_bool("REDLIB_CACHE_SQLITE_ROLLBACK_TO_LEGACY")
 		&& SQLITE_READS_HEALTHY.load(AtomicOrdering::Acquire)
+}
+
+pub(crate) fn mark_reads_unhealthy() {
+	SQLITE_READS_HEALTHY.store(false, AtomicOrdering::Release);
 }
 
 pub(crate) fn database_path(cache_dir: &Path) -> PathBuf {
@@ -815,7 +821,7 @@ pub(crate) fn shadow_source_after_legacy_write(source_cache_key: &str, entry: &P
 		.map_err(|_| "SQLite shadow connection lock poisoned".to_string())
 		.and_then(|mut connection| apply_source_with_codec(&mut connection, source_cache_key, entry, &write_metadata, first_seen, cache.payload_codec));
 	if let Err(error) = result {
-		SQLITE_READS_HEALTHY.store(false, AtomicOrdering::Release);
+		mark_reads_unhealthy();
 		warn!("cache_sqlite: shadow write failed for {source_cache_key}: {error}");
 	}
 }
@@ -833,7 +839,7 @@ pub(crate) fn shadow_remove_after_legacy(source_cache_key: &str) {
 		.map_err(|_| "SQLite shadow connection lock poisoned".to_string())
 		.and_then(|mut connection| remove_source(&mut connection, source_cache_key));
 	if let Err(error) = result {
-		SQLITE_READS_HEALTHY.store(false, AtomicOrdering::Release);
+		mark_reads_unhealthy();
 		warn!("cache_sqlite: shadow removal failed for {source_cache_key}: {error}");
 	}
 }
@@ -2002,10 +2008,6 @@ JOIN active_profiles profiles ON profiles.profile_pk=stats.profile_pk
 	Ok(())
 }
 
-pub(crate) fn sync_active_profile(fingerprint: &[u8], sources: &[(String, i64)]) -> Result<(), String> {
-	sync_active_profile_with_filters(fingerprint, sources, &[])
-}
-
 pub(crate) fn sync_active_profile_with_filters(fingerprint: &[u8], sources: &[(String, i64)], filters: &[String]) -> Result<(), String> {
 	if !shadow_enabled() {
 		return Ok(());
@@ -2094,12 +2096,13 @@ fn ensure_profile_random_epoch_on(connection: &mut Connection, fingerprint: &[u8
 			params![profile_pk, next_generation],
 		)
 		.map_err(|error| error.to_string())?;
+	let retention_floor = pinned_generation_floor(fingerprint, next_generation.saturating_sub(RETAINED_PROFILE_GENERATIONS));
 	transaction
 		.execute(
 			"DELETE FROM profile_feed_entries
 			 WHERE profile_pk=?1 AND valid_to_generation IS NOT NULL
 			   AND valid_to_generation < ?2",
-			params![profile_pk, next_generation.saturating_sub(RETAINED_PROFILE_GENERATIONS)],
+			params![profile_pk, retention_floor],
 		)
 		.map_err(|error| error.to_string())?;
 	transaction.commit().map_err(|error| error.to_string())
@@ -2974,6 +2977,14 @@ mod tests {
 			.collect::<Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(sequences, vec![2, 3]);
+		let discovered = connection
+			.prepare("SELECT fullname FROM objects WHERE discovery_seq>1 ORDER BY discovery_seq DESC")
+			.unwrap()
+			.query_map([], |row| row.get::<_, String>(0))
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
+		assert_eq!(discovered, vec!["t3_daemon-a", "t3_daemon-b"]);
 	}
 
 	#[test]
@@ -3175,6 +3186,16 @@ mod tests {
 			.unwrap();
 		assert_eq!(created_sort, 10);
 		assert_eq!(representative, "t3_visible");
+		assert!(profile_filters_match(&connection, 1, &HashSet::from(["programming".to_string()])).unwrap());
+		assert!(!profile_filters_match(&connection, 1, &HashSet::new()).unwrap());
+		sync_active_profile_on_with_filters(&mut connection, b"filtered-profile", &[("subreddit:rust:new".to_string(), 0)], &[]).unwrap();
+		assert_eq!(
+			connection
+				.query_row("SELECT created_sort FROM profile_feed_entries WHERE valid_to_generation IS NULL", [], |row| row
+					.get::<_, i64>(0),)
+				.unwrap(),
+			20
+		);
 	}
 
 	#[test]
@@ -3328,6 +3349,37 @@ mod tests {
 	}
 
 	#[test]
+	fn history_gc_retains_generations_pinned_by_live_cursor_sessions() {
+		let mut connection = test_connection();
+		let profile = b"pinned-history-profile";
+		apply_source(
+			&mut connection,
+			"subreddit:rust:new",
+			&source(vec![post("older", 10), post("newer", 20)], None),
+			&metadata(b"pinned-initial", 100),
+			FirstSeen::Migration,
+		)
+		.unwrap();
+		sync_active_profile_on(&mut connection, profile, &[("subreddit:rust:new".to_string(), 0)]).unwrap();
+		let first = query_profile_timeline_on(&connection, profile, 1, TimelineSort::New, None, 1, &HashSet::new()).unwrap();
+		let cursor = first.next.expect("pinned cursor");
+		pin_profile_generation(profile, "history-gc-session", cursor.generation);
+
+		for generation in 0..(RETAINED_PROFILE_GENERATIONS + 8) {
+			apply_source(
+				&mut connection,
+				"subreddit:rust:new",
+				&source(vec![post(&format!("refresh-{generation}"), 100 + generation as u64)], Some(PersistedRefreshOrigin::Daemon)),
+				&metadata(format!("pinned-refresh-{generation}").as_bytes(), 200 + generation as u64),
+				FirstSeen::Daemon,
+			)
+			.unwrap();
+		}
+		let continuation = query_profile_timeline_on(&connection, profile, 1, TimelineSort::New, Some(&cursor), 10, &HashSet::new()).unwrap();
+		assert_eq!(continuation.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["older"]);
+	}
+
+	#[test]
 	fn submitted_query_is_direct_author_chronology_with_filters() {
 		let mut connection = test_connection();
 		let mut other_community = post("other", 30);
@@ -3426,7 +3478,7 @@ mod tests {
 		apply_source(
 			&mut connection,
 			"subreddit:rust:new",
-			&source(vec![post("ranked", 10)], None),
+			&source(vec![post("ranked-a", 30), post("ranked-b", 20), post("ranked-c", 10)], None),
 			&metadata(b"ranked", 100),
 			FirstSeen::Migration,
 		)
@@ -3442,19 +3494,24 @@ mod tests {
 			)
 			.unwrap();
 		assert_eq!(stored_rank, deterministic_random_rank(profile, epoch, &card_key));
+		let first_page = query_profile_timeline_on(&connection, profile, 1, TimelineSort::Random, None, 1, &HashSet::new()).unwrap();
+		let old_cursor = first_page.next.expect("first random cursor");
 		ensure_profile_random_epoch_on(&mut connection, profile, epoch + 1).unwrap();
 		let (rotated_epoch, rotated_rank): (i64, i64) = connection
 			.query_row(
 				"SELECT random_epoch,random_rank
 				 FROM profile_feed_entries
-				 WHERE valid_to_generation IS NULL",
-				[],
+				 WHERE valid_to_generation IS NULL AND card_key=?1",
+				[&card_key],
 				|row| Ok((row.get(0)?, row.get(1)?)),
 			)
 			.unwrap();
 		assert_eq!(rotated_epoch, epoch + 1);
 		assert_eq!(rotated_rank, deterministic_random_rank(profile, rotated_epoch, &card_key));
 		assert_ne!(stored_rank, rotated_rank);
+		let old_continuation = query_profile_timeline_on(&connection, profile, 1, TimelineSort::Random, Some(&old_cursor), 10, &HashSet::new()).unwrap();
+		assert!(!old_continuation.posts.is_empty());
+		assert_eq!(old_continuation.next.as_ref().map(|cursor| cursor.random_epoch), Some(epoch));
 	}
 
 	#[test]
@@ -3464,6 +3521,7 @@ mod tests {
 		let changed_role = vec![("subreddit:rust:new".to_string(), 0), ("u_alice".to_string(), 2)];
 		assert_eq!(profile_source_set_hash(&first, &[]), profile_source_set_hash(&reversed, &[]));
 		assert_ne!(profile_source_set_hash(&first, &[]), profile_source_set_hash(&changed_role, &[]));
+		assert_ne!(profile_source_set_hash(&first, &[]), profile_source_set_hash(&first, &["programming".to_string()]));
 	}
 
 	#[test]
@@ -3547,5 +3605,38 @@ mod tests {
 			drop(connection);
 			fs::remove_dir_all(root).unwrap();
 		}
+	}
+
+	#[test]
+	fn wal_reader_remains_available_during_writer_transaction() {
+		let root = std::env::temp_dir().join(format!("redlib-cache-sqlite-concurrency-test-{}", uuid::Uuid::new_v4()));
+		let path = root.join("reader-writer.sqlite3");
+		let mut writer = open_database_with_options(&path, 8192, "FULL").unwrap();
+		apply_source(
+			&mut writer,
+			"subreddit:rust:new",
+			&source(vec![post("concurrent", 10)], None),
+			&metadata(b"concurrent", 100),
+			FirstSeen::Migration,
+		)
+		.unwrap();
+		sync_active_profile_on(&mut writer, b"concurrent-profile", &[("subreddit:rust:new".to_string(), 0)]).unwrap();
+		let reader = open_read_connection(&path).unwrap();
+		let (started_tx, started_rx) = std::sync::mpsc::channel();
+		let writer_thread = std::thread::spawn(move || {
+			let transaction = writer.transaction().unwrap();
+			transaction.execute("UPDATE active_profiles SET last_accessed_at=last_accessed_at+1", []).unwrap();
+			started_tx.send(()).unwrap();
+			std::thread::sleep(std::time::Duration::from_millis(200));
+			transaction.commit().unwrap();
+		});
+		started_rx.recv().unwrap();
+		let started = Instant::now();
+		let page = query_profile_timeline_on(&reader, b"concurrent-profile", 1, TimelineSort::New, None, 25, &HashSet::new()).unwrap();
+		assert_eq!(page.posts.len(), 1);
+		assert!(started.elapsed() < std::time::Duration::from_millis(100));
+		writer_thread.join().unwrap();
+		drop(reader);
+		fs::remove_dir_all(root).unwrap();
 	}
 }
