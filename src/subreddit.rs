@@ -3871,6 +3871,12 @@ mod tests {
 			related_subreddits: crate::materialized_catalog::RelatedSubredditReport {
 				semantic_embedding_count: 42,
 				vibe_embedding_count: 17,
+				followed_subreddits: vec![crate::materialized_catalog::RelatedSubredditEntry {
+					name: "programming".to_string(),
+					score_percent: 84,
+					cached_profile_count: 2,
+					cached_post_count: 8,
+				}],
 				cached_subreddits: vec![crate::materialized_catalog::RelatedSubredditEntry {
 					name: "rustlang".to_string(),
 					score_percent: 91,
@@ -3882,6 +3888,20 @@ mod tests {
 					score_percent: 87,
 					cached_profile_count: 3,
 					cached_post_count: 10,
+				}],
+				followed_profiles: vec![crate::materialized_catalog::RelatedProfileEntry {
+					name: "followed_dev".to_string(),
+					score_percent: 79,
+					cached_posts: 20,
+					current_subreddit_posts: 3,
+					signal_subreddits: vec!["rust".to_string()],
+				}],
+				cached_profiles: vec![crate::materialized_catalog::RelatedProfileEntry {
+					name: "new_dev".to_string(),
+					score_percent: 83,
+					cached_posts: 18,
+					current_subreddit_posts: 2,
+					signal_subreddits: vec!["rustlang".to_string()],
 				}],
 				..Default::default()
 			},
@@ -3925,13 +3945,24 @@ mod tests {
 		assert!(users_index < related_index, "user stats should remain above related recommendations");
 		assert!(html.contains("/user/demo_user\">u/demo_user</a>"));
 		assert!(html.contains(">3</span>"));
-		assert!(html.contains("42 description vectors · 17 vibe vectors"));
+		assert!(html.contains("Related communities"));
+		assert!(html.contains("Related people"));
+		assert_eq!(html.matches(">Discover</p>").count(), 2);
+		assert!(html.contains("id=\"sub_related_topic\" checked"));
+		assert!(html.contains("id=\"sub_related_vibe\""));
 		assert!(html.contains("/r/rustlang"));
-		assert!(html.contains("Known by description"));
-		assert!(html.contains("91% description"));
+		assert!(html.contains("91% topic match"));
 		assert!(html.contains("/r/systems"));
-		assert!(html.contains("Known by vibe"));
-		assert!(html.contains("87% vibe"));
+		assert!(html.contains("87% vibe match"));
+		assert!(html.contains("/user/new_dev"));
+		assert!(html.contains("83% match"));
+		assert_eq!(html.matches("<summary>Already following</summary>").count(), 2);
+		assert!(html.contains("/r/programming"));
+		assert!(html.contains("/user/followed_dev"));
+		assert!(!html.contains("description vectors"));
+		assert!(!html.contains("embedded posts"));
+		assert!(!html.contains("Known by description"));
+		assert!(!html.contains("Profiles from cache"));
 	}
 
 	#[test]

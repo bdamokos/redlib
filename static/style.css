@@ -1010,6 +1010,15 @@ aside {
     margin-top: 20px;
 }
 
+#sub_related,
+#sub_related * {
+    text-align: left;
+}
+
+#sub_related .sub_related_tab_label {
+    text-align: center;
+}
+
 .sub_embedding_activity {
     box-sizing: border-box;
     width: 100%;
@@ -1323,16 +1332,66 @@ aside {
     }
 }
 
-.sub_related_group {
-    margin-top: 12px;
+.sub_related_section + .sub_related_section {
+    border-top: var(--panel-border);
+    margin-top: 18px;
+    padding-top: 16px;
 }
 
+.sub_related_discovery_label,
 .sub_related_group > p {
     color: var(--visited);
     font-size: 12px;
     font-weight: 700;
-    margin: 0 0 6px;
+    margin: 12px 0 6px;
     text-transform: uppercase;
+}
+
+.sub_related_tabs {
+    display: grid;
+    gap: 0 6px;
+    grid-template-columns: 1fr 1fr;
+}
+
+.sub_related_tab_input {
+    height: 1px;
+    opacity: 0;
+    position: absolute;
+    width: 1px;
+}
+
+.sub_related_tab_label {
+    background: var(--post);
+    border: var(--panel-border);
+    border-radius: 5px;
+    color: var(--visited);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 7px 8px;
+    text-align: center;
+}
+
+.sub_related_tab_input:focus-visible + .sub_related_tab_label {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.sub_related_tab_input:checked + .sub_related_tab_label {
+    background: color-mix(in srgb, var(--accent) 14%, var(--post));
+    border-color: color-mix(in srgb, var(--accent) 44%, transparent);
+    color: var(--accent);
+}
+
+.sub_related_tab_panel {
+    display: none;
+    grid-column: 1 / -1;
+    padding-top: 8px;
+}
+
+#sub_related_topic:checked ~ .sub_related_tab_panel--topic,
+#sub_related_vibe:checked ~ .sub_related_tab_panel--vibe {
+    display: block;
 }
 
 .sub_related_list {
@@ -1363,6 +1422,32 @@ aside {
     color: var(--visited);
     font-size: 12px;
     line-height: 1.35;
+}
+
+.sub_related_following {
+    border-top: var(--panel-border);
+    margin-top: 12px;
+    padding-top: 10px;
+}
+
+.sub_related_following > summary {
+    color: var(--visited);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.sub_related_following[open] > summary {
+    color: var(--text);
+    margin-bottom: 8px;
+}
+
+.sub_related_following > .sub_related_list {
+    padding-top: 2px;
+}
+
+.sub_related_following .sub_related_group:first-of-type > p {
+    margin-top: 2px;
 }
 
 .video_mode_sidebar {
