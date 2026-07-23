@@ -945,30 +945,35 @@ fn render_scraped_subreddit_fragment(
 	peer_origin: &str,
 	source_refresh_token: Option<crate::post_cache::SourceRefreshToken>,
 ) -> Result<Response<Body>, String> {
-	cache_subreddit_metadata(&scraped.subreddit);
-	crate::post_components::observe_posts(
-		&scraped.posts,
-		if peer_origin.is_empty() {
-			crate::post_components::ObservationSource::Scrape
-		} else {
-			crate::post_components::ObservationSource::Peer
-		},
-		if peer_origin.is_empty() { "instance-scrape" } else { peer_origin },
-		crate::cache_persistence::unix_now(),
-	);
 	if cacheable_first_page {
 		if let Some(token) = source_refresh_token {
-			crate::post_cache::publish_plain_subreddit_refresh_with_token(
+			let committed_subreddit = scraped.subreddit.clone();
+			crate::post_cache::publish_plain_subreddit_refresh_with_token_and_effects(
 				sub_name,
 				scraped.posts.clone(),
 				scraped.after.clone(),
 				crate::post_cache::RefreshOrigin::DirectLiveFetch,
+				if peer_origin.is_empty() {
+					crate::post_components::ObservationSource::Scrape
+				} else {
+					crate::post_components::ObservationSource::Peer
+				},
 				token,
+				move |_| cache_subreddit_metadata(&committed_subreddit),
 			);
-		} else {
-			crate::post_cache::publish_plain_subreddit_refresh(sub_name, scraped.posts.clone(), scraped.after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
 		}
 	} else {
+		cache_subreddit_metadata(&scraped.subreddit);
+		crate::post_components::observe_posts(
+			&scraped.posts,
+			if peer_origin.is_empty() {
+				crate::post_components::ObservationSource::Scrape
+			} else {
+				crate::post_components::ObservationSource::Peer
+			},
+			if peer_origin.is_empty() { "instance-scrape" } else { peer_origin },
+			crate::cache_persistence::unix_now(),
+		);
 		utils::store_post_flairs(&scraped.posts);
 		enqueue_direct_subreddit_embedding_activity(sub_name, &scraped.posts);
 		utils::store_subreddit_users(sub_name, &scraped.posts);
@@ -3279,16 +3284,14 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				after,
 				all_posts_filtered,
 			}) => {
-				if let Some(token) = source_refresh_token {
+				if let Some(token) = source_refresh_token.clone() {
 					crate::post_cache::publish_plain_subreddit_refresh_with_token(&sub_name, raw_posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch, token);
 				} else {
 					utils::store_post_flairs(&raw_posts);
 					if is_single_sub {
 						enqueue_direct_subreddit_embedding_activity(&sub_name, &raw_posts);
+						utils::store_subreddit_users(&sub_name, &raw_posts);
 					}
-				}
-				if is_single_sub {
-					utils::store_subreddit_users(&sub_name, &raw_posts);
 				}
 				filter_posts_by_flair(&mut posts, &active_flair_filter);
 				let no_posts = posts.is_empty();
@@ -3378,8 +3381,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			}
 			Err(msg) => {
 				if let Some(reason) = (is_subreddit_route && is_single_sub).then(|| crate::client::source_unavailable_from_error(&msg)).flatten() {
-					if uses_remembered_subreddit_cache {
-						crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					if let Some(token) = source_refresh_token.clone() {
+						crate::post_cache::record_plain_subreddit_refresh_failure_with_token(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch, token);
 					}
 					return render_subreddit_source_unavailable_fragment(
 						&req,
@@ -3400,8 +3403,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				}
 				let can_serve_stale_single_subreddit_cache = is_single_sub && request_after.is_empty() && request_before.is_empty();
 				if can_serve_stale_single_subreddit_cache {
-					if uses_remembered_subreddit_cache {
-						crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					if let Some(token) = source_refresh_token {
+						crate::post_cache::record_plain_subreddit_refresh_failure_with_token(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch, token);
 					}
 					if msg.contains("oauth_unavailable") || instance_scrape::should_attempt_scrape_fallback(&msg) {
 						if let Some((mut posts, mut after, mut has_prev, mut has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(

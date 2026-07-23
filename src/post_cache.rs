@@ -17,7 +17,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Instant;
 use tokio::time::{Duration, MissedTickBehavior};
 
@@ -268,6 +268,25 @@ pub(crate) struct SourceRefreshToken {
 	state: Arc<Mutex<u64>>,
 }
 
+impl Drop for SourceRefreshToken {
+	fn drop(&mut self) {
+		release_source_refresh_state(&self.cache_key, &self.state);
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceRefreshOutcome {
+	Committed,
+	Stale,
+	Failed,
+}
+
+impl SourceRefreshOutcome {
+	pub(crate) fn committed(self) -> bool {
+		self == Self::Committed
+	}
+}
+
 #[derive(Clone, Debug)]
 pub struct RememberedSubredditEntry {
 	pub name: String,
@@ -492,7 +511,7 @@ enum SessionWarmMode {
 }
 
 static SOURCE_CACHE: LazyLock<Mutex<HashMap<String, CachedSourcePosts>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static SOURCE_REFRESH_STATES: LazyLock<Mutex<HashMap<String, Arc<Mutex<u64>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static SOURCE_REFRESH_STATES: LazyLock<Mutex<HashMap<String, Weak<Mutex<u64>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 type SqliteProfileSyncTarget = (Vec<(String, i64)>, Vec<String>);
 static SQLITE_PROFILE_SYNC_DESIRED: LazyLock<Mutex<HashMap<String, SqliteProfileSyncTarget>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -512,6 +531,12 @@ static TEST_DURABLE_WRITE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 static TEST_DURABLE_WRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_DURABLE_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_DURABLE_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_PRUNE_REMOVE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_PRUNE_REMOVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn source_cache_is_expired(entry: &CachedSourcePosts) -> bool {
 	entry.fetched_at.elapsed().as_secs() > CACHE_TTL_SECS
@@ -1017,11 +1042,17 @@ fn write_source_entry_to_disk(source_cache_key: &str, entry: &CachedSourcePosts)
 	{
 		let _ = (source_cache_key, entry);
 		TEST_DURABLE_WRITE_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+		if TEST_DURABLE_WRITE_FAIL.load(AtomicOrdering::SeqCst) {
+			return false;
+		}
 		let delay_ms = TEST_DURABLE_WRITE_DELAY_MS.load(AtomicOrdering::SeqCst);
 		if delay_ms > 0 {
 			TEST_DURABLE_WRITE_ACTIVE.store(true, AtomicOrdering::SeqCst);
 			std::thread::sleep(Duration::from_millis(delay_ms));
 			TEST_DURABLE_WRITE_ACTIVE.store(false, AtomicOrdering::SeqCst);
+		}
+		if TEST_DURABLE_WRITE_FAIL.load(AtomicOrdering::SeqCst) {
+			return false;
 		}
 		return true;
 	}
@@ -1061,6 +1092,8 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 	#[cfg(not(test))]
 	{
 		let cache_key = source.cache_key();
+		let refresh_state = source_refresh_state(&cache_key);
+		let refresh_guard = refresh_state.lock().unwrap_or_else(|error| error.into_inner());
 		let persisted = match crate::cache_persistence::read_source_cache_entry(&cache_key) {
 			Ok(Some(entry)) => entry,
 			Ok(None) => return None,
@@ -1104,6 +1137,8 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 		if let Ok(mut cache) = SOURCE_CACHE.lock() {
 			cache.insert(cache_key, entry.clone());
 		}
+		drop(refresh_guard);
+		release_source_refresh_state(&source.cache_key(), &refresh_state);
 		prune_source_cache();
 		Some(entry)
 	}
@@ -1257,7 +1292,23 @@ fn mark_remembered_source_refresh_started(source: &FeedSource) {
 
 fn source_refresh_state(cache_key: &str) -> Arc<Mutex<u64>> {
 	let mut states = SOURCE_REFRESH_STATES.lock().unwrap_or_else(|error| error.into_inner());
-	states.entry(cache_key.to_string()).or_insert_with(|| Arc::new(Mutex::new(0))).clone()
+	// Only active refresh/decay operations retain a strong state reference.
+	// Pruning dead weak entries here keeps the registry proportional to
+	// concurrent work instead of every source ever observed.
+	states.retain(|_, state| state.strong_count() > 0);
+	if let Some(state) = states.get(cache_key).and_then(Weak::upgrade) {
+		return state;
+	}
+	let state = Arc::new(Mutex::new(0));
+	states.insert(cache_key.to_string(), Arc::downgrade(&state));
+	state
+}
+
+fn release_source_refresh_state(cache_key: &str, state: &Arc<Mutex<u64>>) {
+	let mut states = SOURCE_REFRESH_STATES.lock().unwrap_or_else(|error| error.into_inner());
+	if Arc::strong_count(state) == 1 && states.get(cache_key).and_then(Weak::upgrade).is_some_and(|current| Arc::ptr_eq(&current, state)) {
+		states.remove(cache_key);
+	}
 }
 
 pub(crate) fn begin_source_refresh(source: &FeedSource) -> SourceRefreshToken {
@@ -1269,10 +1320,6 @@ pub(crate) fn begin_source_refresh(source: &FeedSource) -> SourceRefreshToken {
 		*current
 	};
 	SourceRefreshToken { cache_key, generation, state }
-}
-
-fn source_refresh_token_is_current(token: &SourceRefreshToken) -> bool {
-	*token.state.lock().unwrap_or_else(|error| error.into_inner()) == token.generation
 }
 
 fn should_evict_resident_source_entry(entry: &CachedSourcePosts) -> bool {
@@ -1360,24 +1407,52 @@ pub(crate) fn prune_source_cache() {
 		return;
 	}
 
-	let sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
-	materialized_catalog::remove_sources(&sources);
-	let removed_disk_sources = pruned_sources
-		.iter()
-		.filter(|(_, remove_disk_entry)| *remove_disk_entry)
-		.map(|(source, _)| source.clone())
-		.collect::<Vec<_>>();
-	materialized_catalog::remove_mixed_feed_sources(&removed_disk_sources);
-	for (source, remove_disk_entry) in &pruned_sources {
-		if *remove_disk_entry {
-			crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
-		}
-	}
+	remove_pruned_sources_if_still_absent(&pruned_sources);
 	bump_source_cache_revision();
 	crate::cache_persistence::mark_dirty();
 }
 
-fn store_source_posts_with_token(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>, token: SourceRefreshToken) -> bool {
+fn remove_pruned_sources_if_still_absent(pruned_sources: &[(FeedSource, bool)]) {
+	for (source, remove_disk_entry) in pruned_sources {
+		#[cfg(test)]
+		{
+			let delay_ms = TEST_PRUNE_REMOVE_DELAY_MS.load(AtomicOrdering::SeqCst);
+			if delay_ms > 0 {
+				TEST_PRUNE_REMOVE_ACTIVE.store(true, AtomicOrdering::SeqCst);
+				std::thread::sleep(Duration::from_millis(delay_ms));
+				TEST_PRUNE_REMOVE_ACTIVE.store(false, AtomicOrdering::SeqCst);
+			}
+		}
+		let cache_key = source.cache_key();
+		let state = source_refresh_state(&cache_key);
+		let generation = state.lock().unwrap_or_else(|error| error.into_inner());
+		let still_absent = SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&cache_key).is_none();
+		if still_absent {
+			materialized_catalog::remove_sources(std::slice::from_ref(source));
+			if *remove_disk_entry {
+				crate::cache_persistence::remove_source_cache_entry(&cache_key);
+				materialized_catalog::remove_mixed_feed_sources(std::slice::from_ref(source));
+			}
+		}
+		drop(generation);
+		release_source_refresh_state(&cache_key, &state);
+	}
+}
+
+fn store_source_posts_with_token_and_effects<Committed, Failed>(
+	source: &FeedSource,
+	posts: Vec<Post>,
+	after: String,
+	refresh_origin: Option<RefreshOrigin>,
+	observation_source: crate::post_components::ObservationSource,
+	token: SourceRefreshToken,
+	on_committed: Committed,
+	on_failed: Failed,
+) -> SourceRefreshOutcome
+where
+	Committed: FnOnce(&[Post]),
+	Failed: FnOnce(),
+{
 	let cache_key = source.cache_key();
 	if token.cache_key != cache_key {
 		warn!(
@@ -1385,7 +1460,7 @@ fn store_source_posts_with_token(source: &FeedSource, posts: Vec<Post>, after: S
 			source.display_name(),
 			token.cache_key
 		);
-		return false;
+		return SourceRefreshOutcome::Stale;
 	}
 	let current_generation = token.state.lock().unwrap_or_else(|error| error.into_inner());
 	if *current_generation != token.generation {
@@ -1395,7 +1470,7 @@ fn store_source_posts_with_token(source: &FeedSource, posts: Vec<Post>, after: S
 			token.generation,
 			*current_generation
 		);
-		return false;
+		return SourceRefreshOutcome::Stale;
 	}
 
 	let new_signature = source_window_signature(&posts, &after);
@@ -1414,9 +1489,20 @@ fn store_source_posts_with_token(source: &FeedSource, posts: Vec<Post>, after: S
 	// outside SOURCE_CACHE; the per-source generation guard prevents an
 	// overlapping completion from reordering the durable commit.
 	if !write_source_entry_to_disk(&cache_key, &new_entry) {
-		return false;
+		on_failed();
+		return SourceRefreshOutcome::Failed;
 	}
 
+	crate::utils::store_post_flairs(&new_entry.posts);
+	match source {
+		FeedSource::Subreddit { name, .. } | FeedSource::Flair { subreddit: name, .. } => {
+			crate::utils::store_subreddit_flairs(name, &new_entry.posts);
+			if !name.to_ascii_lowercase().starts_with("u_") {
+				crate::utils::store_subreddit_users(name, &new_entry.posts);
+			}
+		}
+		FeedSource::UserComments { .. } => {}
+	}
 	update_user_video_stats_from_posts(&new_entry.posts);
 	if materialized_catalog::source_is_supported(source) {
 		if refresh_origin == Some(RefreshOrigin::Daemon) {
@@ -1426,9 +1512,10 @@ fn store_source_posts_with_token(source: &FeedSource, posts: Vec<Post>, after: S
 			// interactive fetch; only genuinely new daemon discoveries rise to the top.
 			materialized_catalog::mark_following_posts_seen(source, &new_entry.posts);
 		}
-		materialized_catalog::apply_source_refresh(source, &new_entry.posts);
+		materialized_catalog::apply_source_refresh_with_observation(source, &new_entry.posts, observation_source);
 		apply_legacy_mixed_feed_source_refresh(source, &new_entry.posts);
 	}
+	on_committed(&new_entry.posts);
 	let mut source_window_changed = true;
 	let mut pruned_sources = Vec::new();
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
@@ -1438,80 +1525,115 @@ fn store_source_posts_with_token(source: &FeedSource, posts: Vec<Post>, after: S
 		cache.insert(cache_key.clone(), new_entry.clone());
 		pruned_sources.extend(prune_source_cache_locked(&mut cache));
 	}
-	let pruned_catalog_sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
-	materialized_catalog::remove_sources(&pruned_catalog_sources);
-	let removed_disk_sources = pruned_sources
-		.iter()
-		.filter(|(_, remove_disk_entry)| *remove_disk_entry)
-		.map(|(source, _)| source.clone())
-		.collect::<Vec<_>>();
-	materialized_catalog::remove_mixed_feed_sources(&removed_disk_sources);
-	for (pruned_source, remove_disk_entry) in &pruned_sources {
-		if *remove_disk_entry {
-			crate::cache_persistence::remove_source_cache_entry(&pruned_source.cache_key());
-		}
-	}
+	let priority = semantic_backfill_priority(refresh_origin);
+	crate::observed_semantic_backfill::enqueue_observed_posts(&cache_key, &new_entry.posts, priority);
+	drop(current_generation);
+	remove_pruned_sources_if_still_absent(&pruned_sources);
 	if source_window_changed || !pruned_sources.is_empty() {
 		bump_source_cache_revision();
 	}
 	if is_persisted_subreddit_feed_source(source) || materialized_catalog::source_is_supported(source) {
 		crate::cache_persistence::mark_dirty();
 	}
-	let priority = semantic_backfill_priority(refresh_origin);
-	crate::observed_semantic_backfill::enqueue_observed_posts(&cache_key, &new_entry.posts, priority);
-	true
+	SourceRefreshOutcome::Committed
+}
+
+fn store_source_posts_with_token(
+	source: &FeedSource,
+	posts: Vec<Post>,
+	after: String,
+	refresh_origin: Option<RefreshOrigin>,
+	token: SourceRefreshToken,
+) -> SourceRefreshOutcome {
+	store_source_posts_with_token_and_effects(
+		source,
+		posts,
+		after,
+		refresh_origin,
+		crate::post_components::ObservationSource::Listing,
+		token,
+		|_| {},
+		|| {},
+	)
 }
 
 #[cfg(test)]
-fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) -> bool {
+fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) -> SourceRefreshOutcome {
 	let token = begin_source_refresh(source);
 	store_source_posts_with_token(source, posts, after, refresh_origin, token)
 }
 
-fn publish_remembered_source_refresh_with_token(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin, token: SourceRefreshToken) -> bool {
+fn publish_remembered_source_refresh_with_token_and_effects<Extra>(
+	source: &FeedSource,
+	posts: Vec<Post>,
+	after: String,
+	refresh_origin: RefreshOrigin,
+	observation_source: crate::post_components::ObservationSource,
+	token: SourceRefreshToken,
+	extra_committed: Extra,
+) -> SourceRefreshOutcome
+where
+	Extra: FnOnce(&[Post]),
+{
 	let Some(source) = normalize_remembered_source(source) else {
-		return false;
+		return SourceRefreshOutcome::Stale;
 	};
-
-	match &source {
-		FeedSource::Subreddit { name, .. } | FeedSource::Flair { subreddit: name, .. } => crate::utils::store_subreddit_flairs(name, &posts),
-		FeedSource::UserComments { .. } => {}
-	}
-	crate::utils::store_post_flairs(&posts);
-	if !store_source_posts_with_token(&source, posts.clone(), after.clone(), Some(refresh_origin), token) {
-		return false;
-	}
-	if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
-		crate::video_preview::prewarm_listing_video_previews(&posts);
-	}
-	let Some(key) = remembered_feed_key_for_source(&source) else {
-		return true;
-	};
-	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-	let Some(entry) = remembered.get_mut(&key) else {
-		return true;
-	};
-
-	entry.last_refresh_succeeded_at = Some(Instant::now());
-	entry.last_refresh_failed_at = None;
-	entry.banned_until = None;
-	entry.consecutive_failures = 0;
-	entry.estimated_post_interval_secs = estimate_post_interval_secs(&posts, entry.estimated_post_interval_secs);
-	entry.refresh_in_flight = false;
-	info!(
-		"post_cache: remembered feed refresh succeeded for {} via {:?}: {} posts, after_present={}",
-		source.display_name(),
-		refresh_origin,
-		posts.len(),
-		!after.is_empty()
-	);
-	crate::cache_persistence::mark_dirty();
-	true
+	let success_source = source.clone();
+	let success_after = after.clone();
+	let failed_source = source.clone();
+	store_source_posts_with_token_and_effects(
+		&source,
+		posts,
+		after,
+		Some(refresh_origin),
+		observation_source,
+		token,
+		move |committed_posts| {
+			extra_committed(committed_posts);
+			if matches!(refresh_origin, RefreshOrigin::Daemon | RefreshOrigin::FrontPageSession) {
+				crate::video_preview::prewarm_listing_video_previews(committed_posts);
+			}
+			let Some(key) = remembered_feed_key_for_source(&success_source) else {
+				return;
+			};
+			let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+			let Some(entry) = remembered.get_mut(&key) else {
+				return;
+			};
+			entry.last_refresh_succeeded_at = Some(Instant::now());
+			entry.last_refresh_failed_at = None;
+			entry.banned_until = None;
+			entry.consecutive_failures = 0;
+			entry.estimated_post_interval_secs = estimate_post_interval_secs(committed_posts, entry.estimated_post_interval_secs);
+			entry.refresh_in_flight = false;
+			info!(
+				"post_cache: remembered feed refresh succeeded for {} via {:?}: {} posts, after_present={}",
+				success_source.display_name(),
+				refresh_origin,
+				committed_posts.len(),
+				!success_after.is_empty()
+			);
+			crate::cache_persistence::mark_dirty();
+		},
+		move || {
+			let _ = record_remembered_source_refresh_failure(&failed_source, "durable source cache publication failed", refresh_origin);
+		},
+	)
 }
 
-fn publish_remembered_source_refresh(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) -> bool {
+fn publish_remembered_source_refresh_with_token(
+	source: &FeedSource,
+	posts: Vec<Post>,
+	after: String,
+	refresh_origin: RefreshOrigin,
+	token: SourceRefreshToken,
+) -> SourceRefreshOutcome {
+	publish_remembered_source_refresh_with_token_and_effects(source, posts, after, refresh_origin, crate::post_components::ObservationSource::Listing, token, |_| {})
+}
+
+fn publish_remembered_source_refresh(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin) -> SourceRefreshOutcome {
 	let Some(normalized) = normalize_remembered_source(source) else {
-		return false;
+		return SourceRefreshOutcome::Stale;
 	};
 	let token = begin_source_refresh(&normalized);
 	publish_remembered_source_refresh_with_token(&normalized, posts, after, refresh_origin, token)
@@ -1525,11 +1647,35 @@ pub fn publish_plain_subreddit_refresh(subreddit: &str, posts: Vec<Post>, after:
 	publish_remembered_source_refresh(&source, posts, after, refresh_origin);
 }
 
-pub(crate) fn publish_plain_subreddit_refresh_with_token(subreddit: &str, posts: Vec<Post>, after: String, refresh_origin: RefreshOrigin, token: SourceRefreshToken) -> bool {
+pub(crate) fn publish_plain_subreddit_refresh_with_token(
+	subreddit: &str,
+	posts: Vec<Post>,
+	after: String,
+	refresh_origin: RefreshOrigin,
+	token: SourceRefreshToken,
+) -> SourceRefreshOutcome {
 	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
-		return false;
+		return SourceRefreshOutcome::Stale;
 	};
 	publish_remembered_source_refresh_with_token(&source, posts, after, refresh_origin, token)
+}
+
+pub(crate) fn publish_plain_subreddit_refresh_with_token_and_effects<Committed>(
+	subreddit: &str,
+	posts: Vec<Post>,
+	after: String,
+	refresh_origin: RefreshOrigin,
+	observation_source: crate::post_components::ObservationSource,
+	token: SourceRefreshToken,
+	on_committed: Committed,
+) -> SourceRefreshOutcome
+where
+	Committed: FnOnce(&[Post]),
+{
+	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
+		return SourceRefreshOutcome::Stale;
+	};
+	publish_remembered_source_refresh_with_token_and_effects(&source, posts, after, refresh_origin, observation_source, token, on_committed)
 }
 
 fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
@@ -1561,6 +1707,30 @@ pub fn record_plain_subreddit_refresh_failure(subreddit: &str, error: &str, refr
 		return;
 	};
 	let _ = record_remembered_source_refresh_failure(&source, error, refresh_origin);
+}
+
+pub(crate) fn record_plain_subreddit_refresh_failure_with_token(
+	subreddit: &str,
+	error: &str,
+	refresh_origin: RefreshOrigin,
+	token: SourceRefreshToken,
+) -> SourceRefreshOutcome {
+	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
+		return SourceRefreshOutcome::Stale;
+	};
+	record_remembered_source_refresh_failure_with_token(&source, error, refresh_origin, token)
+}
+
+fn record_remembered_source_refresh_failure_with_token(source: &FeedSource, error: &str, refresh_origin: RefreshOrigin, token: SourceRefreshToken) -> SourceRefreshOutcome {
+	if token.cache_key != source.cache_key() {
+		return SourceRefreshOutcome::Stale;
+	}
+	let current_generation = token.state.lock().unwrap_or_else(|lock_error| lock_error.into_inner());
+	if *current_generation != token.generation {
+		return SourceRefreshOutcome::Stale;
+	}
+	let _ = record_remembered_source_refresh_failure(source, error, refresh_origin);
+	SourceRefreshOutcome::Failed
 }
 
 fn record_remembered_source_refresh_failure(source: &FeedSource, error: &str, refresh_origin: RefreshOrigin) -> Option<RememberedFailureDisposition> {
@@ -1597,38 +1767,56 @@ fn record_remembered_source_refresh_failure(source: &FeedSource, error: &str, re
 }
 
 pub fn cleanup_decayed_remembered_subreddits() {
-	let decayed = {
-		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
-		let decayed = remembered
+	let candidates = {
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		remembered
 			.iter()
 			.filter(|(_, entry)| !remembered_entry_is_active(entry) || remembered_feed_source_from_key(&entry.name).is_none())
 			.map(|(name, _)| name.clone())
-			.collect::<Vec<_>>();
-		for subreddit in &decayed {
-			remembered.remove(subreddit);
-		}
-		decayed
+			.collect::<Vec<_>>()
 	};
 
-	if decayed.is_empty() {
+	if candidates.is_empty() {
 		return;
 	}
 
-	let removed_sources = decayed.iter().filter_map(|key| remembered_feed_source_from_key(key)).collect::<Vec<_>>();
-	if let Ok(mut cache) = SOURCE_CACHE.lock() {
-		for source in &removed_sources {
-			cache.remove(&source.cache_key());
+	let mut removed_any = false;
+	for key in candidates {
+		let Some(source) = remembered_feed_source_from_key(&key) else {
+			let removed = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner()).remove(&key).is_some();
+			removed_any |= removed;
+			continue;
+		};
+		let cache_key = source.cache_key();
+		let state = source_refresh_state(&cache_key);
+		let mut generation = state.lock().unwrap_or_else(|error| error.into_inner());
+		// Hold the remembered map through the eligibility recheck and deletion.
+		// A concurrent request can re-remember the source only after cleanup is
+		// complete, while the generation bump invalidates any older in-flight
+		// completion before it can resurrect the removed window.
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
+		let still_decayed = remembered
+			.get(&key)
+			.is_some_and(|entry| !remembered_entry_is_active(entry) || remembered_feed_source_from_key(&entry.name).is_none());
+		if still_decayed {
+			*generation = (*generation).saturating_add(1);
+			remembered.remove(&key);
+			SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).remove(&cache_key);
+			crate::cache_persistence::remove_source_cache_entry(&cache_key);
+			if let FeedSource::Subreddit { name, .. } = &source {
+				crate::subreddit::remove_subreddit_metadata_cache(name);
+			}
+			materialized_catalog::remove_sources(std::slice::from_ref(&source));
+			materialized_catalog::remove_mixed_feed_sources(std::slice::from_ref(&source));
+			removed_any = true;
 		}
+		drop(remembered);
+		drop(generation);
+		release_source_refresh_state(&cache_key, &state);
 	}
-	for source in &removed_sources {
-		crate::cache_persistence::remove_source_cache_entry(&source.cache_key());
-		if let FeedSource::Subreddit { name, .. } = source {
-			crate::subreddit::remove_subreddit_metadata_cache(name);
-		}
+	if removed_any {
+		crate::cache_persistence::mark_dirty();
 	}
-	materialized_catalog::remove_sources(&removed_sources);
-	materialized_catalog::remove_mixed_feed_sources(&removed_sources);
-	crate::cache_persistence::mark_dirty();
 }
 
 #[cfg(test)]
@@ -1636,14 +1824,19 @@ pub(crate) fn store_source_posts_for_cache(source: &FeedSource, posts: Vec<Post>
 	store_source_posts_with_origin(source, posts, after, refresh_origin);
 }
 
-pub(crate) fn store_source_posts_for_cache_with_token(
+pub(crate) fn store_source_posts_for_cache_with_token_and_effects<Committed>(
 	source: &FeedSource,
 	posts: Vec<Post>,
 	after: String,
 	refresh_origin: Option<RefreshOrigin>,
+	observation_source: crate::post_components::ObservationSource,
 	token: SourceRefreshToken,
-) -> bool {
-	store_source_posts_with_token(source, posts, after, refresh_origin, token)
+	on_committed: Committed,
+) -> SourceRefreshOutcome
+where
+	Committed: FnOnce(&[Post]),
+{
+	store_source_posts_with_token_and_effects(source, posts, after, refresh_origin, observation_source, token, on_committed, || {})
 }
 
 #[cfg(test)]
@@ -1910,28 +2103,14 @@ async fn refresh_remembered_feed(source: &FeedSource) -> RememberedRefreshOutcom
 	};
 
 	let outcome = match listing_result {
-		Ok((posts, after)) => {
-			let outcome_token = refresh_token.clone();
-			if publish_remembered_source_refresh_with_token(source, posts, after, RefreshOrigin::Daemon, refresh_token) {
-				RememberedRefreshOutcome::Succeeded
-			} else if source_refresh_token_is_current(&outcome_token) {
-				// A current generation can be rejected only before request state
-				// is published, for example when its durable legacy write fails.
-				// Clear the daemon's in-flight marker and apply normal retry
-				// backoff instead of reporting a false success.
-				let disposition = record_remembered_source_refresh_failure(source, "durable source cache publication failed", RefreshOrigin::Daemon)
-					.unwrap_or(RememberedFailureDisposition::Transient);
-				RememberedRefreshOutcome::Failed(disposition)
-			} else {
-				// A newer overlapping request owns the source window and its
-				// remembered-feed bookkeeping.
-				RememberedRefreshOutcome::Succeeded
-			}
-		}
-		Err(error) => {
-			let disposition = record_remembered_source_refresh_failure(source, &error, RefreshOrigin::Daemon).unwrap_or(RememberedFailureDisposition::Transient);
-			RememberedRefreshOutcome::Failed(disposition)
-		}
+		Ok((posts, after)) => match publish_remembered_source_refresh_with_token(source, posts, after, RefreshOrigin::Daemon, refresh_token) {
+			SourceRefreshOutcome::Committed | SourceRefreshOutcome::Stale => RememberedRefreshOutcome::Succeeded,
+			SourceRefreshOutcome::Failed => RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Transient),
+		},
+		Err(error) => match record_remembered_source_refresh_failure_with_token(source, &error, RefreshOrigin::Daemon, refresh_token) {
+			SourceRefreshOutcome::Stale => RememberedRefreshOutcome::Succeeded,
+			SourceRefreshOutcome::Failed | SourceRefreshOutcome::Committed => RememberedRefreshOutcome::Failed(refresh_failure_disposition(&error)),
+		},
 	};
 
 	let metadata_subreddit = match source {
@@ -2252,11 +2431,14 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 			if error.contains("oauth_unavailable") {
 				if let Some(entry) = cached_source_posts_with_mode(&source, CacheServeMode::AllowStaleOnOauthOutage) {
 					warn!("post_cache: serving stale cached source {} because OAuth is unavailable", source.display_name());
+					if remembered_feed_key_for_source(&source).is_some() {
+						let _ = record_remembered_source_refresh_failure_with_token(&source, &error, refresh_origin, refresh_token);
+					}
 					return Ok(entry);
 				}
 			}
 			if remembered_feed_key_for_source(&source).is_some() {
-				let _ = record_remembered_source_refresh_failure(&source, &error, refresh_origin);
+				let _ = record_remembered_source_refresh_failure_with_token(&source, &error, refresh_origin, refresh_token);
 			}
 			return Err(error);
 		}
@@ -2271,7 +2453,6 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 	if remembered_feed_key_for_source(&source).is_some() {
 		publish_remembered_source_refresh_with_token(&source, posts.clone(), after.clone(), refresh_origin, refresh_token);
 	} else {
-		crate::utils::store_post_flairs(&posts);
 		store_source_posts_with_token(&source, posts.clone(), after.clone(), None, refresh_token);
 	}
 
@@ -2986,21 +3167,42 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 		return 0;
 	};
 
-	let mut updated_sources = Vec::new();
+	let sources = SOURCE_CACHE
+		.lock()
+		.unwrap_or_else(|error| error.into_inner())
+		.values()
+		.map(|entry| entry.source.clone())
+		.collect::<Vec<_>>();
+	let mut updated_sources = 0usize;
 	let mut removed_primary_media = 0;
 	let mut removed_posts = 0;
-	let removed_history_media = materialized_catalog::mark_deleted_reddit_media_asset(&deleted_asset_key);
-
-	if let Ok(mut cache) = SOURCE_CACHE.lock() {
-		for (cache_key, entry) in cache.iter_mut() {
-			let result = prune_deleted_media_from_posts(&mut entry.posts, &deleted_asset_key);
-			if result.changed {
-				removed_primary_media += result.primary_media_removed;
-				removed_posts += result.posts_removed;
-				updated_sources.push((cache_key.clone(), entry.clone()));
-			}
+	for source in sources {
+		let cache_key = source.cache_key();
+		let state = source_refresh_state(&cache_key);
+		let mut generation = state.lock().unwrap_or_else(|error| error.into_inner());
+		let Some(mut updated_entry) = SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&cache_key).cloned() else {
+			drop(generation);
+			release_source_refresh_state(&cache_key, &state);
+			continue;
+		};
+		let result = prune_deleted_media_from_posts(&mut updated_entry.posts, &deleted_asset_key);
+		if result.changed {
+			*generation = (*generation).saturating_add(1);
 		}
+		if result.changed && write_source_entry_to_disk(&cache_key, &updated_entry) {
+			removed_primary_media += result.primary_media_removed;
+			removed_posts += result.posts_removed;
+			if materialized_catalog::source_is_supported(&updated_entry.source) {
+				materialized_catalog::apply_source_refresh(&updated_entry.source, &updated_entry.posts);
+				apply_legacy_mixed_feed_source_refresh(&updated_entry.source, &updated_entry.posts);
+			}
+			SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).insert(cache_key.clone(), updated_entry);
+			updated_sources += 1;
+		}
+		drop(generation);
+		release_source_refresh_state(&cache_key, &state);
 	}
+	let removed_history_media = materialized_catalog::mark_deleted_reddit_media_asset(&deleted_asset_key);
 
 	let mut updated_sessions = 0;
 	if let Ok(mut sessions) = FEED_SESSIONS.lock() {
@@ -3021,28 +3223,15 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 		}
 	}
 
-	for (cache_key, entry) in &updated_sources {
-		if materialized_catalog::source_is_supported(&entry.source) {
-			materialized_catalog::apply_source_refresh(&entry.source, &entry.posts);
-			apply_legacy_mixed_feed_source_refresh(&entry.source, &entry.posts);
-		}
-		write_source_entry_to_disk(cache_key, entry);
-	}
-
-	if !updated_sources.is_empty() {
+	if updated_sources > 0 {
 		bump_source_cache_revision();
 		crate::cache_persistence::mark_dirty();
 	}
 
-	if !updated_sources.is_empty() || updated_sessions > 0 || removed_history_media > 0 {
+	if updated_sources > 0 || updated_sessions > 0 || removed_history_media > 0 {
 		info!(
 			"post_cache: marked deleted Reddit media asset {} (sources={}, sessions={}, history_media_removed={}, primary_media_removed={}, posts_removed={})",
-			deleted_asset_key,
-			updated_sources.len(),
-			updated_sessions,
-			removed_history_media,
-			removed_primary_media,
-			removed_posts
+			deleted_asset_key, updated_sources, updated_sessions, removed_history_media, removed_primary_media, removed_posts
 		);
 	}
 
@@ -4061,28 +4250,30 @@ mod tests {
 		build_session_id, cache_status_for_preferences, catalog_source_candidates, cleanup_decayed_remembered_subreddits, continue_feed_session_with_budget,
 		count_sources_in_state, daemon_should_continue_after_refresh, effective_freshness_target_secs, enforce_source_cache_limits_locked, ensure_feed_session_with_budget,
 		feed_page, feed_status, followup_source_budget, freeze_feed_page, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
-		mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
-		pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
-		predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh, random_rotation_seed_for_time,
-		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal,
-		remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at, restore_persisted_state,
-		seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts,
-		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed,
-		sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts,
-		store_source_posts_with_origin, store_source_posts_with_token, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession,
+		mark_deleted_reddit_media_url, mark_fetching_sources_failed, mark_remembered_source_refresh_started, max_sync_source_budget, merged_posts_for_session,
+		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh,
+		plan_session_warm_mode, predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh,
+		publish_remembered_source_refresh_with_token, random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
+		record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal, record_remembered_source_refresh_failure_with_token, remember_flair_request,
+		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries,
+		seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
+		snapshot_persisted_source_entries, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target,
+		source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin,
+		store_source_posts_with_token, store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession,
 		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry,
-		SessionSourceEntry, SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES,
+		SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES,
 		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS,
 		PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS,
-		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES,
-		TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS,
+		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE,
+		TEST_PRUNE_REMOVE_DELAY_MS,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 	use std::cmp::Ordering;
 	use std::collections::{HashMap, HashSet};
-	use std::sync::atomic::Ordering as AtomicOrdering;
-	use std::sync::{LazyLock, Mutex, MutexGuard};
+	use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+	use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 	use std::time::{Duration, Instant};
 
 	static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -4101,6 +4292,9 @@ mod tests {
 		TEST_DURABLE_WRITE_DELAY_MS.store(0, AtomicOrdering::SeqCst);
 		TEST_DURABLE_WRITE_ACTIVE.store(false, AtomicOrdering::SeqCst);
 		TEST_DURABLE_WRITE_COUNT.store(0, AtomicOrdering::SeqCst);
+		TEST_DURABLE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
+		TEST_PRUNE_REMOVE_DELAY_MS.store(0, AtomicOrdering::SeqCst);
+		TEST_PRUNE_REMOVE_ACTIVE.store(false, AtomicOrdering::SeqCst);
 		crate::materialized_catalog::reset_catalog();
 		crate::utils::clear_test_caches();
 		crate::user::clear_test_caches();
@@ -6499,25 +6693,207 @@ mod tests {
 		let older = begin_source_refresh(&source);
 		let newer = begin_source_refresh(&source);
 
-		assert!(store_source_posts_with_token(
-			&source,
-			vec![test_post("newer", "rust", 200)],
-			"new-after".to_string(),
-			Some(RefreshOrigin::Daemon),
-			newer,
-		));
-		assert!(!store_source_posts_with_token(
-			&source,
-			vec![test_post("older", "rust", 100)],
-			"old-after".to_string(),
-			Some(RefreshOrigin::Daemon),
-			older,
-		));
+		assert_eq!(
+			store_source_posts_with_token(&source, vec![test_post("newer", "rust", 200)], "new-after".to_string(), Some(RefreshOrigin::Daemon), newer,),
+			SourceRefreshOutcome::Committed
+		);
+		assert_eq!(
+			store_source_posts_with_token(&source, vec![test_post("older", "rust", 100)], "old-after".to_string(), Some(RefreshOrigin::Daemon), older,),
+			SourceRefreshOutcome::Stale
+		);
 
 		let cached = SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).cloned().unwrap();
 		assert_eq!(cached.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["newer"]);
 		assert_eq!(cached.after, "new-after");
 		assert_eq!(TEST_DURABLE_WRITE_COUNT.load(AtomicOrdering::SeqCst), 1);
+	}
+
+	#[test]
+	fn stale_source_refresh_runs_no_shared_commit_effects() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		let older = begin_source_refresh(&source);
+		let newer = begin_source_refresh(&source);
+		assert_eq!(
+			store_source_posts_with_token(&source, vec![test_post("newer", "rust", 200)], String::new(), Some(RefreshOrigin::DirectLiveFetch), newer,),
+			SourceRefreshOutcome::Committed
+		);
+		let shared_effects = Arc::new(AtomicU64::new(0));
+		let observed_effects = Arc::clone(&shared_effects);
+		assert_eq!(
+			store_source_posts_with_token_and_effects(
+				&source,
+				vec![test_post("older", "rust", 100)],
+				String::new(),
+				Some(RefreshOrigin::DirectLiveFetch),
+				crate::post_components::ObservationSource::Peer,
+				older,
+				move |_| {
+					observed_effects.fetch_add(1, AtomicOrdering::SeqCst);
+				},
+				|| {},
+			),
+			SourceRefreshOutcome::Stale
+		);
+		assert_eq!(shared_effects.load(AtomicOrdering::SeqCst), 0);
+		assert!(!SOURCE_REFRESH_STATES.lock().unwrap_or_else(|error| error.into_inner()).contains_key(&source.cache_key()));
+	}
+
+	#[test]
+	fn stale_user_live_peer_scrape_and_video_completions_run_no_shared_effects() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let cases = [
+			(FeedSource::subreddit("u_video", FeedSort::New), crate::post_components::ObservationSource::Listing),
+			(FeedSource::subreddit("u_submitted", FeedSort::New), crate::post_components::ObservationSource::Peer),
+			(FeedSource::user_comments("u_comments", FeedSort::New), crate::post_components::ObservationSource::Scrape),
+		];
+		for (source, observation_source) in cases {
+			let older = begin_source_refresh(&source);
+			let newer = begin_source_refresh(&source);
+			assert_eq!(
+				store_source_posts_with_token(&source, vec![test_post("newer", "rust", 200)], String::new(), Some(RefreshOrigin::DirectLiveFetch), newer,),
+				SourceRefreshOutcome::Committed
+			);
+			let shared_effects = Arc::new(AtomicU64::new(0));
+			let observed_effects = Arc::clone(&shared_effects);
+			assert_eq!(
+				store_source_posts_with_token_and_effects(
+					&source,
+					vec![test_post("older", "rust", 100)],
+					String::new(),
+					Some(RefreshOrigin::DirectLiveFetch),
+					observation_source,
+					older,
+					move |_| {
+						observed_effects.fetch_add(1, AtomicOrdering::SeqCst);
+					},
+					|| {},
+				),
+				SourceRefreshOutcome::Stale
+			);
+			assert_eq!(shared_effects.load(AtomicOrdering::SeqCst), 0);
+		}
+	}
+
+	#[test]
+	fn stale_success_cannot_clear_newer_refresh_in_flight() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		mark_remembered_source_refresh_started(&source);
+		let older = begin_source_refresh(&source);
+		let newer = begin_source_refresh(&source);
+		assert_eq!(
+			publish_remembered_source_refresh_with_token(&source, vec![test_post("older", "rust", 100)], String::new(), RefreshOrigin::DirectLiveFetch, older,),
+			SourceRefreshOutcome::Stale
+		);
+		assert!(
+			REMEMBERED_SUBREDDITS
+				.lock()
+				.unwrap_or_else(|error| error.into_inner())
+				.get("rust")
+				.unwrap()
+				.refresh_in_flight
+		);
+		drop(newer);
+	}
+
+	#[test]
+	fn stale_failure_cannot_overwrite_newer_success_bookkeeping() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		mark_remembered_source_refresh_started(&source);
+		let older = begin_source_refresh(&source);
+		let newer = begin_source_refresh(&source);
+		assert_eq!(
+			publish_remembered_source_refresh_with_token(&source, vec![test_post("newer", "rust", 200)], String::new(), RefreshOrigin::DirectLiveFetch, newer,),
+			SourceRefreshOutcome::Committed
+		);
+		assert_eq!(
+			record_remembered_source_refresh_failure_with_token(&source, "network failed", RefreshOrigin::DirectLiveFetch, older),
+			SourceRefreshOutcome::Stale
+		);
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
+		let entry = remembered.get("rust").unwrap();
+		assert_eq!(entry.consecutive_failures, 0);
+		assert!(entry.last_refresh_failed_at.is_none());
+		assert!(!entry.refresh_in_flight);
+	}
+
+	#[test]
+	fn durable_publication_failure_clears_in_flight_and_schedules_retry() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		mark_remembered_source_refresh_started(&source);
+		let token = begin_source_refresh(&source);
+		TEST_DURABLE_WRITE_FAIL.store(true, AtomicOrdering::SeqCst);
+		assert_eq!(
+			publish_remembered_source_refresh_with_token(&source, vec![test_post("failed", "rust", 100)], String::new(), RefreshOrigin::Daemon, token,),
+			SourceRefreshOutcome::Failed
+		);
+		TEST_DURABLE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
+		let entry = remembered.get("rust").unwrap();
+		assert_eq!(entry.consecutive_failures, 1);
+		assert!(entry.last_refresh_failed_at.is_some());
+		assert!(!entry.refresh_in_flight);
+		assert!(SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).is_none());
+	}
+
+	#[test]
+	fn prune_cannot_remove_catalog_published_by_concurrent_refresh() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		seed_source(&source, vec![test_post("old", "rust", 100)]);
+		age_source_cache_for_test(&source, Duration::from_secs(CACHE_TTL_SECS + 60));
+		let token = begin_source_refresh(&source);
+		TEST_PRUNE_REMOVE_DELAY_MS.store(200, AtomicOrdering::SeqCst);
+		let pruning = std::thread::spawn(prune_source_cache);
+		let wait_started = Instant::now();
+		while !TEST_PRUNE_REMOVE_ACTIVE.load(AtomicOrdering::SeqCst) {
+			assert!(wait_started.elapsed() < Duration::from_secs(2), "prune removal hook did not start");
+			std::thread::yield_now();
+		}
+		assert_eq!(
+			store_source_posts_with_token(&source, vec![test_post("new", "rust", 200)], String::new(), Some(RefreshOrigin::DirectLiveFetch), token,),
+			SourceRefreshOutcome::Committed
+		);
+		pruning.join().unwrap();
+		TEST_PRUNE_REMOVE_DELAY_MS.store(0, AtomicOrdering::SeqCst);
+		let candidates = catalog_source_candidates(std::slice::from_ref(&source), &HashSet::new()).unwrap();
+		assert_eq!(candidates.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["new"]);
+	}
+
+	#[test]
+	fn decay_gc_invalidates_in_flight_refresh_before_removal() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		seed_source(&source, vec![test_post("old", "rust", 100)]);
+		let token = begin_source_refresh(&source);
+		REMEMBERED_SUBREDDITS
+			.lock()
+			.unwrap_or_else(|error| error.into_inner())
+			.get_mut("rust")
+			.unwrap()
+			.last_requested_at = Instant::now() - Duration::from_secs(REMEMBERED_SUBREDDIT_TTL_SECS + 60);
+		cleanup_decayed_remembered_subreddits();
+		assert_eq!(
+			store_source_posts_with_token(&source, vec![test_post("late", "rust", 200)], String::new(), Some(RefreshOrigin::Daemon), token,),
+			SourceRefreshOutcome::Stale
+		);
+		assert!(!REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner()).contains_key("rust"));
+		assert!(SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).is_none());
+		assert!(catalog_source_candidates(std::slice::from_ref(&source), &HashSet::new()).unwrap().is_empty());
 	}
 
 	#[test]
@@ -6542,7 +6918,7 @@ mod tests {
 		let cached = servable_cached_source_posts(&source).expect("Hot source remains readable");
 		assert!(read_started.elapsed() < Duration::from_millis(50));
 		assert_eq!(cached[0].id, "initial");
-		assert!(writer.join().unwrap());
+		assert_eq!(writer.join().unwrap(), SourceRefreshOutcome::Committed);
 		assert_eq!(servable_cached_source_posts(&source).unwrap()[0].id, "refreshed");
 		TEST_DURABLE_WRITE_DELAY_MS.store(0, AtomicOrdering::SeqCst);
 	}

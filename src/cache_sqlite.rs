@@ -537,7 +537,7 @@ fn open_read_connection(path: &Path) -> Result<Connection, String> {
 }
 
 fn with_read_connection<T>(cache: &ShadowCache, operation: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-	let result = (|| {
+	let result: Result<T, String> = (|| -> Result<T, String> {
 		let index = cache.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % cache.readers.len();
 		let mut connection = cache.readers[index].lock().map_err(|_| "SQLite shadow reader connection lock poisoned".to_string())?;
 		let transaction = connection.transaction().map_err(|error| error.to_string())?;
@@ -545,10 +545,22 @@ fn with_read_connection<T>(cache: &ShadowCache, operation: impl FnOnce(&Connecti
 		transaction.commit().map_err(|error| error.to_string())?;
 		Ok(result)
 	})();
-	if result.is_err() {
-		mark_reads_unhealthy();
+	if let Err(error) = &result {
+		if sqlite_read_error_requires_latch(error) {
+			mark_reads_unhealthy();
+		}
 	}
 	result
+}
+
+fn sqlite_read_error_requires_latch(error: &str) -> bool {
+	let error = error.to_ascii_lowercase();
+	!(error.contains("database is locked")
+		|| error.contains("database table is locked")
+		|| error.contains("database is busy")
+		|| error.contains("sqlite_busy")
+		|| error.contains("sqlite_interrupt")
+		|| error.contains("operation interrupted"))
 }
 
 fn open_database_with_options(path: &Path, requested_page_size: i64, synchronous: &str) -> Result<Connection, String> {
@@ -2796,6 +2808,15 @@ pub fn run_shadow_verifier() -> Result<(), String> {
 mod tests {
 	use super::*;
 	use crate::cache_persistence::{PersistedAuthor, PersistedFlags, PersistedFlair, PersistedMedia, PersistedParentComment};
+
+	#[test]
+	fn transient_sqlite_read_errors_do_not_trip_the_global_read_latch() {
+		assert!(!sqlite_read_error_requires_latch("database is locked"));
+		assert!(!sqlite_read_error_requires_latch("Error code 5: database is busy"));
+		assert!(!sqlite_read_error_requires_latch("SQLITE_INTERRUPT: operation interrupted"));
+		assert!(sqlite_read_error_requires_latch("database disk image is malformed"));
+		assert!(sqlite_read_error_requires_latch("unsupported SQLite payload codec 9"));
+	}
 
 	fn empty_flair() -> PersistedFlair {
 		PersistedFlair {

@@ -1385,7 +1385,7 @@ fn cached_video_mode_sidebar(req: &Request<Body>, username: &str, url: &str, que
 	build_video_mode_sidebar(url, &listing_data, &preview_posts, &normalized_query)
 }
 
-async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
+async fn fetch_user_listing_posts(_username: &str, path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
 	let should_refill_duplicates = listing == "submitted" || listing == "overview";
 	let mut request_path = path.to_string();
 	let mut all_posts = Vec::new();
@@ -1396,7 +1396,6 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 	let after = loop {
 		let (mut posts, next_after) = Post::fetch(&request_path, false).await?;
 		fetched_raw_posts |= !posts.is_empty();
-		utils::store_post_flairs(&posts);
 
 		let (_, page_all_posts_filtered) = filter_posts(&mut posts, filters);
 		if should_refill_duplicates {
@@ -1427,10 +1426,7 @@ async fn fetch_user_listing_posts(username: &str, path: &str, listing: &str, fil
 	if should_refill_duplicates {
 		all_posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
 	}
-	utils::store_user_subreddits(username, &all_posts);
-	crate::materialized_catalog::record_author_history_from_posts(&all_posts);
 	utils::hydrate_post_author_links_from_cache(&mut all_posts);
-	update_user_video_stats(username, &all_posts);
 	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
 	Ok((all_posts, after, all_posts_filtered))
 }
@@ -1444,11 +1440,15 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<(Vec<Post>, b
 	let path = format!("/user/{username}/submitted.json?sort=new&limit={}&raw_json=1", crate::post_cache::per_source_limit());
 	let refresh_token = crate::post_cache::begin_source_refresh(&source);
 	let (posts, after) = Post::fetch(&path, false).await?;
-	utils::store_post_flairs(&posts);
-	utils::store_user_subreddits(username, &posts);
-	crate::materialized_catalog::record_author_history_from_posts(&posts);
-	update_user_video_stats(username, &posts);
-	crate::post_cache::store_source_posts_for_cache_with_token(&source, posts.clone(), after, Some(crate::post_cache::RefreshOrigin::DirectLiveFetch), refresh_token);
+	crate::post_cache::store_source_posts_for_cache_with_token_and_effects(
+		&source,
+		posts.clone(),
+		after,
+		Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+		crate::post_components::ObservationSource::Listing,
+		refresh_token,
+		|committed_posts| utils::store_user_subreddits(username, committed_posts),
+	);
 	Ok((posts, false))
 }
 
@@ -3565,25 +3565,39 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			};
 			(merged.posts, merged.cached_post_ids, all_posts_filtered)
 		};
-		let store_live_listing_cache = |posts: &[Post], after: &str| {
+		let store_live_listing_cache = |posts: &[Post], after: &str, metadata: Option<&User>, observation_source: crate::post_components::ObservationSource| {
 			if let Some((source, token)) = source_refresh.as_ref() {
-				crate::post_cache::store_source_posts_for_cache_with_token(
+				let committed_metadata = metadata.cloned();
+				crate::post_cache::store_source_posts_for_cache_with_token_and_effects(
 					source,
 					posts.to_vec(),
 					after.to_string(),
 					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+					observation_source,
 					token.clone(),
-				);
+					|committed_posts| {
+						if let Some(metadata) = committed_metadata.as_ref() {
+							store_user_metadata(&username, metadata);
+						}
+						utils::store_user_subreddits(&username, committed_posts);
+					},
+				)
+				.committed()
+			} else {
+				if let Some(metadata) = metadata {
+					store_user_metadata(&username, metadata);
+				}
+				utils::store_post_flairs(posts);
+				utils::store_user_subreddits(&username, posts);
+				crate::materialized_catalog::record_author_history_from_posts(posts);
+				update_user_video_stats(&username, posts);
+				true
 			}
 		};
 		let mut fallback_notice = String::new();
 		let maybe_scraped = pre_scraped;
 		let (fragment_user, posts, cached_post_ids, ends, prev_page_url, next_page_url, all_posts_filtered) = if let Some(peer) = pre_peer {
-			store_user_metadata(&username, &peer.user);
-			utils::store_post_flairs(&peer.posts);
-			utils::store_user_subreddits(&username, &peer.posts);
-			crate::materialized_catalog::record_author_history_from_posts(&peer.posts);
-			store_live_listing_cache(&peer.posts, &peer.after);
+			store_live_listing_cache(&peer.posts, &peer.after, Some(&peer.user), crate::post_components::ObservationSource::Peer);
 			let mut peer_posts = peer.posts;
 			let (_, all_peer_posts_filtered) = filter_posts(&mut peer_posts, &filters);
 			let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(peer_posts, all_peer_posts_filtered);
@@ -3598,11 +3612,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 				all_posts_filtered,
 			)
 		} else if let Some(scraped) = maybe_scraped {
-			store_user_metadata(&username, &scraped.user);
-			utils::store_post_flairs(&scraped.posts);
-			utils::store_user_subreddits(&username, &scraped.posts);
-			crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
-			store_live_listing_cache(&scraped.posts, &scraped.after);
+			store_live_listing_cache(&scraped.posts, &scraped.after, Some(&scraped.user), crate::post_components::ObservationSource::Scrape);
 			let mut scraped_posts = scraped.posts.clone();
 			let (_, all_scraped_posts_filtered) = filter_posts(&mut scraped_posts, &filters);
 			let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(scraped_posts, all_scraped_posts_filtered);
@@ -3619,7 +3629,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		} else {
 			match fetch_user_listing_posts(&username, &path, &listing, &filters).await {
 				Ok((posts, after, all_posts_filtered)) => {
-					store_live_listing_cache(&posts, &after);
+					store_live_listing_cache(&posts, &after, None, crate::post_components::ObservationSource::Listing);
 					let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(posts, all_posts_filtered);
 					(
 						user.clone(),
@@ -3649,11 +3659,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 					info!("user: retrying {} via configured Redlib peer API after listing error: {}", current_url, msg);
 					match peer_api_fallback::fetch_user_listing(&username, &listing, &sort, Some(query)).await {
 						Ok(peer) => {
-							store_user_metadata(&username, &peer.user);
-							utils::store_post_flairs(&peer.posts);
-							utils::store_user_subreddits(&username, &peer.posts);
-							crate::materialized_catalog::record_author_history_from_posts(&peer.posts);
-							store_live_listing_cache(&peer.posts, &peer.after);
+							store_live_listing_cache(&peer.posts, &peer.after, Some(&peer.user), crate::post_components::ObservationSource::Peer);
 							let mut peer_posts = peer.posts;
 							let (_, all_peer_posts_filtered) = filter_posts(&mut peer_posts, &filters);
 							let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(peer_posts, all_peer_posts_filtered);
@@ -3671,11 +3677,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 						Err(peer_error) if instance_scrape::instance_scrape_enabled() => {
 							warn!("user: Redlib peer API fallback failed for {}: {}; trying scrape fallback", current_url, peer_error);
 							let scraped = instance_scrape::scrape_user_page(&current_url).await.map_err(|_| msg.clone())?;
-							store_user_metadata(&username, &scraped.user);
-							utils::store_post_flairs(&scraped.posts);
-							utils::store_user_subreddits(&username, &scraped.posts);
-							crate::materialized_catalog::record_author_history_from_posts(&scraped.posts);
-							store_live_listing_cache(&scraped.posts, &scraped.after);
+							store_live_listing_cache(&scraped.posts, &scraped.after, Some(&scraped.user), crate::post_components::ObservationSource::Scrape);
 							let mut scraped_posts = scraped.posts.clone();
 							let (_, all_scraped_posts_filtered) = filter_posts(&mut scraped_posts, &filters);
 							let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(scraped_posts, all_scraped_posts_filtered);
@@ -3734,12 +3736,14 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let mut fragment = fragment;
 	utils::hydrate_post_author_links_from_cache(&mut fragment.posts);
 	utils::refresh_post_times(&mut fragment.posts);
-	crate::observed_semantic_backfill::enqueue_observed_user_posts(
-		&username,
-		&format!("user:{username}:{}:direct-page", fragment.listing),
-		&fragment.posts,
-		crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
-	);
+	if source_refresh.is_none() {
+		crate::observed_semantic_backfill::enqueue_observed_user_posts(
+			&username,
+			&format!("user:{username}:{}:direct-page", fragment.listing),
+			&fragment.posts,
+			crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
+		);
+	}
 	let body = fragment.render().map_err(|error| error.to_string())?;
 	Response::builder()
 		.status(200)
