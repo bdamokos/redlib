@@ -122,18 +122,27 @@ all-source profile build to 1.81 s. Refreshing those keys once per 32-source
 migration transaction kept the fresh import at 11.43 s instead of the
 source-by-source prototype's 65.31 s.
 
-| Configuration | Import | First profile | DB bytes | Deep New p50/p95/p99 |
-|---|---:|---:|---:|---:|
-| 8 KiB, raw, FULL, batch 32 | 11.43 s | 1.81 s | 193,855,488 | 0.286/0.342/0.395 ms |
-| 16 KiB, raw, NORMAL, batch 32 | 10.74 s | 1.86 s | 183,418,880 | 0.283/0.344/0.398 ms |
-| 8 KiB, zstd level 1, FULL, batch 32 | 11.39 s | 1.63 s | 98,033,664 | 0.512/0.636/0.746 ms |
+The final schema-v4 candidate at exact source revision
+`0c9a7f94769bfcccd9be3402bf33784e2a3e38ca` was rebuilt in release mode and
+rerun from fresh disposable databases after the cursor-pinning, materialized
+filter snapshots, bounded reader pool and checksum-resume corrections:
+
+| Configuration | Import | First profile | DB bytes | Deep New p50/p95/p99 | Render 25 p50/p95/p99 |
+|---|---:|---:|---:|---:|---:|
+| 8 KiB, raw, FULL, batch 32 | 10.74 s | 1.88 s | 195,723,264 | 0.289/0.347/0.400 ms | 0.211/0.224/0.262 ms |
+| 16 KiB, raw, NORMAL, batch 32 | 13.68 s | 1.77 s | 185,270,272 | 0.301/0.379/0.463 ms | 0.212/0.236/0.418 ms |
+| 8 KiB, zstd level 1, FULL, batch 32 | 12.11 s | 1.75 s | 99,893,248 | 0.517/0.635/0.743 ms | 0.216/0.222/0.248 ms |
 
 All three runs completed 400 keyset pages, rendered the returned cards, and
-reported `PRAGMA quick_check=ok`. A warm idempotent restart scanned 1,411
-descriptors, imported zero, skipped all 1,411, and completed migration checking
-in 12-18 ms. The 8 KiB raw release verifier used 25,853,952 bytes maximum RSS
-and 18,841,936 bytes peak footprint on macOS; this is not presented as Linux
-PSS.
+reported `PRAGMA quick_check=ok`. The raw 8 KiB run materialized 47,430 active
+cards from 50,833 canonical objects and 51,647 memberships. A warm idempotent
+restart scanned and SHA-256 verified all 1,411 legacy files, imported zero and
+skipped all 1,411 in 510 ms; the earlier 12-18 ms descriptor-only result is
+superseded because it did not hash every skipped file. Fresh migration used
+64,061,440 bytes maximum RSS and 57,000,320 bytes peak footprint on macOS. The
+warm verifier used 26,116,096 bytes maximum RSS and 19,104,080 bytes peak
+footprint. These measurements include the verifier process and are not
+presented as Linux PSS.
 
 Migration batch sizes 16/32/64 took 14.27/11.43/10.00 s respectively. The
 default remains 32 to bound rollback scope and transient transaction state
@@ -175,12 +184,7 @@ The cold-ish test reset SQLite caches but did not force cold storage reads. Linu
 
 ## Remaining gates
 
-- Compare 8 KiB and 16 KiB pages in the direct corrected-ROWID importer.
-- Measure zstd level-1 through actual end-to-end page rendering, not only
-  payload hydration, before choosing the production payload codec.
-- Batch migration checkpoints so `FULL` durability does not require 1,411 fsync-bound commits; measure 16/32/64-source batches and crash redo bounds.
-- Compare `FULL` and `NORMAL` on the target filesystem. Production defaults to `FULL` until discovery durability is explicitly proven equivalent.
-- Exercise exact current duplicate-key normalization, promotion/deleted filters and profile-local representative choice.
-- Run real multi-user comment bundles and missing-linked-submission cases through semantic page comparison.
-- Measure the actual Redlib process RSS/PSS, render-cache caps and multiple frozen sessions.
+- Measure the actual ARM64 Redlib service RSS/PSS with the configured SQLite,
+  render-cache, source-cache and frozen-session caps.
+- Exercise Submitted and Videos deep-cursor behavior in the integrated UI.
 - Prove Home Hot latency and source diversity in the integrated service before deployment handoff.
