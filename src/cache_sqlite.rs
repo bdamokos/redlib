@@ -11,17 +11,21 @@ use log::{info, warn};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DATABASE_FILE_NAME: &str = "canonical-cache.sqlite3";
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 const MIGRATION_ORIGIN: i64 = 3;
 const DAEMON_ORIGIN: i64 = 1;
 const INTERACTIVE_ORIGIN: i64 = 2;
+const RETAINED_PROFILE_GENERATIONS: i64 = 128;
+const ACTIVE_PROFILE_IDLE_SECS: i64 = 10_800;
+const PROFILE_CURSOR_PIN_TTL_SECS: u64 = 10_800;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS cache_meta (
@@ -140,6 +144,12 @@ CREATE TABLE IF NOT EXISTS active_profile_source_sets (
     source_set_hash BLOB NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS profile_filters (
+    profile_pk INTEGER NOT NULL REFERENCES active_profiles(profile_pk) ON DELETE CASCADE,
+    filter_lc TEXT NOT NULL,
+    PRIMARY KEY (profile_pk, filter_lc)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS profile_sources (
     profile_pk INTEGER NOT NULL REFERENCES active_profiles(profile_pk) ON DELETE CASCADE,
     source_pk INTEGER NOT NULL REFERENCES sources(source_pk) ON DELETE CASCADE,
@@ -212,6 +222,8 @@ CREATE TABLE IF NOT EXISTS profile_feed_entry_members (
     card_key TEXT NOT NULL,
     version INTEGER NOT NULL,
     object_pk INTEGER NOT NULL REFERENCES objects(object_pk) ON DELETE CASCADE,
+    community_lc TEXT NOT NULL,
+    author_lc TEXT NOT NULL,
     PRIMARY KEY (profile_pk, view_kind, card_key, version, object_pk),
     FOREIGN KEY (profile_pk, view_kind, card_key, version)
       REFERENCES profile_feed_entries(profile_pk, view_kind, card_key, version)
@@ -333,11 +345,54 @@ struct PreparedSourceImport {
 }
 
 struct ShadowCache {
-	connection: Mutex<Connection>,
+	writer: Mutex<Connection>,
+	readers: Vec<Mutex<Connection>>,
+	next_reader: AtomicUsize,
 	payload_codec: PayloadCodec,
 }
 
 static SHADOW_CACHE: OnceLock<ShadowCache> = OnceLock::new();
+static SQLITE_READS_HEALTHY: AtomicBool = AtomicBool::new(true);
+static PINNED_PROFILE_GENERATIONS: LazyLock<Mutex<HashMap<(Vec<u8>, String), (i64, Instant)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn pin_profile_generation(fingerprint: &[u8], session_id: &str, generation: i64) {
+	if fingerprint.is_empty() || session_id.is_empty() {
+		return;
+	}
+	let Ok(mut pins) = PINNED_PROFILE_GENERATIONS.lock() else {
+		return;
+	};
+	pins.retain(|_, (_, touched)| touched.elapsed().as_secs() <= PROFILE_CURSOR_PIN_TTL_SECS);
+	let key = (fingerprint.to_vec(), session_id.to_string());
+	pins
+		.entry(key)
+		.and_modify(|(pinned, touched)| {
+			*pinned = (*pinned).min(generation);
+			*touched = Instant::now();
+		})
+		.or_insert((generation, Instant::now()));
+}
+
+fn pinned_generation_floor(fingerprint: &[u8], default_floor: i64) -> i64 {
+	let Ok(mut pins) = PINNED_PROFILE_GENERATIONS.lock() else {
+		return default_floor;
+	};
+	pins.retain(|_, (_, touched)| touched.elapsed().as_secs() <= PROFILE_CURSOR_PIN_TTL_SECS);
+	pins
+		.iter()
+		.filter(|((profile, _), _)| profile.as_slice() == fingerprint)
+		.map(|(_, (generation, _))| *generation)
+		.min()
+		.map_or(default_floor, |generation| generation.min(default_floor))
+}
+
+fn profile_is_pinned(fingerprint: &[u8]) -> bool {
+	let Ok(mut pins) = PINNED_PROFILE_GENERATIONS.lock() else {
+		return true;
+	};
+	pins.retain(|_, (_, touched)| touched.elapsed().as_secs() <= PROFILE_CURSOR_PIN_TTL_SECS);
+	pins.keys().any(|(profile, _)| profile.as_slice() == fingerprint)
+}
 
 fn env_bool(name: &str) -> bool {
 	std::env::var(name)
@@ -351,7 +406,10 @@ pub(crate) fn shadow_enabled() -> bool {
 }
 
 pub(crate) fn reads_enabled() -> bool {
-	shadow_enabled() && env_bool("REDLIB_CACHE_SQLITE_READS_ENABLED") && !env_bool("REDLIB_CACHE_SQLITE_ROLLBACK_TO_LEGACY")
+	shadow_enabled()
+		&& env_bool("REDLIB_CACHE_SQLITE_READS_ENABLED")
+		&& !env_bool("REDLIB_CACHE_SQLITE_ROLLBACK_TO_LEGACY")
+		&& SQLITE_READS_HEALTHY.load(AtomicOrdering::Acquire)
 }
 
 pub(crate) fn database_path(cache_dir: &Path) -> PathBuf {
@@ -372,9 +430,15 @@ pub(crate) fn init(cache_dir: &Path) -> Result<ImportStats, String> {
 	let mut connection = open_database(&path)?;
 	let payload_codec = PayloadCodec::from_environment()?;
 	let stats = import_legacy_sources(&mut connection, cache_dir, payload_codec)?;
+	let readers = (0..configured_reader_connections()?)
+		.map(|_| open_read_connection(&path).map(Mutex::new))
+		.collect::<Result<Vec<_>, _>>()?;
+	SQLITE_READS_HEALTHY.store(true, AtomicOrdering::Release);
 	SHADOW_CACHE
 		.set(ShadowCache {
-			connection: Mutex::new(connection),
+			writer: Mutex::new(connection),
+			readers,
+			next_reader: AtomicUsize::new(0),
 			payload_codec,
 		})
 		.map_err(|_| "SQLite shadow cache initialized concurrently".to_string())?;
@@ -432,8 +496,42 @@ fn configured_active_profile_limit() -> Result<usize, String> {
 	}
 }
 
+fn configured_reader_connections() -> Result<usize, String> {
+	let value = std::env::var("REDLIB_CACHE_SQLITE_READER_CONNECTIONS").unwrap_or_else(|_| "2".to_string());
+	let readers = value.parse::<usize>().map_err(|_| format!("invalid REDLIB_CACHE_SQLITE_READER_CONNECTIONS={value}"))?;
+	if (1..=4).contains(&readers) {
+		Ok(readers)
+	} else {
+		Err(format!("REDLIB_CACHE_SQLITE_READER_CONNECTIONS must be between 1 and 4, got {readers}"))
+	}
+}
+
 fn open_database(path: &Path) -> Result<Connection, String> {
 	open_database_with_options(path, configured_page_size()?, configured_synchronous()?)
+}
+
+fn open_read_connection(path: &Path) -> Result<Connection, String> {
+	let connection = Connection::open(path).map_err(|error| error.to_string())?;
+	connection
+		.execute_batch(
+			"PRAGMA query_only=ON;
+			 PRAGMA foreign_keys=ON;
+			 PRAGMA temp_store=FILE;
+			 PRAGMA cache_size=-2048;
+			 PRAGMA mmap_size=0;
+			 PRAGMA busy_timeout=5000;",
+		)
+		.map_err(|error| error.to_string())?;
+	Ok(connection)
+}
+
+fn with_read_connection<T>(cache: &ShadowCache, operation: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+	let index = cache.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % cache.readers.len();
+	let mut connection = cache.readers[index].lock().map_err(|_| "SQLite shadow reader connection lock poisoned".to_string())?;
+	let transaction = connection.transaction().map_err(|error| error.to_string())?;
+	let result = operation(&transaction)?;
+	transaction.commit().map_err(|error| error.to_string())?;
+	Ok(result)
 }
 
 fn open_database_with_options(path: &Path, requested_page_size: i64, synchronous: &str) -> Result<Connection, String> {
@@ -470,10 +568,41 @@ fn open_database_with_options(path: &Path, requested_page_size: i64, synchronous
 		.map_err(|error| error.to_string())?;
 	register_connection_functions(&connection)?;
 	connection.execute_batch(SCHEMA).map_err(|error| error.to_string())?;
+	ensure_member_snapshot_columns(&connection)?;
 	backfill_object_feed_cards(&connection)?;
 	backfill_current_feed_entry_members(&connection)?;
 	set_meta_i64(&connection, "schema_version", CURRENT_SCHEMA_VERSION)?;
 	Ok(connection)
+}
+
+fn ensure_member_snapshot_columns(connection: &Connection) -> Result<(), String> {
+	let mut statement = connection.prepare("PRAGMA table_info(profile_feed_entry_members)").map_err(|error| error.to_string())?;
+	let columns = statement
+		.query_map([], |row| row.get::<_, String>(1))
+		.map_err(|error| error.to_string())?
+		.collect::<Result<HashSet<_>, _>>()
+		.map_err(|error| error.to_string())?;
+	drop(statement);
+	if !columns.contains("community_lc") {
+		connection
+			.execute_batch("ALTER TABLE profile_feed_entry_members ADD COLUMN community_lc TEXT NOT NULL DEFAULT '';")
+			.map_err(|error| error.to_string())?;
+	}
+	if !columns.contains("author_lc") {
+		connection
+			.execute_batch("ALTER TABLE profile_feed_entry_members ADD COLUMN author_lc TEXT NOT NULL DEFAULT '';")
+			.map_err(|error| error.to_string())?;
+	}
+	connection
+		.execute(
+			"UPDATE profile_feed_entry_members
+			 SET community_lc=(SELECT community_lc FROM objects WHERE object_pk=profile_feed_entry_members.object_pk),
+			     author_lc=(SELECT author_lc FROM objects WHERE object_pk=profile_feed_entry_members.object_pk)
+			 WHERE community_lc='' OR author_lc=''",
+			[],
+		)
+		.map_err(|error| error.to_string())?;
+	Ok(())
 }
 
 fn register_connection_functions(connection: &Connection) -> Result<(), String> {
@@ -602,22 +731,22 @@ fn import_legacy_sources(connection: &mut Connection, cache_dir: &Path, payload_
 	};
 	let mut pending = Vec::with_capacity(batch_size);
 	for descriptor in descriptors {
-		let metadata_unchanged = connection
+		let previous = connection
 			.query_row(
-				"SELECT 1 FROM migration_sources
-				 WHERE cache_key=?1 AND source_size=?2 AND source_mtime_ns=?3 AND status=1",
-				params![descriptor.cache_key, descriptor.size as i64, i64::try_from(descriptor.mtime_ns).unwrap_or(i64::MAX)],
-				|row| row.get::<_, i64>(0),
+				"SELECT source_size,source_mtime_ns,source_hash,status
+				 FROM migration_sources WHERE cache_key=?1",
+				[&descriptor.cache_key],
+				|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)),
 			)
 			.optional()
-			.map_err(|error| error.to_string())?
-			.is_some();
-		if metadata_unchanged {
+			.map_err(|error| error.to_string())?;
+		let bytes = fs::read(&descriptor.path).map_err(|error| format!("{}: {error}", descriptor.path.display()))?;
+		let source_hash = sha256(&bytes);
+		let mtime = i64::try_from(descriptor.mtime_ns).unwrap_or(i64::MAX);
+		if previous.is_some_and(|(size, mtime_ns, hash, status)| status == 1 && size == descriptor.size as i64 && mtime_ns == mtime && hash == source_hash) {
 			stats.skipped_sources += 1;
 			continue;
 		}
-		let bytes = fs::read(&descriptor.path).map_err(|error| format!("{}: {error}", descriptor.path.display()))?;
-		let source_hash = sha256(&bytes);
 		let entry: PersistedSourceCacheEntry = bincode::deserialize(&bytes).map_err(|error| format!("{}: {error}", descriptor.path.display()))?;
 		let metadata = SourceWriteMetadata {
 			size: descriptor.size,
@@ -681,11 +810,12 @@ pub(crate) fn shadow_source_after_legacy_write(source_cache_key: &str, entry: &P
 		Some(PersistedRefreshOrigin::FrontPageSession | PersistedRefreshOrigin::DirectLiveFetch) | None => FirstSeen::Interactive,
 	};
 	let result = cache
-		.connection
+		.writer
 		.lock()
 		.map_err(|_| "SQLite shadow connection lock poisoned".to_string())
 		.and_then(|mut connection| apply_source_with_codec(&mut connection, source_cache_key, entry, &write_metadata, first_seen, cache.payload_codec));
 	if let Err(error) = result {
+		SQLITE_READS_HEALTHY.store(false, AtomicOrdering::Release);
 		warn!("cache_sqlite: shadow write failed for {source_cache_key}: {error}");
 	}
 }
@@ -698,11 +828,12 @@ pub(crate) fn shadow_remove_after_legacy(source_cache_key: &str) {
 		return;
 	};
 	let result = cache
-		.connection
+		.writer
 		.lock()
 		.map_err(|_| "SQLite shadow connection lock poisoned".to_string())
 		.and_then(|mut connection| remove_source(&mut connection, source_cache_key));
 	if let Err(error) = result {
+		SQLITE_READS_HEALTHY.store(false, AtomicOrdering::Release);
 		warn!("cache_sqlite: shadow removal failed for {source_cache_key}: {error}");
 	}
 }
@@ -748,7 +879,10 @@ pub(crate) fn read_source(source_cache_key: &str) -> Result<Option<PersistedSour
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
-	let connection = cache.connection.lock().map_err(|_| "SQLite shadow connection lock poisoned".to_string())?;
+	with_read_connection(cache, |connection| read_source_on(connection, source_cache_key))
+}
+
+fn read_source_on(connection: &Connection, source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, String> {
 	let source = connection
 		.query_row(
 			"SELECT display_name,after_cursor,fetched_at,refresh_origin FROM sources WHERE cache_key=?1",
@@ -824,16 +958,19 @@ pub(crate) fn query_profile_timeline(
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
-	let connection = cache.connection.lock().map_err(|_| "SQLite shadow connection lock poisoned".to_string())?;
-	let profile_exists = connection
-		.query_row("SELECT 1 FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| row.get::<_, i64>(0))
-		.optional()
-		.map_err(|error| error.to_string())?
-		.is_some();
-	if !profile_exists {
-		return Ok(None);
-	}
-	query_profile_timeline_on(&connection, fingerprint, view_kind, sort, cursor, limit, filters).map(Some)
+	with_read_connection(cache, |connection| {
+		let profile_pk = connection
+			.query_row("SELECT profile_pk FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| row.get::<_, i64>(0))
+			.optional()
+			.map_err(|error| error.to_string())?;
+		let Some(profile_pk) = profile_pk else {
+			return Ok(None);
+		};
+		if !profile_filters_match(connection, profile_pk, filters)? {
+			return Ok(None);
+		}
+		query_profile_timeline_on(connection, fingerprint, view_kind, sort, cursor, limit, filters).map(Some)
+	})
 }
 
 pub(crate) fn query_profile_video_candidates(fingerprint: &[u8], view_kind: i64, limit: usize, filters: &HashSet<String>) -> Result<Option<Vec<PersistedPost>>, String> {
@@ -843,16 +980,38 @@ pub(crate) fn query_profile_video_candidates(fingerprint: &[u8], view_kind: i64,
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
-	let connection = cache.connection.lock().map_err(|_| "SQLite shadow connection lock poisoned".to_string())?;
-	let profile_exists = connection
-		.query_row("SELECT 1 FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| row.get::<_, i64>(0))
-		.optional()
+	with_read_connection(cache, |connection| {
+		let profile_pk = connection
+			.query_row("SELECT profile_pk FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| row.get::<_, i64>(0))
+			.optional()
+			.map_err(|error| error.to_string())?;
+		let Some(profile_pk) = profile_pk else {
+			return Ok(None);
+		};
+		if !profile_filters_match(connection, profile_pk, filters)? {
+			return Ok(None);
+		}
+		query_profile_timeline_on(connection, fingerprint, view_kind, TimelineSort::Videos, None, limit, filters).map(|page| Some(page.posts))
+	})
+}
+
+fn profile_filters_match(connection: &Connection, profile_pk: i64, filters: &HashSet<String>) -> Result<bool, String> {
+	let mut requested = filters
+		.iter()
+		.map(|value| value.trim().to_ascii_lowercase())
+		.filter(|value| !value.is_empty())
+		.collect::<Vec<_>>();
+	requested.sort();
+	requested.dedup();
+	let mut statement = connection
+		.prepare("SELECT filter_lc FROM profile_filters WHERE profile_pk=?1 ORDER BY filter_lc")
+		.map_err(|error| error.to_string())?;
+	let stored = statement
+		.query_map([profile_pk], |row| row.get::<_, String>(0))
 		.map_err(|error| error.to_string())?
-		.is_some();
-	if !profile_exists {
-		return Ok(None);
-	}
-	query_profile_timeline_on(&connection, fingerprint, view_kind, TimelineSort::Videos, None, limit, filters).map(|page| Some(page.posts))
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|error| error.to_string())?;
+	Ok(stored == requested)
 }
 
 pub(crate) fn source_exists(source_cache_key: &str) -> bool {
@@ -862,18 +1021,14 @@ pub(crate) fn source_exists(source_cache_key: &str) -> bool {
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return false;
 	};
-	cache
-		.connection
-		.lock()
-		.ok()
-		.and_then(|connection| {
-			connection
-				.query_row("SELECT 1 FROM sources WHERE cache_key=?1 AND generation>0", [source_cache_key], |row| row.get::<_, i64>(0))
-				.optional()
-				.ok()
-				.flatten()
-		})
-		.is_some()
+	with_read_connection(cache, |connection| {
+		connection
+			.query_row("SELECT 1 FROM sources WHERE cache_key=?1 AND generation>0", [source_cache_key], |row| row.get::<_, i64>(0))
+			.optional()
+			.map(|value| value.is_some())
+			.map_err(|error| error.to_string())
+	})
+	.unwrap_or(false)
 }
 
 pub(crate) fn source_seed_entries() -> Result<Option<Vec<(String, u64)>>, String> {
@@ -883,19 +1038,20 @@ pub(crate) fn source_seed_entries() -> Result<Option<Vec<(String, u64)>>, String
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
-	let connection = cache.connection.lock().map_err(|_| "SQLite shadow connection lock poisoned".to_string())?;
-	let mut statement = connection
-		.prepare("SELECT cache_key,fetched_at FROM sources WHERE generation>0 ORDER BY cache_key")
-		.map_err(|error| error.to_string())?;
-	let rows = statement
-		.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-		.map_err(|error| error.to_string())?;
-	let mut entries = Vec::new();
-	for row in rows {
-		let (cache_key, fetched_at) = row.map_err(|error| error.to_string())?;
-		entries.push((cache_key, fetched_at.max(0) as u64));
-	}
-	Ok(Some(entries))
+	with_read_connection(cache, |connection| {
+		let mut statement = connection
+			.prepare("SELECT cache_key,fetched_at FROM sources WHERE generation>0 ORDER BY cache_key")
+			.map_err(|error| error.to_string())?;
+		let rows = statement
+			.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+			.map_err(|error| error.to_string())?;
+		let mut entries = Vec::new();
+		for row in rows {
+			let (cache_key, fetched_at) = row.map_err(|error| error.to_string())?;
+			entries.push((cache_key, fetched_at.max(0) as u64));
+		}
+		Ok(Some(entries))
+	})
 }
 
 fn query_profile_timeline_on(
@@ -943,13 +1099,12 @@ fn query_profile_timeline_on(
 			" AND EXISTS(
 			   SELECT 1
 			   FROM profile_feed_entry_members filter_members
-			   JOIN objects filter_object ON filter_object.object_pk=filter_members.object_pk
 			   WHERE filter_members.profile_pk=feed.profile_pk
 			     AND filter_members.view_kind=feed.view_kind
 			     AND filter_members.card_key=feed.card_key
 			     AND filter_members.version=feed.version
-			     AND filter_object.community_lc NOT IN ({values})
-			     AND ('u_' || filter_object.author_lc) NOT IN ({values})
+			     AND filter_members.community_lc NOT IN ({values})
+			     AND ('u_' || filter_members.author_lc) NOT IN ({values})
 			 )"
 		)
 	};
@@ -1064,15 +1219,14 @@ fn hydrate_profile_card(
 ) -> Result<Option<PersistedPost>, String> {
 	let mut object_statement = connection
 		.prepare_cached(
-			"SELECT o.community_lc,o.author_lc,o.duration_seconds,o.created_utc,
+			"SELECT members.community_lc,members.author_lc,o.duration_seconds,o.created_utc,
 			        o.object_pk,o.payload_codec,o.payload
 			 FROM profile_feed_entry_members members
 			 JOIN objects o ON o.object_pk=members.object_pk
 			 WHERE members.profile_pk=?1
 			   AND members.view_kind=?2
 			   AND members.card_key=?3
-			   AND members.version=?4
-			   AND o.is_deleted=0 AND o.is_promotional=0",
+			   AND members.version=?4",
 		)
 		.map_err(|error| error.to_string())?;
 	let mut candidates = Vec::new();
@@ -1134,8 +1288,9 @@ pub(crate) fn query_submitted(author: &str, limit: usize, filters: &HashSet<Stri
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
-	let connection = cache.connection.lock().map_err(|_| "SQLite shadow connection lock poisoned".to_string())?;
-	query_submitted_on(&connection, author, None, limit, filters).map(|(posts, _)| Some(posts))
+	with_read_connection(cache, |connection| {
+		query_submitted_on(connection, author, None, limit, filters).map(|(posts, _)| Some(posts))
+	})
 }
 
 pub(crate) fn query_submitted_on(
@@ -1272,7 +1427,15 @@ fn apply_source_in_transaction(
 		.execute("DELETE FROM source_memberships WHERE source_pk=?1", [source_pk])
 		.map_err(|error| error.to_string())?;
 	let observed_at = if entry.fetched_at_unix == 0 { metadata.imported_at } else { entry.fetched_at_unix };
-	for (position, post) in entry.posts.iter().enumerate() {
+	let mut positions = (0..entry.posts.len()).collect::<Vec<_>>();
+	if first_seen == FirstSeen::Daemon {
+		// Reddit listings are newest-first. Allocate increasing discovery
+		// sequences oldest-first so DESC preserves the listing order inside one
+		// daemon refresh, matching the legacy discovery index.
+		positions.reverse();
+	}
+	for position in positions {
+		let post = &entry.posts[position];
 		let object_pk = upsert_object(&transaction, post, observed_at, first_seen, baseline_at, baseline_seq, payload_codec)?;
 		transaction
 			.execute("INSERT OR IGNORE INTO temp_affected_objects(object_pk) VALUES(?1)", [object_pk])
@@ -1371,6 +1534,15 @@ END
 fn refresh_affected_object_feed_cards(transaction: &Transaction<'_>) -> Result<(), String> {
 	transaction
 		.execute(
+			"INSERT OR IGNORE INTO temp_affected_cards(card_key)
+			 SELECT cards.card_key
+			 FROM temp_affected_objects changed
+			 JOIN object_feed_cards cards ON cards.object_pk=changed.object_pk",
+			[],
+		)
+		.map_err(|error| error.to_string())?;
+	transaction
+		.execute(
 			"INSERT OR IGNORE INTO temp_affected_objects(object_pk)
 			 SELECT thread_member.object_pk
 			 FROM temp_affected_objects changed
@@ -1378,6 +1550,24 @@ fn refresh_affected_object_feed_cards(transaction: &Transaction<'_>) -> Result<(
 			 JOIN duplicate_members sibling ON sibling.duplicate_group_pk=changed_duplicate.duplicate_group_pk
 			 JOIN thread_groups thread_group ON thread_group.linked_submission_pk=sibling.object_pk
 			 JOIN thread_members thread_member ON thread_member.thread_group_pk=thread_group.thread_group_pk",
+			[],
+		)
+		.map_err(|error| error.to_string())?;
+	transaction
+		.execute(
+			"INSERT OR IGNORE INTO temp_affected_cards(card_key)
+			 SELECT cards.card_key
+			 FROM temp_affected_objects changed
+			 JOIN object_feed_cards cards ON cards.object_pk=changed.object_pk",
+			[],
+		)
+		.map_err(|error| error.to_string())?;
+	transaction
+		.execute(
+			"INSERT OR IGNORE INTO temp_affected_profiles(profile_pk)
+			 SELECT DISTINCT refs.profile_pk
+			 FROM temp_affected_objects changed
+			 JOIN profile_view_object_refs refs ON refs.object_pk=changed.object_pk",
 			[],
 		)
 		.map_err(|error| error.to_string())?;
@@ -1398,6 +1588,15 @@ WHERE {OBJECT_CARD_KEY_SQL} IS NOT NULL
 "#
 	);
 	transaction.execute(&sql, []).map_err(|error| error.to_string())?;
+	transaction
+		.execute(
+			"INSERT OR IGNORE INTO temp_affected_cards(card_key)
+			 SELECT cards.card_key
+			 FROM temp_affected_objects changed
+			 JOIN object_feed_cards cards ON cards.object_pk=changed.object_pk",
+			[],
+		)
+		.map_err(|error| error.to_string())?;
 	Ok(())
 }
 
@@ -1454,10 +1653,12 @@ fn backfill_current_feed_entry_members(connection: &Connection) -> Result<(), St
 	}
 	let sql = r#"
 INSERT OR IGNORE INTO profile_feed_entry_members(
-  profile_pk,view_kind,card_key,version,object_pk)
-SELECT feed.profile_pk,feed.view_kind,feed.card_key,feed.version,refs.object_pk
+  profile_pk,view_kind,card_key,version,object_pk,community_lc,author_lc)
+SELECT feed.profile_pk,feed.view_kind,feed.card_key,feed.version,
+       refs.object_pk,o.community_lc,o.author_lc
 FROM profile_view_object_refs refs
 JOIN object_feed_cards cards ON cards.object_pk=refs.object_pk
+JOIN objects o ON o.object_pk=refs.object_pk
 JOIN profile_feed_entries feed
   ON feed.profile_pk=refs.profile_pk
  AND feed.view_kind=refs.view_kind
@@ -1565,6 +1766,46 @@ fn refresh_affected_profiles(transaction: &Transaction<'_>) -> Result<(), String
 	trace_stage("feed_entries", &mut stage_started);
 	close_and_insert_thread_entries(transaction)?;
 	trace_stage("thread_entries", &mut stage_started);
+	gc_profile_history(transaction)?;
+	trace_stage("history_gc", &mut stage_started);
+	Ok(())
+}
+
+fn gc_profile_history(transaction: &Transaction<'_>) -> Result<(), String> {
+	let profiles = {
+		let mut statement = transaction
+			.prepare(
+				"SELECT profiles.profile_pk,profiles.fingerprint,profiles.generation
+				 FROM active_profiles profiles
+				 JOIN temp_affected_profiles affected ON affected.profile_pk=profiles.profile_pk",
+			)
+			.map_err(|error| error.to_string())?;
+		let rows = statement
+			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)))
+			.map_err(|error| error.to_string())?
+			.collect::<Result<Vec<_>, _>>()
+			.map_err(|error| error.to_string())?;
+		rows
+	};
+	for (profile_pk, fingerprint, generation) in profiles {
+		let floor = pinned_generation_floor(&fingerprint, generation.saturating_sub(RETAINED_PROFILE_GENERATIONS));
+		transaction
+			.execute(
+				"DELETE FROM profile_feed_entries
+				 WHERE profile_pk=?1 AND valid_to_generation IS NOT NULL
+				   AND valid_to_generation<?2",
+				params![profile_pk, floor],
+			)
+			.map_err(|error| error.to_string())?;
+		transaction
+			.execute(
+				"DELETE FROM profile_thread_entries
+				 WHERE profile_pk=?1 AND valid_to_generation IS NOT NULL
+				   AND valid_to_generation<?2",
+				params![profile_pk, floor],
+			)
+			.map_err(|error| error.to_string())?;
+	}
 	Ok(())
 }
 
@@ -1596,6 +1837,11 @@ WITH raw_eligible AS (
   JOIN objects o ON o.object_pk=refs.object_pk
   JOIN object_feed_cards object_card ON object_card.object_pk=o.object_pk
   WHERE o.is_deleted=0 AND o.is_promotional=0
+    AND NOT EXISTS(
+      SELECT 1 FROM profile_filters filter
+      WHERE filter.profile_pk=affected.profile_pk
+        AND (filter.filter_lc=o.community_lc OR filter.filter_lc='u_' || o.author_lc)
+    )
 ),
 eligible AS (
   SELECT profile_pk,view_kind,object_pk,kind,created_utc,link_created_utc,
@@ -1661,8 +1907,9 @@ JOIN active_profiles profiles ON profiles.profile_pk=expanded.profile_pk
 	transaction.execute(&sql, []).map_err(|error| error.to_string())?;
 	let member_sql = r#"
 INSERT OR IGNORE INTO profile_feed_entry_members(
-  profile_pk,view_kind,card_key,version,object_pk)
-SELECT feed.profile_pk,feed.view_kind,feed.card_key,feed.version,refs.object_pk
+  profile_pk,view_kind,card_key,version,object_pk,community_lc,author_lc)
+SELECT feed.profile_pk,feed.view_kind,feed.card_key,feed.version,
+       refs.object_pk,o.community_lc,o.author_lc
 FROM temp_affected_cards changed
 JOIN profile_feed_entries feed ON feed.card_key=changed.card_key
 JOIN object_feed_cards object_card ON object_card.card_key=feed.card_key
@@ -1675,6 +1922,11 @@ WHERE feed.valid_to_generation IS NULL
   AND feed.profile_pk IN (SELECT profile_pk FROM temp_affected_profiles)
   AND o.is_deleted=0
   AND o.is_promotional=0
+  AND NOT EXISTS(
+    SELECT 1 FROM profile_filters filter
+    WHERE filter.profile_pk=feed.profile_pk
+      AND (filter.filter_lc=o.community_lc OR filter.filter_lc='u_' || o.author_lc)
+  )
 "#;
 	transaction.execute(&member_sql, []).map_err(|error| error.to_string())?;
 	Ok(())
@@ -1705,6 +1957,11 @@ WITH eligible AS (
   JOIN temp_affected_threads changed ON changed.thread_group_pk=tm.thread_group_pk
   JOIN objects o ON o.object_pk=refs.object_pk
   WHERE o.is_deleted=0 AND o.is_promotional=0
+    AND NOT EXISTS(
+      SELECT 1 FROM profile_filters filter
+      WHERE filter.profile_pk=affected.profile_pk
+        AND (filter.filter_lc=o.community_lc OR filter.filter_lc='u_' || o.author_lc)
+    )
 ),
 ranked AS (
   SELECT eligible.*,
@@ -1746,14 +2003,18 @@ JOIN active_profiles profiles ON profiles.profile_pk=stats.profile_pk
 }
 
 pub(crate) fn sync_active_profile(fingerprint: &[u8], sources: &[(String, i64)]) -> Result<(), String> {
+	sync_active_profile_with_filters(fingerprint, sources, &[])
+}
+
+pub(crate) fn sync_active_profile_with_filters(fingerprint: &[u8], sources: &[(String, i64)], filters: &[String]) -> Result<(), String> {
 	if !shadow_enabled() {
 		return Ok(());
 	}
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite shadow store is unavailable".to_string());
 	};
-	let mut connection = cache.connection.lock().map_err(|_| "SQLite shadow connection lock poisoned".to_string())?;
-	sync_active_profile_on(&mut connection, fingerprint, sources)
+	let mut connection = cache.writer.lock().map_err(|_| "SQLite shadow writer connection lock poisoned".to_string())?;
+	sync_active_profile_on_with_filters(&mut connection, fingerprint, sources, filters)
 }
 
 pub(crate) fn ensure_profile_random_epoch(fingerprint: &[u8], random_epoch: i64) -> Result<(), String> {
@@ -1763,40 +2024,93 @@ pub(crate) fn ensure_profile_random_epoch(fingerprint: &[u8], random_epoch: i64)
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
-	let mut connection = cache.connection.lock().map_err(|_| "SQLite shadow connection lock poisoned".to_string())?;
+	let mut connection = cache.writer.lock().map_err(|_| "SQLite shadow writer connection lock poisoned".to_string())?;
 	ensure_profile_random_epoch_on(&mut connection, fingerprint, random_epoch)
 }
 
 fn ensure_profile_random_epoch_on(connection: &mut Connection, fingerprint: &[u8], random_epoch: i64) -> Result<(), String> {
 	let transaction = connection.transaction().map_err(|error| error.to_string())?;
-	let (profile_pk, current_epoch): (i64, i64) = transaction
-		.query_row("SELECT profile_pk,random_epoch FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| {
-			Ok((row.get(0)?, row.get(1)?))
-		})
+	let (profile_pk, current_epoch, current_generation): (i64, i64, i64) = transaction
+		.query_row(
+			"SELECT profile_pk,random_epoch,generation FROM active_profiles WHERE fingerprint=?1",
+			[fingerprint],
+			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+		)
 		.map_err(|error| error.to_string())?;
 	if current_epoch == random_epoch {
 		return transaction.commit().map_err(|error| error.to_string());
 	}
+	let next_generation = current_generation.saturating_add(1);
 	transaction
 		.execute(
-			"UPDATE active_profiles SET random_epoch=?2,last_accessed_at=?3 WHERE profile_pk=?1",
-			params![profile_pk, random_epoch, unix_now() as i64],
+			"UPDATE active_profiles
+			 SET random_epoch=?2,generation=?3,last_accessed_at=?4
+			 WHERE profile_pk=?1",
+			params![profile_pk, random_epoch, next_generation, unix_now() as i64],
 		)
 		.map_err(|error| error.to_string())?;
 	transaction
 		.execute(
 			"UPDATE profile_feed_entries
-			 SET random_epoch=?2,
-			     random_rank=redlib_random_rank(?3,?2,card_key)
+			 SET valid_to_generation=?2
 			 WHERE profile_pk=?1 AND valid_to_generation IS NULL",
-			params![profile_pk, random_epoch, fingerprint],
+			params![profile_pk, next_generation],
+		)
+		.map_err(|error| error.to_string())?;
+	transaction
+		.execute(
+			"INSERT INTO profile_feed_entries(
+			   profile_pk,view_kind,card_key,version,valid_from_generation,valid_to_generation,
+			   representative_pk,duplicate_group_pk,thread_group_pk,created_sort,activity_sort,
+			   discovery_sort,duration_seconds,community_lc,author_lc,random_epoch,random_round,
+			   random_rank,member_count)
+			 SELECT profile_pk,view_kind,card_key,version+1,?2,NULL,
+			        representative_pk,duplicate_group_pk,thread_group_pk,created_sort,activity_sort,
+			        discovery_sort,duration_seconds,community_lc,author_lc,?3,random_round,
+			        redlib_random_rank(?4,?3,card_key),member_count
+			 FROM profile_feed_entries
+			 WHERE profile_pk=?1 AND valid_to_generation=?2",
+			params![profile_pk, next_generation, random_epoch, fingerprint],
+		)
+		.map_err(|error| error.to_string())?;
+	transaction
+		.execute(
+			"INSERT INTO profile_feed_entry_members(
+			   profile_pk,view_kind,card_key,version,object_pk,community_lc,author_lc)
+			 SELECT newer.profile_pk,newer.view_kind,newer.card_key,newer.version,
+			        members.object_pk,members.community_lc,members.author_lc
+			 FROM profile_feed_entries older
+			 JOIN profile_feed_entries newer
+			   ON newer.profile_pk=older.profile_pk
+			  AND newer.view_kind=older.view_kind
+			  AND newer.card_key=older.card_key
+			  AND newer.valid_from_generation=?2
+			 JOIN profile_feed_entry_members members
+			   ON members.profile_pk=older.profile_pk
+			  AND members.view_kind=older.view_kind
+			  AND members.card_key=older.card_key
+			  AND members.version=older.version
+			 WHERE older.profile_pk=?1 AND older.valid_to_generation=?2",
+			params![profile_pk, next_generation],
+		)
+		.map_err(|error| error.to_string())?;
+	transaction
+		.execute(
+			"DELETE FROM profile_feed_entries
+			 WHERE profile_pk=?1 AND valid_to_generation IS NOT NULL
+			   AND valid_to_generation < ?2",
+			params![profile_pk, next_generation.saturating_sub(RETAINED_PROFILE_GENERATIONS)],
 		)
 		.map_err(|error| error.to_string())?;
 	transaction.commit().map_err(|error| error.to_string())
 }
 
 fn sync_active_profile_on(connection: &mut Connection, fingerprint: &[u8], sources: &[(String, i64)]) -> Result<(), String> {
-	let source_set_hash = profile_source_set_hash(sources);
+	sync_active_profile_on_with_filters(connection, fingerprint, sources, &[])
+}
+
+fn sync_active_profile_on_with_filters(connection: &mut Connection, fingerprint: &[u8], sources: &[(String, i64)], filters: &[String]) -> Result<(), String> {
+	let source_set_hash = profile_source_set_hash(sources, filters);
 	let transaction = connection.transaction().map_err(|error| error.to_string())?;
 	reset_delta_tables(&transaction)?;
 	evict_active_profiles_for_new(&transaction, fingerprint, configured_active_profile_limit()?)?;
@@ -1822,6 +2136,21 @@ fn sync_active_profile_on(connection: &mut Connection, fingerprint: &[u8], sourc
 		.is_some_and(|matches| matches != 0);
 	if source_set_unchanged {
 		return transaction.commit().map_err(|error| error.to_string());
+	}
+	transaction
+		.execute("DELETE FROM profile_filters WHERE profile_pk=?1", [profile_pk])
+		.map_err(|error| error.to_string())?;
+	let mut normalized_filters = filters
+		.iter()
+		.map(|value| value.trim().to_ascii_lowercase())
+		.filter(|value| !value.is_empty())
+		.collect::<Vec<_>>();
+	normalized_filters.sort();
+	normalized_filters.dedup();
+	for filter in normalized_filters {
+		transaction
+			.execute("INSERT INTO profile_filters(profile_pk,filter_lc) VALUES(?1,?2)", params![profile_pk, filter])
+			.map_err(|error| error.to_string())?;
 	}
 	transaction
 		.execute("INSERT INTO temp_affected_profiles(profile_pk) VALUES(?1)", [profile_pk])
@@ -1865,46 +2194,6 @@ fn sync_active_profile_on(connection: &mut Connection, fingerprint: &[u8], sourc
 			)
 			.map_err(|error| error.to_string())?;
 	}
-	let changed_source_count: i64 = transaction
-		.query_row(
-			"SELECT
-			   (SELECT COUNT(*) FROM profile_sources existing
-			    LEFT JOIN temp_requested_sources requested
-			      ON requested.source_pk=existing.source_pk
-			     AND requested.source_role=existing.source_role
-			    WHERE existing.profile_pk=?1 AND requested.source_pk IS NULL)
-			 + (SELECT COUNT(*) FROM temp_requested_sources requested
-			    LEFT JOIN profile_sources existing
-			      ON existing.profile_pk=?1
-			     AND existing.source_pk=requested.source_pk
-			     AND existing.source_role=requested.source_role
-			    WHERE existing.source_pk IS NULL)
-			 + CASE WHEN
-			     EXISTS(
-			       SELECT 1
-			       FROM profile_sources ps
-			       JOIN source_memberships sm ON sm.source_pk=ps.source_pk
-			       WHERE ps.profile_pk=?1
-			     )
-			     AND NOT EXISTS(
-			       SELECT 1 FROM profile_view_object_refs refs WHERE refs.profile_pk=?1
-			     )
-			   THEN 1 ELSE 0 END",
-			[profile_pk],
-			|row| row.get(0),
-		)
-		.map_err(|error| error.to_string())?;
-	if changed_source_count == 0 {
-		transaction
-			.execute(
-				"INSERT INTO active_profile_source_sets(profile_pk,source_set_hash)
-				 VALUES(?1,?2)
-				 ON CONFLICT(profile_pk) DO UPDATE SET source_set_hash=excluded.source_set_hash",
-				params![profile_pk, source_set_hash],
-			)
-			.map_err(|error| error.to_string())?;
-		return transaction.commit().map_err(|error| error.to_string());
-	}
 	transaction
 		.execute(
 			"INSERT OR IGNORE INTO temp_affected_objects(object_pk)
@@ -1936,7 +2225,7 @@ fn sync_active_profile_on(connection: &mut Connection, fingerprint: &[u8], sourc
 	transaction.commit().map_err(|error| error.to_string())
 }
 
-fn profile_source_set_hash(sources: &[(String, i64)]) -> Vec<u8> {
+fn profile_source_set_hash(sources: &[(String, i64)], filters: &[String]) -> Vec<u8> {
 	let mut sorted = sources.to_vec();
 	sorted.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 	let mut digest = Sha256::new();
@@ -1944,6 +2233,18 @@ fn profile_source_set_hash(sources: &[(String, i64)]) -> Vec<u8> {
 		digest.update((cache_key.len() as u64).to_be_bytes());
 		digest.update(cache_key.as_bytes());
 		digest.update(role.to_be_bytes());
+	}
+	digest.update(b"\0filters\0");
+	let mut normalized_filters = filters
+		.iter()
+		.map(|value| value.trim().to_ascii_lowercase())
+		.filter(|value| !value.is_empty())
+		.collect::<Vec<_>>();
+	normalized_filters.sort();
+	normalized_filters.dedup();
+	for filter in normalized_filters {
+		digest.update((filter.len() as u64).to_be_bytes());
+		digest.update(filter.as_bytes());
 	}
 	digest.finalize().to_vec()
 }
@@ -1962,17 +2263,42 @@ fn evict_active_profiles_for_new(transaction: &Transaction<'_>, fingerprint: &[u
 		.map_err(|error| error.to_string())?;
 	let remove_count = profile_count.saturating_sub(limit.saturating_sub(1) as i64);
 	if remove_count > 0 {
-		transaction
-			.execute(
-				"DELETE FROM active_profiles
-				 WHERE profile_pk IN (
-				   SELECT profile_pk FROM active_profiles
-				   ORDER BY last_accessed_at ASC,profile_pk ASC
-				   LIMIT ?1
-				 )",
-				[remove_count],
-			)
-			.map_err(|error| error.to_string())?;
+		let candidates = {
+			let mut statement = transaction
+				.prepare(
+					"SELECT profile_pk,fingerprint
+					 FROM active_profiles
+					 WHERE last_accessed_at<=?1
+					 ORDER BY last_accessed_at ASC,profile_pk ASC",
+				)
+				.map_err(|error| error.to_string())?;
+			let rows = statement
+				.query_map([(unix_now() as i64).saturating_sub(ACTIVE_PROFILE_IDLE_SECS)], |row| {
+					Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+				})
+				.map_err(|error| error.to_string())?
+				.collect::<Result<Vec<_>, _>>()
+				.map_err(|error| error.to_string())?;
+			rows
+		};
+		let mut removed = 0usize;
+		for (profile_pk, candidate_fingerprint) in candidates {
+			if removed >= remove_count as usize {
+				break;
+			}
+			if profile_is_pinned(&candidate_fingerprint) {
+				continue;
+			}
+			transaction
+				.execute("DELETE FROM active_profiles WHERE profile_pk=?1", [profile_pk])
+				.map_err(|error| error.to_string())?;
+			removed += 1;
+		}
+		if removed < remove_count as usize {
+			return Err(format!(
+				"active profile limit {limit} is full with recently used profiles; keeping their live cursor generations and using the legacy feed for this profile"
+			));
+		}
 	}
 	Ok(())
 }
@@ -2005,23 +2331,8 @@ fn upsert_object(
 	let is_video = i64::from(matches!(post.post_type.as_str(), "gif" | "video") && post.media.duration_seconds > 0);
 	let is_deleted = i64::from(post.author.name == "[deleted]" || (post.body == "[deleted]" && post.title == "[deleted]"));
 	let is_promotional = i64::from(crate::promo_detection::post_is_promotional(&post.id));
-	if let Some((object_pk, existing_discovery_seq, existing_discovered_at, existing_last_seen_at)) = existing {
-		let (discovery_seq, discovered_at) = if first_seen == FirstSeen::Daemon && existing_discovery_seq == 0 {
-			let sequence = meta_i64(transaction, "next_discovery_seq")?.unwrap_or_else(|| baseline_seq.saturating_add(1));
-			set_meta_i64_tx(transaction, "next_discovery_seq", sequence.saturating_add(1))?;
-			(sequence, observed_at as i64)
-		} else {
-			(existing_discovery_seq, existing_discovered_at)
-		};
+	if let Some((object_pk, _existing_discovery_seq, _existing_discovered_at, existing_last_seen_at)) = existing {
 		if (observed_at as i64) < existing_last_seen_at {
-			if discovery_seq != existing_discovery_seq {
-				transaction
-					.execute(
-						"UPDATE objects SET discovery_seq=?2,discovered_at=?3 WHERE object_pk=?1",
-						params![object_pk, discovery_seq, discovered_at],
-					)
-					.map_err(|error| error.to_string())?;
-			}
 			return Ok(object_pk);
 		}
 		transaction
@@ -2030,8 +2341,7 @@ fn upsert_object(
 				   kind=?2,created_utc=?3,link_created_utc=?4,author_lc=?5,community_lc=?6,
 				   submission_fullname=?7,parent_fullname=?8,post_type=?9,duration_seconds=?10,
 				   is_video=?11,is_deleted=?12,is_promotional=?13,last_seen_at=MAX(last_seen_at,?14),
-				   payload_revision=payload_revision+1,payload_codec=?15,payload_hash=?16,payload=?17,
-				   discovery_seq=?18,discovered_at=?19
+				   payload_revision=payload_revision+1,payload_codec=?15,payload_hash=?16,payload=?17
 				 WHERE object_pk=?1",
 				params![
 					object_pk,
@@ -2050,9 +2360,7 @@ fn upsert_object(
 					observed_at as i64,
 					payload_codec_value,
 					payload_hash,
-					payload,
-					discovery_seq,
-					discovered_at
+					payload
 				],
 			)
 			.map_err(|error| error.to_string())?;
@@ -2624,7 +2932,7 @@ mod tests {
 	}
 
 	#[test]
-	fn daemon_discovery_is_monotonic_and_records_first_daemon_observation() {
+	fn daemon_discovery_is_monotonic_without_repromoting_interactive_objects() {
 		let mut connection = test_connection();
 		apply_source(
 			&mut connection,
@@ -2657,7 +2965,7 @@ mod tests {
 		let interactive: i64 = connection
 			.query_row("SELECT discovery_seq FROM objects WHERE fullname='t3_interactive'", [], |row| row.get(0))
 			.unwrap();
-		assert_eq!(interactive, 2);
+		assert_eq!(interactive, 0);
 		let sequences = connection
 			.prepare("SELECT discovery_seq FROM objects WHERE fullname LIKE 't3_daemon-%' ORDER BY object_pk")
 			.unwrap()
@@ -2665,7 +2973,7 @@ mod tests {
 			.unwrap()
 			.collect::<Result<Vec<_>, _>>()
 			.unwrap();
-		assert_eq!(sequences, vec![3, 4]);
+		assert_eq!(sequences, vec![2, 3]);
 	}
 
 	#[test]
@@ -2773,7 +3081,6 @@ mod tests {
 		let generation_before_fast_path: i64 = connection
 			.query_row("SELECT generation FROM active_profiles WHERE fingerprint=?1", [b"profile-a".as_slice()], |row| row.get(0))
 			.unwrap();
-		connection.execute("DELETE FROM active_profile_source_sets", []).unwrap();
 		sync_active_profile_on(&mut connection, b"profile-a", &[("rust".to_string(), 0)]).unwrap();
 		assert_eq!(
 			connection
@@ -2838,6 +3145,39 @@ mod tests {
 	}
 
 	#[test]
+	fn profile_filters_are_applied_before_duplicate_sort_statistics() {
+		let mut connection = test_connection();
+		let mut visible = post("visible", 10);
+		visible.post_type = "image".to_string();
+		visible.media.content_fingerprint = "shared-filter-image".to_string();
+		let mut filtered = post("filtered", 20);
+		filtered.post_type = "image".to_string();
+		filtered.media.content_fingerprint = "shared-filter-image".to_string();
+		filtered.community = "programming".to_string();
+		apply_source(
+			&mut connection,
+			"subreddit:rust:new",
+			&source(vec![visible, filtered], None),
+			&metadata(b"filtered-source", 100),
+			FirstSeen::Migration,
+		)
+		.unwrap();
+		sync_active_profile_on_with_filters(&mut connection, b"filtered-profile", &[("subreddit:rust:new".to_string(), 0)], &["programming".to_string()]).unwrap();
+		let (created_sort, representative): (i64, String) = connection
+			.query_row(
+				"SELECT feed.created_sort,o.fullname
+				 FROM profile_feed_entries feed
+				 JOIN objects o ON o.object_pk=feed.representative_pk
+				 WHERE feed.valid_to_generation IS NULL",
+				[],
+				|row| Ok((row.get(0)?, row.get(1)?)),
+			)
+			.unwrap();
+		assert_eq!(created_sort, 10);
+		assert_eq!(representative, "t3_visible");
+	}
+
+	#[test]
 	fn profile_thread_entries_bundle_comments_from_multiple_followed_users() {
 		let mut connection = test_connection();
 		apply_source(
@@ -2898,6 +3238,62 @@ mod tests {
 		let page = query_profile_timeline_on(&connection, b"profile-comments", 2, TimelineSort::New, None, 25, &HashSet::new()).unwrap();
 		assert_eq!(page.posts.len(), 1);
 		assert_eq!(page.posts[0].following_comments.len(), 2);
+	}
+
+	#[test]
+	fn comment_card_identity_transition_closes_old_key_across_profiles() {
+		let mut connection = test_connection();
+		apply_source(
+			&mut connection,
+			"user_comments:u_alice",
+			&source(vec![comment("comment-a", "alice", "submission", 200)], None),
+			&metadata(b"alice-comment", 100),
+			FirstSeen::Migration,
+		)
+		.unwrap();
+		sync_active_profile_on(&mut connection, b"comment-profile", &[("user_comments:u_alice".to_string(), 2)]).unwrap();
+		let old_key: String = connection
+			.query_row(
+				"SELECT card_key FROM profile_feed_entries
+				 WHERE valid_to_generation IS NULL AND view_kind=2",
+				[],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert!(old_key.starts_with("t:"));
+
+		apply_source(
+			&mut connection,
+			"subreddit:rust:new",
+			&source(vec![post("submission", 100)], Some(PersistedRefreshOrigin::Daemon)),
+			&metadata(b"submission", 200),
+			FirstSeen::Daemon,
+		)
+		.unwrap();
+
+		let current_keys = connection
+			.prepare(
+				"SELECT card_key FROM profile_feed_entries
+				 WHERE valid_to_generation IS NULL AND view_kind=2",
+			)
+			.unwrap()
+			.query_map([], |row| row.get::<_, String>(0))
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
+		assert_eq!(current_keys.len(), 1);
+		assert!(current_keys[0].starts_with("d:"));
+		assert_eq!(
+			connection
+				.query_row(
+					"SELECT COUNT(*) FROM profile_feed_entries
+					 WHERE card_key=?1 AND valid_to_generation IS NULL",
+					[old_key],
+					|row| row.get::<_, i64>(0),
+				)
+				.unwrap(),
+			0
+		);
 	}
 
 	#[test]
@@ -3066,8 +3462,8 @@ mod tests {
 		let first = vec![("subreddit:rust:new".to_string(), 0), ("u_alice".to_string(), 1)];
 		let reversed = vec![("u_alice".to_string(), 1), ("subreddit:rust:new".to_string(), 0)];
 		let changed_role = vec![("subreddit:rust:new".to_string(), 0), ("u_alice".to_string(), 2)];
-		assert_eq!(profile_source_set_hash(&first), profile_source_set_hash(&reversed));
-		assert_ne!(profile_source_set_hash(&first), profile_source_set_hash(&changed_role));
+		assert_eq!(profile_source_set_hash(&first, &[]), profile_source_set_hash(&reversed, &[]));
+		assert_ne!(profile_source_set_hash(&first, &[]), profile_source_set_hash(&changed_role, &[]));
 	}
 
 	#[test]

@@ -616,6 +616,19 @@ pub fn mark_dirty() {
 pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &PersistedSourceCacheEntry) -> Result<(), String> {
 	let final_path = source_cache_path(source_cache_key);
 	let temp_path = final_path.with_extension("tmp");
+	if entry.fetched_at_unix > 0 {
+		if let Ok(existing_bytes) = fs::read(&final_path) {
+			if let Ok(existing) = bincode::deserialize::<PersistedSourceCacheEntry>(&existing_bytes) {
+				if existing.fetched_at_unix > entry.fetched_at_unix {
+					warn!(
+						"cache_persistence: rejected stale source window for {source_cache_key} ({} < {})",
+						entry.fetched_at_unix, existing.fetched_at_unix
+					);
+					return Ok(());
+				}
+			}
+		}
+	}
 
 	if let Some(parent) = final_path.parent() {
 		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -627,6 +640,11 @@ pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &Persisted
 	file.sync_all().map_err(|error| error.to_string())?;
 	drop(file);
 	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())?;
+	if let Some(parent) = final_path.parent() {
+		File::open(parent)
+			.and_then(|directory| directory.sync_all())
+			.map_err(|error| format!("failed to sync source-cache directory {}: {error}", parent.display()))?;
+	}
 	crate::cache_sqlite::shadow_source_after_legacy_write(source_cache_key, entry, &bytes, &final_path);
 	Ok(())
 }

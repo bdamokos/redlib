@@ -277,7 +277,10 @@ Creating a wholly new profile performs a bounded initial build in a blocking
 worker. Requests continue on the legacy feed until that profile generation
 commits; later requests use the indexed timeline. Existing SQLite profile
 requests continue using the prior generation until an updated generation
-commits.
+commits. Profile filters are part of the source-set fingerprint and are applied
+before duplicate, thread, duration and temporal sort statistics are
+materialized. A filter change therefore falls back to the legacy path until
+the replacement profile generation commits.
 
 ## Indexed reads
 
@@ -288,7 +291,13 @@ commits.
 - Videos: `(duration_seconds, created_sort, card_key)`.
 - User Submitted: direct `objects(author_lc, kind, created_utc, object_pk)` scan.
 
-All cursors include the profile fingerprint/generation and complete ordering tuple. New objects above a cursor do not shift later pages. Back pages retain bounded object/card references, not full `Post` clones. Old materialized versions are garbage-collected only after no live session can reference their generation.
+All cursors include the profile fingerprint/generation and complete ordering
+tuple. New objects above a cursor do not shift later pages. Back pages retain
+bounded object/card references, not full `Post` clones. Closed materialized
+versions retain 128 profile generations, covering the three-hour cursor
+window at the bounded daemon refresh rate, and are then garbage-collected.
+Recently used profiles are never evicted to admit another profile; if the
+active-profile cap is full, the new profile stays on the legacy feed.
 
 `random_rank` is a stable keyed hash of `(profile fingerprint, epoch, card key)`. `random_round` is the lowest eligible within-source ordinal so each source contributes before repeats. Build the next epoch in bounded background transactions and activate it atomically; never call SQLite `random()` over the feed.
 
@@ -311,14 +320,26 @@ RS2 migrates its own sparse cache independently; this design does not copy RS1's
 
 Initial hard limits:
 
-- one fixed SQLite connection with an 8 MiB page cache, serialized behind the
-  shadow-store mutex;
+- one serialized writer with an 8 MiB page cache plus two read-only WAL
+  connections with 2 MiB page caches each by default; reader count is bounded
+  to four;
 - `mmap_size = 0` until a bounded mapping proves useful;
 - at most four materialized active profiles by default;
-- at most 64 timeline cursor sessions, 2,048 page cursors per session and 16
-  frozen full-post pages per feed session;
+- at most 64 feed sessions and 64 timeline cursor sessions, 2,048 page cursors
+  per session and 16 frozen full-post pages per feed session;
+- resident source windows are independently limited to 128 entries and an
+  estimated 64 MiB of serialized payload plus `Post` storage by default;
 - file-backed temp store and migration batches capped at 64 sources;
-- no full-post materialized catalog, Following clone or browser-heartbeat eviction exemption.
+- browser heartbeats never exempt resident sources from TTL or hard-budget
+  eviction;
+- while SQLite reads are enabled, do not populate the redundant mixed/following
+  full-post clone. The bounded legacy primary catalog remains only as a
+  cutover/Hot fallback until a later release removes that dependency.
+
+Home Hot remains a score merge, but startup no longer needs the unbounded
+mixed-feed clone: the first 32 SQLite-backed source windows become immediately
+eligible and hydrate on demand, while the existing bounded background warmer
+adds later sources.
 
 Expose page-cache, render-cache, frozen-page, connection, WAL and eviction metrics. RSS and PSS must be measured in the real service because benchmark fixture construction can dominate process memory.
 

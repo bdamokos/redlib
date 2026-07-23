@@ -20,6 +20,7 @@ use std::time::Instant;
 use tokio::time::{Duration, MissedTickBehavior};
 
 pub(crate) const CACHE_TTL_SECS: u64 = 10_800;
+const MAX_FEED_SESSIONS: usize = 64;
 const MAX_FROZEN_FEED_PAGES: usize = 16;
 pub(crate) const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 pub(crate) const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
@@ -58,6 +59,8 @@ const BACKGROUND_LOOKAHEAD_PAGES: usize = 1;
 const BACKGROUND_DIVERSITY_SOURCE_CAP: usize = 12;
 pub const POSTS_PER_PAGE: usize = 25;
 const DEFAULT_SOURCE_RESIDENT_TTL_SECS: u64 = 15 * 60;
+const DEFAULT_SOURCE_CACHE_MAX_ENTRIES: usize = 128;
+const DEFAULT_SOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Max time the server waits for a full contextual page (or background complete) before
 /// sealing whatever merged posts exist so the HTML/fragment response does not keep changing.
@@ -253,6 +256,7 @@ struct CachedSourcePosts {
 	fetched_at: Instant,
 	last_accessed: Instant,
 	refresh_origin: Option<RefreshOrigin>,
+	estimated_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -480,7 +484,8 @@ enum SessionWarmMode {
 
 static SOURCE_CACHE: LazyLock<Mutex<HashMap<String, CachedSourcePosts>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static SQLITE_PROFILE_SYNC_DESIRED: LazyLock<Mutex<HashMap<String, Vec<(String, i64)>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+type SqliteProfileSyncTarget = (Vec<(String, i64)>, Vec<String>);
+static SQLITE_PROFILE_SYNC_DESIRED: LazyLock<Mutex<HashMap<String, SqliteProfileSyncTarget>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 struct SqliteSessionCursorState {
 	last_accessed: Instant,
 	after_page: HashMap<usize, crate::cache_sqlite::TimelineCursor>,
@@ -501,6 +506,38 @@ fn source_resident_ttl_secs() -> u64 {
 		.ok()
 		.and_then(|value| value.parse::<u64>().ok())
 		.unwrap_or(DEFAULT_SOURCE_RESIDENT_TTL_SECS)
+}
+
+fn source_cache_max_entries() -> usize {
+	std::env::var("REDLIB_SOURCE_CACHE_MAX_ENTRIES")
+		.ok()
+		.and_then(|value| value.parse::<usize>().ok())
+		.filter(|value| *value > 0)
+		.unwrap_or(DEFAULT_SOURCE_CACHE_MAX_ENTRIES)
+}
+
+fn source_cache_max_bytes() -> usize {
+	std::env::var("REDLIB_SOURCE_CACHE_MAX_BYTES")
+		.ok()
+		.and_then(|value| value.parse::<usize>().ok())
+		.filter(|value| *value > 0)
+		.unwrap_or(DEFAULT_SOURCE_CACHE_MAX_BYTES)
+}
+
+fn estimated_source_bytes(posts: &[Post], after: &str) -> usize {
+	let serialized = bincode::serialized_size(&(posts, after))
+		.ok()
+		.and_then(|value| usize::try_from(value).ok())
+		.unwrap_or_else(|| posts.len().saturating_mul(4 * 1024).saturating_add(after.len()));
+	serialized
+		.saturating_add(std::mem::size_of::<CachedSourcePosts>())
+		.saturating_add(std::mem::size_of_val(posts))
+}
+
+fn apply_legacy_mixed_feed_source_refresh(source: &FeedSource, posts: &[Post]) {
+	if !crate::cache_sqlite::reads_enabled() {
+		materialized_catalog::apply_mixed_feed_source_refresh(source, posts);
+	}
 }
 
 fn remembered_entry_is_active(entry: &RememberedSubredditEntry) -> bool {
@@ -798,6 +835,14 @@ pub(crate) fn schedule_sqlite_active_profile_sync(preferences: &Preferences, pro
 		return;
 	}
 	let sources = sqlite_active_profile_sources(preferences);
+	let mut filters = preferences
+		.filters
+		.iter()
+		.map(|value| value.trim().to_ascii_lowercase())
+		.filter(|value| !value.is_empty())
+		.collect::<Vec<_>>();
+	filters.sort();
+	filters.dedup();
 	let profile_id = profile_id.to_string();
 	let should_spawn = {
 		let Ok(mut desired) = SQLITE_PROFILE_SYNC_DESIRED.lock() else {
@@ -805,7 +850,7 @@ pub(crate) fn schedule_sqlite_active_profile_sync(preferences: &Preferences, pro
 			return;
 		};
 		let should_spawn = !desired.contains_key(&profile_id);
-		desired.insert(profile_id.clone(), sources);
+		desired.insert(profile_id.clone(), (sources, filters));
 		should_spawn
 	};
 	if !should_spawn {
@@ -822,7 +867,7 @@ pub(crate) fn schedule_sqlite_active_profile_sync(preferences: &Preferences, pro
 			};
 			target.clone()
 		};
-		let result = crate::cache_sqlite::sync_active_profile(profile_id.as_bytes(), &target);
+		let result = crate::cache_sqlite::sync_active_profile_with_filters(profile_id.as_bytes(), &target.0, &target.1);
 		let Ok(mut desired) = SQLITE_PROFILE_SYNC_DESIRED.lock() else {
 			warn!("cache_sqlite: active profile scheduler lock poisoned");
 			return;
@@ -992,6 +1037,7 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 
 		let now_unix = crate::cache_persistence::unix_now();
 		let posts = persisted.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
+		let estimated_bytes = estimated_source_bytes(&posts, &persisted.after);
 		let entry = CachedSourcePosts {
 			source: source.clone(),
 			posts,
@@ -999,6 +1045,7 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 			fetched_at: unix_to_instant(persisted.fetched_at_unix, now_unix),
 			last_accessed: Instant::now(),
 			refresh_origin: persisted.refresh_origin.map(PersistedRefreshOrigin::into_runtime),
+			estimated_bytes,
 		};
 		if !source_cache_is_servable_with_mode(source, &entry, mode) {
 			return None;
@@ -1007,11 +1054,12 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 		update_user_video_stats_from_posts(&entry.posts);
 		if materialized_catalog::source_is_supported(source) {
 			materialized_catalog::apply_source_refresh_with_observation(source, &entry.posts, crate::post_components::ObservationSource::Persisted);
-			materialized_catalog::apply_mixed_feed_source_refresh(source, &entry.posts);
+			apply_legacy_mixed_feed_source_refresh(source, &entry.posts);
 		}
 		if let Ok(mut cache) = SOURCE_CACHE.lock() {
 			cache.insert(cache_key, entry.clone());
 		}
+		prune_source_cache();
 		Some(entry)
 	}
 }
@@ -1162,7 +1210,7 @@ fn mark_remembered_source_refresh_started(source: &FeedSource) {
 }
 
 fn should_evict_resident_source_entry(entry: &CachedSourcePosts) -> bool {
-	is_persisted_subreddit_feed_source(&entry.source) && !has_active_browser_sessions() && entry.last_accessed.elapsed().as_secs() > source_resident_ttl_secs()
+	is_persisted_subreddit_feed_source(&entry.source) && entry.last_accessed.elapsed().as_secs() > source_resident_ttl_secs()
 }
 
 fn prune_source_cache_locked(cache: &mut HashMap<String, CachedSourcePosts>) -> Vec<(FeedSource, bool)> {
@@ -1179,7 +1227,29 @@ fn prune_source_cache_locked(cache: &mut HashMap<String, CachedSourcePosts>) -> 
 		}
 		keep
 	});
+	enforce_source_cache_limits_locked(cache, source_cache_max_entries(), source_cache_max_bytes(), &mut pruned_sources);
 	pruned_sources
+}
+
+fn enforce_source_cache_limits_locked(cache: &mut HashMap<String, CachedSourcePosts>, max_entries: usize, max_bytes: usize, pruned_sources: &mut Vec<(FeedSource, bool)>) {
+	let mut resident_bytes = cache.values().map(|entry| entry.estimated_bytes).sum::<usize>();
+	if cache.len() > max_entries || resident_bytes > max_bytes {
+		let mut oldest = cache.iter().map(|(key, entry)| (key.clone(), entry.last_accessed)).collect::<Vec<_>>();
+		oldest.sort_by_key(|(_, accessed)| *accessed);
+		for (key, _) in oldest {
+			if cache.len() <= max_entries && resident_bytes <= max_bytes {
+				break;
+			}
+			let Some(entry) = cache.remove(&key) else {
+				continue;
+			};
+			resident_bytes = resident_bytes.saturating_sub(entry.estimated_bytes);
+			if is_persisted_subreddit_feed_source(&entry.source) {
+				write_source_entry_to_disk(&key, &entry);
+			}
+			pruned_sources.push((entry.source, false));
+		}
+	}
 }
 
 fn semantic_backfill_priority(refresh_origin: Option<RefreshOrigin>) -> crate::observed_semantic_backfill::ObservedBackfillPriority {
@@ -1245,24 +1315,11 @@ pub(crate) fn prune_source_cache() {
 
 fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: String, refresh_origin: Option<RefreshOrigin>) {
 	update_user_video_stats_from_posts(&posts);
-	let pruned_sources = if let Ok(mut cache) = SOURCE_CACHE.lock() {
+	let mut pruned_sources = if let Ok(mut cache) = SOURCE_CACHE.lock() {
 		prune_source_cache_locked(&mut cache)
 	} else {
 		Vec::new()
 	};
-	let pruned_catalog_sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
-	materialized_catalog::remove_sources(&pruned_catalog_sources);
-	let removed_disk_sources = pruned_sources
-		.iter()
-		.filter(|(_, remove_disk_entry)| *remove_disk_entry)
-		.map(|(source, _)| source.clone())
-		.collect::<Vec<_>>();
-	materialized_catalog::remove_mixed_feed_sources(&removed_disk_sources);
-	for (pruned_source, remove_disk_entry) in &pruned_sources {
-		if *remove_disk_entry {
-			crate::cache_persistence::remove_source_cache_entry(&pruned_source.cache_key());
-		}
-	}
 	if materialized_catalog::source_is_supported(source) {
 		if refresh_origin == Some(RefreshOrigin::Daemon) {
 			materialized_catalog::record_following_discoveries(source, &posts);
@@ -1272,9 +1329,10 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 			materialized_catalog::mark_following_posts_seen(source, &posts);
 		}
 		materialized_catalog::apply_source_refresh(source, &posts);
-		materialized_catalog::apply_mixed_feed_source_refresh(source, &posts);
+		apply_legacy_mixed_feed_source_refresh(source, &posts);
 	}
 	let new_signature = source_window_signature(&posts, &after);
+	let estimated_bytes = estimated_source_bytes(&posts, &after);
 	let mut source_window_changed = true;
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
 		source_window_changed = cache
@@ -1289,10 +1347,25 @@ fn store_source_posts_with_origin(source: &FeedSource, posts: Vec<Post>, after: 
 				fetched_at: Instant::now(),
 				last_accessed: Instant::now(),
 				refresh_origin,
+				estimated_bytes,
 			},
 		);
 		if let Some(entry) = cache.get(&source.cache_key()) {
 			write_source_entry_to_disk(&source.cache_key(), entry);
+		}
+		pruned_sources.extend(prune_source_cache_locked(&mut cache));
+	}
+	let pruned_catalog_sources = pruned_sources.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>();
+	materialized_catalog::remove_sources(&pruned_catalog_sources);
+	let removed_disk_sources = pruned_sources
+		.iter()
+		.filter(|(_, remove_disk_entry)| *remove_disk_entry)
+		.map(|(source, _)| source.clone())
+		.collect::<Vec<_>>();
+	materialized_catalog::remove_mixed_feed_sources(&removed_disk_sources);
+	for (pruned_source, remove_disk_entry) in &pruned_sources {
+		if *remove_disk_entry {
+			crate::cache_persistence::remove_source_cache_entry(&pruned_source.cache_key());
 		}
 	}
 	if source_window_changed || !pruned_sources.is_empty() {
@@ -1905,6 +1978,19 @@ fn session_is_expired(entry: &FeedSession) -> bool {
 	entry.last_updated.elapsed().as_secs() > CACHE_TTL_SECS
 }
 
+fn prune_feed_sessions_locked(sessions: &mut HashMap<String, FeedSession>, incoming_id: &str) {
+	sessions.retain(|_, session| !session_is_expired(session));
+	if sessions.contains_key(incoming_id) {
+		return;
+	}
+	while sessions.len() >= MAX_FEED_SESSIONS {
+		let Some(oldest) = sessions.iter().max_by_key(|(_, session)| session.last_updated.elapsed()).map(|(id, _)| id.clone()) else {
+			break;
+		};
+		sessions.remove(&oldest);
+	}
+}
+
 fn source_priority(source: &FeedSource) -> (u8, String, String) {
 	match source {
 		FeedSource::Subreddit { name, sort } => (0, format!("{}:{}", sort.as_str(), name.to_lowercase()), "0".to_string()),
@@ -2059,6 +2145,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		store_source_posts(&source, posts.clone(), after.clone());
 	}
 
+	let estimated_bytes = estimated_source_bytes(&posts, &after);
 	Ok(CachedSourcePosts {
 		source: source.clone(),
 		posts,
@@ -2066,6 +2153,7 @@ async fn fetch_source_posts(source: FeedSource, quarantine: bool, refresh_origin
 		fetched_at: Instant::now(),
 		last_accessed: Instant::now(),
 		refresh_origin: remembered_feed_key_for_source(&source).map(|_| refresh_origin),
+		estimated_bytes,
 	})
 }
 
@@ -2132,11 +2220,11 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 fn reconcile_session_with_source_cache(session: &mut FeedSession) {
 	let mut changed = false;
 	let use_mixed_feed_index = session_uses_mixed_feed_catalog(session);
-	let sqlite_timeline_ready = session_merge_sort(session) != FeedSort::Hot;
-	for entry in &mut session.sources {
-		let cached_for_session = source_has_resident_servable_cache(&entry.source)
-			|| (use_mixed_feed_index && materialized_catalog::mixed_feed_source_is_cached(&entry.source))
-			|| (sqlite_timeline_ready && crate::cache_sqlite::source_exists(&entry.source.cache_key()));
+	let hot = session_merge_sort(session) == FeedSort::Hot;
+	for (index, entry) in session.sources.iter_mut().enumerate() {
+		let sqlite_cached = hot && index < INITIAL_SOURCE_WINDOW && crate::cache_sqlite::source_exists(&entry.source.cache_key());
+		let cached_for_session =
+			source_has_resident_servable_cache(&entry.source) || (use_mixed_feed_index && materialized_catalog::mixed_feed_source_is_cached(&entry.source)) || sqlite_cached;
 		if cached_for_session && entry.state != SessionSourceState::Ready {
 			entry.state = SessionSourceState::Ready;
 			entry.last_error = None;
@@ -2434,6 +2522,9 @@ fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page
 			else {
 				return Ok(None);
 			};
+			if let Some(cursor) = batch.next.as_ref() {
+				crate::cache_sqlite::pin_profile_generation(session.request.profile_id.as_bytes(), &session.id, cursor.generation);
+			}
 			posts.extend(batch.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime));
 			after = batch.next;
 			if after.is_none() {
@@ -2803,7 +2894,7 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 	for (cache_key, entry) in &updated_sources {
 		if materialized_catalog::source_is_supported(&entry.source) {
 			materialized_catalog::apply_source_refresh(&entry.source, &entry.posts);
-			materialized_catalog::apply_mixed_feed_source_refresh(&entry.source, &entry.posts);
+			apply_legacy_mixed_feed_source_refresh(&entry.source, &entry.posts);
 		}
 		write_source_entry_to_disk(cache_key, entry);
 	}
@@ -3171,7 +3262,7 @@ async fn ensure_feed_session_inner(request: FeedSessionRequest, page: usize, per
 
 	let session_is_new = {
 		let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-		sessions.retain(|_, session| !session_is_expired(session));
+		prune_feed_sessions_locked(&mut sessions, &session_id);
 
 		let session_is_new = !sessions.contains_key(&session_id);
 		let session = sessions.entry(session_id.clone()).or_insert_with(|| make_session(request.clone()));
@@ -3838,21 +3929,21 @@ mod tests {
 	use super::{
 		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, build_session_id,
 		cache_status_for_preferences, catalog_source_candidates, cleanup_decayed_remembered_subreddits, continue_feed_session_with_budget, count_sources_in_state,
-		daemon_should_continue_after_refresh, effective_freshness_target_secs, ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget, freeze_feed_page,
-		get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget,
-		merged_posts_for_session, merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode,
-		pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position, prune_source_cache, publish_plain_subreddit_refresh,
-		random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
-		record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at,
-		restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts,
-		session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random,
+		daemon_should_continue_after_refresh, effective_freshness_target_secs, enforce_source_cache_limits_locked, ensure_feed_session_with_budget, feed_page, feed_status,
+		followup_source_budget, freeze_feed_page, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url,
+		mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live, pick_next_remembered_feed_to_refresh,
+		pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position,
+		prune_source_cache, publish_plain_subreddit_refresh, random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
+		record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request,
+		remembered_refresh_priority_at, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys,
+		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random,
 		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_timeline_selection,
-		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource,
-		RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState,
-		SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS,
-		MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS,
-		REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
-		SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession, FeedSessionRequest,
+		FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry,
+		SessionSourceState, SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS,
+		FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE,
+		RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK,
+		REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, SOURCE_CACHE, SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -6195,6 +6286,33 @@ mod tests {
 		assert_eq!(session.frozen_pages.len(), MAX_FROZEN_FEED_PAGES);
 		assert!(session.frozen_pages.contains_key(&(MAX_FROZEN_FEED_PAGES + 7)));
 		assert!(!session.frozen_pages.contains_key(&0));
+	}
+
+	#[test]
+	fn resident_source_cache_has_hard_count_and_byte_caps() {
+		let mut cache = HashMap::new();
+		for index in 0..4 {
+			let source = FeedSource::subreddit(format!("source{index}"), FeedSort::New);
+			cache.insert(
+				source.cache_key(),
+				CachedSourcePosts {
+					source,
+					posts: Vec::new(),
+					after: String::new(),
+					fetched_at: Instant::now(),
+					last_accessed: Instant::now() - Duration::from_secs((4 - index) as u64),
+					refresh_origin: None,
+					estimated_bytes: 10,
+				},
+			);
+		}
+		let mut pruned = Vec::new();
+		enforce_source_cache_limits_locked(&mut cache, 3, 25, &mut pruned);
+		assert_eq!(cache.len(), 2);
+		assert_eq!(cache.values().map(|entry| entry.estimated_bytes).sum::<usize>(), 20);
+		assert_eq!(pruned.len(), 2);
+		assert!(cache.contains_key("subreddit:source2:new"));
+		assert!(cache.contains_key("subreddit:source3:new"));
 	}
 
 	#[test]
