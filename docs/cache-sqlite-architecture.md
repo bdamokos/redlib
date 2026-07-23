@@ -294,10 +294,12 @@ the replacement profile generation commits.
 All cursors include the profile fingerprint/generation and complete ordering
 tuple. New objects above a cursor do not shift later pages. Back pages retain
 bounded object/card references, not full `Post` clones. Closed materialized
-versions retain 128 profile generations, covering the three-hour cursor
-window at the bounded daemon refresh rate, and are then garbage-collected.
-Recently used profiles are never evicted to admit another profile; if the
-active-profile cap is full, the new profile stays on the legacy feed.
+versions retain at least 128 profile generations. Every live cursor session
+also pins its oldest referenced generation for the three-hour session TTL;
+garbage collection uses the older of that pin and the 128-generation floor.
+Recently used or cursor-pinned profiles are never evicted to admit another
+profile; if the active-profile cap is full, the new profile stays on the
+legacy feed.
 
 `random_rank` is a stable keyed hash of `(profile fingerprint, epoch, card key)`. `random_round` is the lowest eligible within-source ordinal so each source contributes before repeats. Build the next epoch in bounded background transactions and activate it atomically; never call SQLite `random()` over the feed.
 
