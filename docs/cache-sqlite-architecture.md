@@ -273,7 +273,11 @@ A subscription toggle uses the same delta machinery:
 4. close/insert only changed profile entry versions;
 5. increment the profile generation.
 
-Creating a wholly new profile may perform a bounded initial build in the background. Existing profile requests continue using the prior generation until the new generation commits.
+Creating a wholly new profile performs a bounded initial build in a blocking
+worker. Requests continue on the legacy feed until that profile generation
+commits; later requests use the indexed timeline. Existing SQLite profile
+requests continue using the prior generation until an updated generation
+commits.
 
 ## Indexed reads
 
@@ -292,7 +296,7 @@ All cursors include the profile fingerprint/generation and complete ordering tup
 
 1. Create the database beside `sources.v2`.
 2. Record one deployment baseline sequence/timestamp before importing.
-3. Import one source blob per idempotent transaction and checkpoint its size, mtime and hash.
+3. Import a bounded batch of source blobs per idempotent transaction and checkpoint each source's size, mtime and hash.
 4. Resume after interruption; re-import only changed fingerprints.
 5. Keep daemon refresh disabled until catch-up, or enable legacy-first dual writes before the daemon starts.
 6. Verify source counts, memberships, unique fullnames, sampled payload hashes, relationships, semantic page IDs and `PRAGMA quick_check`.
@@ -307,12 +311,13 @@ RS2 migrates its own sparse cache independently; this design does not copy RS1's
 
 Initial hard limits:
 
-- writer SQLite page cache: 8 MiB;
-- two reader page caches: 4 MiB each;
+- one fixed SQLite connection with an 8 MiB page cache, serialized behind the
+  shadow-store mutex;
 - `mmap_size = 0` until a bounded mapping proves useful;
-- rendered object LRU: 32 MiB;
-- frozen page references: 8 MiB total plus session/page/age caps;
-- file-backed temp store, bounded `IN` batches and fixed connection count;
+- at most four materialized active profiles by default;
+- at most 64 timeline cursor sessions, 2,048 page cursors per session and 16
+  frozen full-post pages per feed session;
+- file-backed temp store and migration batches capped at 64 sources;
 - no full-post materialized catalog, Following clone or browser-heartbeat eviction exemption.
 
 Expose page-cache, render-cache, frozen-page, connection, WAL and eviction metrics. RSS and PSS must be measured in the real service because benchmark fixture construction can dominate process memory.

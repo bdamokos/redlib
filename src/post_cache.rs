@@ -20,6 +20,7 @@ use std::time::Instant;
 use tokio::time::{Duration, MissedTickBehavior};
 
 pub(crate) const CACHE_TTL_SECS: u64 = 10_800;
+const MAX_FROZEN_FEED_PAGES: usize = 16;
 pub(crate) const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 pub(crate) const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
 const REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK: usize = 3;
@@ -399,6 +400,7 @@ pub struct FeedSessionRequest {
 	pub filters: HashSet<String>,
 	pub quarantine: bool,
 	pub query_fingerprint: String,
+	pub profile_id: String,
 	pub cache_revision: u64,
 	pub bundle_followed_user_comments: bool,
 	pub following_discovery_order: bool,
@@ -415,6 +417,7 @@ impl Default for FeedSessionRequest {
 			filters: HashSet::new(),
 			quarantine: false,
 			query_fingerprint: String::new(),
+			profile_id: String::new(),
 			cache_revision: 0,
 			bundle_followed_user_comments: false,
 			following_discovery_order: false,
@@ -477,6 +480,13 @@ enum SessionWarmMode {
 
 static SOURCE_CACHE: LazyLock<Mutex<HashMap<String, CachedSourcePosts>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FEED_SESSIONS: LazyLock<Mutex<HashMap<String, FeedSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static SQLITE_PROFILE_SYNC_DESIRED: LazyLock<Mutex<HashMap<String, Vec<(String, i64)>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+struct SqliteSessionCursorState {
+	last_accessed: Instant,
+	after_page: HashMap<usize, crate::cache_sqlite::TimelineCursor>,
+}
+
+static SQLITE_SESSION_CURSORS: LazyLock<Mutex<HashMap<String, SqliteSessionCursorState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
@@ -759,7 +769,7 @@ pub fn remember_frontpage_subreddits(preferences: &Preferences, include_followed
 	}
 }
 
-pub(crate) fn sync_sqlite_active_profile(preferences: &Preferences, profile_id: &str) -> Result<(), String> {
+fn sqlite_active_profile_sources(preferences: &Preferences) -> Vec<(String, i64)> {
 	let mut roles_by_source = HashMap::<String, i64>::new();
 	for subscription in &preferences.subscriptions {
 		let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subscription.clone(), FeedSort::New)) else {
@@ -780,7 +790,51 @@ pub(crate) fn sync_sqlite_active_profile(preferences: &Preferences, profile_id: 
 	}
 	let mut sources = roles_by_source.into_iter().collect::<Vec<_>>();
 	sources.sort_by(|left, right| left.0.cmp(&right.0));
-	crate::cache_sqlite::sync_active_profile(profile_id.as_bytes(), &sources)
+	sources
+}
+
+pub(crate) fn schedule_sqlite_active_profile_sync(preferences: &Preferences, profile_id: &str) {
+	if !crate::cache_sqlite::shadow_enabled() || profile_id.is_empty() {
+		return;
+	}
+	let sources = sqlite_active_profile_sources(preferences);
+	let profile_id = profile_id.to_string();
+	let should_spawn = {
+		let Ok(mut desired) = SQLITE_PROFILE_SYNC_DESIRED.lock() else {
+			warn!("cache_sqlite: active profile scheduler lock poisoned");
+			return;
+		};
+		let should_spawn = !desired.contains_key(&profile_id);
+		desired.insert(profile_id.clone(), sources);
+		should_spawn
+	};
+	if !should_spawn {
+		return;
+	}
+	tokio::task::spawn_blocking(move || loop {
+		let target = {
+			let Ok(desired) = SQLITE_PROFILE_SYNC_DESIRED.lock() else {
+				warn!("cache_sqlite: active profile scheduler lock poisoned");
+				return;
+			};
+			let Some(target) = desired.get(&profile_id) else {
+				return;
+			};
+			target.clone()
+		};
+		let result = crate::cache_sqlite::sync_active_profile(profile_id.as_bytes(), &target);
+		let Ok(mut desired) = SQLITE_PROFILE_SYNC_DESIRED.lock() else {
+			warn!("cache_sqlite: active profile scheduler lock poisoned");
+			return;
+		};
+		if result.is_err() || desired.get(&profile_id) == Some(&target) {
+			desired.remove(&profile_id);
+			if let Err(error) = result {
+				warn!("cache_sqlite: failed to synchronize active profile: {error}");
+			}
+			return;
+		}
+	});
 }
 
 pub(crate) fn seed_remembered_feeds_from_source_cache_entries<I, S>(entries: I, now_unix: u64) -> usize
@@ -2019,6 +2073,7 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	let mut hasher = DefaultHasher::new();
 	request.quarantine.hash(&mut hasher);
 	request.query_fingerprint.hash(&mut hasher);
+	request.profile_id.hash(&mut hasher);
 	request.cache_revision.hash(&mut hasher);
 	request.bundle_followed_user_comments.hash(&mut hasher);
 	request.following_discovery_order.hash(&mut hasher);
@@ -2077,8 +2132,11 @@ fn make_session(request: FeedSessionRequest) -> FeedSession {
 fn reconcile_session_with_source_cache(session: &mut FeedSession) {
 	let mut changed = false;
 	let use_mixed_feed_index = session_uses_mixed_feed_catalog(session);
+	let sqlite_timeline_ready = session_merge_sort(session) != FeedSort::Hot;
 	for entry in &mut session.sources {
-		let cached_for_session = source_has_resident_servable_cache(&entry.source) || (use_mixed_feed_index && materialized_catalog::mixed_feed_source_is_cached(&entry.source));
+		let cached_for_session = source_has_resident_servable_cache(&entry.source)
+			|| (use_mixed_feed_index && materialized_catalog::mixed_feed_source_is_cached(&entry.source))
+			|| (sqlite_timeline_ready && crate::cache_sqlite::source_exists(&entry.source.cache_key()));
 		if cached_for_session && entry.state != SessionSourceState::Ready {
 			entry.state = SessionSourceState::Ready;
 			entry.last_error = None;
@@ -2302,7 +2360,111 @@ fn finalize_session_posts(session: &FeedSession, all_posts: Vec<Post>) -> Vec<Po
 	finalize_session_posts_with_order(session, all_posts, false)
 }
 
+fn sqlite_timeline_selection(session: &FeedSession) -> Option<(i64, crate::cache_sqlite::TimelineSort)> {
+	if session.request.profile_id.is_empty() || session_merge_sort(session) == FeedSort::Hot {
+		return None;
+	}
+	let sort = if session.request.following_discovery_order {
+		crate::cache_sqlite::TimelineSort::Discovered
+	} else {
+		match session_merge_sort(session) {
+			FeedSort::New => crate::cache_sqlite::TimelineSort::New,
+			FeedSort::Random => crate::cache_sqlite::TimelineSort::Random,
+			FeedSort::Hot => return None,
+		}
+	};
+	let view_kind = if session.request.bundle_followed_user_comments { 2 } else { 1 };
+	Some((view_kind, sort))
+}
+
+fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page: usize) -> Result<Option<(Vec<Post>, bool)>, String> {
+	const MAX_CURSOR_SESSIONS: usize = 64;
+	const MAX_CURSOR_PAGES_PER_SESSION: usize = 2_048;
+	const MAX_FILTER_FILL_SCANS: usize = 4;
+
+	let Some((view_kind, sort)) = sqlite_timeline_selection(session) else {
+		return Ok(None);
+	};
+	if sort == crate::cache_sqlite::TimelineSort::Random {
+		let random_epoch = i64::try_from(session.request.random_rotation_seed).unwrap_or(i64::MAX);
+		crate::cache_sqlite::ensure_profile_random_epoch(session.request.profile_id.as_bytes(), random_epoch)?;
+	}
+	if page >= MAX_CURSOR_PAGES_PER_SESSION {
+		return Err(format!("SQLite timeline page {page} exceeds the bounded cursor window"));
+	}
+	let mut cursors = SQLITE_SESSION_CURSORS.lock().map_err(|_| "SQLite session cursor lock poisoned".to_string())?;
+	cursors.retain(|_, state| state.last_accessed.elapsed().as_secs() <= CACHE_TTL_SECS);
+	if !cursors.contains_key(&session.id) && cursors.len() >= MAX_CURSOR_SESSIONS {
+		if let Some(oldest) = cursors.iter().max_by_key(|(_, state)| state.last_accessed.elapsed()).map(|(id, _)| id.clone()) {
+			cursors.remove(&oldest);
+		}
+	}
+	let state = cursors.entry(session.id.clone()).or_insert_with(|| SqliteSessionCursorState {
+		last_accessed: Instant::now(),
+		after_page: HashMap::new(),
+	});
+	state.last_accessed = Instant::now();
+
+	let (mut logical_page, mut cursor) = if page == 0 {
+		(0, None)
+	} else if let Some(cursor) = state.after_page.get(&(page - 1)).cloned() {
+		(page, Some(cursor))
+	} else if let Some((prior_page, cursor)) = state
+		.after_page
+		.iter()
+		.filter(|(completed_page, _)| **completed_page < page)
+		.max_by_key(|(completed_page, _)| **completed_page)
+		.map(|(completed_page, cursor)| (*completed_page, cursor.clone()))
+	{
+		(prior_page + 1, Some(cursor))
+	} else {
+		(0, None)
+	};
+
+	loop {
+		let mut posts = Vec::with_capacity(per_page);
+		let mut after = cursor.clone();
+		for _ in 0..MAX_FILTER_FILL_SCANS {
+			let remaining = per_page.saturating_sub(posts.len());
+			if remaining == 0 {
+				break;
+			}
+			let Some(batch) =
+				crate::cache_sqlite::query_profile_timeline(session.request.profile_id.as_bytes(), view_kind, sort, after.as_ref(), remaining, &session.request.filters)?
+			else {
+				return Ok(None);
+			};
+			posts.extend(batch.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime));
+			after = batch.next;
+			if after.is_none() {
+				break;
+			}
+		}
+		if let Some(after_cursor) = after.clone() {
+			state.after_page.insert(logical_page, after_cursor);
+		} else {
+			state.after_page.remove(&logical_page);
+		}
+		if logical_page == page {
+			return Ok(Some((posts, after.is_some())));
+		}
+		if after.is_none() {
+			return Ok(Some((Vec::new(), false)));
+		}
+		cursor = after;
+		logical_page += 1;
+	}
+}
+
 fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
+	if let Some((view_kind, sort)) = sqlite_timeline_selection(session) {
+		let target = background_target_posts(session).clamp(POSTS_PER_PAGE, 250);
+		match crate::cache_sqlite::query_profile_timeline(session.request.profile_id.as_bytes(), view_kind, sort, None, target, &session.request.filters) {
+			Ok(Some(page)) => return page.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect(),
+			Ok(None) => {}
+			Err(error) => warn!("post_cache: SQLite timeline read failed; using legacy merge: {error}"),
+		}
+	}
 	if session_uses_materialized_catalog(session) {
 		// The materialized catalog is ordered, but it still requires scanning candidates.
 		// Bound the scan by the session's existing background target so request-time work
@@ -3176,6 +3338,19 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 			ready: true,
 		});
 	}
+	match sqlite_timeline_page_for_session(session, page, per_page) {
+		Ok(Some((posts, has_next))) => {
+			freeze_feed_page(session, page, posts.clone());
+			return Some(FeedPage {
+				posts,
+				has_prev: page > 0,
+				has_next,
+				ready: true,
+			});
+		}
+		Ok(None) => {}
+		Err(error) => warn!("post_cache: SQLite timeline page failed; using legacy merge: {error}"),
+	}
 
 	let merged_posts = merged_posts_for_session(session);
 	let page_ready = current_page_is_ready(session, &merged_posts, page, per_page);
@@ -3188,7 +3363,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		let chunk: Vec<Post> = tail_for_page.iter().take(per_page).cloned().collect();
 		let finalized = finalize_page_posts(sort, bundle_activity, session.request.following_discovery_order, chunk);
 		if page_ready {
-			session.frozen_pages.insert(page, finalized.clone());
+			freeze_feed_page(session, page, finalized.clone());
 		}
 		finalized
 	};
@@ -3200,6 +3375,22 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		has_next: has_next_from_feed || has_more_available,
 		ready: page_ready,
 	})
+}
+
+fn freeze_feed_page(session: &mut FeedSession, page: usize, posts: Vec<Post>) {
+	session.frozen_pages.insert(page, posts);
+	while session.frozen_pages.len() > MAX_FROZEN_FEED_PAGES {
+		let Some(evict_page) = session
+			.frozen_pages
+			.keys()
+			.filter(|candidate| **candidate != page)
+			.max_by_key(|candidate| candidate.abs_diff(page))
+			.copied()
+		else {
+			break;
+		};
+		session.frozen_pages.remove(&evict_page);
+	}
 }
 
 fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: usize) {
@@ -3222,7 +3413,7 @@ fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: u
 		return;
 	}
 	let finalized = finalize_page_posts(sort, bundle_activity, session.request.following_discovery_order, chunk);
-	session.frozen_pages.insert(page, finalized);
+	freeze_feed_page(session, page, finalized);
 	touch_session(session);
 }
 
@@ -3349,6 +3540,26 @@ pub fn catalog_source_candidates(sources: &[FeedSource], filters: &HashSet<Strin
 	} else {
 		None
 	}
+}
+
+pub fn catalog_profile_video_candidates(profile_id: &str, view_kind: i64, sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
+	const CATALOG_MAX_CANDIDATES: usize = 8_000;
+	if !profile_id.is_empty() {
+		match crate::cache_sqlite::query_profile_video_candidates(profile_id.as_bytes(), view_kind, CATALOG_MAX_CANDIDATES, filters) {
+			Ok(Some(posts)) => return posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect(),
+			Ok(None) => {}
+			Err(error) => warn!("post_cache: SQLite video candidate query failed; using legacy catalog: {error}"),
+		}
+	}
+	catalog_source_candidates(sources, filters).unwrap_or_else(|| {
+		let mut posts = Vec::new();
+		for source in sources {
+			if let Some(mut cached) = servable_cached_source_posts(source) {
+				posts.append(&mut cached);
+			}
+		}
+		posts
+	})
 }
 
 pub fn feed_session_sort(session_id: &str) -> Option<FeedSort> {
@@ -3627,7 +3838,7 @@ mod tests {
 	use super::{
 		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, build_session_id,
 		cache_status_for_preferences, catalog_source_candidates, cleanup_decayed_remembered_subreddits, continue_feed_session_with_budget, count_sources_in_state,
-		daemon_should_continue_after_refresh, effective_freshness_target_secs, ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget,
+		daemon_should_continue_after_refresh, effective_freshness_target_secs, ensure_feed_session_with_budget, feed_page, feed_status, followup_source_budget, freeze_feed_page,
 		get_cached_source_page, has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget,
 		merged_posts_for_session, merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode,
 		pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position, prune_source_cache, publish_plain_subreddit_refresh,
@@ -3635,13 +3846,13 @@ mod tests {
 		record_remembered_feed_visit_signal, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at,
 		restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts,
 		session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, sort_posts_by_deterministic_random,
-		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, store_source_posts,
-		store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
-		RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
-		ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS,
-		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS,
-		REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, SOURCE_CACHE,
-		SOURCE_CACHE_REVISION,
+		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_timeline_selection,
+		store_source_posts, store_source_posts_with_origin, sync_sources_to_request, warm_targets, ActiveBrowserSession, FeedSession, FeedSessionRequest, FeedSort, FeedSource,
+		RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState,
+		SessionWarmMode, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, FEED_SESSIONS,
+		MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS,
+		REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
+		SOURCE_CACHE, SOURCE_CACHE_REVISION,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -5933,6 +6144,60 @@ mod tests {
 	}
 
 	#[test]
+	fn sqlite_timeline_keeps_home_hot_on_legacy_and_selects_chronological_modes() {
+		let base_session = FeedSession {
+			id: "sqlite-routing".to_string(),
+			request: FeedSessionRequest {
+				profile_id: "profile".to_string(),
+				sources: vec![new_source("rust")],
+				..Default::default()
+			},
+			sources: vec![session_entry(new_source("rust"), SessionSourceState::Ready)],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let mut hot = base_session.clone();
+		hot.request.merge_sort = Some(FeedSort::Hot);
+		assert!(sqlite_timeline_selection(&hot).is_none());
+
+		let mut chronological = base_session.clone();
+		chronological.request.merge_sort = Some(FeedSort::New);
+		assert_eq!(sqlite_timeline_selection(&chronological), Some((1, crate::cache_sqlite::TimelineSort::New)));
+
+		let mut discovered = base_session;
+		discovered.request.merge_sort = Some(FeedSort::New);
+		discovered.request.bundle_followed_user_comments = true;
+		discovered.request.following_discovery_order = true;
+		assert_eq!(sqlite_timeline_selection(&discovered), Some((2, crate::cache_sqlite::TimelineSort::Discovered)));
+	}
+
+	#[test]
+	fn frozen_feed_pages_have_a_hard_nearest_page_cap() {
+		let mut session = FeedSession {
+			id: "frozen-cap".to_string(),
+			request: FeedSessionRequest::default(),
+			sources: Vec::new(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+		for page in 0..(MAX_FROZEN_FEED_PAGES + 8) {
+			freeze_feed_page(&mut session, page, vec![test_post(&format!("post-{page}"), "rust", page as u64)]);
+		}
+		assert_eq!(session.frozen_pages.len(), MAX_FROZEN_FEED_PAGES);
+		assert!(session.frozen_pages.contains_key(&(MAX_FROZEN_FEED_PAGES + 7)));
+		assert!(!session.frozen_pages.contains_key(&0));
+	}
+
+	#[test]
 	fn warm_targets_prioritize_never_refreshed_then_recent_requests() {
 		let _guard = test_lock();
 		reset_test_caches();
@@ -6225,6 +6490,7 @@ mod tests {
 					filters: HashSet::new(),
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
+					profile_id: String::new(),
 					cache_revision: 0,
 					bundle_followed_user_comments: true,
 					following_discovery_order: false,

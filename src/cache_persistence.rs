@@ -656,6 +656,10 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 
 #[cfg(not(test))]
 pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
+	if let Some(entries) = crate::cache_sqlite::source_seed_entries()? {
+		post_cache::reset_persisted_mixed_feed_index();
+		return Ok(entries);
+	}
 	let mut entries = Vec::new();
 	post_cache::reset_persisted_mixed_feed_index();
 	for_each_persisted_source_cache_file_with_options(false, |file| {

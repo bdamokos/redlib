@@ -289,9 +289,18 @@ fn remove_db_files(path: &Path) -> Result<(), String> {
 }
 
 fn configure(conn: &Connection) -> Result<(), String> {
+	let synchronous = std::env::var("REDLIB_CACHE_SQLITE_BENCH_SYNCHRONOUS")
+		.unwrap_or_else(|_| "FULL".to_string())
+		.trim()
+		.to_ascii_uppercase();
+	if !matches!(synchronous.as_str(), "FULL" | "NORMAL") {
+		return Err(format!("REDLIB_CACHE_SQLITE_BENCH_SYNCHRONOUS must be FULL or NORMAL, got {synchronous}"));
+	}
 	conn.busy_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?;
 	conn
-		.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;")
+		.execute_batch(&format!(
+			"PRAGMA foreign_keys=ON; PRAGMA synchronous={synchronous}; PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;"
+		))
 		.map_err(|error| error.to_string())
 }
 

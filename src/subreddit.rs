@@ -1179,18 +1179,8 @@ fn video_mode_visibility_counts(posts: &[Post], filters: &HashSet<String>, now_u
 	(eligible, eligible_with_timestamp)
 }
 
-fn collect_cached_source_posts(sources: &[FeedSource]) -> Vec<Post> {
-	let mut posts = Vec::new();
-	for source in sources {
-		if let Some(mut cached_posts) = crate::post_cache::servable_cached_source_posts(source) {
-			posts.append(&mut cached_posts);
-		}
-	}
-	posts
-}
-
-fn collect_front_page_video_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
-	crate::post_cache::catalog_source_candidates(sources, filters).unwrap_or_else(|| collect_cached_source_posts(sources))
+fn collect_front_page_video_candidates(profile_id: &str, view_kind: i64, sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
+	crate::post_cache::catalog_profile_video_candidates(profile_id, view_kind, sources, filters)
 }
 
 async fn cached_or_live_new_subreddit_posts(subreddit: &str, quarantined: bool) -> Result<Vec<Post>, String> {
@@ -2065,9 +2055,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	if aggregate_front_page {
 		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
 		if let Some(profile_id) = prefs_store::request_session_id(&req) {
-			if let Err(error) = crate::post_cache::sync_sqlite_active_profile(&prefs, &profile_id) {
-				warn!("cache_sqlite: failed to synchronize active profile: {error}");
-			}
+			crate::post_cache::schedule_sqlite_active_profile_sync(&prefs, &profile_id);
 		}
 	}
 
@@ -2166,7 +2154,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			filter_posts_by_flair(&mut cached_posts, &active_flair_filter);
 			cached_posts
 		} else {
-			collect_front_page_video_candidates(&build_video_mode_front_page_sources(&prefs, &front_page), &get_filters(&req))
+			collect_front_page_video_candidates(
+				&prefs_store::request_session_id(&req).unwrap_or_default(),
+				if front_page_is_following { 2 } else { 1 },
+				&build_video_mode_front_page_sources(&prefs, &front_page),
+				&get_filters(&req),
+			)
 		};
 		let parsed_vm = video_mode::parse_query_or_cookie(
 			req.uri().query().unwrap_or_default(),
@@ -2214,6 +2207,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				filters: get_filters(&req),
 				quarantine: true,
 				query_fingerprint,
+				profile_id: prefs_store::request_session_id(&req).unwrap_or_default(),
 				// Keep plain homepage reloads on the same contextual session while
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
@@ -2495,9 +2489,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	if aggregate_saved_feeds {
 		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
 		if let Some(profile_id) = prefs_store::request_session_id(&req) {
-			if let Err(error) = crate::post_cache::sync_sqlite_active_profile(&prefs, &profile_id) {
-				warn!("cache_sqlite: failed to synchronize active profile: {error}");
-			}
+			crate::post_cache::schedule_sqlite_active_profile_sync(&prefs, &profile_id);
 		}
 	}
 	let cached_subreddit_page = if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
@@ -2865,7 +2857,12 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			filter_posts_by_flair(&mut posts, &active_flair_filter);
 			posts
 		} else if !is_subreddit_route {
-			collect_front_page_video_candidates(&build_video_mode_front_page_sources(&prefs, &front_page), &filters)
+			collect_front_page_video_candidates(
+				&prefs_store::request_session_id(&req).unwrap_or_default(),
+				if front_page_is_following { 2 } else { 1 },
+				&build_video_mode_front_page_sources(&prefs, &front_page),
+				&filters,
+			)
 		} else {
 			Vec::new()
 		};
@@ -2900,6 +2897,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				filters: filters.clone(),
 				quarantine: quarantined,
 				query_fingerprint,
+				profile_id: prefs_store::request_session_id(&req).unwrap_or_default(),
 				// Keep plain homepage reloads on the same contextual session while
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,

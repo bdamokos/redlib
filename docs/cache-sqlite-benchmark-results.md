@@ -107,6 +107,47 @@ selected sources cost 20.1/23.8/26.1 ms p50/p95/p99 in the raw run. This
 independently preserves the decision to materialize active-profile cards during
 bounded refresh transactions.
 
+### Feature-gated production-shaped shadow store
+
+The implementation candidate was then exercised against the same 1,411 real
+`sources.v2` files. Unlike the comparator, this is the feature-gated schema and
+query code used by Redlib: one canonical ROWID object payload, normalized source,
+duplicate and thread relationships, maintained object-to-card keys, versioned
+active-profile feed members, strict generation/keyset cursors and real card
+rendering.
+
+The initial correlated profile build took 60.43 s and was rejected. Maintaining
+object-to-card keys and choosing representatives set-wise reduced a fresh
+all-source profile build to 1.81 s. Refreshing those keys once per 32-source
+migration transaction kept the fresh import at 11.43 s instead of the
+source-by-source prototype's 65.31 s.
+
+| Configuration | Import | First profile | DB bytes | Deep New p50/p95/p99 |
+|---|---:|---:|---:|---:|
+| 8 KiB, raw, FULL, batch 32 | 11.43 s | 1.81 s | 193,855,488 | 0.286/0.342/0.395 ms |
+| 16 KiB, raw, NORMAL, batch 32 | 10.74 s | 1.86 s | 183,418,880 | 0.283/0.344/0.398 ms |
+| 8 KiB, zstd level 1, FULL, batch 32 | 11.39 s | 1.63 s | 98,033,664 | 0.512/0.636/0.746 ms |
+
+All three runs completed 400 keyset pages, rendered the returned cards, and
+reported `PRAGMA quick_check=ok`. A warm idempotent restart scanned 1,411
+descriptors, imported zero, skipped all 1,411, and completed migration checking
+in 12-18 ms. The 8 KiB raw release verifier used 25,853,952 bytes maximum RSS
+and 18,841,936 bytes peak footprint on macOS; this is not presented as Linux
+PSS.
+
+Migration batch sizes 16/32/64 took 14.27/11.43/10.00 s respectively. The
+default remains 32 to bound rollback scope and transient transaction state
+rather than selecting the widest transaction solely for throughput.
+
+A rebuilt disposable comparator run retained its separate contention and crash
+probes: four-reader WAL contention completed with zero errors at
+0.010/0.066/0.097 ms p50/p95/p99, bounded refresh transactions measured
+0.102/0.162/0.182 ms, killed uncommitted work rolled back, committed work was
+durable, and `quick_check=ok`. Production-schema batch failure/replay,
+generation stability, zstd hydration, stale-payload precedence, duplicate
+membership and multi-user comment bundles are additionally covered by focused
+Rust tests.
+
 ## Raspberry Server 2 arm64 synthetic experiment
 
 Environment: Python 3.13.5, SQLite 3.46.1, aarch64, WAL, `synchronous=NORMAL`, 8 MiB cache, mmap disabled. Fixture: 1,400 sources x 50 memberships, 64,400 canonical objects, 1.7 KiB payloads, exact/shared duplicates, comment/submission bundles and four active profiles.

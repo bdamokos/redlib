@@ -1297,11 +1297,22 @@ fn cached_user_posts_for_listing(username: &str, listing: &str, filters: &HashSe
 		.collect::<Vec<_>>();
 
 	posts.extend(cached_subreddit_source_posts_for_user(username, listing, filters));
-	posts.extend(crate::materialized_catalog::query_author_posts_limited(
-		username,
-		filters,
-		USER_CACHE_MATERIALIZED_POST_LIMIT,
-	));
+	match crate::cache_sqlite::query_submitted(username, USER_CACHE_MATERIALIZED_POST_LIMIT, filters) {
+		Ok(Some(cached)) => posts.extend(cached.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime)),
+		Ok(None) => posts.extend(crate::materialized_catalog::query_author_posts_limited(
+			username,
+			filters,
+			USER_CACHE_MATERIALIZED_POST_LIMIT,
+		)),
+		Err(error) => {
+			warn!("user cache: SQLite Submitted query failed; using legacy materialized catalog: {error}");
+			posts.extend(crate::materialized_catalog::query_author_posts_limited(
+				username,
+				filters,
+				USER_CACHE_MATERIALIZED_POST_LIMIT,
+			));
+		}
+	}
 	posts.retain(|post| cached_post_matches_user_listing(post, listing));
 	posts.sort_by(|left, right| {
 		post_feed_activity_ts(right)
