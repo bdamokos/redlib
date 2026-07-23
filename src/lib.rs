@@ -1,5 +1,6 @@
 pub mod bookmarks;
 pub mod cache_persistence;
+pub mod cache_sqlite;
 #[cfg(feature = "cache-sqlite-bench")]
 pub mod cache_sqlite_bench;
 pub mod client;

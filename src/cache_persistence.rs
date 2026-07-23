@@ -547,6 +547,9 @@ pub fn init() {
 	if let Err(error) = fs::create_dir_all(cache_dir()) {
 		warn!("cache_persistence: failed to create cache dir: {error}");
 	}
+	if let Err(error) = crate::cache_sqlite::init(Path::new(&cache_dir())) {
+		warn!("cache_persistence: SQLite shadow initialization failed; legacy cache remains authoritative: {error}");
+	}
 
 	let mut persist_startup_recovery = false;
 	if let Err(error) = load_snapshot() {
@@ -623,11 +626,20 @@ pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &Persisted
 	file.write_all(&bytes).map_err(|error| error.to_string())?;
 	file.sync_all().map_err(|error| error.to_string())?;
 	drop(file);
-	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())
+	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())?;
+	crate::cache_sqlite::shadow_source_after_legacy_write(source_cache_key, entry, &bytes, &final_path);
+	Ok(())
 }
 
 #[cfg(not(test))]
 pub(crate) fn read_source_cache_entry(source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, String> {
+	if crate::cache_sqlite::reads_enabled() {
+		match crate::cache_sqlite::read_source(source_cache_key) {
+			Ok(Some(entry)) => return Ok(Some(entry)),
+			Ok(None) => {}
+			Err(error) => warn!("cache_persistence: SQLite source read failed for {source_cache_key}; falling back to legacy: {error}"),
+		}
+	}
 	let path = source_cache_path(source_cache_key);
 	let bytes = match fs::read(path) {
 		Ok(bytes) => bytes,
@@ -769,8 +781,10 @@ pub(crate) fn remove_source_cache_entry(source_cache_key: &str) {
 	if let Err(error) = fs::remove_file(source_cache_path(source_cache_key)) {
 		if error.kind() != std::io::ErrorKind::NotFound {
 			warn!("cache_persistence: failed to remove source cache entry {source_cache_key}: {error}");
+			return;
 		}
 	}
+	crate::cache_sqlite::shadow_remove_after_legacy(source_cache_key);
 }
 
 fn load_snapshot() -> Result<(), String> {

@@ -2064,6 +2064,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
 	if aggregate_front_page {
 		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
+		if let Some(profile_id) = prefs_store::request_session_id(&req) {
+			if let Err(error) = crate::post_cache::sync_sqlite_active_profile(&prefs, &profile_id) {
+				warn!("cache_sqlite: failed to synchronize active profile: {error}");
+			}
+		}
 	}
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
@@ -2489,6 +2494,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	}
 	if aggregate_saved_feeds {
 		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
+		if let Some(profile_id) = prefs_store::request_session_id(&req) {
+			if let Err(error) = crate::post_cache::sync_sqlite_active_profile(&prefs, &profile_id) {
+				warn!("cache_sqlite: failed to synchronize active profile: {error}");
+			}
+		}
 	}
 	let cached_subreddit_page = if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
 		crate::post_cache::get_cached_subreddit_page(&sub_name, cache_page, crate::post_cache::POSTS_PER_PAGE)

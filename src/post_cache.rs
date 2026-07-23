@@ -159,7 +159,7 @@ impl FeedSource {
 		}
 	}
 
-	fn cache_key(&self) -> String {
+	pub(crate) fn cache_key(&self) -> String {
 		match self {
 			Self::Subreddit { name, sort } => format!("subreddit:{}:{}", name.to_lowercase(), sort.as_str()),
 			Self::UserComments { name, sort } => format!("user_comments:{}:{}", name.to_lowercase(), sort.as_str()),
@@ -757,6 +757,30 @@ pub fn remember_frontpage_subreddits(preferences: &Preferences, include_followed
 			record_remembered_feed_visit_signal(&source);
 		}
 	}
+}
+
+pub(crate) fn sync_sqlite_active_profile(preferences: &Preferences, profile_id: &str) -> Result<(), String> {
+	let mut roles_by_source = HashMap::<String, i64>::new();
+	for subscription in &preferences.subscriptions {
+		let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subscription.clone(), FeedSort::New)) else {
+			continue;
+		};
+		let role = if subscription.trim().to_ascii_lowercase().starts_with("u_") { 1 } else { 0 };
+		roles_by_source.insert(source.cache_key(), role);
+		if role == 1 {
+			if let Some(comments) = normalize_remembered_source(&FeedSource::user_comments(subscription.clone(), FeedSort::New)) {
+				roles_by_source.insert(comments.cache_key(), 2);
+			}
+		}
+	}
+	for subscription in &preferences.flair_subscriptions {
+		if let Some(source) = normalize_remembered_source(&FeedSource::flair(subscription.subreddit.clone(), subscription.flair.clone(), FeedSort::New)) {
+			roles_by_source.insert(source.cache_key(), 0);
+		}
+	}
+	let mut sources = roles_by_source.into_iter().collect::<Vec<_>>();
+	sources.sort_by(|left, right| left.0.cmp(&right.0));
+	crate::cache_sqlite::sync_active_profile(profile_id.as_bytes(), &sources)
 }
 
 pub(crate) fn seed_remembered_feeds_from_source_cache_entries<I, S>(entries: I, now_unix: u64) -> usize
