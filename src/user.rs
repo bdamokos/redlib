@@ -1442,12 +1442,13 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<(Vec<Post>, b
 	}
 
 	let path = format!("/user/{username}/submitted.json?sort=new&limit={}&raw_json=1", crate::post_cache::per_source_limit());
+	let refresh_token = crate::post_cache::begin_source_refresh(&source);
 	let (posts, after) = Post::fetch(&path, false).await?;
 	utils::store_post_flairs(&posts);
 	utils::store_user_subreddits(username, &posts);
 	crate::materialized_catalog::record_author_history_from_posts(&posts);
 	update_user_video_stats(username, &posts);
-	crate::post_cache::store_source_posts_for_cache(&source, posts.clone(), after, Some(crate::post_cache::RefreshOrigin::DirectLiveFetch));
+	crate::post_cache::store_source_posts_for_cache_with_token(&source, posts.clone(), after, Some(crate::post_cache::RefreshOrigin::DirectLiveFetch), refresh_token);
 	Ok((posts, false))
 }
 
@@ -3385,6 +3386,20 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let sort = param(&path, "sort").unwrap_or_default();
 	let request_after = param(&format!("?{query}"), "after").unwrap_or_default();
 	let request_before = param(&format!("?{query}"), "before").unwrap_or_default();
+	let filters = get_filters(&req);
+	let first_user_page = request_is_first_user_page(query);
+	let cacheable_submitted_first_page = listing == "submitted" && sort == "new" && first_user_page;
+	let cacheable_comments_first_page = listing == "comments" && sort == "new" && first_user_page;
+	let source_refresh = if !filters.contains(&["u_", &username].concat()) && (cacheable_submitted_first_page || cacheable_comments_first_page) {
+		let source = if cacheable_comments_first_page {
+			crate::post_cache::FeedSource::user_comments(format!("u_{username}"), crate::post_cache::FeedSort::New)
+		} else {
+			crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New)
+		};
+		Some((source.clone(), crate::post_cache::begin_source_refresh(&source)))
+	} else {
+		None
+	};
 	let mut pre_peer = if !video_listing
 		&& !peer_api_fallback::request_is_peer_api_fallback(&req)
 		&& (peer_api_fallback::request_should_force_peer_api_fallback(&req) || instance_scrape::reddit_rate_limited_now())
@@ -3438,7 +3453,6 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		crate::post_cache::record_remembered_feed_visit_signal(&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New));
 	}
 
-	let filters = get_filters(&req);
 	let fragment = if filters.contains(&["u_", &username].concat()) {
 		UserFragmentTemplate {
 			user,
@@ -3538,9 +3552,6 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			video_mode_sidebar,
 		}
 	} else {
-		let first_user_page = request_is_first_user_page(query);
-		let cacheable_submitted_first_page = listing == "submitted" && sort == "new" && first_user_page;
-		let cacheable_comments_first_page = listing == "comments" && sort == "new" && first_user_page;
 		let merge_cached_posts = |posts: Vec<Post>, all_live_posts_filtered: bool| -> (Vec<Post>, Vec<String>, bool) {
 			if !first_user_page {
 				return (posts, Vec::new(), all_live_posts_filtered);
@@ -3555,20 +3566,13 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			(merged.posts, merged.cached_post_ids, all_posts_filtered)
 		};
 		let store_live_listing_cache = |posts: &[Post], after: &str| {
-			if cacheable_submitted_first_page {
-				crate::post_cache::store_source_posts_for_cache(
-					&crate::post_cache::FeedSource::subreddit(format!("u_{username}"), crate::post_cache::FeedSort::New),
+			if let Some((source, token)) = source_refresh.as_ref() {
+				crate::post_cache::store_source_posts_for_cache_with_token(
+					source,
 					posts.to_vec(),
 					after.to_string(),
 					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
-				);
-			}
-			if cacheable_comments_first_page {
-				crate::post_cache::store_source_posts_for_cache(
-					&crate::post_cache::FeedSource::user_comments(format!("u_{username}"), crate::post_cache::FeedSort::New),
-					posts.to_vec(),
-					after.to_string(),
-					Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
+					token.clone(),
 				);
 			}
 		};

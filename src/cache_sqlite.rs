@@ -352,7 +352,7 @@ struct ShadowCache {
 }
 
 static SHADOW_CACHE: OnceLock<ShadowCache> = OnceLock::new();
-static SQLITE_READS_HEALTHY: AtomicBool = AtomicBool::new(true);
+static SQLITE_READS_HEALTHY: AtomicBool = AtomicBool::new(false);
 static PINNED_PROFILE_GENERATIONS: LazyLock<Mutex<HashMap<(Vec<u8>, String), (i64, Instant)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn pin_profile_generation(fingerprint: &[u8], session_id: &str, generation: i64) {
@@ -428,7 +428,12 @@ pub(crate) fn init(cache_dir: &Path) -> Result<ImportStats, String> {
 	if !shadow_enabled() {
 		return Ok(ImportStats::default());
 	}
+	// Read cutover is fail-closed while the writer, schema/import and complete
+	// reader pool are being established. Only a fully published store may
+	// advertise itself as healthy.
+	SQLITE_READS_HEALTHY.store(false, AtomicOrdering::Release);
 	if SHADOW_CACHE.get().is_some() {
+		SQLITE_READS_HEALTHY.store(true, AtomicOrdering::Release);
 		return Ok(ImportStats::default());
 	}
 
@@ -439,7 +444,6 @@ pub(crate) fn init(cache_dir: &Path) -> Result<ImportStats, String> {
 	let readers = (0..configured_reader_connections()?)
 		.map(|_| open_read_connection(&path).map(Mutex::new))
 		.collect::<Result<Vec<_>, _>>()?;
-	SQLITE_READS_HEALTHY.store(true, AtomicOrdering::Release);
 	SHADOW_CACHE
 		.set(ShadowCache {
 			writer: Mutex::new(connection),
@@ -448,6 +452,7 @@ pub(crate) fn init(cache_dir: &Path) -> Result<ImportStats, String> {
 			payload_codec,
 		})
 		.map_err(|_| "SQLite shadow cache initialized concurrently".to_string())?;
+	SQLITE_READS_HEALTHY.store(true, AtomicOrdering::Release);
 	info!(
 		"cache_sqlite: shadow ready at {} (scanned={}, imported={}, skipped={}, objects={})",
 		path.display(),
@@ -532,12 +537,18 @@ fn open_read_connection(path: &Path) -> Result<Connection, String> {
 }
 
 fn with_read_connection<T>(cache: &ShadowCache, operation: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-	let index = cache.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % cache.readers.len();
-	let mut connection = cache.readers[index].lock().map_err(|_| "SQLite shadow reader connection lock poisoned".to_string())?;
-	let transaction = connection.transaction().map_err(|error| error.to_string())?;
-	let result = operation(&transaction)?;
-	transaction.commit().map_err(|error| error.to_string())?;
-	Ok(result)
+	let result = (|| {
+		let index = cache.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % cache.readers.len();
+		let mut connection = cache.readers[index].lock().map_err(|_| "SQLite shadow reader connection lock poisoned".to_string())?;
+		let transaction = connection.transaction().map_err(|error| error.to_string())?;
+		let result = operation(&transaction)?;
+		transaction.commit().map_err(|error| error.to_string())?;
+		Ok(result)
+	})();
+	if result.is_err() {
+		mark_reads_unhealthy();
+	}
+	result
 }
 
 fn open_database_with_options(path: &Path, requested_page_size: i64, synchronous: &str) -> Result<Connection, String> {

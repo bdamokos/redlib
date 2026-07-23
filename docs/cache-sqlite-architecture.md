@@ -247,7 +247,20 @@ Every comment maps to a stable `thread_groups.submission_fullname`. The linked s
 
 ## Bounded source refresh
 
-The daemon remains the single writer. Readers use a small fixed pool of read-only WAL connections.
+The daemon remains the normal writer. Every network refresh allocates a
+monotonic per-source generation before the fetch starts. Completion takes that
+source's short commit lock and is rejected unless its generation is still
+current, so an older response that finishes late cannot replace a newer source
+window or create false discoveries. Different sources still commit
+independently.
+
+Readers use a small fixed pool of read-only WAL connections. Legacy
+serialization/fsync and the SQLite transaction run without holding the global
+resident source-cache mutex. The prior committed Home Hot window therefore
+remains readable during a durable refresh. The new request-visible memory and
+legacy catalog state publish only after the legacy blob is durably committed
+and the optional SQLite shadow attempt completes. If that shadow transaction
+fails, its read latch closes and the durable legacy cache remains authoritative.
 
 Before `BEGIN IMMEDIATE`, parse and serialize the source response and derive duplicate keys. Inside the transaction:
 
@@ -314,7 +327,13 @@ legacy feed.
 7. Cut reads over behind a rollback flag. Keep legacy-first dual writes and retain every blob through a validated soak.
 8. Retire blobs only in a later explicitly approved release.
 
-Writing the legacy blob before the SQLite transaction keeps the rollback cache at least as new as the database. A failed SQLite transaction is reconciled from the blob at restart. Request state changes only after SQLite commit.
+Writing the legacy blob before the SQLite transaction keeps the rollback cache at least as new as the database. A failed SQLite transaction is reconciled from the blob at restart, with SQLite reads disabled until a successful reinitialization. Request state changes only after the legacy commit and shadow attempt complete.
+
+SQLite read health is fail-closed during initialization and after any structural
+read, shadow write or directory-fsync failure. The read-cutover latch becomes
+healthy only after the writer, import and complete bounded reader pool have been
+published; otherwise requests stay on the legacy path without repeatedly
+entering a half-initialized store.
 
 RS2 migrates its own sparse cache independently; this design does not copy RS1's personalized cache into it.
 

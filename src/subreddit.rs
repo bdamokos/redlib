@@ -943,6 +943,7 @@ fn render_scraped_subreddit_fragment(
 	cacheable_first_page: bool,
 	cache_notice: &str,
 	peer_origin: &str,
+	source_refresh_token: Option<crate::post_cache::SourceRefreshToken>,
 ) -> Result<Response<Body>, String> {
 	cache_subreddit_metadata(&scraped.subreddit);
 	crate::post_components::observe_posts(
@@ -956,7 +957,17 @@ fn render_scraped_subreddit_fragment(
 		crate::cache_persistence::unix_now(),
 	);
 	if cacheable_first_page {
-		crate::post_cache::publish_plain_subreddit_refresh(sub_name, scraped.posts.clone(), scraped.after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+		if let Some(token) = source_refresh_token {
+			crate::post_cache::publish_plain_subreddit_refresh_with_token(
+				sub_name,
+				scraped.posts.clone(),
+				scraped.after.clone(),
+				crate::post_cache::RefreshOrigin::DirectLiveFetch,
+				token,
+			);
+		} else {
+			crate::post_cache::publish_plain_subreddit_refresh(sub_name, scraped.posts.clone(), scraped.after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+		}
 	} else {
 		utils::store_post_flairs(&scraped.posts);
 		enqueue_direct_subreddit_embedding_activity(sub_name, &scraped.posts);
@@ -1050,6 +1061,7 @@ async fn render_peer_api_subreddit_fragment(
 	if !peer_api_fallback::peer_api_fallback_enabled() {
 		return None;
 	}
+	let refresh_token = cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.to_string(), FeedSort::New)));
 	match peer_api_fallback::fetch_subreddit_listing(sub_name, sort, query).await {
 		Ok(peer) => {
 			info!("subreddit: rendering {} via configured Redlib peer API {}", url, peer.origin);
@@ -1074,6 +1086,7 @@ async fn render_peer_api_subreddit_fragment(
 				cacheable_first_page,
 				peer_api_fallback::peer_api_notice(),
 				&peer.origin,
+				refresh_token,
 			))
 		}
 		Err(error) => {
@@ -1190,8 +1203,9 @@ async fn cached_or_live_new_subreddit_posts(subreddit: &str, quarantined: bool) 
 	}
 
 	let path = format!("/r/{}/new.json?limit={}&raw_json=1", subreddit.replace('+', "%2B"), crate::post_cache::per_source_limit());
+	let refresh_token = crate::post_cache::begin_source_refresh(&source);
 	let (posts, after) = Post::fetch(&path, quarantined).await?;
-	crate::post_cache::publish_plain_subreddit_refresh(subreddit, posts.clone(), after, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+	crate::post_cache::publish_plain_subreddit_refresh_with_token(subreddit, posts.clone(), after, crate::post_cache::RefreshOrigin::DirectLiveFetch, refresh_token);
 	Ok(posts)
 }
 
@@ -2596,6 +2610,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			return response;
 		}
 		if instance_scrape::instance_scrape_enabled() {
+			let refresh_token = scrape_cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.clone(), FeedSort::New)));
 			if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 				return render_scraped_subreddit_fragment(
 					&req,
@@ -2613,6 +2628,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					scrape_cacheable_first_page,
 					instance_scrape::scrape_notice(),
 					"",
+					refresh_token,
 				);
 			}
 		}
@@ -2763,6 +2779,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			return response;
 		}
 		if instance_scrape::instance_scrape_enabled() {
+			let refresh_token = scrape_cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.clone(), FeedSort::New)));
 			if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 				return render_scraped_subreddit_fragment(
 					&req,
@@ -2780,6 +2797,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					scrape_cacheable_first_page,
 					instance_scrape::scrape_notice(),
 					"",
+					refresh_token,
 				);
 			}
 		}
@@ -3248,9 +3266,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			// Fall through to normal fetch if not cached.
 		}
 
-		if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-			crate::post_cache::mark_plain_subreddit_refresh_started(&sub_name);
-		}
+		let source_refresh_token = if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
+			crate::post_cache::mark_plain_subreddit_refresh_started(&sub_name)
+		} else {
+			None
+		};
 
 		match fetch_listing_skipping_filtered_pages(&path, quarantined, &filters).await {
 			Ok(FilteredListingFetch {
@@ -3259,8 +3279,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				after,
 				all_posts_filtered,
 			}) => {
-				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-					crate::post_cache::publish_plain_subreddit_refresh(&sub_name, raw_posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+				if let Some(token) = source_refresh_token {
+					crate::post_cache::publish_plain_subreddit_refresh_with_token(&sub_name, raw_posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch, token);
 				} else {
 					utils::store_post_flairs(&raw_posts);
 					if is_single_sub {
@@ -3510,6 +3530,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						return response;
 					}
 					if instance_scrape::instance_scrape_enabled() {
+						let refresh_token = scrape_cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.clone(), FeedSort::New)));
 						if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 							return render_scraped_subreddit_fragment(
 								&req,
@@ -3527,6 +3548,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								scrape_cacheable_first_page,
 								instance_scrape::scrape_notice(),
 								"",
+								refresh_token,
 							);
 						}
 					}

@@ -184,7 +184,11 @@ The cold-ish test reset SQLite caches but did not force cold storage reads. Linu
 
 ## Remaining gates
 
+- Compare `FULL` and `NORMAL` durability and write latency on the target ARM64
+  filesystem; production remains `FULL` until that evidence supports a change.
 - Measure the actual ARM64 Redlib service RSS/PSS with the configured SQLite,
   render-cache, source-cache and frozen-session caps.
+- Compare personalized Following New/Discovered IDs, filters, duplicate
+  representatives and multi-user comment bundles against the legacy feed.
 - Exercise Submitted and Videos deep-cursor behavior in the integrated UI.
 - Prove Home Hot latency and source diversity in the integrated service before deployment handoff.
