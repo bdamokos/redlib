@@ -1290,6 +1290,9 @@ fn cached_subreddit_source_posts_for_user(username: &str, listing: &str, filters
 }
 
 fn cached_user_posts_for_listing(username: &str, listing: &str, filters: &HashSet<String>) -> Vec<Post> {
+	if !crate::post_cache::deleted_media_safety_healthy() {
+		return Vec::new();
+	}
 	let mut posts = cached_user_sources_for_listing(username, listing)
 		.into_iter()
 		.filter_map(|source| crate::post_cache::servable_cached_source_posts(&source))

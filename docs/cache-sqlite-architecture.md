@@ -277,7 +277,11 @@ unchanged legacy source is re-applied when the tombstone set changes. Runtime
 deletion closes the SQLite read latch until that tombstone-aware restart, while
 corrupt/oversized/unreadable tombstone state disables durable cache reads
 entirely. The sidecar has fixed file, entry and key-size caps; entries are never
-silently evicted. Thus eviction or restart cannot resurrect removed media. Refresh
+silently evicted. Each update first fsyncs a write-ahead unsafe marker and clears
+it only after the replacement sidecar and directory are durable. A failed or
+capacity-rejected update therefore remains fail-closed across restart, and live
+source publication stays disabled while the safety latch is down. Thus eviction
+or restart cannot resurrect removed media. Refresh
 state is held through weak registry entries and disappears when the last
 in-flight token drops, keeping the registry proportional to concurrent work.
 Per-request author/subreddit filters are applied only to the rendered response

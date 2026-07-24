@@ -569,6 +569,8 @@ static TEST_DURABLE_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_TOMBSTONE_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
+static TEST_TOMBSTONE_MARKER_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
 static TEST_PRUNE_REMOVE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static TEST_PRUNE_REMOVE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1137,7 +1139,13 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 			Ok(None) => return None,
 			Err(error) => {
 				warn!("post_cache: failed to read source cache entry {}: {}", source.display_name(), error);
-				crate::cache_persistence::remove_source_cache_entry(&cache_key);
+				// A tombstone failure can close the safety latch after the
+				// initial check above but before the persistence layer reads.
+				// Preserve the legacy blob and SQLite shadow in that case:
+				// safety unavailability is not evidence of corruption.
+				if deleted_media_safety_healthy() {
+					crate::cache_persistence::remove_source_cache_entry(&cache_key);
+				}
 				return None;
 			}
 		};
@@ -1577,6 +1585,11 @@ where
 			*current_generation
 		);
 		return SourceRefreshOutcome::Stale;
+	}
+	if !deleted_media_safety_healthy() {
+		warn!("post_cache: rejected source refresh for {} while deleted-media durability is unsafe", source.display_name());
+		on_failed();
+		return SourceRefreshOutcome::Failed;
 	}
 
 	let mut posts = posts;
@@ -2476,6 +2489,9 @@ fn resident_cached_source_origin(source: &FeedSource) -> Option<RefreshOrigin> {
 }
 
 fn cached_source_posts_with_mode(source: &FeedSource, mode: CacheServeMode) -> Option<CachedSourcePosts> {
+	if !deleted_media_safety_healthy() {
+		return None;
+	}
 	let cache_key = source.cache_key();
 	if let Ok(mut cache) = SOURCE_CACHE.lock() {
 		if let Some(entry) = cache.get_mut(&cache_key) {
@@ -2989,6 +3005,9 @@ fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page
 }
 
 fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
+	if !deleted_media_safety_healthy() {
+		return Vec::new();
+	}
 	if let Some((view_kind, sort)) = sqlite_timeline_selection(session) {
 		let target = background_target_posts(session).clamp(POSTS_PER_PAGE, 250);
 		match crate::cache_sqlite::query_profile_timeline(session.request.profile_id.as_bytes(), view_kind, sort, None, target, &session.request.filters) {
@@ -3292,7 +3311,7 @@ fn prune_deleted_media_from_posts(posts: &mut Vec<Post>, deleted_asset_key: &str
 	result
 }
 
-fn record_deleted_media_tombstone(deleted_asset_key: &str) {
+fn record_deleted_media_tombstone(deleted_asset_key: &str) -> bool {
 	// Serialize snapshot/write/insert ordering without holding the tombstone
 	// read mutex across fsync. Otherwise two concurrent deletions could write an
 	// older, smaller snapshot after a newer one.
@@ -3302,24 +3321,30 @@ fn record_deleted_media_tombstone(deleted_asset_key: &str) {
 		tombstones.iter().cloned().collect::<Vec<_>>()
 	};
 	if !snapshot.iter().any(|key| key == deleted_asset_key) {
-		if deleted_asset_key.len() > crate::cache_persistence::DELETED_MEDIA_MAX_KEY_BYTES || snapshot.len() >= crate::cache_persistence::DELETED_MEDIA_MAX_ENTRIES {
-			mark_deleted_media_safety_unhealthy();
-			warn!("post_cache: deleted-media tombstone bounds exhausted; durable cache reads are disabled");
-			return;
-		}
 		snapshot.push(deleted_asset_key.to_string());
 	}
-	if let Err(error) = persist_deleted_media_tombstone_snapshot(&snapshot) {
-		mark_deleted_media_safety_unhealthy();
-		warn!("post_cache: failed to persist deleted-media tombstone; durable cache reads are disabled: {error}");
-	}
-	DELETED_MEDIA_TOMBSTONES
-		.lock()
-		.unwrap_or_else(|error| error.into_inner())
-		.insert(deleted_asset_key.to_string());
+	let restart_guarded = if deleted_media_safety_healthy() {
+		match persist_deleted_media_tombstone_snapshot(&snapshot) {
+			Ok(()) => {
+				DELETED_MEDIA_TOMBSTONES
+					.lock()
+					.unwrap_or_else(|error| error.into_inner())
+					.insert(deleted_asset_key.to_string());
+				return true;
+			}
+			Err((error, restart_guarded)) => {
+				mark_deleted_media_safety_unhealthy();
+				warn!("post_cache: failed to persist deleted-media tombstone; durable cache reads are disabled: {error}");
+				restart_guarded
+			}
+		}
+	} else {
+		false
+	};
+	restart_guarded
 }
 
-fn persist_deleted_media_tombstone_snapshot(snapshot: &[String]) -> Result<(), String> {
+fn persist_deleted_media_tombstone_snapshot(snapshot: &[String]) -> Result<(), (String, bool)> {
 	#[cfg(not(test))]
 	{
 		crate::cache_persistence::write_deleted_media_tombstones(snapshot)
@@ -3327,8 +3352,10 @@ fn persist_deleted_media_tombstone_snapshot(snapshot: &[String]) -> Result<(), S
 	#[cfg(test)]
 	{
 		let _ = snapshot;
-		if TEST_TOMBSTONE_WRITE_FAIL.load(AtomicOrdering::SeqCst) {
-			Err("injected deleted-media tombstone write failure".to_string())
+		if TEST_TOMBSTONE_MARKER_WRITE_FAIL.load(AtomicOrdering::SeqCst) {
+			Err(("injected deleted-media safety-marker write failure".to_string(), false))
+		} else if TEST_TOMBSTONE_WRITE_FAIL.load(AtomicOrdering::SeqCst) {
+			Err(("injected deleted-media tombstone write failure".to_string(), true))
 		} else {
 			Ok(())
 		}
@@ -3396,7 +3423,9 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 		return 0;
 	};
 
-	record_deleted_media_tombstone(&deleted_asset_key);
+	if !record_deleted_media_tombstone(&deleted_asset_key) {
+		return 0;
+	}
 	// Existing SQLite payload/materialized rows may predate this tombstone.
 	// Close the optional read cutover immediately; restart revalidates the
 	// migration against the durable tombstone revision before reopening reads.
@@ -3974,6 +4003,9 @@ pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_pa
 }
 
 pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedPage> {
+	if !deleted_media_safety_healthy() {
+		return None;
+	}
 	let mut sessions = FEED_SESSIONS.lock().ok()?;
 	let session = sessions.get_mut(session_id)?;
 	if session_is_expired(session) {
@@ -4179,6 +4211,9 @@ pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Ve
 }
 
 pub fn catalog_source_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Option<Vec<Post>> {
+	if !deleted_media_safety_healthy() {
+		return None;
+	}
 	if sources.iter().all(materialized_catalog::source_is_supported) {
 		// Video-mode and other aggregate listings only need a bounded candidate pool.
 		// Avoid scanning the full catalog for pages with many subscriptions.
@@ -4531,7 +4566,7 @@ mod tests {
 		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS,
 		REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
 		REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT,
-		TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_WRITE_FAIL,
+		TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4558,6 +4593,7 @@ mod tests {
 		TEST_DURABLE_WRITE_ACTIVE.store(false, AtomicOrdering::SeqCst);
 		TEST_DURABLE_WRITE_COUNT.store(0, AtomicOrdering::SeqCst);
 		TEST_DURABLE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
+		TEST_TOMBSTONE_MARKER_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
 		TEST_TOMBSTONE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
 		TEST_PRUNE_REMOVE_DELAY_MS.store(0, AtomicOrdering::SeqCst);
 		TEST_PRUNE_REMOVE_ACTIVE.store(false, AtomicOrdering::SeqCst);
@@ -7331,7 +7367,65 @@ mod tests {
 			.posts
 			.is_empty());
 		assert!(!super::deleted_media_safety_healthy());
+		assert!(servable_cached_source_posts(&source).is_none());
+		assert!(catalog_source_candidates(std::slice::from_ref(&source), &HashSet::new()).is_none());
 		TEST_TOMBSTONE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
+		let token = begin_source_refresh(&source);
+		assert_eq!(
+			store_source_posts_with_token(
+				&source,
+				vec![test_post("post-failure-refresh", "rust", 400)],
+				String::new(),
+				Some(RefreshOrigin::Daemon),
+				token
+			),
+			SourceRefreshOutcome::Failed
+		);
+		assert!(SOURCE_CACHE
+			.lock()
+			.unwrap_or_else(|error| error.into_inner())
+			.get(&source.cache_key())
+			.unwrap()
+			.posts
+			.is_empty());
+	}
+
+	#[test]
+	fn deleted_media_marker_write_failure_does_not_apply_an_unrecoverable_deletion() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		let mut deleted = test_post("resident-marker", "rust", 300);
+		deleted.post_type = "image".to_string();
+		deleted.media.url = "https://preview.redd.it/deleted-marker-failure.jpg?width=640&format=pjpg".to_string();
+		seed_source(&source, vec![deleted]);
+
+		TEST_TOMBSTONE_MARKER_WRITE_FAIL.store(true, AtomicOrdering::SeqCst);
+		assert_eq!(mark_deleted_reddit_media_url("https://preview.redd.it/deleted-marker-failure.jpg?width=640&format=pjpg"), 0);
+		assert!(!super::deleted_media_safety_healthy());
+		assert!(servable_cached_source_posts(&source).is_none());
+		assert!(catalog_source_candidates(std::slice::from_ref(&source), &HashSet::new()).is_none());
+		assert_eq!(
+			SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).unwrap().posts.len(),
+			1
+		);
+
+		TEST_TOMBSTONE_MARKER_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
+		let token = begin_source_refresh(&source);
+		assert_eq!(
+			store_source_posts_with_token(
+				&source,
+				vec![test_post("post-marker-failure-refresh", "rust", 400)],
+				String::new(),
+				Some(RefreshOrigin::Daemon),
+				token
+			),
+			SourceRefreshOutcome::Failed
+		);
+		assert_eq!(
+			SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).unwrap().posts[0].id,
+			"resident-marker"
+		);
 	}
 
 	#[test]
