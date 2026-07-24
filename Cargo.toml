@@ -12,6 +12,19 @@ edition = "2021"
 rust-version = "1.81"
 default-run = "redlib"
 
+[features]
+cache-sqlite-bench = []
+
+[[bin]]
+name = "cache_sqlite_bench"
+path = "src/bin/cache_sqlite_bench.rs"
+required-features = ["cache-sqlite-bench"]
+
+[[bin]]
+name = "cache_sqlite_shadow_verify"
+path = "src/bin/cache_sqlite_shadow_verify.rs"
+required-features = ["cache-sqlite-bench"]
+
 [dependencies]
 askama = { version = "0.14.0", default-features = false, features = [
     "std",
@@ -66,9 +79,10 @@ base2048 = "2.0.2"
 revision = "0.10.0"
 fake_user_agent = "0.2.2"
 rustls = "0.21.12"
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+rusqlite = { version = "0.31.0", features = ["bundled", "functions"] }
 wreq = { version = "6.0.0-rc.28", features = ["brotli", "gzip", "deflate", "zstd", "json", "stream", "socks"] }
 wreq-util = { version = "3.0.0-rc.10" }
+zstd = "0.13.3"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2.183"

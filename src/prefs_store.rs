@@ -183,7 +183,7 @@ fn session_cookie_id(req: &Request<Body>) -> Option<String> {
 	req.cookie(PREFS_COOKIE).map(|cookie| cookie.value().trim().to_string()).filter(|id| valid_session_id(id))
 }
 
-fn request_session_id(req: &Request<Body>) -> Option<String> {
+pub(crate) fn request_session_id(req: &Request<Body>) -> Option<String> {
 	req
 		.extensions()
 		.get::<RequestPreferences>()

@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::BufReader;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::sync::Mutex;
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -24,6 +26,12 @@ const LEGACY_SNAPSHOT_VERSION_V3: u8 = 3;
 const LEGACY_SNAPSHOT_VERSION_V2: u8 = 2;
 const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v2.bin";
 const SOURCE_CACHE_DIR_NAME: &str = "sources.v2";
+const DELETED_MEDIA_FILE_NAME: &str = "deleted-reddit-media.v1.bin";
+const DELETED_MEDIA_UNSAFE_FILE_NAME: &str = "deleted-reddit-media.v1.unsafe";
+const DELETED_MEDIA_FILE_VERSION: u8 = 1;
+const DELETED_MEDIA_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const DELETED_MEDIA_MAX_ENTRIES: usize = 65_536;
+pub(crate) const DELETED_MEDIA_MAX_KEY_BYTES: usize = 512;
 #[cfg(not(test))]
 const LEGACY_SOURCE_CACHE_DIR_NAME: &str = "sources.v1";
 const DEFAULT_CACHE_DIR: &str = "/var/lib/redlib/cache";
@@ -31,6 +39,14 @@ const WRITE_DEBOUNCE_SECS: u64 = 1;
 
 static PERSISTENCE_EVENTS: OnceLock<mpsc::UnboundedSender<()>> = OnceLock::new();
 static PERSISTENCE_PATH: LazyLock<PathBuf> = LazyLock::new(snapshot_path);
+#[cfg(not(test))]
+static DELETED_MEDIA_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PersistedDeletedMediaTombstones {
+	version: u8,
+	asset_keys: Vec<String>,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) enum PersistedRefreshOrigin {
@@ -503,6 +519,205 @@ pub fn snapshot_path() -> PathBuf {
 	Path::new(&cache_dir()).join(SNAPSHOT_FILE_NAME)
 }
 
+fn deleted_media_tombstones_path() -> PathBuf {
+	Path::new(&cache_dir()).join(DELETED_MEDIA_FILE_NAME)
+}
+
+fn deleted_media_unsafe_path() -> PathBuf {
+	Path::new(&cache_dir()).join(DELETED_MEDIA_UNSAFE_FILE_NAME)
+}
+
+fn serialize_deleted_media_tombstones(asset_keys: &[String]) -> Result<Vec<u8>, String> {
+	let mut asset_keys = asset_keys.to_vec();
+	asset_keys.sort();
+	asset_keys.dedup();
+	validate_deleted_media_tombstones(&asset_keys)?;
+	let bytes = bincode::serialize(&PersistedDeletedMediaTombstones {
+		version: DELETED_MEDIA_FILE_VERSION,
+		asset_keys,
+	})
+	.map_err(|error| error.to_string())?;
+	if bytes.len() as u64 > DELETED_MEDIA_FILE_MAX_BYTES {
+		return Err(format!("deleted-media tombstone file exceeds {DELETED_MEDIA_FILE_MAX_BYTES} bytes"));
+	}
+	Ok(bytes)
+}
+
+fn deserialize_deleted_media_tombstones(bytes: &[u8]) -> Result<Vec<String>, String> {
+	if bytes.len() as u64 > DELETED_MEDIA_FILE_MAX_BYTES {
+		return Err(format!("deleted-media tombstone file exceeds {DELETED_MEDIA_FILE_MAX_BYTES} bytes"));
+	}
+	validate_deleted_media_tombstone_wire(bytes)?;
+	let mut tombstones = bincode::DefaultOptions::new()
+		.with_fixint_encoding()
+		.reject_trailing_bytes()
+		.with_limit(bytes.len() as u64)
+		.deserialize::<PersistedDeletedMediaTombstones>(bytes)
+		.map_err(|error| error.to_string())?;
+	if tombstones.version != DELETED_MEDIA_FILE_VERSION {
+		return Err(format!("unsupported deleted-media tombstone version {}", tombstones.version));
+	}
+	tombstones.asset_keys.retain(|key| !key.trim().is_empty());
+	tombstones.asset_keys.sort();
+	tombstones.asset_keys.dedup();
+	validate_deleted_media_tombstones(&tombstones.asset_keys)?;
+	Ok(tombstones.asset_keys)
+}
+
+fn validate_deleted_media_tombstone_wire(bytes: &[u8]) -> Result<(), String> {
+	const U64_BYTES: usize = std::mem::size_of::<u64>();
+	if bytes.len() < 1 + U64_BYTES {
+		return Err("deleted-media tombstone file is truncated".to_string());
+	}
+	let mut offset = 1usize;
+	let read_len = |offset: &mut usize| -> Result<usize, String> {
+		let end = offset
+			.checked_add(U64_BYTES)
+			.filter(|end| *end <= bytes.len())
+			.ok_or_else(|| "deleted-media tombstone length is truncated".to_string())?;
+		let encoded: [u8; U64_BYTES] = bytes[*offset..end].try_into().map_err(|_| "invalid tombstone length".to_string())?;
+		*offset = end;
+		usize::try_from(u64::from_le_bytes(encoded)).map_err(|_| "deleted-media tombstone length exceeds address space".to_string())
+	};
+	let count = read_len(&mut offset)?;
+	if count > DELETED_MEDIA_MAX_ENTRIES {
+		return Err(format!("deleted-media tombstone count {count} exceeds {DELETED_MEDIA_MAX_ENTRIES}"));
+	}
+	for _ in 0..count {
+		let key_len = read_len(&mut offset)?;
+		if key_len > DELETED_MEDIA_MAX_KEY_BYTES {
+			return Err(format!("deleted-media tombstone key length {key_len} exceeds {DELETED_MEDIA_MAX_KEY_BYTES}"));
+		}
+		offset = offset
+			.checked_add(key_len)
+			.filter(|end| *end <= bytes.len())
+			.ok_or_else(|| "deleted-media tombstone key is truncated".to_string())?;
+	}
+	if offset != bytes.len() {
+		return Err("deleted-media tombstone file has trailing bytes".to_string());
+	}
+	Ok(())
+}
+
+fn validate_deleted_media_tombstones(asset_keys: &[String]) -> Result<(), String> {
+	if asset_keys.len() > DELETED_MEDIA_MAX_ENTRIES {
+		return Err(format!("deleted-media tombstone count {} exceeds {DELETED_MEDIA_MAX_ENTRIES}", asset_keys.len()));
+	}
+	if let Some(key) = asset_keys.iter().find(|key| key.len() > DELETED_MEDIA_MAX_KEY_BYTES) {
+		return Err(format!("deleted-media tombstone key length {} exceeds {DELETED_MEDIA_MAX_KEY_BYTES}", key.len()));
+	}
+	Ok(())
+}
+
+pub(crate) fn read_deleted_media_tombstones() -> Result<Vec<String>, String> {
+	read_deleted_media_tombstones_with_marker_at(&deleted_media_tombstones_path(), &deleted_media_unsafe_path())
+}
+
+fn read_deleted_media_tombstones_with_marker_at(path: &Path, unsafe_path: &Path) -> Result<Vec<String>, String> {
+	for marker_path in [unsafe_path.to_path_buf(), unsafe_path.with_extension("unsafe.tmp")] {
+		match fs::metadata(&marker_path) {
+			Ok(_) => {
+				return Err(format!(
+					"deleted-media tombstone update is incomplete at {}; durable cache reads require operator recovery",
+					marker_path.display()
+				));
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => return Err(format!("failed to inspect deleted-media safety marker {}: {error}", marker_path.display())),
+		}
+	}
+	read_deleted_media_tombstones_at(path)
+}
+
+fn read_deleted_media_tombstones_at(path: &Path) -> Result<Vec<String>, String> {
+	let file = match File::open(path) {
+		Ok(file) => file,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => return Err(error.to_string()),
+	};
+	let metadata = file.metadata().map_err(|error| error.to_string())?;
+	if metadata.len() > DELETED_MEDIA_FILE_MAX_BYTES {
+		return Err(format!(
+			"deleted-media tombstone file {} is {} bytes; maximum is {DELETED_MEDIA_FILE_MAX_BYTES}",
+			path.display(),
+			metadata.len()
+		));
+	}
+	let mut bytes = Vec::with_capacity(metadata.len() as usize);
+	file.take(DELETED_MEDIA_FILE_MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+	if bytes.len() as u64 > DELETED_MEDIA_FILE_MAX_BYTES {
+		return Err(format!(
+			"deleted-media tombstone file {} grew beyond {DELETED_MEDIA_FILE_MAX_BYTES} bytes while reading",
+			path.display()
+		));
+	}
+	deserialize_deleted_media_tombstones(&bytes)
+}
+
+fn write_deleted_media_tombstones_at(final_path: &Path, asset_keys: &[String]) -> Result<(), String> {
+	let temp_path = final_path.with_extension("tmp");
+	if let Some(parent) = final_path.parent() {
+		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+	}
+	let bytes = serialize_deleted_media_tombstones(asset_keys)?;
+	let mut file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	file.write_all(&bytes).map_err(|error| error.to_string())?;
+	file.sync_all().map_err(|error| error.to_string())?;
+	drop(file);
+	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())?;
+	if let Some(parent) = final_path.parent() {
+		File::open(parent)
+			.and_then(|directory| directory.sync_all())
+			.map_err(|error| format!("failed to sync deleted-media directory {}: {error}", parent.display()))?;
+	}
+	Ok(())
+}
+
+fn write_deleted_media_unsafe_marker_at(marker_path: &Path) -> Result<(), String> {
+	let temp_path = marker_path.with_extension("unsafe.tmp");
+	let Some(parent) = marker_path.parent() else {
+		return Err(format!("deleted-media safety marker {} has no parent directory", marker_path.display()));
+	};
+	fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+	let mut file = File::create(&temp_path).map_err(|error| error.to_string())?;
+	file.write_all(b"pending deleted-media tombstone update\n").map_err(|error| error.to_string())?;
+	file.sync_all().map_err(|error| error.to_string())?;
+	drop(file);
+	fs::rename(&temp_path, marker_path).map_err(|error| error.to_string())?;
+	File::open(parent)
+		.and_then(|directory| directory.sync_all())
+		.map_err(|error| format!("failed to sync deleted-media safety marker directory {}: {error}", parent.display()))
+}
+
+fn clear_deleted_media_unsafe_marker_at(marker_path: &Path) -> Result<(), String> {
+	match fs::remove_file(marker_path) {
+		Ok(()) => {}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(error.to_string()),
+	}
+	if let Some(parent) = marker_path.parent() {
+		File::open(parent)
+			.and_then(|directory| directory.sync_all())
+			.map_err(|error| format!("failed to sync deleted-media safety marker removal in {}: {error}", parent.display()))?;
+	}
+	Ok(())
+}
+
+fn write_deleted_media_tombstones_with_marker_at(final_path: &Path, marker_path: &Path, asset_keys: &[String]) -> Result<(), (String, bool)> {
+	write_deleted_media_unsafe_marker_at(marker_path).map_err(|error| (error, false))?;
+	write_deleted_media_tombstones_at(final_path, asset_keys).map_err(|error| (error, true))?;
+	clear_deleted_media_unsafe_marker_at(marker_path).map_err(|error| (error, true))
+}
+
+#[cfg(not(test))]
+pub(crate) fn write_deleted_media_tombstones(asset_keys: &[String]) -> Result<(), (String, bool)> {
+	if persistence_read_only() {
+		return Err(("cache persistence is read-only".to_string(), false));
+	}
+	let _write_guard = DELETED_MEDIA_WRITE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+	write_deleted_media_tombstones_with_marker_at(&deleted_media_tombstones_path(), &deleted_media_unsafe_path(), asset_keys)
+}
+
 fn source_cache_dir() -> PathBuf {
 	Path::new(&cache_dir()).join(SOURCE_CACHE_DIR_NAME)
 }
@@ -546,6 +761,28 @@ pub(crate) fn option_unix_to_instant(timestamp_unix: Option<u64>, now_unix: u64)
 pub fn init() {
 	if let Err(error) = fs::create_dir_all(cache_dir()) {
 		warn!("cache_persistence: failed to create cache dir: {error}");
+	}
+	let deleted_media_safety_ready = if persistence_read_only() {
+		post_cache::mark_deleted_media_safety_unhealthy();
+		warn!("cache_persistence: read-only mode cannot durably record deleted-media tombstones; durable cache reads remain disabled");
+		false
+	} else {
+		match read_deleted_media_tombstones() {
+			Ok(asset_keys) => {
+				post_cache::restore_deleted_media_tombstones(asset_keys);
+				true
+			}
+			Err(error) => {
+				post_cache::mark_deleted_media_safety_unhealthy();
+				warn!("cache_persistence: failed to load deleted-media tombstones; durable cache reads remain disabled: {error}");
+				false
+			}
+		}
+	};
+	if deleted_media_safety_ready {
+		if let Err(error) = crate::cache_sqlite::init(Path::new(&cache_dir())) {
+			warn!("cache_persistence: SQLite shadow initialization failed; legacy cache remains authoritative: {error}");
+		}
 	}
 
 	let mut persist_startup_recovery = false;
@@ -613,6 +850,19 @@ pub fn mark_dirty() {
 pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &PersistedSourceCacheEntry) -> Result<(), String> {
 	let final_path = source_cache_path(source_cache_key);
 	let temp_path = final_path.with_extension("tmp");
+	if entry.fetched_at_unix > 0 {
+		if let Ok(existing_bytes) = fs::read(&final_path) {
+			if let Ok(existing) = bincode::deserialize::<PersistedSourceCacheEntry>(&existing_bytes) {
+				if existing.fetched_at_unix > entry.fetched_at_unix {
+					warn!(
+						"cache_persistence: rejected stale source window for {source_cache_key} ({} < {})",
+						entry.fetched_at_unix, existing.fetched_at_unix
+					);
+					return Ok(());
+				}
+			}
+		}
+	}
 
 	if let Some(parent) = final_path.parent() {
 		fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -623,11 +873,29 @@ pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &Persisted
 	file.write_all(&bytes).map_err(|error| error.to_string())?;
 	file.sync_all().map_err(|error| error.to_string())?;
 	drop(file);
-	fs::rename(&temp_path, final_path).map_err(|error| error.to_string())
+	fs::rename(&temp_path, &final_path).map_err(|error| error.to_string())?;
+	if let Some(parent) = final_path.parent() {
+		if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+			crate::cache_sqlite::mark_reads_unhealthy();
+			return Err(format!("failed to sync source-cache directory {}: {error}", parent.display()));
+		}
+	}
+	crate::cache_sqlite::shadow_source_after_legacy_write(source_cache_key, entry, &bytes, &final_path);
+	Ok(())
 }
 
 #[cfg(not(test))]
 pub(crate) fn read_source_cache_entry(source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, String> {
+	if !post_cache::deleted_media_safety_healthy() {
+		return Err("deleted-media tombstones are unavailable; durable source reads are disabled".to_string());
+	}
+	if crate::cache_sqlite::reads_enabled() {
+		match crate::cache_sqlite::read_source(source_cache_key) {
+			Ok(Some(entry)) => return Ok(Some(entry)),
+			Ok(None) => {}
+			Err(error) => warn!("cache_persistence: SQLite source read failed for {source_cache_key}; falling back to legacy: {error}"),
+		}
+	}
 	let path = source_cache_path(source_cache_key);
 	let bytes = match fs::read(path) {
 		Ok(bytes) => bytes,
@@ -644,6 +912,14 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 
 #[cfg(not(test))]
 pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
+	if !post_cache::deleted_media_safety_healthy() {
+		post_cache::reset_persisted_mixed_feed_index();
+		return Err("deleted-media tombstones are unavailable; durable source indexing is disabled".to_string());
+	}
+	if let Some(entries) = crate::cache_sqlite::source_seed_entries()? {
+		post_cache::reset_persisted_mixed_feed_index();
+		return Ok(entries);
+	}
 	let mut entries = Vec::new();
 	post_cache::reset_persisted_mixed_feed_index();
 	for_each_persisted_source_cache_file_with_options(false, |file| {
@@ -769,8 +1045,10 @@ pub(crate) fn remove_source_cache_entry(source_cache_key: &str) {
 	if let Err(error) = fs::remove_file(source_cache_path(source_cache_key)) {
 		if error.kind() != std::io::ErrorKind::NotFound {
 			warn!("cache_persistence: failed to remove source cache entry {source_cache_key}: {error}");
+			return;
 		}
 	}
+	crate::cache_sqlite::shadow_remove_after_legacy(source_cache_key);
 }
 
 fn load_snapshot() -> Result<(), String> {
@@ -783,10 +1061,16 @@ fn load_snapshot() -> Result<(), String> {
 
 	let snapshot = deserialize_snapshot(&bytes)?;
 	let now_unix = unix_now();
-	crate::materialized_catalog::restore_following_discoveries(snapshot.following_discoveries);
-	post_cache::restore_persisted_state(snapshot.source_entries, snapshot.remembered_subreddits, snapshot.saved_at_unix, now_unix);
+	let durable_content_safe = post_cache::deleted_media_safety_healthy();
+	crate::materialized_catalog::restore_following_discoveries(if durable_content_safe { snapshot.following_discoveries } else { Vec::new() });
+	post_cache::restore_persisted_state(
+		if durable_content_safe { snapshot.source_entries } else { Vec::new() },
+		snapshot.remembered_subreddits,
+		snapshot.saved_at_unix,
+		now_unix,
+	);
 	crate::materialized_catalog::restore_persisted_rejected_author_redgifs_profiles(snapshot.rejected_author_redgifs_profiles, snapshot.saved_at_unix, now_unix);
-	crate::materialized_catalog::restore_persisted_author_history(snapshot.author_history, snapshot.saved_at_unix, now_unix);
+	crate::materialized_catalog::restore_persisted_author_history(if durable_content_safe { snapshot.author_history } else { Vec::new() }, snapshot.saved_at_unix, now_unix);
 	subreddit::restore_persisted_state(snapshot.subreddit_metadata, snapshot.subreddit_nsfw, snapshot.saved_at_unix, now_unix);
 	subreddit_semantics::restore_persisted_embeddings(snapshot.subreddit_semantic_embeddings, snapshot.saved_at_unix, now_unix);
 	utils::restore_persisted_state(snapshot.subreddit_flairs, snapshot.subreddit_users, snapshot.saved_at_unix, now_unix);
@@ -1042,7 +1326,8 @@ impl PersistedRefreshOrigin {
 #[cfg(test)]
 mod tests {
 	use super::{
-		deserialize_catalog_snapshot, deserialize_snapshot, serialize_catalog_snapshot, serialize_snapshot, PersistedCacheSnapshot, PersistedCacheSnapshotV2,
+		deserialize_catalog_snapshot, deserialize_deleted_media_tombstones, deserialize_snapshot, serialize_catalog_snapshot, serialize_deleted_media_tombstones,
+		serialize_snapshot, write_deleted_media_tombstones_at, write_deleted_media_tombstones_with_marker_at, PersistedCacheSnapshot, PersistedCacheSnapshotV2,
 		PersistedCacheSnapshotV3, PersistedCacheSnapshotV4WithoutFeedback, PersistedCacheSnapshotV6, PersistedCacheSnapshotV7, PersistedCacheSnapshotV8,
 		PersistedCatalogSnapshotFile, PersistedRememberedSubredditEntry, PersistedRememberedSubredditEntryWithoutFeedback, LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3,
 		LEGACY_SNAPSHOT_VERSION_V4, LEGACY_SNAPSHOT_VERSION_V7, LEGACY_SNAPSHOT_VERSION_V8, SNAPSHOT_VERSION,
@@ -1183,6 +1468,83 @@ mod tests {
 		assert!(decoded.author_history.is_empty());
 		assert!(decoded.rejected_author_redgifs_profiles.is_empty());
 		assert_eq!(decoded.following_discoveries, snapshot.following_discoveries);
+	}
+
+	#[test]
+	fn deleted_media_tombstones_round_trip_deduplicated_and_sorted() {
+		let bytes = serialize_deleted_media_tombstones(&[
+			"preview.redd.it/z.jpg".to_string(),
+			"preview.redd.it/a.jpg".to_string(),
+			"preview.redd.it/z.jpg".to_string(),
+		])
+		.unwrap();
+		assert_eq!(
+			deserialize_deleted_media_tombstones(&bytes).unwrap(),
+			vec!["preview.redd.it/a.jpg".to_string(), "preview.redd.it/z.jpg".to_string()]
+		);
+	}
+
+	#[test]
+	fn deleted_media_tombstone_file_is_atomically_replaced() {
+		let root = std::env::temp_dir().join(format!("redlib-deleted-media-test-{}", uuid::Uuid::new_v4()));
+		let path = root.join("deleted-reddit-media.v1.bin");
+		let marker = root.join("deleted-reddit-media.v1.unsafe");
+		write_deleted_media_tombstones_with_marker_at(&path, &marker, &["preview.redd.it/first.jpg".to_string()]).unwrap();
+		write_deleted_media_tombstones_with_marker_at(&path, &marker, &["preview.redd.it/first.jpg".to_string(), "preview.redd.it/second.jpg".to_string()]).unwrap();
+		assert_eq!(
+			deserialize_deleted_media_tombstones(&std::fs::read(&path).unwrap()).unwrap(),
+			vec!["preview.redd.it/first.jpg".to_string(), "preview.redd.it/second.jpg".to_string()]
+		);
+		assert!(!path.with_extension("tmp").exists());
+		assert!(!marker.exists());
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn failed_tombstone_update_leaves_restart_fail_closed_marker() {
+		let root = std::env::temp_dir().join(format!("redlib-deleted-media-unsafe-test-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		let path = root.join("deleted.bin");
+		let marker = root.join("deleted.unsafe");
+		write_deleted_media_tombstones_at(&path, &["preview.redd.it/retained.jpg".to_string()]).unwrap();
+
+		let oversized_key = "x".repeat(super::DELETED_MEDIA_MAX_KEY_BYTES + 1);
+		assert!(write_deleted_media_tombstones_with_marker_at(&path, &marker, &[oversized_key]).is_err());
+		assert!(marker.exists());
+		assert!(super::read_deleted_media_tombstones_with_marker_at(&path, &marker).is_err());
+		assert_eq!(super::read_deleted_media_tombstones_at(&path).unwrap(), vec!["preview.redd.it/retained.jpg".to_string()]);
+
+		std::fs::remove_file(&marker).unwrap();
+		std::fs::write(marker.with_extension("unsafe.tmp"), b"pending").unwrap();
+		assert!(super::read_deleted_media_tombstones_with_marker_at(&path, &marker).is_err());
+
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn deleted_media_tombstones_reject_hard_cap_overflows() {
+		let oversized_key = "x".repeat(super::DELETED_MEDIA_MAX_KEY_BYTES + 1);
+		assert!(serialize_deleted_media_tombstones(&[oversized_key]).is_err());
+		let too_many = (0..=super::DELETED_MEDIA_MAX_ENTRIES)
+			.map(|index| format!("preview.redd.it/{index}.jpg"))
+			.collect::<Vec<_>>();
+		assert!(serialize_deleted_media_tombstones(&too_many).is_err());
+		assert!(deserialize_deleted_media_tombstones(&vec![0; super::DELETED_MEDIA_FILE_MAX_BYTES as usize + 1]).is_err());
+
+		let mut malicious_count = vec![super::DELETED_MEDIA_FILE_VERSION];
+		malicious_count.extend_from_slice(&u64::MAX.to_le_bytes());
+		assert!(deserialize_deleted_media_tombstones(&malicious_count).is_err());
+
+		let mut trailing = serialize_deleted_media_tombstones(&["preview.redd.it/a.jpg".to_string()]).unwrap();
+		trailing.push(0);
+		assert!(deserialize_deleted_media_tombstones(&trailing).is_err());
+
+		let root = std::env::temp_dir().join(format!("redlib-deleted-media-cap-test-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		let path = root.join("oversized.bin");
+		std::fs::write(&path, vec![0; super::DELETED_MEDIA_FILE_MAX_BYTES as usize + 1]).unwrap();
+		assert!(super::read_deleted_media_tombstones_at(&path).is_err());
+		std::fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]

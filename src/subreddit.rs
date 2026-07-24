@@ -943,21 +943,37 @@ fn render_scraped_subreddit_fragment(
 	cacheable_first_page: bool,
 	cache_notice: &str,
 	peer_origin: &str,
+	source_refresh_token: Option<crate::post_cache::SourceRefreshToken>,
 ) -> Result<Response<Body>, String> {
-	cache_subreddit_metadata(&scraped.subreddit);
-	crate::post_components::observe_posts(
-		&scraped.posts,
-		if peer_origin.is_empty() {
-			crate::post_components::ObservationSource::Scrape
-		} else {
-			crate::post_components::ObservationSource::Peer
-		},
-		if peer_origin.is_empty() { "instance-scrape" } else { peer_origin },
-		crate::cache_persistence::unix_now(),
-	);
 	if cacheable_first_page {
-		crate::post_cache::publish_plain_subreddit_refresh(sub_name, scraped.posts.clone(), scraped.after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+		if let Some(token) = source_refresh_token {
+			let committed_subreddit = scraped.subreddit.clone();
+			crate::post_cache::publish_plain_subreddit_refresh_with_token_and_effects(
+				sub_name,
+				scraped.posts.clone(),
+				scraped.after.clone(),
+				crate::post_cache::RefreshOrigin::DirectLiveFetch,
+				if peer_origin.is_empty() {
+					crate::post_components::ObservationSource::Scrape
+				} else {
+					crate::post_components::ObservationSource::Peer
+				},
+				token,
+				move |_| cache_subreddit_metadata(&committed_subreddit),
+			);
+		}
 	} else {
+		cache_subreddit_metadata(&scraped.subreddit);
+		crate::post_components::observe_posts(
+			&scraped.posts,
+			if peer_origin.is_empty() {
+				crate::post_components::ObservationSource::Scrape
+			} else {
+				crate::post_components::ObservationSource::Peer
+			},
+			if peer_origin.is_empty() { "instance-scrape" } else { peer_origin },
+			crate::cache_persistence::unix_now(),
+		);
 		utils::store_post_flairs(&scraped.posts);
 		enqueue_direct_subreddit_embedding_activity(sub_name, &scraped.posts);
 		utils::store_subreddit_users(sub_name, &scraped.posts);
@@ -1050,6 +1066,7 @@ async fn render_peer_api_subreddit_fragment(
 	if !peer_api_fallback::peer_api_fallback_enabled() {
 		return None;
 	}
+	let refresh_token = cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.to_string(), FeedSort::New)));
 	match peer_api_fallback::fetch_subreddit_listing(sub_name, sort, query).await {
 		Ok(peer) => {
 			info!("subreddit: rendering {} via configured Redlib peer API {}", url, peer.origin);
@@ -1074,6 +1091,7 @@ async fn render_peer_api_subreddit_fragment(
 				cacheable_first_page,
 				peer_api_fallback::peer_api_notice(),
 				&peer.origin,
+				refresh_token,
 			))
 		}
 		Err(error) => {
@@ -1179,18 +1197,8 @@ fn video_mode_visibility_counts(posts: &[Post], filters: &HashSet<String>, now_u
 	(eligible, eligible_with_timestamp)
 }
 
-fn collect_cached_source_posts(sources: &[FeedSource]) -> Vec<Post> {
-	let mut posts = Vec::new();
-	for source in sources {
-		if let Some(mut cached_posts) = crate::post_cache::servable_cached_source_posts(source) {
-			posts.append(&mut cached_posts);
-		}
-	}
-	posts
-}
-
-fn collect_front_page_video_candidates(sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
-	crate::post_cache::catalog_source_candidates(sources, filters).unwrap_or_else(|| collect_cached_source_posts(sources))
+fn collect_front_page_video_candidates(profile_id: &str, view_kind: i64, sources: &[FeedSource], filters: &HashSet<String>) -> Vec<Post> {
+	crate::post_cache::catalog_profile_video_candidates(profile_id, view_kind, sources, filters)
 }
 
 async fn cached_or_live_new_subreddit_posts(subreddit: &str, quarantined: bool) -> Result<Vec<Post>, String> {
@@ -1200,8 +1208,9 @@ async fn cached_or_live_new_subreddit_posts(subreddit: &str, quarantined: bool) 
 	}
 
 	let path = format!("/r/{}/new.json?limit={}&raw_json=1", subreddit.replace('+', "%2B"), crate::post_cache::per_source_limit());
+	let refresh_token = crate::post_cache::begin_source_refresh(&source);
 	let (posts, after) = Post::fetch(&path, quarantined).await?;
-	crate::post_cache::publish_plain_subreddit_refresh(subreddit, posts.clone(), after, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+	crate::post_cache::publish_plain_subreddit_refresh_with_token(subreddit, posts.clone(), after, crate::post_cache::RefreshOrigin::DirectLiveFetch, refresh_token);
 	Ok(posts)
 }
 
@@ -2064,6 +2073,9 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let video_mode_front_page = req.param("sub").is_none() && is_video_length_sort(&sort);
 	if aggregate_front_page {
 		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
+		if let Some(profile_id) = prefs_store::request_session_id(&req) {
+			crate::post_cache::schedule_sqlite_active_profile_sync(&prefs, &profile_id);
+		}
 	}
 
 	let sub_name = req.param("sub").unwrap_or(if video_mode_front_page {
@@ -2161,7 +2173,12 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			filter_posts_by_flair(&mut cached_posts, &active_flair_filter);
 			cached_posts
 		} else {
-			collect_front_page_video_candidates(&build_video_mode_front_page_sources(&prefs, &front_page), &get_filters(&req))
+			collect_front_page_video_candidates(
+				&crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
+				if front_page_is_following { 2 } else { 1 },
+				&build_video_mode_front_page_sources(&prefs, &front_page),
+				&get_filters(&req),
+			)
 		};
 		let parsed_vm = video_mode::parse_query_or_cookie(
 			req.uri().query().unwrap_or_default(),
@@ -2209,6 +2226,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				filters: get_filters(&req),
 				quarantine: true,
 				query_fingerprint,
+				profile_id: crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
 				// Keep plain homepage reloads on the same contextual session while
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
@@ -2489,6 +2507,9 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	}
 	if aggregate_saved_feeds {
 		crate::post_cache::remember_frontpage_subreddits(&prefs, front_page_is_following);
+		if let Some(profile_id) = prefs_store::request_session_id(&req) {
+			crate::post_cache::schedule_sqlite_active_profile_sync(&prefs, &profile_id);
+		}
 	}
 	let cached_subreddit_page = if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
 		crate::post_cache::get_cached_subreddit_page(&sub_name, cache_page, crate::post_cache::POSTS_PER_PAGE)
@@ -2594,6 +2615,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			return response;
 		}
 		if instance_scrape::instance_scrape_enabled() {
+			let refresh_token = scrape_cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.clone(), FeedSort::New)));
 			if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 				return render_scraped_subreddit_fragment(
 					&req,
@@ -2611,6 +2633,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					scrape_cacheable_first_page,
 					instance_scrape::scrape_notice(),
 					"",
+					refresh_token,
 				);
 			}
 		}
@@ -2761,6 +2784,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			return response;
 		}
 		if instance_scrape::instance_scrape_enabled() {
+			let refresh_token = scrape_cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.clone(), FeedSort::New)));
 			if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 				return render_scraped_subreddit_fragment(
 					&req,
@@ -2778,6 +2802,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 					scrape_cacheable_first_page,
 					instance_scrape::scrape_notice(),
 					"",
+					refresh_token,
 				);
 			}
 		}
@@ -2855,7 +2880,12 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			filter_posts_by_flair(&mut posts, &active_flair_filter);
 			posts
 		} else if !is_subreddit_route {
-			collect_front_page_video_candidates(&build_video_mode_front_page_sources(&prefs, &front_page), &filters)
+			collect_front_page_video_candidates(
+				&crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
+				if front_page_is_following { 2 } else { 1 },
+				&build_video_mode_front_page_sources(&prefs, &front_page),
+				&filters,
+			)
 		} else {
 			Vec::new()
 		};
@@ -2890,6 +2920,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				filters: filters.clone(),
 				quarantine: quarantined,
 				query_fingerprint,
+				profile_id: crate::post_cache::sqlite_active_profile_id(&prefs, &prefs_store::request_session_id(&req).unwrap_or_default()),
 				// Keep plain homepage reloads on the same contextual session while
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
@@ -3240,9 +3271,11 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			// Fall through to normal fetch if not cached.
 		}
 
-		if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-			crate::post_cache::mark_plain_subreddit_refresh_started(&sub_name);
-		}
+		let source_refresh_token = if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
+			crate::post_cache::mark_plain_subreddit_refresh_started(&sub_name)
+		} else {
+			None
+		};
 
 		match fetch_listing_skipping_filtered_pages(&path, quarantined, &filters).await {
 			Ok(FilteredListingFetch {
@@ -3251,16 +3284,14 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				after,
 				all_posts_filtered,
 			}) => {
-				if uses_remembered_subreddit_cache && request_after.is_empty() && request_before.is_empty() {
-					crate::post_cache::publish_plain_subreddit_refresh(&sub_name, raw_posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch);
+				if let Some(token) = source_refresh_token.clone() {
+					crate::post_cache::publish_plain_subreddit_refresh_with_token(&sub_name, raw_posts.clone(), after.clone(), crate::post_cache::RefreshOrigin::DirectLiveFetch, token);
 				} else {
 					utils::store_post_flairs(&raw_posts);
 					if is_single_sub {
 						enqueue_direct_subreddit_embedding_activity(&sub_name, &raw_posts);
+						utils::store_subreddit_users(&sub_name, &raw_posts);
 					}
-				}
-				if is_single_sub {
-					utils::store_subreddit_users(&sub_name, &raw_posts);
 				}
 				filter_posts_by_flair(&mut posts, &active_flair_filter);
 				let no_posts = posts.is_empty();
@@ -3350,8 +3381,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 			}
 			Err(msg) => {
 				if let Some(reason) = (is_subreddit_route && is_single_sub).then(|| crate::client::source_unavailable_from_error(&msg)).flatten() {
-					if uses_remembered_subreddit_cache {
-						crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					if let Some(token) = source_refresh_token.clone() {
+						crate::post_cache::record_plain_subreddit_refresh_failure_with_token(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch, token);
 					}
 					return render_subreddit_source_unavailable_fragment(
 						&req,
@@ -3372,8 +3403,8 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				}
 				let can_serve_stale_single_subreddit_cache = is_single_sub && request_after.is_empty() && request_before.is_empty();
 				if can_serve_stale_single_subreddit_cache {
-					if uses_remembered_subreddit_cache {
-						crate::post_cache::record_plain_subreddit_refresh_failure(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch);
+					if let Some(token) = source_refresh_token {
+						crate::post_cache::record_plain_subreddit_refresh_failure_with_token(&sub_name, &msg, crate::post_cache::RefreshOrigin::DirectLiveFetch, token);
 					}
 					if msg.contains("oauth_unavailable") || instance_scrape::should_attempt_scrape_fallback(&msg) {
 						if let Some((mut posts, mut after, mut has_prev, mut has_next)) = crate::post_cache::get_cached_subreddit_page_with_mode(
@@ -3502,6 +3533,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 						return response;
 					}
 					if instance_scrape::instance_scrape_enabled() {
+						let refresh_token = scrape_cacheable_first_page.then(|| crate::post_cache::begin_source_refresh(&FeedSource::subreddit(sub_name.clone(), FeedSort::New)));
 						if let Ok(scraped) = instance_scrape::scrape_subreddit_page(&req_url).await {
 							return render_scraped_subreddit_fragment(
 								&req,
@@ -3519,6 +3551,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 								scrape_cacheable_first_page,
 								instance_scrape::scrape_notice(),
 								"",
+								refresh_token,
 							);
 						}
 					}

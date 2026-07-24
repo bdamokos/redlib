@@ -2041,6 +2041,7 @@ dependencies = [
  "uuid",
  "wreq",
  "wreq-util",
+ "zstd",
 ]
 
 [[package]]
