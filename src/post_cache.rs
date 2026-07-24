@@ -557,6 +557,8 @@ static DELETED_MEDIA_TOMBSTONES: LazyLock<Mutex<HashSet<String>>> = LazyLock::ne
 static DELETED_MEDIA_PERSIST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static DELETED_MEDIA_SAFETY_HEALTHY: AtomicBool = AtomicBool::new(true);
 #[cfg(test)]
+static TEST_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
 static TEST_DURABLE_WRITE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static TEST_DURABLE_WRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -3359,6 +3361,11 @@ pub(crate) fn deleted_media_tombstone_asset_keys() -> Vec<String> {
 	keys
 }
 
+#[cfg(test)]
+pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+	TEST_STATE_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 fn prune_known_deleted_media_from_posts(posts: &mut Vec<Post>) -> bool {
 	let deleted_asset_keys = {
 		let tombstones = DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|error| error.into_inner());
@@ -4524,20 +4531,18 @@ mod tests {
 		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS,
 		REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
 		REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT,
-		TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS,
+		TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_WRITE_FAIL,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 	use std::cmp::Ordering;
 	use std::collections::{HashMap, HashSet};
 	use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-	use std::sync::{Arc, Barrier, LazyLock, Mutex, MutexGuard};
+	use std::sync::{Arc, Barrier, MutexGuard};
 	use std::time::{Duration, Instant};
 
-	static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 	fn test_lock() -> MutexGuard<'static, ()> {
-		TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+		super::test_state_lock()
 	}
 
 	fn reset_test_caches() {
@@ -4553,6 +4558,7 @@ mod tests {
 		TEST_DURABLE_WRITE_ACTIVE.store(false, AtomicOrdering::SeqCst);
 		TEST_DURABLE_WRITE_COUNT.store(0, AtomicOrdering::SeqCst);
 		TEST_DURABLE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
+		TEST_TOMBSTONE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
 		TEST_PRUNE_REMOVE_DELAY_MS.store(0, AtomicOrdering::SeqCst);
 		TEST_PRUNE_REMOVE_ACTIVE.store(false, AtomicOrdering::SeqCst);
 		crate::materialized_catalog::reset_catalog();
@@ -7301,6 +7307,31 @@ mod tests {
 			.is_empty());
 		assert!(!super::deleted_media_safety_healthy());
 		TEST_DURABLE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
+	}
+
+	#[test]
+	fn deleted_media_tombstone_write_failure_latches_reads_and_keeps_pruned_ram() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		let mut deleted = test_post("resident-sidecar", "rust", 300);
+		deleted.post_type = "image".to_string();
+		deleted.media.url = "https://preview.redd.it/deleted-sidecar-failure.jpg?width=640&format=pjpg".to_string();
+		seed_source(&source, vec![deleted]);
+		TEST_TOMBSTONE_WRITE_FAIL.store(true, AtomicOrdering::SeqCst);
+		assert_eq!(
+			mark_deleted_reddit_media_url("https://preview.redd.it/deleted-sidecar-failure.jpg?width=640&format=pjpg"),
+			1
+		);
+		assert!(SOURCE_CACHE
+			.lock()
+			.unwrap_or_else(|error| error.into_inner())
+			.get(&source.cache_key())
+			.unwrap()
+			.posts
+			.is_empty());
+		assert!(!super::deleted_media_safety_healthy());
+		TEST_TOMBSTONE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
 	}
 
 	#[test]

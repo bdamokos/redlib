@@ -815,6 +815,9 @@ pub(crate) fn write_source_cache_entry(source_cache_key: &str, entry: &Persisted
 
 #[cfg(not(test))]
 pub(crate) fn read_source_cache_entry(source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, String> {
+	if !post_cache::deleted_media_safety_healthy() {
+		return Err("deleted-media tombstones are unavailable; durable source reads are disabled".to_string());
+	}
 	if crate::cache_sqlite::reads_enabled() {
 		match crate::cache_sqlite::read_source(source_cache_key) {
 			Ok(Some(entry)) => return Ok(Some(entry)),

@@ -3519,6 +3519,7 @@ mod tests {
 
 	#[test]
 	fn tombstone_revision_reimports_checksum_unchanged_sources_and_profile_entries() {
+		let _guard = crate::post_cache::test_state_lock();
 		let root = std::env::temp_dir().join(format!("redlib-cache-sqlite-tombstone-test-{}", uuid::Uuid::new_v4()));
 		let source_dir = root.join("sources.v2");
 		fs::create_dir_all(&source_dir).unwrap();
