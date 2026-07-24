@@ -4351,16 +4351,16 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 #[cfg(test)]
 mod tests {
 	use super::{
-		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, begin_source_refresh,
-		build_session_id, cache_status_for_preferences, catalog_source_candidates, cleanup_decayed_remembered_subreddits, continue_feed_session_with_budget,
+		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, begin_remembered_source_refresh,
+		begin_source_refresh, build_session_id, cache_status_for_preferences, catalog_source_candidates, cleanup_decayed_remembered_subreddits, continue_feed_session_with_budget,
 		count_sources_in_state, daemon_should_continue_after_refresh, effective_freshness_target_secs, enforce_source_cache_limits_locked, ensure_feed_session_with_budget,
 		feed_page, feed_status, followup_source_budget, freeze_feed_page, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
-		mark_deleted_reddit_media_url, mark_fetching_sources_failed, mark_remembered_source_refresh_started, max_sync_source_budget, merged_posts_for_session,
-		merged_posts_for_session_live, pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh,
-		plan_session_warm_mode, predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh,
-		publish_remembered_source_refresh_with_token, random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure,
-		record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal, record_remembered_source_refresh_failure_with_token, remember_flair_request,
-		remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries,
+		mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
+		pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
+		predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh, publish_remembered_source_refresh_with_token,
+		random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
+		record_remembered_feed_visit_signal, record_remembered_source_refresh_failure_with_token, remember_flair_request, remember_frontpage_subreddits,
+		remember_subreddit_request, remembered_refresh_priority_at, resolve_source_refresh_result, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries,
 		seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
 		snapshot_persisted_source_entries, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target,
 		source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin,
@@ -6889,9 +6889,8 @@ mod tests {
 		reset_test_caches();
 		let source = new_source("rust");
 		remember_subreddit_request("rust");
-		mark_remembered_source_refresh_started(&source);
-		let older = begin_source_refresh(&source);
-		let newer = begin_source_refresh(&source);
+		let older = begin_remembered_source_refresh(&source);
+		let newer = begin_remembered_source_refresh(&source);
 		assert_eq!(
 			publish_remembered_source_refresh_with_token(&source, vec![test_post("older", "rust", 100)], String::new(), RefreshOrigin::DirectLiveFetch, older,),
 			SourceRefreshOutcome::Stale
@@ -6913,9 +6912,8 @@ mod tests {
 		reset_test_caches();
 		let source = new_source("rust");
 		remember_subreddit_request("rust");
-		mark_remembered_source_refresh_started(&source);
-		let older = begin_source_refresh(&source);
-		let newer = begin_source_refresh(&source);
+		let older = begin_remembered_source_refresh(&source);
+		let newer = begin_remembered_source_refresh(&source);
 		assert_eq!(
 			publish_remembered_source_refresh_with_token(&source, vec![test_post("newer", "rust", 200)], String::new(), RefreshOrigin::DirectLiveFetch, newer,),
 			SourceRefreshOutcome::Committed
@@ -6937,8 +6935,7 @@ mod tests {
 		reset_test_caches();
 		let source = new_source("rust");
 		remember_subreddit_request("rust");
-		mark_remembered_source_refresh_started(&source);
-		let token = begin_source_refresh(&source);
+		let token = begin_remembered_source_refresh(&source);
 		TEST_DURABLE_WRITE_FAIL.store(true, AtomicOrdering::SeqCst);
 		assert_eq!(
 			publish_remembered_source_refresh_with_token(&source, vec![test_post("failed", "rust", 100)], String::new(), RefreshOrigin::Daemon, token,),
@@ -6951,6 +6948,27 @@ mod tests {
 		assert!(entry.last_refresh_failed_at.is_some());
 		assert!(!entry.refresh_in_flight);
 		assert!(SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).is_none());
+	}
+
+	#[test]
+	fn stale_or_failed_publication_returns_only_an_authoritative_window() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		seed_source(&source, vec![test_post("authoritative", "rust", 100)]);
+		let mut candidate = SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).cloned().unwrap();
+		candidate.posts = vec![test_post("unpublished", "rust", 200)];
+
+		let stale = resolve_source_refresh_result(&source, SourceRefreshOutcome::Stale, candidate.clone()).unwrap();
+		assert_eq!(stale.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["authoritative"]);
+		let failed = resolve_source_refresh_result(&source, SourceRefreshOutcome::Failed, candidate.clone()).unwrap();
+		assert_eq!(failed.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["authoritative"]);
+		let committed = resolve_source_refresh_result(&source, SourceRefreshOutcome::Committed, candidate.clone()).unwrap();
+		assert_eq!(committed.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["unpublished"]);
+
+		SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).clear();
+		assert!(resolve_source_refresh_result(&source, SourceRefreshOutcome::Stale, candidate.clone()).is_err());
+		assert!(resolve_source_refresh_result(&source, SourceRefreshOutcome::Failed, candidate).is_err());
 	}
 
 	#[test]

@@ -2827,15 +2827,8 @@ mod tests {
 				Ok(0)
 			})
 			.unwrap();
-		let mut statement = connection
-			.prepare("SELECT interrupt_shadow_read() FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3)")
-			.unwrap();
-		let interrupted = statement
-			.query([])
-			.unwrap()
-			.mapped(|row| row.get::<_, i64>(0))
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap_err();
+		let mut statement = connection.prepare("SELECT interrupt_shadow_read() FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3)").unwrap();
+		let interrupted = statement.query([]).unwrap().mapped(|row| row.get::<_, i64>(0)).collect::<Result<Vec<_>, _>>().unwrap_err();
 		assert_eq!(interrupted.sqlite_error_code(), Some(rusqlite::ErrorCode::OperationInterrupted));
 		assert!(!sqlite_read_error_requires_latch(&ShadowReadError::Sqlite(interrupted)));
 
