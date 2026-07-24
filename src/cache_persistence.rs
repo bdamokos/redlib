@@ -28,6 +28,9 @@ const SNAPSHOT_FILE_NAME: &str = "subreddit-cache.v2.bin";
 const SOURCE_CACHE_DIR_NAME: &str = "sources.v2";
 const DELETED_MEDIA_FILE_NAME: &str = "deleted-reddit-media.v1.bin";
 const DELETED_MEDIA_FILE_VERSION: u8 = 1;
+const DELETED_MEDIA_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const DELETED_MEDIA_MAX_ENTRIES: usize = 65_536;
+pub(crate) const DELETED_MEDIA_MAX_KEY_BYTES: usize = 512;
 #[cfg(not(test))]
 const LEGACY_SOURCE_CACHE_DIR_NAME: &str = "sources.v1";
 const DEFAULT_CACHE_DIR: &str = "/var/lib/redlib/cache";
@@ -523,17 +526,26 @@ fn serialize_deleted_media_tombstones(asset_keys: &[String]) -> Result<Vec<u8>, 
 	let mut asset_keys = asset_keys.to_vec();
 	asset_keys.sort();
 	asset_keys.dedup();
-	bincode::serialize(&PersistedDeletedMediaTombstones {
+	validate_deleted_media_tombstones(&asset_keys)?;
+	let bytes = bincode::serialize(&PersistedDeletedMediaTombstones {
 		version: DELETED_MEDIA_FILE_VERSION,
 		asset_keys,
 	})
-	.map_err(|error| error.to_string())
+	.map_err(|error| error.to_string())?;
+	if bytes.len() as u64 > DELETED_MEDIA_FILE_MAX_BYTES {
+		return Err(format!("deleted-media tombstone file exceeds {DELETED_MEDIA_FILE_MAX_BYTES} bytes"));
+	}
+	Ok(bytes)
 }
 
 fn deserialize_deleted_media_tombstones(bytes: &[u8]) -> Result<Vec<String>, String> {
+	if bytes.len() as u64 > DELETED_MEDIA_FILE_MAX_BYTES {
+		return Err(format!("deleted-media tombstone file exceeds {DELETED_MEDIA_FILE_MAX_BYTES} bytes"));
+	}
+	validate_deleted_media_tombstone_wire(bytes)?;
 	let mut tombstones = bincode::DefaultOptions::new()
 		.with_fixint_encoding()
-		.allow_trailing_bytes()
+		.reject_trailing_bytes()
 		.with_limit(bytes.len() as u64)
 		.deserialize::<PersistedDeletedMediaTombstones>(bytes)
 		.map_err(|error| error.to_string())?;
@@ -543,13 +555,71 @@ fn deserialize_deleted_media_tombstones(bytes: &[u8]) -> Result<Vec<String>, Str
 	tombstones.asset_keys.retain(|key| !key.trim().is_empty());
 	tombstones.asset_keys.sort();
 	tombstones.asset_keys.dedup();
+	validate_deleted_media_tombstones(&tombstones.asset_keys)?;
 	Ok(tombstones.asset_keys)
 }
 
+fn validate_deleted_media_tombstone_wire(bytes: &[u8]) -> Result<(), String> {
+	const U64_BYTES: usize = std::mem::size_of::<u64>();
+	if bytes.len() < 1 + U64_BYTES {
+		return Err("deleted-media tombstone file is truncated".to_string());
+	}
+	let mut offset = 1usize;
+	let read_len = |offset: &mut usize| -> Result<usize, String> {
+		let end = offset
+			.checked_add(U64_BYTES)
+			.filter(|end| *end <= bytes.len())
+			.ok_or_else(|| "deleted-media tombstone length is truncated".to_string())?;
+		let encoded: [u8; U64_BYTES] = bytes[*offset..end].try_into().map_err(|_| "invalid tombstone length".to_string())?;
+		*offset = end;
+		usize::try_from(u64::from_le_bytes(encoded)).map_err(|_| "deleted-media tombstone length exceeds address space".to_string())
+	};
+	let count = read_len(&mut offset)?;
+	if count > DELETED_MEDIA_MAX_ENTRIES {
+		return Err(format!("deleted-media tombstone count {count} exceeds {DELETED_MEDIA_MAX_ENTRIES}"));
+	}
+	for _ in 0..count {
+		let key_len = read_len(&mut offset)?;
+		if key_len > DELETED_MEDIA_MAX_KEY_BYTES {
+			return Err(format!("deleted-media tombstone key length {key_len} exceeds {DELETED_MEDIA_MAX_KEY_BYTES}"));
+		}
+		offset = offset
+			.checked_add(key_len)
+			.filter(|end| *end <= bytes.len())
+			.ok_or_else(|| "deleted-media tombstone key is truncated".to_string())?;
+	}
+	if offset != bytes.len() {
+		return Err("deleted-media tombstone file has trailing bytes".to_string());
+	}
+	Ok(())
+}
+
+fn validate_deleted_media_tombstones(asset_keys: &[String]) -> Result<(), String> {
+	if asset_keys.len() > DELETED_MEDIA_MAX_ENTRIES {
+		return Err(format!("deleted-media tombstone count {} exceeds {DELETED_MEDIA_MAX_ENTRIES}", asset_keys.len()));
+	}
+	if let Some(key) = asset_keys.iter().find(|key| key.len() > DELETED_MEDIA_MAX_KEY_BYTES) {
+		return Err(format!("deleted-media tombstone key length {} exceeds {DELETED_MEDIA_MAX_KEY_BYTES}", key.len()));
+	}
+	Ok(())
+}
+
 pub(crate) fn read_deleted_media_tombstones() -> Result<Vec<String>, String> {
-	let bytes = match fs::read(deleted_media_tombstones_path()) {
-		Ok(bytes) => bytes,
+	let path = deleted_media_tombstones_path();
+	let metadata = match fs::metadata(&path) {
+		Ok(metadata) => metadata,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => return Err(error.to_string()),
+	};
+	if metadata.len() > DELETED_MEDIA_FILE_MAX_BYTES {
+		return Err(format!(
+			"deleted-media tombstone file {} is {} bytes; maximum is {DELETED_MEDIA_FILE_MAX_BYTES}",
+			path.display(),
+			metadata.len()
+		));
+	}
+	let bytes = match fs::read(path) {
+		Ok(bytes) => bytes,
 		Err(error) => return Err(error.to_string()),
 	};
 	deserialize_deleted_media_tombstones(&bytes)
@@ -627,12 +697,21 @@ pub fn init() {
 	if let Err(error) = fs::create_dir_all(cache_dir()) {
 		warn!("cache_persistence: failed to create cache dir: {error}");
 	}
-	match read_deleted_media_tombstones() {
-		Ok(asset_keys) => post_cache::restore_deleted_media_tombstones(asset_keys),
-		Err(error) => warn!("cache_persistence: failed to load deleted-media tombstones: {error}"),
-	}
-	if let Err(error) = crate::cache_sqlite::init(Path::new(&cache_dir())) {
-		warn!("cache_persistence: SQLite shadow initialization failed; legacy cache remains authoritative: {error}");
+	let deleted_media_safety_ready = match read_deleted_media_tombstones() {
+		Ok(asset_keys) => {
+			post_cache::restore_deleted_media_tombstones(asset_keys);
+			true
+		}
+		Err(error) => {
+			post_cache::mark_deleted_media_safety_unhealthy();
+			warn!("cache_persistence: failed to load deleted-media tombstones; durable cache reads remain disabled: {error}");
+			false
+		}
+	};
+	if deleted_media_safety_ready {
+		if let Err(error) = crate::cache_sqlite::init(Path::new(&cache_dir())) {
+			warn!("cache_persistence: SQLite shadow initialization failed; legacy cache remains authoritative: {error}");
+		}
 	}
 
 	let mut persist_startup_recovery = false;
@@ -759,6 +838,10 @@ pub(crate) fn source_cache_entry_exists(source_cache_key: &str) -> bool {
 
 #[cfg(not(test))]
 pub(crate) fn source_cache_seed_entries() -> Result<Vec<(String, u64)>, String> {
+	if !post_cache::deleted_media_safety_healthy() {
+		post_cache::reset_persisted_mixed_feed_index();
+		return Err("deleted-media tombstones are unavailable; durable source indexing is disabled".to_string());
+	}
 	if let Some(entries) = crate::cache_sqlite::source_seed_entries()? {
 		post_cache::reset_persisted_mixed_feed_index();
 		return Ok(entries);
@@ -904,10 +987,16 @@ fn load_snapshot() -> Result<(), String> {
 
 	let snapshot = deserialize_snapshot(&bytes)?;
 	let now_unix = unix_now();
-	crate::materialized_catalog::restore_following_discoveries(snapshot.following_discoveries);
-	post_cache::restore_persisted_state(snapshot.source_entries, snapshot.remembered_subreddits, snapshot.saved_at_unix, now_unix);
+	let durable_content_safe = post_cache::deleted_media_safety_healthy();
+	crate::materialized_catalog::restore_following_discoveries(if durable_content_safe { snapshot.following_discoveries } else { Vec::new() });
+	post_cache::restore_persisted_state(
+		if durable_content_safe { snapshot.source_entries } else { Vec::new() },
+		snapshot.remembered_subreddits,
+		snapshot.saved_at_unix,
+		now_unix,
+	);
 	crate::materialized_catalog::restore_persisted_rejected_author_redgifs_profiles(snapshot.rejected_author_redgifs_profiles, snapshot.saved_at_unix, now_unix);
-	crate::materialized_catalog::restore_persisted_author_history(snapshot.author_history, snapshot.saved_at_unix, now_unix);
+	crate::materialized_catalog::restore_persisted_author_history(if durable_content_safe { snapshot.author_history } else { Vec::new() }, snapshot.saved_at_unix, now_unix);
 	subreddit::restore_persisted_state(snapshot.subreddit_metadata, snapshot.subreddit_nsfw, snapshot.saved_at_unix, now_unix);
 	subreddit_semantics::restore_persisted_embeddings(snapshot.subreddit_semantic_embeddings, snapshot.saved_at_unix, now_unix);
 	utils::restore_persisted_state(snapshot.subreddit_flairs, snapshot.subreddit_users, snapshot.saved_at_unix, now_unix);
@@ -1333,6 +1422,25 @@ mod tests {
 		);
 		assert!(!path.with_extension("tmp").exists());
 		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn deleted_media_tombstones_reject_hard_cap_overflows() {
+		let oversized_key = "x".repeat(super::DELETED_MEDIA_MAX_KEY_BYTES + 1);
+		assert!(serialize_deleted_media_tombstones(&[oversized_key]).is_err());
+		let too_many = (0..=super::DELETED_MEDIA_MAX_ENTRIES)
+			.map(|index| format!("preview.redd.it/{index}.jpg"))
+			.collect::<Vec<_>>();
+		assert!(serialize_deleted_media_tombstones(&too_many).is_err());
+		assert!(deserialize_deleted_media_tombstones(&vec![0; super::DELETED_MEDIA_FILE_MAX_BYTES as usize + 1]).is_err());
+
+		let mut malicious_count = vec![super::DELETED_MEDIA_FILE_VERSION];
+		malicious_count.extend_from_slice(&u64::MAX.to_le_bytes());
+		assert!(deserialize_deleted_media_tombstones(&malicious_count).is_err());
+
+		let mut trailing = serialize_deleted_media_tombstones(&["preview.redd.it/a.jpg".to_string()]).unwrap();
+		trailing.push(0);
+		assert!(deserialize_deleted_media_tombstones(&trailing).is_err());
 	}
 
 	#[test]

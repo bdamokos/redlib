@@ -784,7 +784,39 @@ fn source_descriptors(cache_dir: &Path) -> Result<Vec<SourceDescriptor>, String>
 	Ok(descriptors)
 }
 
+fn deleted_media_tombstone_revision() -> Vec<u8> {
+	let mut digest = Sha256::new();
+	for key in crate::post_cache::deleted_media_tombstone_asset_keys() {
+		digest.update((key.len() as u64).to_be_bytes());
+		digest.update(key.as_bytes());
+	}
+	digest.finalize().to_vec()
+}
+
+fn reconcile_deleted_media_tombstone_revision(connection: &mut Connection) -> Result<(), String> {
+	let revision = deleted_media_tombstone_revision();
+	let transaction = connection.transaction().map_err(|error| error.to_string())?;
+	let previous = transaction
+		.query_row("SELECT value FROM cache_meta WHERE key='deleted_media_tombstone_revision'", [], |row| {
+			row.get::<_, Vec<u8>>(0)
+		})
+		.optional()
+		.map_err(|error| error.to_string())?;
+	if previous.as_deref() != Some(revision.as_slice()) {
+		transaction.execute("UPDATE migration_sources SET status=0", []).map_err(|error| error.to_string())?;
+		transaction
+			.execute(
+				"INSERT INTO cache_meta(key,value) VALUES('deleted_media_tombstone_revision',?1)
+				 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+				[revision],
+			)
+			.map_err(|error| error.to_string())?;
+	}
+	transaction.commit().map_err(|error| error.to_string())
+}
+
 fn import_legacy_sources(connection: &mut Connection, cache_dir: &Path, payload_codec: PayloadCodec) -> Result<ImportStats, String> {
+	reconcile_deleted_media_tombstone_revision(connection)?;
 	let descriptors = source_descriptors(cache_dir)?;
 	let batch_size = configured_migration_batch_sources()?;
 	let mut stats = ImportStats {
@@ -3481,6 +3513,38 @@ mod tests {
 		assert_eq!((third.imported_sources, third.skipped_sources), (1, 1));
 		let baselines: i64 = connection.query_row("SELECT COUNT(DISTINCT discovery_seq) FROM objects", [], |row| row.get(0)).unwrap();
 		assert_eq!(baselines, 1);
+		drop(connection);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn tombstone_revision_reimports_checksum_unchanged_sources_and_profile_entries() {
+		let root = std::env::temp_dir().join(format!("redlib-cache-sqlite-tombstone-test-{}", uuid::Uuid::new_v4()));
+		let source_dir = root.join("sources.v2");
+		fs::create_dir_all(&source_dir).unwrap();
+		let cache_key = "subreddit:tombstone_revision_test:new";
+		let source_path = source_dir.join(format!("{}.bin", URL_SAFE_NO_PAD.encode(cache_key)));
+		let mut deleted = post("deleted-reimport", 30);
+		deleted.post_type = "image".to_string();
+		deleted.media.url = "https://preview.redd.it/deleted-reimport.jpg?width=640&format=pjpg".to_string();
+		fs::write(&source_path, bincode::serialize(&source(vec![deleted], None)).unwrap()).unwrap();
+
+		crate::post_cache::restore_deleted_media_tombstones(Vec::new());
+		let mut connection = open_database(&root.join("cache.sqlite3")).unwrap();
+		assert_eq!(import_legacy_sources(&mut connection, &root, PayloadCodec::Raw).unwrap().imported_sources, 1);
+		let profile = b"tombstone-revision-profile";
+		sync_active_profile_on(&mut connection, profile, &[(cache_key.to_string(), 0)]).unwrap();
+		let before = query_profile_timeline_on(&connection, profile, 1, TimelineSort::New, None, 25, &HashSet::new()).unwrap();
+		assert_eq!(before.posts[0].post_type, "image");
+
+		crate::post_cache::restore_deleted_media_tombstones(vec!["preview.redd.it/deleted-reimport.jpg".to_string()]);
+		let reapplied = import_legacy_sources(&mut connection, &root, PayloadCodec::Raw).unwrap();
+		assert_eq!((reapplied.imported_sources, reapplied.skipped_sources), (1, 0));
+		assert!(read_source_on(&connection, cache_key).unwrap().unwrap().posts.is_empty());
+		let after = query_profile_timeline_on(&connection, profile, 1, TimelineSort::New, None, 25, &HashSet::new()).unwrap();
+		assert!(after.posts.is_empty());
+
+		crate::post_cache::restore_deleted_media_tombstones(Vec::new());
 		drop(connection);
 		fs::remove_dir_all(root).unwrap();
 	}

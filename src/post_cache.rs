@@ -14,9 +14,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Instant;
 use tokio::time::{Duration, MissedTickBehavior};
@@ -265,27 +263,30 @@ struct CachedSourcePosts {
 pub(crate) struct SourceRefreshToken {
 	cache_key: String,
 	generation: u64,
-	state: Arc<Mutex<u64>>,
-	remembered_key: Option<String>,
-	lifecycle: Arc<()>,
+	lifecycle: Arc<SourceRefreshLifecycle>,
 }
 
-impl Drop for SourceRefreshToken {
+struct SourceRefreshLifecycle {
+	cache_key: String,
+	generation: u64,
+	state: Arc<Mutex<u64>>,
+	remembered_key: Option<String>,
+}
+
+impl Drop for SourceRefreshLifecycle {
 	fn drop(&mut self) {
 		let mut remembered_changed = false;
-		if Arc::strong_count(&self.lifecycle) == 1 {
-			let current_generation = self.state.lock().unwrap_or_else(|error| error.into_inner());
-			if *current_generation == self.generation {
-				if let Some(remembered_key) = self.remembered_key.as_ref() {
-					let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
-					if let Some(entry) = remembered.get_mut(remembered_key) {
-						remembered_changed = entry.refresh_in_flight;
-						entry.refresh_in_flight = false;
-					}
+		let current_generation = self.state.lock().unwrap_or_else(|error| error.into_inner());
+		if *current_generation == self.generation {
+			if let Some(remembered_key) = self.remembered_key.as_ref() {
+				let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
+				if let Some(entry) = remembered.get_mut(remembered_key) {
+					remembered_changed = entry.refresh_in_flight;
+					entry.refresh_in_flight = false;
 				}
 			}
-			drop(current_generation);
 		}
+		drop(current_generation);
 		if remembered_changed {
 			crate::cache_persistence::mark_dirty();
 		}
@@ -554,6 +555,7 @@ static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>
 static SOURCE_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
 static DELETED_MEDIA_TOMBSTONES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static DELETED_MEDIA_PERSIST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static DELETED_MEDIA_SAFETY_HEALTHY: AtomicBool = AtomicBool::new(true);
 #[cfg(test)]
 static TEST_DURABLE_WRITE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -562,6 +564,8 @@ static TEST_DURABLE_WRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TEST_DURABLE_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static TEST_DURABLE_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_TOMBSTONE_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_PRUNE_REMOVE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -1120,6 +1124,9 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 	}
 	#[cfg(not(test))]
 	{
+		if !deleted_media_safety_healthy() {
+			return None;
+		}
 		let cache_key = source.cache_key();
 		let refresh_state = source_refresh_state(&cache_key);
 		let refresh_guard = refresh_state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1153,6 +1160,7 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 		if deleted_media_changed {
 			persisted.posts = posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect();
 			if let Err(error) = crate::cache_persistence::write_source_cache_entry(&cache_key, &persisted) {
+				mark_deleted_media_safety_unhealthy();
 				warn!(
 					"post_cache: refusing to publish source {} after deleted-media pruning could not be persisted: {}",
 					source.display_name(),
@@ -1409,13 +1417,13 @@ fn begin_source_refresh_with_remembered_state(source: &FeedSource) -> SourceRefr
 		let remembered_key = mark_remembered_source_refresh_started(source);
 		(*current, remembered_key)
 	};
-	SourceRefreshToken {
-		cache_key,
+	let lifecycle = Arc::new(SourceRefreshLifecycle {
+		cache_key: cache_key.clone(),
 		generation,
-		state,
+		state: Arc::clone(&state),
 		remembered_key,
-		lifecycle: Arc::new(()),
-	}
+	});
+	SourceRefreshToken { cache_key, generation, lifecycle }
 }
 
 fn should_evict_resident_source_entry(entry: &CachedSourcePosts) -> bool {
@@ -1558,7 +1566,7 @@ where
 		);
 		return SourceRefreshOutcome::Stale;
 	}
-	let current_generation = token.state.lock().unwrap_or_else(|error| error.into_inner());
+	let current_generation = token.lifecycle.state.lock().unwrap_or_else(|error| error.into_inner());
 	if *current_generation != token.generation {
 		info!(
 			"post_cache: discarded stale source refresh for {} (generation {} < {})",
@@ -1823,7 +1831,7 @@ fn record_remembered_source_refresh_failure_with_token(source: &FeedSource, erro
 	if token.cache_key != source.cache_key() {
 		return SourceRefreshOutcome::Stale;
 	}
-	let current_generation = token.state.lock().unwrap_or_else(|lock_error| lock_error.into_inner());
+	let current_generation = token.lifecycle.state.lock().unwrap_or_else(|lock_error| lock_error.into_inner());
 	if *current_generation != token.generation {
 		return SourceRefreshOutcome::Stale;
 	}
@@ -2055,6 +2063,10 @@ pub(crate) fn restore_persisted_state(
 }
 
 pub(crate) fn rebuild_materialized_catalog_from_source_cache() {
+	if !deleted_media_safety_healthy() {
+		materialized_catalog::reset_source_catalog_preserving_author_history();
+		return;
+	}
 	prune_source_cache();
 	let sources = SOURCE_CACHE
 		.lock()
@@ -3288,23 +3300,63 @@ fn record_deleted_media_tombstone(deleted_asset_key: &str) {
 		tombstones.iter().cloned().collect::<Vec<_>>()
 	};
 	if !snapshot.iter().any(|key| key == deleted_asset_key) {
+		if deleted_asset_key.len() > crate::cache_persistence::DELETED_MEDIA_MAX_KEY_BYTES || snapshot.len() >= crate::cache_persistence::DELETED_MEDIA_MAX_ENTRIES {
+			mark_deleted_media_safety_unhealthy();
+			warn!("post_cache: deleted-media tombstone bounds exhausted; durable cache reads are disabled");
+			return;
+		}
 		snapshot.push(deleted_asset_key.to_string());
 	}
-	#[cfg(not(test))]
-	if let Err(error) = crate::cache_persistence::write_deleted_media_tombstones(&snapshot) {
-		warn!("post_cache: failed to persist deleted-media tombstone: {error}");
+	if let Err(error) = persist_deleted_media_tombstone_snapshot(&snapshot) {
+		mark_deleted_media_safety_unhealthy();
+		warn!("post_cache: failed to persist deleted-media tombstone; durable cache reads are disabled: {error}");
 	}
-	#[cfg(test)]
-	let _ = snapshot;
 	DELETED_MEDIA_TOMBSTONES
 		.lock()
 		.unwrap_or_else(|error| error.into_inner())
 		.insert(deleted_asset_key.to_string());
 }
 
+fn persist_deleted_media_tombstone_snapshot(snapshot: &[String]) -> Result<(), String> {
+	#[cfg(not(test))]
+	{
+		crate::cache_persistence::write_deleted_media_tombstones(snapshot)
+	}
+	#[cfg(test)]
+	{
+		let _ = snapshot;
+		if TEST_TOMBSTONE_WRITE_FAIL.load(AtomicOrdering::SeqCst) {
+			Err("injected deleted-media tombstone write failure".to_string())
+		} else {
+			Ok(())
+		}
+	}
+}
+
 pub(crate) fn restore_deleted_media_tombstones(asset_keys: Vec<String>) {
 	let mut tombstones = DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|error| error.into_inner());
 	*tombstones = asset_keys.into_iter().filter(|key| !key.trim().is_empty()).collect();
+	DELETED_MEDIA_SAFETY_HEALTHY.store(true, AtomicOrdering::Release);
+}
+
+pub(crate) fn mark_deleted_media_safety_unhealthy() {
+	DELETED_MEDIA_SAFETY_HEALTHY.store(false, AtomicOrdering::Release);
+	crate::cache_sqlite::mark_reads_unhealthy();
+}
+
+pub(crate) fn deleted_media_safety_healthy() -> bool {
+	DELETED_MEDIA_SAFETY_HEALTHY.load(AtomicOrdering::Acquire)
+}
+
+pub(crate) fn deleted_media_tombstone_asset_keys() -> Vec<String> {
+	let mut keys = DELETED_MEDIA_TOMBSTONES
+		.lock()
+		.unwrap_or_else(|error| error.into_inner())
+		.iter()
+		.cloned()
+		.collect::<Vec<_>>();
+	keys.sort();
+	keys
 }
 
 fn prune_known_deleted_media_from_posts(posts: &mut Vec<Post>) -> bool {
@@ -3338,6 +3390,10 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 	};
 
 	record_deleted_media_tombstone(&deleted_asset_key);
+	// Existing SQLite payload/materialized rows may predate this tombstone.
+	// Close the optional read cutover immediately; restart revalidates the
+	// migration against the durable tombstone revision before reopening reads.
+	crate::cache_sqlite::mark_reads_unhealthy();
 	// Include first fetches that have not published a resident source yet. A
 	// commit already in progress finishes before its generation is invalidated
 	// and is then included in the resident snapshot below; a network fetch still
@@ -3365,7 +3421,10 @@ pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
 		if result.changed {
 			*generation = (*generation).saturating_add(1);
 		}
-		if result.changed && write_source_entry_to_disk(&cache_key, &updated_entry) {
+		if result.changed {
+			if !write_source_entry_to_disk(&cache_key, &updated_entry) {
+				mark_deleted_media_safety_unhealthy();
+			}
 			removed_primary_media += result.primary_media_removed;
 			removed_posts += result.posts_removed;
 			if materialized_catalog::source_is_supported(&updated_entry.source) {
@@ -4461,18 +4520,18 @@ mod tests {
 		store_source_posts_with_token, store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession,
 		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry,
 		SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES,
-		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, DELETED_MEDIA_TOMBSTONES, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS,
-		MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS,
-		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION,
-		SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE,
-		TEST_PRUNE_REMOVE_DELAY_MS,
+		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES,
+		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS,
+		REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
+		REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT,
+		TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 	use std::cmp::Ordering;
 	use std::collections::{HashMap, HashSet};
 	use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-	use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+	use std::sync::{Arc, Barrier, LazyLock, Mutex, MutexGuard};
 	use std::time::{Duration, Instant};
 
 	static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -4488,6 +4547,7 @@ mod tests {
 		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		DELETED_MEDIA_SAFETY_HEALTHY.store(true, AtomicOrdering::Release);
 		SOURCE_CACHE_REVISION.store(0, AtomicOrdering::Relaxed);
 		TEST_DURABLE_WRITE_DELAY_MS.store(0, AtomicOrdering::SeqCst);
 		TEST_DURABLE_WRITE_ACTIVE.store(false, AtomicOrdering::SeqCst);
@@ -7038,6 +7098,30 @@ mod tests {
 	}
 
 	#[test]
+	fn concurrent_last_token_clone_drops_clear_remembered_bookkeeping_once() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+		let first = begin_remembered_source_refresh(&source);
+		let second = first.clone();
+		let barrier = Arc::new(Barrier::new(3));
+		let drop_clone = |token, barrier: Arc<Barrier>| {
+			std::thread::spawn(move || {
+				barrier.wait();
+				drop(token);
+			})
+		};
+		let first_drop = drop_clone(first, Arc::clone(&barrier));
+		let second_drop = drop_clone(second, Arc::clone(&barrier));
+		barrier.wait();
+		first_drop.join().unwrap();
+		second_drop.join().unwrap();
+		assert!(!REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner())["rust"].refresh_in_flight);
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("rust".to_string()));
+	}
+
+	#[test]
 	fn stale_failure_cannot_overwrite_newer_success_bookkeeping() {
 		let _guard = test_lock();
 		reset_test_caches();
@@ -7195,6 +7279,28 @@ mod tests {
 		let mut persisted = vec![crate::cache_persistence::PersistedPost::from_runtime(&deleted)];
 		assert!(super::prune_known_deleted_media_from_persisted_posts(&mut persisted));
 		assert!(persisted.is_empty());
+	}
+
+	#[test]
+	fn deleted_media_rewrite_failure_keeps_pruned_ram_and_latches_durable_reads() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		let mut deleted = test_post("resident", "rust", 300);
+		deleted.post_type = "image".to_string();
+		deleted.media.url = "https://preview.redd.it/deleted-write-failure.jpg?width=640&format=pjpg".to_string();
+		seed_source(&source, vec![deleted]);
+		TEST_DURABLE_WRITE_FAIL.store(true, AtomicOrdering::SeqCst);
+		assert_eq!(mark_deleted_reddit_media_url("https://preview.redd.it/deleted-write-failure.jpg?width=640&format=pjpg"), 1);
+		assert!(SOURCE_CACHE
+			.lock()
+			.unwrap_or_else(|error| error.into_inner())
+			.get(&source.cache_key())
+			.unwrap()
+			.posts
+			.is_empty());
+		assert!(!super::deleted_media_safety_healthy());
+		TEST_DURABLE_WRITE_FAIL.store(false, AtomicOrdering::SeqCst);
 	}
 
 	#[test]

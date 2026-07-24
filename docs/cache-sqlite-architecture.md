@@ -272,7 +272,12 @@ atomically fsyncs a durable asset-key tombstone, then invalidates active refresh
 tokens (including first fetches with no resident entry), clears their guarded
 remembered-source in-flight state, and filters later commits. Tombstones are
 restored before SQLite migration and are applied to legacy imports and cold
-source hydration, so eviction or restart cannot resurrect removed media. Refresh
+source hydration. Their stable hash participates in migration validity, so an
+unchanged legacy source is re-applied when the tombstone set changes. Runtime
+deletion closes the SQLite read latch until that tombstone-aware restart, while
+corrupt/oversized/unreadable tombstone state disables durable cache reads
+entirely. The sidecar has fixed file, entry and key-size caps; entries are never
+silently evicted. Thus eviction or restart cannot resurrect removed media. Refresh
 state is held through weak registry entries and disappears when the last
 in-flight token drops, keeping the registry proportional to concurrent work.
 Per-request author/subreddit filters are applied only to the rendered response
