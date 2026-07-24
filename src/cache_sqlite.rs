@@ -809,7 +809,8 @@ fn import_legacy_sources(connection: &mut Connection, cache_dir: &Path, payload_
 			stats.skipped_sources += 1;
 			continue;
 		}
-		let entry: PersistedSourceCacheEntry = bincode::deserialize(&bytes).map_err(|error| format!("{}: {error}", descriptor.path.display()))?;
+		let mut entry: PersistedSourceCacheEntry = bincode::deserialize(&bytes).map_err(|error| format!("{}: {error}", descriptor.path.display()))?;
+		crate::post_cache::prune_known_deleted_media_from_persisted_posts(&mut entry.posts);
 		let metadata = SourceWriteMetadata {
 			size: descriptor.size,
 			mtime_ns: descriptor.mtime_ns,

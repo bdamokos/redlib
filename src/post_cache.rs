@@ -63,7 +63,6 @@ pub const POSTS_PER_PAGE: usize = 25;
 const DEFAULT_SOURCE_RESIDENT_TTL_SECS: u64 = 15 * 60;
 const DEFAULT_SOURCE_CACHE_MAX_ENTRIES: usize = 128;
 const DEFAULT_SOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-const MAX_DELETED_MEDIA_TOMBSTONES: usize = 256;
 
 /// Max time the server waits for a full contextual page (or background complete) before
 /// sealing whatever merged posts exist so the HTML/fragment response does not keep changing.
@@ -267,10 +266,29 @@ pub(crate) struct SourceRefreshToken {
 	cache_key: String,
 	generation: u64,
 	state: Arc<Mutex<u64>>,
+	remembered_key: Option<String>,
+	lifecycle: Arc<()>,
 }
 
 impl Drop for SourceRefreshToken {
 	fn drop(&mut self) {
+		let mut remembered_changed = false;
+		if Arc::strong_count(&self.lifecycle) == 1 {
+			let current_generation = self.state.lock().unwrap_or_else(|error| error.into_inner());
+			if *current_generation == self.generation {
+				if let Some(remembered_key) = self.remembered_key.as_ref() {
+					let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
+					if let Some(entry) = remembered.get_mut(remembered_key) {
+						remembered_changed = entry.refresh_in_flight;
+						entry.refresh_in_flight = false;
+					}
+				}
+			}
+			drop(current_generation);
+		}
+		if remembered_changed {
+			crate::cache_persistence::mark_dirty();
+		}
 		release_source_refresh_state(&self.cache_key, &self.state);
 	}
 }
@@ -534,7 +552,8 @@ pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubre
 static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 static SOURCE_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
-static DELETED_MEDIA_TOMBSTONES: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static DELETED_MEDIA_TOMBSTONES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static DELETED_MEDIA_PERSIST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 #[cfg(test)]
 static TEST_DURABLE_WRITE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -1104,7 +1123,7 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 		let cache_key = source.cache_key();
 		let refresh_state = source_refresh_state(&cache_key);
 		let refresh_guard = refresh_state.lock().unwrap_or_else(|error| error.into_inner());
-		let persisted = match crate::cache_persistence::read_source_cache_entry(&cache_key) {
+		let mut persisted = match crate::cache_persistence::read_source_cache_entry(&cache_key) {
 			Ok(Some(entry)) => entry,
 			Ok(None) => return None,
 			Err(error) => {
@@ -1124,7 +1143,24 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 		}
 
 		let now_unix = crate::cache_persistence::unix_now();
-		let posts = persisted.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
+		let mut posts = persisted
+			.posts
+			.iter()
+			.cloned()
+			.map(crate::cache_persistence::PersistedPost::into_runtime)
+			.collect::<Vec<_>>();
+		let deleted_media_changed = prune_known_deleted_media_from_posts(&mut posts);
+		if deleted_media_changed {
+			persisted.posts = posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect();
+			if let Err(error) = crate::cache_persistence::write_source_cache_entry(&cache_key, &persisted) {
+				warn!(
+					"post_cache: refusing to publish source {} after deleted-media pruning could not be persisted: {}",
+					source.display_name(),
+					error
+				);
+				return None;
+			}
+		}
 		let estimated_bytes = estimated_source_bytes(&posts, &persisted.after);
 		let entry = CachedSourcePosts {
 			source: source.clone(),
@@ -1284,19 +1320,20 @@ pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) -> Option<So
 	Some(begin_remembered_source_refresh(&source))
 }
 
-fn mark_remembered_source_refresh_started(source: &FeedSource) {
+fn mark_remembered_source_refresh_started(source: &FeedSource) -> Option<String> {
 	let Some(key) = remembered_feed_key_for_source(source) else {
-		return;
+		return None;
 	};
 
 	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let Some(entry) = remembered.get_mut(&key) else {
-		return;
+		return None;
 	};
 
 	entry.last_refresh_started_at = Some(Instant::now());
 	entry.refresh_in_flight = true;
 	crate::cache_persistence::mark_dirty();
+	Some(key)
 }
 
 fn source_refresh_state(cache_key: &str) -> Arc<Mutex<u64>> {
@@ -1324,38 +1361,61 @@ fn invalidate_active_source_refreshes() {
 	let states = {
 		let mut registry = SOURCE_REFRESH_STATES.lock().unwrap_or_else(|error| error.into_inner());
 		registry.retain(|_, state| state.strong_count() > 0);
-		registry.values().filter_map(Weak::upgrade).collect::<Vec<_>>()
+		registry
+			.iter()
+			.filter_map(|(cache_key, state)| Weak::upgrade(state).map(|state| (cache_key.clone(), state)))
+			.collect::<Vec<_>>()
 	};
-	for state in states {
+	let mut remembered_changed = false;
+	for (cache_key, state) in states {
 		let mut generation = state.lock().unwrap_or_else(|error| error.into_inner());
 		*generation = (*generation).saturating_add(1);
+		let remembered_key = source_from_cache_key(&cache_key).as_ref().and_then(remembered_feed_key_for_source);
+		if let Some(remembered_key) = remembered_key {
+			let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
+			if let Some(entry) = remembered.get_mut(&remembered_key) {
+				// The invalidated completion will return Stale and therefore
+				// cannot clear its own bookkeeping. Make the source eligible
+				// for a replacement refresh while holding the same generation
+				// guard that invalidated the token.
+				remembered_changed |= entry.refresh_in_flight;
+				entry.refresh_in_flight = false;
+			}
+		}
+	}
+	if remembered_changed {
+		crate::cache_persistence::mark_dirty();
 	}
 }
 
 pub(crate) fn begin_source_refresh(source: &FeedSource) -> SourceRefreshToken {
-	begin_source_refresh_with_remembered_state(source, false)
+	begin_source_refresh_with_remembered_state(source)
 }
 
 fn begin_remembered_source_refresh(source: &FeedSource) -> SourceRefreshToken {
-	begin_source_refresh_with_remembered_state(source, true)
+	begin_source_refresh_with_remembered_state(source)
 }
 
-fn begin_source_refresh_with_remembered_state(source: &FeedSource, mark_remembered: bool) -> SourceRefreshToken {
+fn begin_source_refresh_with_remembered_state(source: &FeedSource) -> SourceRefreshToken {
 	let cache_key = source.cache_key();
 	let state = source_refresh_state(&cache_key);
-	let generation = {
+	let (generation, remembered_key) = {
 		let mut current = state.lock().unwrap_or_else(|error| error.into_inner());
 		*current = current.saturating_add(1);
 		// Keep refresh-start bookkeeping in the same generation critical
 		// section as token allocation. Otherwise an older completion can clear
 		// refresh_in_flight after a newer request has announced itself but
 		// before that request acquires the generation mutex.
-		if mark_remembered {
-			mark_remembered_source_refresh_started(source);
-		}
-		*current
+		let remembered_key = mark_remembered_source_refresh_started(source);
+		(*current, remembered_key)
 	};
-	SourceRefreshToken { cache_key, generation, state }
+	SourceRefreshToken {
+		cache_key,
+		generation,
+		state,
+		remembered_key,
+		lifecycle: Arc::new(()),
+	}
 }
 
 fn should_evict_resident_source_entry(entry: &CachedSourcePosts) -> bool {
@@ -3219,23 +3279,57 @@ fn prune_deleted_media_from_posts(posts: &mut Vec<Post>, deleted_asset_key: &str
 }
 
 fn record_deleted_media_tombstone(deleted_asset_key: &str) {
-	let mut tombstones = DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|error| error.into_inner());
-	if !tombstones.contains_key(deleted_asset_key) && tombstones.len() >= MAX_DELETED_MEDIA_TOMBSTONES {
-		if let Some(oldest) = tombstones.iter().max_by_key(|(_, recorded_at)| recorded_at.elapsed()).map(|(key, _)| key.clone()) {
-			tombstones.remove(&oldest);
-		}
+	// Serialize snapshot/write/insert ordering without holding the tombstone
+	// read mutex across fsync. Otherwise two concurrent deletions could write an
+	// older, smaller snapshot after a newer one.
+	let _persist_guard = DELETED_MEDIA_PERSIST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+	let mut snapshot = {
+		let tombstones = DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|error| error.into_inner());
+		tombstones.iter().cloned().collect::<Vec<_>>()
+	};
+	if !snapshot.iter().any(|key| key == deleted_asset_key) {
+		snapshot.push(deleted_asset_key.to_string());
 	}
-	tombstones.insert(deleted_asset_key.to_string(), Instant::now());
+	#[cfg(not(test))]
+	if let Err(error) = crate::cache_persistence::write_deleted_media_tombstones(&snapshot) {
+		warn!("post_cache: failed to persist deleted-media tombstone: {error}");
+	}
+	#[cfg(test)]
+	let _ = snapshot;
+	DELETED_MEDIA_TOMBSTONES
+		.lock()
+		.unwrap_or_else(|error| error.into_inner())
+		.insert(deleted_asset_key.to_string());
 }
 
-fn prune_known_deleted_media_from_posts(posts: &mut Vec<Post>) {
+pub(crate) fn restore_deleted_media_tombstones(asset_keys: Vec<String>) {
+	let mut tombstones = DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|error| error.into_inner());
+	*tombstones = asset_keys.into_iter().filter(|key| !key.trim().is_empty()).collect();
+}
+
+fn prune_known_deleted_media_from_posts(posts: &mut Vec<Post>) -> bool {
 	let deleted_asset_keys = {
 		let tombstones = DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|error| error.into_inner());
-		tombstones.keys().cloned().collect::<Vec<_>>()
+		tombstones.iter().cloned().collect::<Vec<_>>()
 	};
+	let mut changed = false;
 	for deleted_asset_key in deleted_asset_keys {
-		prune_deleted_media_from_posts(posts, &deleted_asset_key);
+		changed |= prune_deleted_media_from_posts(posts, &deleted_asset_key).changed;
 	}
+	changed
+}
+
+pub(crate) fn prune_known_deleted_media_from_persisted_posts(posts: &mut Vec<crate::cache_persistence::PersistedPost>) -> bool {
+	if DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|error| error.into_inner()).is_empty() {
+		return false;
+	}
+	let mut runtime_posts = std::mem::take(posts)
+		.into_iter()
+		.map(crate::cache_persistence::PersistedPost::into_runtime)
+		.collect::<Vec<_>>();
+	let changed = prune_known_deleted_media_from_posts(&mut runtime_posts);
+	*posts = runtime_posts.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect();
+	changed
 }
 
 pub(crate) fn mark_deleted_reddit_media_url(media_url: &str) -> usize {
@@ -6907,6 +7001,43 @@ mod tests {
 	}
 
 	#[test]
+	fn generic_refresh_supersession_cannot_strand_remembered_bookkeeping() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = new_source("rust");
+		remember_subreddit_request("rust");
+
+		let daemon = begin_remembered_source_refresh(&source);
+		let abandoned_generic = begin_source_refresh(&source);
+		drop(abandoned_generic);
+		assert!(!REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner())["rust"].refresh_in_flight);
+		assert_eq!(
+			publish_remembered_source_refresh_with_token(&source, vec![test_post("stale-daemon", "rust", 100)], String::new(), RefreshOrigin::Daemon, daemon,),
+			SourceRefreshOutcome::Stale
+		);
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("rust".to_string()));
+
+		let daemon = begin_remembered_source_refresh(&source);
+		let committed_generic = begin_source_refresh(&source);
+		assert_eq!(
+			store_source_posts_with_token(
+				&source,
+				vec![test_post("generic", "rust", 300)],
+				String::new(),
+				Some(RefreshOrigin::DirectLiveFetch),
+				committed_generic,
+			),
+			SourceRefreshOutcome::Committed
+		);
+		assert!(!REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner())["rust"].refresh_in_flight);
+		assert_eq!(
+			publish_remembered_source_refresh_with_token(&source, vec![test_post("stale-daemon-2", "rust", 200)], String::new(), RefreshOrigin::Daemon, daemon,),
+			SourceRefreshOutcome::Stale
+		);
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("rust".to_string()));
+	}
+
+	#[test]
 	fn stale_failure_cannot_overwrite_newer_success_bookkeeping() {
 		let _guard = test_lock();
 		reset_test_caches();
@@ -7025,21 +7156,25 @@ mod tests {
 		let _guard = test_lock();
 		reset_test_caches();
 		let source = new_source("rust");
-		let token = begin_source_refresh(&source);
+		remember_subreddit_request("rust");
+		let token = begin_remembered_source_refresh(&source);
+		assert!(REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner())["rust"].refresh_in_flight);
 		assert_eq!(mark_deleted_reddit_media_url("https://preview.redd.it/deleted.jpg?width=640&format=pjpg"), 0);
+		assert!(!REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner())["rust"].refresh_in_flight);
 		assert_eq!(
-			store_source_posts_with_token(&source, vec![test_post("late", "rust", 200)], String::new(), Some(RefreshOrigin::DirectLiveFetch), token,),
+			publish_remembered_source_refresh_with_token(&source, vec![test_post("late", "rust", 200)], String::new(), RefreshOrigin::DirectLiveFetch, token,),
 			SourceRefreshOutcome::Stale
 		);
 		assert!(SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&source.cache_key()).is_none());
-		let token = begin_source_refresh(&source);
+		let token = begin_remembered_source_refresh(&source);
 		let mut deleted = test_post("new-fetch", "rust", 300);
 		deleted.post_type = "image".to_string();
 		deleted.media.url = "https://preview.redd.it/deleted.jpg?width=640&format=pjpg".to_string();
 		assert_eq!(
-			store_source_posts_with_token(&source, vec![deleted], String::new(), Some(RefreshOrigin::DirectLiveFetch), token,),
+			publish_remembered_source_refresh_with_token(&source, vec![deleted], String::new(), RefreshOrigin::DirectLiveFetch, token,),
 			SourceRefreshOutcome::Committed
 		);
+		assert!(!REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner())["rust"].refresh_in_flight);
 		assert!(SOURCE_CACHE
 			.lock()
 			.unwrap_or_else(|error| error.into_inner())
@@ -7047,6 +7182,19 @@ mod tests {
 			.unwrap()
 			.posts
 			.is_empty());
+	}
+
+	#[test]
+	fn restored_deleted_media_tombstone_prunes_persisted_source_before_import() {
+		let _guard = test_lock();
+		reset_test_caches();
+		super::restore_deleted_media_tombstones(vec!["preview.redd.it/deleted.jpg".to_string()]);
+		let mut deleted = test_post("persisted", "rust", 300);
+		deleted.post_type = "image".to_string();
+		deleted.media.url = "https://preview.redd.it/deleted.jpg?width=640&format=pjpg".to_string();
+		let mut persisted = vec![crate::cache_persistence::PersistedPost::from_runtime(&deleted)];
+		assert!(super::prune_known_deleted_media_from_persisted_posts(&mut persisted));
+		assert!(persisted.is_empty());
 	}
 
 	#[test]

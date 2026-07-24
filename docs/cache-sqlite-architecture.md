@@ -267,10 +267,12 @@ author-history updates, semantic enqueueing and remembered-feed success/failure
 bookkeeping. Callers receive `Committed`, `Stale` or `Failed`; stale responses
 may still render for their initiating request but perform no shared mutation.
 Automatic RAM/catalog pruning rechecks source absence while holding this lock.
-Explicit decay increments the generation first. Deleted-media invalidation also
-records a bounded process-lifetime tombstone, invalidates every active refresh
-token (including first fetches with no resident entry), and filters later
-commits, so a response cannot resurrect removed or superseded state. Refresh
+Explicit decay increments the generation first. Deleted-media invalidation first
+atomically fsyncs a durable asset-key tombstone, then invalidates active refresh
+tokens (including first fetches with no resident entry), clears their guarded
+remembered-source in-flight state, and filters later commits. Tombstones are
+restored before SQLite migration and are applied to legacy imports and cold
+source hydration, so eviction or restart cannot resurrect removed media. Refresh
 state is held through weak registry entries and disappears when the last
 in-flight token drops, keeping the registry proportional to concurrent work.
 Per-request author/subreddit filters are applied only to the rendered response
