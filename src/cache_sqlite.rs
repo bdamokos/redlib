@@ -536,13 +536,42 @@ fn open_read_connection(path: &Path) -> Result<Connection, String> {
 	Ok(connection)
 }
 
-fn with_read_connection<T>(cache: &ShadowCache, operation: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-	let result: Result<T, String> = (|| -> Result<T, String> {
+#[derive(Debug)]
+enum ShadowReadError {
+	Sqlite(rusqlite::Error),
+	Message(String),
+}
+
+impl std::fmt::Display for ShadowReadError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Sqlite(error) => error.fmt(formatter),
+			Self::Message(error) => formatter.write_str(error),
+		}
+	}
+}
+
+impl From<rusqlite::Error> for ShadowReadError {
+	fn from(error: rusqlite::Error) -> Self {
+		Self::Sqlite(error)
+	}
+}
+
+impl From<String> for ShadowReadError {
+	fn from(error: String) -> Self {
+		Self::Message(error)
+	}
+}
+
+fn with_read_connection<T>(cache: &ShadowCache, operation: impl FnOnce(&Connection) -> Result<T, ShadowReadError>) -> Result<T, String> {
+	let result: Result<T, ShadowReadError> = (|| {
 		let index = cache.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % cache.readers.len();
-		let mut connection = cache.readers[index].lock().map_err(|_| "SQLite shadow reader connection lock poisoned".to_string())?;
-		let transaction = connection.transaction().map_err(|error| error.to_string())?;
+		let mut connection = cache.readers[index]
+			.lock()
+			.map_err(|_| ShadowReadError::Message("SQLite shadow reader connection lock poisoned".to_string()))?;
+		let transaction = connection.transaction()?;
 		let result = operation(&transaction)?;
-		transaction.commit().map_err(|error| error.to_string())?;
+		transaction.commit()?;
 		Ok(result)
 	})();
 	if let Err(error) = &result {
@@ -550,17 +579,21 @@ fn with_read_connection<T>(cache: &ShadowCache, operation: impl FnOnce(&Connecti
 			mark_reads_unhealthy();
 		}
 	}
-	result
+	result.map_err(|error| error.to_string())
 }
 
-fn sqlite_read_error_requires_latch(error: &str) -> bool {
-	let error = error.to_ascii_lowercase();
-	!(error.contains("database is locked")
-		|| error.contains("database table is locked")
-		|| error.contains("database is busy")
-		|| error.contains("sqlite_busy")
-		|| error.contains("sqlite_interrupt")
-		|| error.contains("operation interrupted"))
+fn sqlite_read_error_requires_latch(error: &ShadowReadError) -> bool {
+	match error {
+		ShadowReadError::Sqlite(error) => sqlite_error_code_requires_latch(error.sqlite_error_code()),
+		ShadowReadError::Message(_) => true,
+	}
+}
+
+fn sqlite_error_code_requires_latch(code: Option<rusqlite::ErrorCode>) -> bool {
+	!matches!(
+		code,
+		Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked | rusqlite::ErrorCode::OperationInterrupted)
+	)
 }
 
 fn open_database_with_options(path: &Path, requested_page_size: i64, synchronous: &str) -> Result<Connection, String> {
@@ -911,34 +944,29 @@ pub(crate) fn read_source(source_cache_key: &str) -> Result<Option<PersistedSour
 	with_read_connection(cache, |connection| read_source_on(connection, source_cache_key))
 }
 
-fn read_source_on(connection: &Connection, source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, String> {
+fn read_source_on(connection: &Connection, source_cache_key: &str) -> Result<Option<PersistedSourceCacheEntry>, ShadowReadError> {
 	let source = connection
 		.query_row(
 			"SELECT display_name,after_cursor,fetched_at,refresh_origin FROM sources WHERE cache_key=?1",
 			[source_cache_key],
 			|row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<i64>>(3)?)),
 		)
-		.optional()
-		.map_err(|error| error.to_string())?;
+		.optional()?;
 	let Some((subreddit, after, fetched_at, refresh_origin)) = source else {
 		return Ok(None);
 	};
-	let mut statement = connection
-		.prepare(
-			"SELECT o.payload_codec,o.payload
+	let mut statement = connection.prepare(
+		"SELECT o.payload_codec,o.payload
 			 FROM source_memberships sm
 			 JOIN sources s ON s.source_pk=sm.source_pk
 			 JOIN objects o ON o.object_pk=sm.object_pk
 			 WHERE s.cache_key=?1
 			 ORDER BY sm.source_position",
-		)
-		.map_err(|error| error.to_string())?;
-	let rows = statement
-		.query_map([source_cache_key], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
-		.map_err(|error| error.to_string())?;
+	)?;
+	let rows = statement.query_map([source_cache_key], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
 	let mut posts = Vec::new();
 	for row in rows {
-		let (codec, payload) = row.map_err(|error| error.to_string())?;
+		let (codec, payload) = row?;
 		posts.push(decode_payload(codec, &payload)?);
 	}
 	Ok(Some(PersistedSourceCacheEntry {
@@ -990,15 +1018,14 @@ pub(crate) fn query_profile_timeline(
 	with_read_connection(cache, |connection| {
 		let profile_pk = connection
 			.query_row("SELECT profile_pk FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| row.get::<_, i64>(0))
-			.optional()
-			.map_err(|error| error.to_string())?;
+			.optional()?;
 		let Some(profile_pk) = profile_pk else {
 			return Ok(None);
 		};
 		if !profile_filters_match(connection, profile_pk, filters)? {
 			return Ok(None);
 		}
-		query_profile_timeline_on(connection, fingerprint, view_kind, sort, cursor, limit, filters).map(Some)
+		Ok(Some(query_profile_timeline_on(connection, fingerprint, view_kind, sort, cursor, limit, filters)?))
 	})
 }
 
@@ -1012,19 +1039,20 @@ pub(crate) fn query_profile_video_candidates(fingerprint: &[u8], view_kind: i64,
 	with_read_connection(cache, |connection| {
 		let profile_pk = connection
 			.query_row("SELECT profile_pk FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| row.get::<_, i64>(0))
-			.optional()
-			.map_err(|error| error.to_string())?;
+			.optional()?;
 		let Some(profile_pk) = profile_pk else {
 			return Ok(None);
 		};
 		if !profile_filters_match(connection, profile_pk, filters)? {
 			return Ok(None);
 		}
-		query_profile_timeline_on(connection, fingerprint, view_kind, TimelineSort::Videos, None, limit, filters).map(|page| Some(page.posts))
+		Ok(Some(
+			query_profile_timeline_on(connection, fingerprint, view_kind, TimelineSort::Videos, None, limit, filters)?.posts,
+		))
 	})
 }
 
-fn profile_filters_match(connection: &Connection, profile_pk: i64, filters: &HashSet<String>) -> Result<bool, String> {
+fn profile_filters_match(connection: &Connection, profile_pk: i64, filters: &HashSet<String>) -> Result<bool, ShadowReadError> {
 	let mut requested = filters
 		.iter()
 		.map(|value| value.trim().to_ascii_lowercase())
@@ -1032,14 +1060,8 @@ fn profile_filters_match(connection: &Connection, profile_pk: i64, filters: &Has
 		.collect::<Vec<_>>();
 	requested.sort();
 	requested.dedup();
-	let mut statement = connection
-		.prepare("SELECT filter_lc FROM profile_filters WHERE profile_pk=?1 ORDER BY filter_lc")
-		.map_err(|error| error.to_string())?;
-	let stored = statement
-		.query_map([profile_pk], |row| row.get::<_, String>(0))
-		.map_err(|error| error.to_string())?
-		.collect::<Result<Vec<_>, _>>()
-		.map_err(|error| error.to_string())?;
+	let mut statement = connection.prepare("SELECT filter_lc FROM profile_filters WHERE profile_pk=?1 ORDER BY filter_lc")?;
+	let stored = statement.query_map([profile_pk], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
 	Ok(stored == requested)
 }
 
@@ -1051,11 +1073,10 @@ pub(crate) fn source_exists(source_cache_key: &str) -> bool {
 		return false;
 	};
 	with_read_connection(cache, |connection| {
-		connection
+		let value = connection
 			.query_row("SELECT 1 FROM sources WHERE cache_key=?1 AND generation>0", [source_cache_key], |row| row.get::<_, i64>(0))
-			.optional()
-			.map(|value| value.is_some())
-			.map_err(|error| error.to_string())
+			.optional()?;
+		Ok(value.is_some())
 	})
 	.unwrap_or(false)
 }
@@ -1068,15 +1089,11 @@ pub(crate) fn source_seed_entries() -> Result<Option<Vec<(String, u64)>>, String
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
 	with_read_connection(cache, |connection| {
-		let mut statement = connection
-			.prepare("SELECT cache_key,fetched_at FROM sources WHERE generation>0 ORDER BY cache_key")
-			.map_err(|error| error.to_string())?;
-		let rows = statement
-			.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-			.map_err(|error| error.to_string())?;
+		let mut statement = connection.prepare("SELECT cache_key,fetched_at FROM sources WHERE generation>0 ORDER BY cache_key")?;
+		let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
 		let mut entries = Vec::new();
 		for row in rows {
-			let (cache_key, fetched_at) = row.map_err(|error| error.to_string())?;
+			let (cache_key, fetched_at) = row?;
 			entries.push((cache_key, fetched_at.max(0) as u64));
 		}
 		Ok(Some(entries))
@@ -1091,21 +1108,19 @@ fn query_profile_timeline_on(
 	cursor: Option<&TimelineCursor>,
 	limit: usize,
 	filters: &HashSet<String>,
-) -> Result<TimelinePage, String> {
+) -> Result<TimelinePage, ShadowReadError> {
 	if !matches!(view_kind, 1 | 2) {
-		return Err(format!("invalid profile view kind {view_kind}"));
+		return Err(format!("invalid profile view kind {view_kind}").into());
 	}
-	let (profile_pk, current_generation, current_random_epoch): (i64, i64, i64) = connection
-		.query_row(
-			"SELECT profile_pk,generation,random_epoch FROM active_profiles WHERE fingerprint=?1",
-			[fingerprint],
-			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-		)
-		.map_err(|error| error.to_string())?;
+	let (profile_pk, current_generation, current_random_epoch): (i64, i64, i64) = connection.query_row(
+		"SELECT profile_pk,generation,random_epoch FROM active_profiles WHERE fingerprint=?1",
+		[fingerprint],
+		|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+	)?;
 	let generation = cursor.map_or(current_generation, |value| value.generation);
 	let random_epoch = cursor.map_or(current_random_epoch, |value| value.random_epoch);
 	if generation > current_generation {
-		return Err("timeline cursor generation is newer than the active profile".to_string());
+		return Err("timeline cursor generation is newer than the active profile".to_string().into());
 	}
 	let limit = if sort == TimelineSort::Videos { limit.clamp(1, 8_000) } else { limit.clamp(1, 250) };
 	let scan_limit = limit.saturating_mul(4).min(if sort == TimelineSort::Videos { 32_000 } else { 1_000 });
@@ -1181,37 +1196,35 @@ fn query_profile_timeline_on(
 	let (cursor_primary, cursor_secondary, cursor_key) = cursor
 		.map(|value| (value.sort_primary, value.sort_secondary, value.card_key.as_str()))
 		.unwrap_or((0, 0, ""));
-	let mut statement = connection.prepare(&sql).map_err(|error| error.to_string())?;
-	let rows = statement
-		.query_map(
-			params![
-				profile_pk,
-				view_kind,
-				generation,
-				cursor_primary,
-				cursor_secondary,
-				cursor_key,
-				random_epoch,
-				scan_limit as i64
-			],
-			|row| {
-				Ok((
-					row.get::<_, String>(0)?,
-					row.get::<_, i64>(1)?,
-					row.get::<_, i64>(2)?,
-					row.get::<_, i64>(3)?,
-					row.get::<_, i64>(4)?,
-					row.get::<_, i64>(5)?,
-					row.get::<_, i64>(6)?,
-					row.get::<_, i64>(7)?,
-				))
-			},
-		)
-		.map_err(|error| error.to_string())?;
+	let mut statement = connection.prepare(&sql)?;
+	let rows = statement.query_map(
+		params![
+			profile_pk,
+			view_kind,
+			generation,
+			cursor_primary,
+			cursor_secondary,
+			cursor_key,
+			random_epoch,
+			scan_limit as i64
+		],
+		|row| {
+			Ok((
+				row.get::<_, String>(0)?,
+				row.get::<_, i64>(1)?,
+				row.get::<_, i64>(2)?,
+				row.get::<_, i64>(3)?,
+				row.get::<_, i64>(4)?,
+				row.get::<_, i64>(5)?,
+				row.get::<_, i64>(6)?,
+				row.get::<_, i64>(7)?,
+			))
+		},
+	)?;
 	let mut posts = Vec::new();
 	let mut next = None;
 	for row in rows {
-		let (card_key, version, created_sort, activity_sort, discovery_sort, duration, random_round, random_rank) = row.map_err(|error| error.to_string())?;
+		let (card_key, version, created_sort, activity_sort, discovery_sort, duration, random_round, random_rank) = row?;
 		let (sort_primary, sort_secondary) = match sort {
 			TimelineSort::New if view_kind == 2 => (activity_sort, 0),
 			TimelineSort::New => (created_sort, 0),
@@ -1245,10 +1258,9 @@ fn hydrate_profile_card(
 	version: i64,
 	sort: TimelineSort,
 	filters: &[String],
-) -> Result<Option<PersistedPost>, String> {
-	let mut object_statement = connection
-		.prepare_cached(
-			"SELECT members.community_lc,members.author_lc,o.duration_seconds,o.created_utc,
+) -> Result<Option<PersistedPost>, ShadowReadError> {
+	let mut object_statement = connection.prepare_cached(
+		"SELECT members.community_lc,members.author_lc,o.duration_seconds,o.created_utc,
 			        o.object_pk,o.payload_codec,o.payload
 			 FROM profile_feed_entry_members members
 			 JOIN objects o ON o.object_pk=members.object_pk
@@ -1256,24 +1268,21 @@ fn hydrate_profile_card(
 			   AND members.view_kind=?2
 			   AND members.card_key=?3
 			   AND members.version=?4",
-		)
-		.map_err(|error| error.to_string())?;
+	)?;
 	let mut candidates = Vec::new();
-	let rows = object_statement
-		.query_map(params![profile_pk, view_kind, card_key, version], |row| {
-			Ok((
-				row.get::<_, String>(0)?,
-				row.get::<_, String>(1)?,
-				row.get::<_, i64>(2)?,
-				row.get::<_, i64>(3)?,
-				row.get::<_, i64>(4)?,
-				row.get::<_, i64>(5)?,
-				row.get::<_, Vec<u8>>(6)?,
-			))
-		})
-		.map_err(|error| error.to_string())?;
+	let rows = object_statement.query_map(params![profile_pk, view_kind, card_key, version], |row| {
+		Ok((
+			row.get::<_, String>(0)?,
+			row.get::<_, String>(1)?,
+			row.get::<_, i64>(2)?,
+			row.get::<_, i64>(3)?,
+			row.get::<_, i64>(4)?,
+			row.get::<_, i64>(5)?,
+			row.get::<_, Vec<u8>>(6)?,
+		))
+	})?;
 	for row in rows {
-		let (community_lc, author_lc, duration, created, object_pk, codec, payload) = row.map_err(|error| error.to_string())?;
+		let (community_lc, author_lc, duration, created, object_pk, codec, payload) = row?;
 		if filters.binary_search(&community_lc).is_ok() || filters.binary_search(&format!("u_{author_lc}")).is_ok() {
 			continue;
 		}
@@ -1317,18 +1326,16 @@ pub(crate) fn query_submitted(author: &str, limit: usize, filters: &HashSet<Stri
 	let Some(cache) = SHADOW_CACHE.get() else {
 		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
 	};
-	with_read_connection(cache, |connection| {
-		query_submitted_on(connection, author, None, limit, filters).map(|(posts, _)| Some(posts))
-	})
+	with_read_connection(cache, |connection| Ok(Some(query_submitted_on(connection, author, None, limit, filters)?.0)))
 }
 
-pub(crate) fn query_submitted_on(
+fn query_submitted_on(
 	connection: &Connection,
 	author: &str,
 	cursor: Option<&SubmittedCursor>,
 	limit: usize,
 	filters: &HashSet<String>,
-) -> Result<(Vec<PersistedPost>, Option<SubmittedCursor>), String> {
+) -> Result<(Vec<PersistedPost>, Option<SubmittedCursor>), ShadowReadError> {
 	let author = author.trim().trim_start_matches("u_").to_ascii_lowercase();
 	let limit = limit.clamp(1, 250);
 	let mut normalized_filters = filters
@@ -1358,16 +1365,14 @@ pub(crate) fn query_submitted_on(
 		 LIMIT ?4"
 	);
 	let (cursor_created, cursor_pk) = cursor.map(|value| (value.created_utc, value.object_pk)).unwrap_or((0, 0));
-	let mut statement = connection.prepare(&sql).map_err(|error| error.to_string())?;
-	let rows = statement
-		.query_map(params![author, cursor_created, cursor_pk, limit as i64], |row| {
-			Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?))
-		})
-		.map_err(|error| error.to_string())?;
+	let mut statement = connection.prepare(&sql)?;
+	let rows = statement.query_map(params![author, cursor_created, cursor_pk, limit as i64], |row| {
+		Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?))
+	})?;
 	let mut posts = Vec::new();
 	let mut next = None;
 	for row in rows {
-		let (object_pk, created_utc, codec, payload) = row.map_err(|error| error.to_string())?;
+		let (object_pk, created_utc, codec, payload) = row?;
 		posts.push(decode_payload(codec, &payload)?);
 		next = Some(SubmittedCursor { created_utc, object_pk });
 	}
@@ -2703,7 +2708,7 @@ pub fn run_shadow_verifier() -> Result<(), String> {
 	let mut render_samples = Vec::with_capacity(iterations);
 	for _ in 0..iterations {
 		let query_started = Instant::now();
-		let page = query_profile_timeline_on(&connection, &profile, 1, TimelineSort::New, None, 25, &HashSet::new())?;
+		let page = query_profile_timeline_on(&connection, &profile, 1, TimelineSort::New, None, 25, &HashSet::new()).map_err(|error| error.to_string())?;
 		query_samples.push(query_started.elapsed().as_micros() as u64);
 		for (sort, samples) in [
 			(TimelineSort::Discovered, &mut discovered_samples),
@@ -2711,7 +2716,7 @@ pub fn run_shadow_verifier() -> Result<(), String> {
 			(TimelineSort::Videos, &mut video_samples),
 		] {
 			let started = Instant::now();
-			let sorted_page = query_profile_timeline_on(&connection, &profile, 1, sort, None, 25, &HashSet::new())?;
+			let sorted_page = query_profile_timeline_on(&connection, &profile, 1, sort, None, 25, &HashSet::new()).map_err(|error| error.to_string())?;
 			black_box(sorted_page.posts.len());
 			samples.push(started.elapsed().as_micros() as u64);
 		}
@@ -2739,7 +2744,7 @@ pub fn run_shadow_verifier() -> Result<(), String> {
 	let mut deep_pages = 0usize;
 	for _ in 0..400 {
 		let started = Instant::now();
-		let page = query_profile_timeline_on(&connection, &profile, 1, TimelineSort::New, deep_cursor.as_ref(), 25, &HashSet::new())?;
+		let page = query_profile_timeline_on(&connection, &profile, 1, TimelineSort::New, deep_cursor.as_ref(), 25, &HashSet::new()).map_err(|error| error.to_string())?;
 		deep_samples.push(started.elapsed().as_micros() as u64);
 		if page.posts.is_empty() {
 			break;
@@ -2811,11 +2816,35 @@ mod tests {
 
 	#[test]
 	fn transient_sqlite_read_errors_do_not_trip_the_global_read_latch() {
-		assert!(!sqlite_read_error_requires_latch("database is locked"));
-		assert!(!sqlite_read_error_requires_latch("Error code 5: database is busy"));
-		assert!(!sqlite_read_error_requires_latch("SQLITE_INTERRUPT: operation interrupted"));
-		assert!(sqlite_read_error_requires_latch("database disk image is malformed"));
-		assert!(sqlite_read_error_requires_latch("unsupported SQLite payload codec 9"));
+		let busy = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None);
+		assert!(!sqlite_read_error_requires_latch(&ShadowReadError::Sqlite(busy)));
+
+		let connection = Connection::open_in_memory().unwrap();
+		let interrupt_handle = connection.get_interrupt_handle();
+		connection
+			.create_scalar_function("interrupt_shadow_read", 0, FunctionFlags::default(), move |_| {
+				interrupt_handle.interrupt();
+				Ok(0)
+			})
+			.unwrap();
+		let mut statement = connection
+			.prepare("SELECT interrupt_shadow_read() FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3)")
+			.unwrap();
+		let interrupted = statement
+			.query([])
+			.unwrap()
+			.mapped(|row| row.get::<_, i64>(0))
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap_err();
+		assert_eq!(interrupted.sqlite_error_code(), Some(rusqlite::ErrorCode::OperationInterrupted));
+		assert!(!sqlite_read_error_requires_latch(&ShadowReadError::Sqlite(interrupted)));
+
+		let corrupt = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT), None);
+		assert!(sqlite_read_error_requires_latch(&ShadowReadError::Sqlite(corrupt)));
+		assert!(sqlite_error_code_requires_latch(None));
+		assert!(sqlite_read_error_requires_latch(&ShadowReadError::Message(
+			"unsupported SQLite payload codec 9".to_string()
+		)));
 	}
 
 	fn empty_flair() -> PersistedFlair {

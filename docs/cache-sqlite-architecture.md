@@ -267,10 +267,15 @@ author-history updates, semantic enqueueing and remembered-feed success/failure
 bookkeeping. Callers receive `Committed`, `Stale` or `Failed`; stale responses
 may still render for their initiating request but perform no shared mutation.
 Automatic RAM/catalog pruning rechecks source absence while holding this lock.
-Explicit decay and deleted-media mutation increment the generation first, so
-an in-flight response cannot resurrect removed or superseded state. Refresh
+Explicit decay increments the generation first. Deleted-media invalidation also
+records a bounded process-lifetime tombstone, invalidates every active refresh
+token (including first fetches with no resident entry), and filters later
+commits, so a response cannot resurrect removed or superseded state. Refresh
 state is held through weak registry entries and disappears when the last
 in-flight token drops, keeping the registry proportional to concurrent work.
+Per-request author/subreddit filters are applied only to the rendered response
+and profile materialization; the guarded canonical source commit always receives
+the unfiltered fetched membership set.
 
 Before `BEGIN IMMEDIATE`, parse and serialize the source response and derive duplicate keys. Inside the transaction:
 

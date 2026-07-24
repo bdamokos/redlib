@@ -1385,10 +1385,18 @@ fn cached_video_mode_sidebar(req: &Request<Body>, username: &str, url: &str, que
 	build_video_mode_sidebar(url, &listing_data, &preview_posts, &normalized_query)
 }
 
-async fn fetch_user_listing_posts(_username: &str, path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, String, bool), String> {
+fn split_user_listing_page(posts: Vec<Post>, filters: &HashSet<String>) -> (Vec<Post>, Vec<Post>, bool) {
+	let canonical_posts = posts;
+	let mut visible_posts = canonical_posts.clone();
+	let (_, all_posts_filtered) = filter_posts(&mut visible_posts, filters);
+	(visible_posts, canonical_posts, all_posts_filtered)
+}
+
+async fn fetch_user_listing_posts(_username: &str, path: &str, listing: &str, filters: &HashSet<String>) -> Result<(Vec<Post>, Vec<Post>, String, bool), String> {
 	let should_refill_duplicates = listing == "submitted" || listing == "overview";
 	let mut request_path = path.to_string();
 	let mut all_posts = Vec::new();
+	let mut canonical_posts = Vec::new();
 	let mut fetched_raw_posts = false;
 	let mut requests = 0;
 	let mut filtered_page_advances = 0;
@@ -1396,12 +1404,12 @@ async fn fetch_user_listing_posts(_username: &str, path: &str, listing: &str, fi
 	let after = loop {
 		let (mut posts, next_after) = Post::fetch(&request_path, false).await?;
 		fetched_raw_posts |= !posts.is_empty();
-
-		let (_, page_all_posts_filtered) = filter_posts(&mut posts, filters);
 		if should_refill_duplicates {
 			utils::hydrate_media_content_fingerprints(&mut posts).await;
 		}
-		all_posts.extend(posts);
+		let (visible_posts, page_canonical_posts, page_all_posts_filtered) = split_user_listing_page(posts, filters);
+		canonical_posts.extend(page_canonical_posts);
+		all_posts.extend(visible_posts);
 
 		if should_refill_duplicates {
 			all_posts = collapse_duplicate_submissions(all_posts);
@@ -1428,7 +1436,7 @@ async fn fetch_user_listing_posts(_username: &str, path: &str, listing: &str, fi
 	}
 	utils::hydrate_post_author_links_from_cache(&mut all_posts);
 	let all_posts_filtered = fetched_raw_posts && all_posts.is_empty();
-	Ok((all_posts, after, all_posts_filtered))
+	Ok((all_posts, canonical_posts, after, all_posts_filtered))
 }
 
 async fn cached_or_live_user_video_posts(username: &str) -> Result<(Vec<Post>, bool), String> {
@@ -1447,14 +1455,22 @@ async fn cached_or_live_user_video_posts(username: &str) -> Result<(Vec<Post>, b
 		Some(crate::post_cache::RefreshOrigin::DirectLiveFetch),
 		crate::post_components::ObservationSource::Listing,
 		refresh_token,
-		|committed_posts| utils::store_user_subreddits(username, committed_posts),
+		|committed_posts| {
+			utils::store_user_subreddits(username, committed_posts);
+			crate::observed_semantic_backfill::enqueue_observed_user_posts(
+				username,
+				&format!("user:{username}:videos:committed-page"),
+				committed_posts,
+				crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
+			);
+		},
 	);
 	Ok((posts, false))
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{append_missing_following_link_posts, collapse_duplicate_submissions, show_successful_empty_state};
+	use super::{append_missing_following_link_posts, collapse_duplicate_submissions, show_successful_empty_state, split_user_listing_page};
 	use askama::Template;
 	use hyper::{Body, Request};
 	use std::collections::HashSet;
@@ -1465,6 +1481,17 @@ mod tests {
 	#[test]
 	fn successful_zero_post_listing_has_a_distinct_empty_state() {
 		assert!(show_successful_empty_state(true, false, ""));
+	}
+
+	#[test]
+	fn user_listing_filters_only_the_response_not_canonical_cache_membership() {
+		let visible = test_post("visible", "Visible", "allowed", "", "self", "", &[]);
+		let blocked = test_post("blocked", "Blocked", "blocked_sub", "", "self", "", &[]);
+		let filters = HashSet::from(["blocked_sub".to_string()]);
+		let (response_posts, canonical_posts, all_filtered) = split_user_listing_page(vec![visible, blocked], &filters);
+		assert_eq!(response_posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["visible"]);
+		assert_eq!(canonical_posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["visible", "blocked"]);
+		assert!(!all_filtered);
 	}
 
 	#[test]
@@ -3565,6 +3592,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			};
 			(merged.posts, merged.cached_post_ids, all_posts_filtered)
 		};
+		let semantic_listing = listing.clone();
 		let store_live_listing_cache = |posts: &[Post], after: &str, metadata: Option<&User>, observation_source: crate::post_components::ObservationSource| {
 			if let Some((source, token)) = source_refresh.as_ref() {
 				let committed_metadata = metadata.cloned();
@@ -3580,6 +3608,12 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 							store_user_metadata(&username, metadata);
 						}
 						utils::store_user_subreddits(&username, committed_posts);
+						crate::observed_semantic_backfill::enqueue_observed_user_posts(
+							&username,
+							&format!("user:{username}:{semantic_listing}:committed-page"),
+							committed_posts,
+							crate::observed_semantic_backfill::ObservedBackfillPriority::Opportunistic,
+						);
 					},
 				)
 				.committed()
@@ -3628,8 +3662,8 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 			)
 		} else {
 			match fetch_user_listing_posts(&username, &path, &listing, &filters).await {
-				Ok((posts, after, all_posts_filtered)) => {
-					store_live_listing_cache(&posts, &after, None, crate::post_components::ObservationSource::Listing);
+				Ok((posts, canonical_posts, after, all_posts_filtered)) => {
+					store_live_listing_cache(&canonical_posts, &after, None, crate::post_components::ObservationSource::Listing);
 					let (posts, cached_post_ids, all_posts_filtered) = merge_cached_posts(posts, all_posts_filtered);
 					(
 						user.clone(),
@@ -3736,7 +3770,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 	let mut fragment = fragment;
 	utils::hydrate_post_author_links_from_cache(&mut fragment.posts);
 	utils::refresh_post_times(&mut fragment.posts);
-	if source_refresh.is_none() {
+	if source_refresh.is_none() && !video_listing {
 		crate::observed_semantic_backfill::enqueue_observed_user_posts(
 			&username,
 			&format!("user:{username}:{}:direct-page", fragment.listing),
