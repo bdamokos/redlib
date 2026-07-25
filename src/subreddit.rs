@@ -663,7 +663,7 @@ fn is_random_sort(sort: &str) -> bool {
 	sort == "random"
 }
 
-fn is_following_discovery_sort(sort: &str) -> bool {
+fn is_daemon_discovery_sort(sort: &str) -> bool {
 	sort == "discovered"
 }
 
@@ -1106,7 +1106,7 @@ fn build_sort_options(base_path: &str, current_query_url: &str, selected_sort: &
 	let methods = if base_path == FOLLOWING_ROUTE {
 		vec!["new", "discovered", "hot", "random", "top", "rising", "controversial", "video-length"]
 	} else if base_path.is_empty() {
-		vec!["hot", "new", "random", "top", "rising", "controversial", "video-length"]
+		vec!["hot", "new", "discovered", "random", "top", "rising", "controversial", "video-length"]
 	} else {
 		vec!["hot", "new", "top", "rising", "controversial", "video-length"]
 	};
@@ -1468,7 +1468,7 @@ fn is_following_front_page(front_page: &str) -> bool {
 
 /// Listing sort for merge/finalize when source fetch sort intentionally differs from display sort.
 fn contextual_feed_merge_sort(front_page: &str, sort: &str) -> Option<FeedSort> {
-	(is_following_front_page(front_page) || is_random_sort(sort)).then(|| FeedSort::from_listing(sort))
+	(is_following_front_page(front_page) || is_random_sort(sort) || is_daemon_discovery_sort(sort)).then(|| FeedSort::from_listing(sort))
 }
 
 fn build_subscription_sources(subscriptions: &[String], sort: FeedSort) -> Vec<FeedSource> {
@@ -1605,7 +1605,7 @@ fn build_listing_path(chunk: &str, sort: &str, base_query: &str, after: &str, be
 		.extend_pairs(query_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))
 		.finish();
 
-	let reddit_sort = if is_random_sort(sort) { "new" } else { sort };
+	let reddit_sort = if is_random_sort(sort) || is_daemon_discovery_sort(sort) { "new" } else { sort };
 	format!("/r/{}/{reddit_sort}.json?{query}", chunk.replace('+', "%2B"))
 }
 
@@ -2231,7 +2231,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
-				following_discovery_order: is_following_front_page(&front_page) && is_following_discovery_sort(&sort),
+				daemon_discovery_order: is_daemon_discovery_sort(&sort),
 				random_rotation_seed: random_rotation_seed_for_sort(&sort),
 				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
@@ -2925,7 +2925,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				// background source refreshes advance the global cache revision.
 				cache_revision: 0,
 				bundle_followed_user_comments: is_following_front_page(&front_page),
-				following_discovery_order: is_following_front_page(&front_page) && is_following_discovery_sort(&sort),
+				daemon_discovery_order: is_daemon_discovery_sort(&sort),
 				random_rotation_seed: random_rotation_seed_for_sort(&sort),
 				merge_sort: contextual_feed_merge_sort(&front_page, &sort),
 				..Default::default()
@@ -4846,15 +4846,31 @@ mod tests {
 	#[test]
 	fn aggregate_frontpage_sort_links_use_frontpage_routes() {
 		let options = super::build_sort_options("", "/hot?front_cursor=abc&after=t3_demo&t=day", "hot", "");
+		let discovered = options.iter().find(|option| option.label == "Discovered").unwrap();
 		let random = options.iter().find(|option| option.label == "Random").unwrap();
 		let top = options.iter().find(|option| option.label == "Top").unwrap();
 		let rising = options.iter().find(|option| option.label == "Rising").unwrap();
 		let controversial = options.iter().find(|option| option.label == "Controversial").unwrap();
 
+		assert_eq!(discovered.url, "/discovered?t=day");
 		assert_eq!(random.url, "/random?t=day");
 		assert_eq!(top.url, "/top?t=day");
 		assert_eq!(rising.url, "/rising?t=day");
 		assert_eq!(controversial.url, "/controversial?t=day");
+	}
+
+	#[test]
+	fn home_discovered_uses_new_source_windows_and_discovery_merge() {
+		let mut prefs = test_prefs();
+		prefs.subscriptions = vec!["rust".to_string(), "programming".to_string()];
+		let sources = super::build_front_page_session_sources(&prefs, "default", true, true, "unused", "discovered");
+
+		assert!(super::front_page_uses_contextual_session(false, "discovered"));
+		assert_eq!(super::contextual_feed_merge_sort("default", "discovered"), Some(FeedSort::New));
+		assert!(!sources.is_empty());
+		assert!(sources
+			.iter()
+			.all(|source| matches!(source, FeedSource::Subreddit { sort: FeedSort::New, .. } | FeedSource::Flair { sort: FeedSort::New, .. })));
 	}
 
 	#[test]

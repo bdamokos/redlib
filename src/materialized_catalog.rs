@@ -39,7 +39,7 @@ const MIXED_FEED_MAX_POSTS: usize = 4_096;
 // homepage catalog. This is intentionally aligned with the discovery index bound so
 // deep `/following` pages can reach every cached post up to the durable safety cap.
 const FOLLOWING_FEED_MAX_POSTS: usize = 100_000;
-const FOLLOWING_DISCOVERY_MAX_POSTS: usize = 100_000;
+const DAEMON_DISCOVERY_MAX_POSTS: usize = 100_000;
 pub const SUGGESTED_PROFILE_SEMANTIC_DEFAULT_MIX_PERCENT: u8 = 50;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -98,6 +98,8 @@ pub struct CatalogRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Kept under its original serialized name for snapshot compatibility. Entries now cover
+/// every daemon-managed aggregate-feed source, not only followed profiles.
 pub(crate) struct PersistedFollowingDiscoveryEntry {
 	pub post_id: String,
 	pub discovered_at_unix: u64,
@@ -318,7 +320,7 @@ struct MixedFeedCatalog {
 
 static MIXED_FEED_CATALOG: LazyLock<Mutex<MixedFeedCatalog>> = LazyLock::new(|| Mutex::new(MixedFeedCatalog::default()));
 static FOLLOWING_FEED_CATALOG: LazyLock<Mutex<MixedFeedCatalog>> = LazyLock::new(|| Mutex::new(MixedFeedCatalog::default()));
-static FOLLOWING_DISCOVERY: LazyLock<Mutex<FollowingDiscoveryState>> = LazyLock::new(|| Mutex::new(FollowingDiscoveryState::default()));
+static DAEMON_DISCOVERY: LazyLock<Mutex<FollowingDiscoveryState>> = LazyLock::new(|| Mutex::new(FollowingDiscoveryState::default()));
 
 fn normalize_catalog_source(source: &FeedSource) -> Option<CatalogSourceKey> {
 	match source {
@@ -358,34 +360,34 @@ fn insert_following_discovery_if_missing(state: &mut FollowingDiscoveryState, po
 	);
 }
 
-pub(crate) fn record_following_discoveries(source: &FeedSource, posts: &[Post]) {
-	if !is_followed_user_source(source) || posts.is_empty() {
+pub(crate) fn record_daemon_discoveries(source: &FeedSource, posts: &[Post]) {
+	if normalize_catalog_source(source).is_none() || posts.is_empty() {
 		return;
 	}
 	let now_unix = crate::cache_persistence::unix_now();
-	let mut state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let mut state = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
 	for post in posts.iter().rev() {
 		insert_following_discovery_if_missing(&mut state, &post.id, now_unix);
 	}
 }
 
-pub(crate) fn mark_following_posts_seen(source: &FeedSource, posts: &[Post]) {
-	if !is_followed_user_source(source) || posts.is_empty() {
+pub(crate) fn mark_posts_seen_before_daemon(source: &FeedSource, posts: &[Post]) {
+	if normalize_catalog_source(source).is_none() || posts.is_empty() {
 		return;
 	}
-	let mut state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let mut state = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
 	for post in posts.iter().rev() {
 		insert_following_discovery_if_missing(&mut state, &post.id, 0);
 	}
 }
 
 pub(crate) fn seed_following_discovery_baseline(source: &FeedSource, posts: &[PersistedPost], fetched_at_unix: u64) {
-	if !is_followed_user_source(source) || posts.is_empty() {
+	if normalize_catalog_source(source).is_none() || posts.is_empty() {
 		return;
 	}
 	let mut ordered = posts.iter().collect::<Vec<_>>();
 	ordered.sort_by(|left, right| left.created_ts.cmp(&right.created_ts).then_with(|| left.id.cmp(&right.id)));
-	let mut state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let mut state = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
 	let baseline_unix = state.bootstrap_at_unix.unwrap_or(fetched_at_unix);
 	for post in ordered {
 		insert_following_discovery_if_missing(&mut state, &post.id, baseline_unix);
@@ -394,9 +396,6 @@ pub(crate) fn seed_following_discovery_baseline(source: &FeedSource, posts: &[Pe
 
 pub(crate) fn restore_following_discoveries(entries: Vec<PersistedFollowingDiscoveryEntry>) {
 	let mut state = FollowingDiscoveryState::default();
-	if !entries.is_empty() {
-		state.bootstrap_at_unix = None;
-	}
 	for entry in entries {
 		state.next_sequence = state.next_sequence.max(entry.sequence);
 		state.posts.insert(
@@ -407,11 +406,14 @@ pub(crate) fn restore_following_discoveries(entries: Vec<PersistedFollowingDisco
 			},
 		);
 	}
-	*FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner()) = state;
+	// A release that broadens discovery tracking must give all legacy source windows one
+	// deployment baseline instead of inventing an order from their unrelated fetch times.
+	// Already-restored entries are insert-only and retain their original stamps.
+	*DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner()) = state;
 }
 
 pub(crate) fn snapshot_following_discoveries() -> Vec<PersistedFollowingDiscoveryEntry> {
-	let state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let state = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
 	let mut entries = state
 		.posts
 		.iter()
@@ -422,12 +424,12 @@ pub(crate) fn snapshot_following_discoveries() -> Vec<PersistedFollowingDiscover
 		})
 		.collect::<Vec<_>>();
 	entries.sort_by(|left, right| right.discovered_at_unix.cmp(&left.discovered_at_unix).then_with(|| right.sequence.cmp(&left.sequence)));
-	entries.truncate(FOLLOWING_DISCOVERY_MAX_POSTS);
+	entries.truncate(DAEMON_DISCOVERY_MAX_POSTS);
 	entries
 }
 
-pub(crate) fn sort_following_posts_by_discovery(posts: &mut [Post]) {
-	let state = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+pub(crate) fn sort_posts_by_daemon_discovery(posts: &mut [Post]) {
+	let state = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
 	let rank = |post: &Post| {
 		std::iter::once(post.id.as_str())
 			.chain(post.following_comments.iter().map(|comment| comment.id.as_str()))
@@ -1644,7 +1646,7 @@ fn query_mixed_feed_for_keys_limited(
 	limit: usize,
 	sort: FeedSort,
 	random_rotation_seed: u64,
-	following_discovery_order: bool,
+	daemon_discovery_order: bool,
 	following_activity_order: bool,
 ) -> Option<Vec<Post>> {
 	if allowed_keys.is_empty() || limit == 0 {
@@ -1690,8 +1692,8 @@ fn query_mixed_feed_for_keys_limited(
 		posts.truncate(limit);
 		return Some(posts.into_iter().map(|(_, _, post)| post).collect());
 	}
-	if following_discovery_order {
-		let discovery = FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	if daemon_discovery_order {
+		let discovery = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
 		let mut posts = catalog
 			.posts_by_id
 			.values()
@@ -2015,7 +2017,7 @@ pub(crate) fn query_mixed_feed_session_stream_limited(session: &FeedSession, lim
 		limit,
 		session_merge_sort(session),
 		session_random_rotation_seed(session),
-		session.request.following_discovery_order,
+		session.request.daemon_discovery_order,
 		session.request.bundle_followed_user_comments,
 	)
 }
@@ -3574,7 +3576,7 @@ pub(crate) fn reset_catalog() {
 	*catalog = MaterializedCatalog::default();
 	drop(catalog);
 	reset_mixed_feed_catalog();
-	*FOLLOWING_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner()) = FollowingDiscoveryState::default();
+	*DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner()) = FollowingDiscoveryState::default();
 }
 
 #[cfg(test)]

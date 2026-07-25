@@ -181,7 +181,7 @@ fn register_json_api_routes(app: &mut server::Server) {
 }
 
 fn is_front_page_sort_route(id: &str) -> bool {
-	matches!(id, "best" | "hot" | "new" | "random" | "top" | "rising" | "controversial" | "video-length")
+	matches!(id, "best" | "hot" | "new" | "discovered" | "random" | "top" | "rising" | "controversial" | "video-length")
 }
 
 #[cfg(test)]
@@ -225,6 +225,7 @@ mod tests {
 	fn front_page_sort_routes_include_random() {
 		assert!(is_front_page_sort_route("random"));
 		assert!(is_front_page_sort_route("new"));
+		assert!(is_front_page_sort_route("discovered"));
 		assert!(!is_front_page_sort_route("comments"));
 	}
 

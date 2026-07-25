@@ -463,7 +463,7 @@ pub struct FeedSessionRequest {
 	pub profile_id: String,
 	pub cache_revision: u64,
 	pub bundle_followed_user_comments: bool,
-	pub following_discovery_order: bool,
+	pub daemon_discovery_order: bool,
 	pub random_rotation_seed: u64,
 	/// When set, merge / finalize use this sort while [`FeedSource::sort`] may differ (e.g. `/following/hot`
 	/// loads `New` listings to match daemon-cached `u_` keys).
@@ -480,7 +480,7 @@ impl Default for FeedSessionRequest {
 			profile_id: String::new(),
 			cache_revision: 0,
 			bundle_followed_user_comments: false,
-			following_discovery_order: false,
+			daemon_discovery_order: false,
 			random_rotation_seed: 0,
 			merge_sort: None,
 		}
@@ -1627,11 +1627,11 @@ where
 	update_user_video_stats_from_posts(&new_entry.posts);
 	if materialized_catalog::source_is_supported(source) {
 		if refresh_origin == Some(RefreshOrigin::Daemon) {
-			materialized_catalog::record_following_discoveries(source, &new_entry.posts);
+			materialized_catalog::record_daemon_discoveries(source, &new_entry.posts);
 		} else {
 			// A later daemon refresh must not promote posts already seen through an
 			// interactive fetch; only genuinely new daemon discoveries rise to the top.
-			materialized_catalog::mark_following_posts_seen(source, &new_entry.posts);
+			materialized_catalog::mark_posts_seen_before_daemon(source, &new_entry.posts);
 		}
 		materialized_catalog::apply_source_refresh_with_observation(source, &new_entry.posts, observation_source);
 		apply_legacy_mixed_feed_source_refresh(source, &new_entry.posts);
@@ -2621,7 +2621,7 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	request.profile_id.hash(&mut hasher);
 	request.cache_revision.hash(&mut hasher);
 	request.bundle_followed_user_comments.hash(&mut hasher);
-	request.following_discovery_order.hash(&mut hasher);
+	request.daemon_discovery_order.hash(&mut hasher);
 	request.random_rotation_seed.hash(&mut hasher);
 	request.merge_sort.hash(&mut hasher);
 
@@ -2886,8 +2886,8 @@ fn finalize_session_posts_with_order(session: &FeedSession, all_posts: Vec<Post>
 		sort_posts_by_deterministic_random_with_seed(&mut merged, session.request.random_rotation_seed);
 		return merged;
 	}
-	if session.request.following_discovery_order {
-		materialized_catalog::sort_following_posts_by_discovery(&mut merged);
+	if session.request.daemon_discovery_order {
+		materialized_catalog::sort_posts_by_daemon_discovery(&mut merged);
 		return merged;
 	}
 	if session.request.bundle_followed_user_comments && merge_sort == FeedSort::New {
@@ -2909,7 +2909,7 @@ fn sqlite_timeline_selection(session: &FeedSession) -> Option<(i64, crate::cache
 	if session.request.profile_id.is_empty() || session_merge_sort(session) == FeedSort::Hot {
 		return None;
 	}
-	let sort = if session.request.following_discovery_order {
+	let sort = if session.request.daemon_discovery_order {
 		crate::cache_sqlite::TimelineSort::Discovered
 	} else {
 		match session_merge_sort(session) {
@@ -3077,9 +3077,9 @@ fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per
 	tail.len() >= per_page || session.background_complete
 }
 
-fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, following_discovery_order: bool, mut posts: Vec<Post>) -> Vec<Post> {
-	if following_discovery_order {
-		materialized_catalog::sort_following_posts_by_discovery(&mut posts);
+fn finalize_page_posts(sort: FeedSort, bundle_activity_sort: bool, daemon_discovery_order: bool, mut posts: Vec<Post>) -> Vec<Post> {
+	if daemon_discovery_order {
+		materialized_catalog::sort_posts_by_daemon_discovery(&mut posts);
 		return posts;
 	}
 	match sort {
@@ -4045,7 +4045,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		frozen_posts.clone()
 	} else {
 		let chunk: Vec<Post> = tail_for_page.iter().take(per_page).cloned().collect();
-		let finalized = finalize_page_posts(sort, bundle_activity, session.request.following_discovery_order, chunk);
+		let finalized = finalize_page_posts(sort, bundle_activity, session.request.daemon_discovery_order, chunk);
 		if page_ready {
 			freeze_feed_page(session, page, finalized.clone());
 		}
@@ -4096,7 +4096,7 @@ fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: u
 	if chunk.is_empty() {
 		return;
 	}
-	let finalized = finalize_page_posts(sort, bundle_activity, session.request.following_discovery_order, chunk);
+	let finalized = finalize_page_posts(sort, bundle_activity, session.request.daemon_discovery_order, chunk);
 	freeze_feed_page(session, page, finalized);
 	touch_session(session);
 }
@@ -5034,31 +5034,47 @@ mod tests {
 	}
 
 	#[test]
-	fn following_discovery_order_only_promotes_newly_seen_posts() {
+	fn daemon_discovery_order_only_promotes_newly_seen_posts() {
 		let _guard = test_lock();
 		reset_test_caches();
 
 		let source = FeedSource::subreddit("u_demo", FeedSort::New);
 		let old = test_post("old", "community", 200);
 		let newly_found = test_post("newly-found", "community", 100);
-		crate::materialized_catalog::mark_following_posts_seen(&source, std::slice::from_ref(&old));
-		crate::materialized_catalog::record_following_discoveries(&source, &[old.clone(), newly_found.clone()]);
+		crate::materialized_catalog::mark_posts_seen_before_daemon(&source, std::slice::from_ref(&old));
+		crate::materialized_catalog::record_daemon_discoveries(&source, &[old.clone(), newly_found.clone()]);
 
 		let mut posts = vec![old.clone(), newly_found.clone()];
-		crate::materialized_catalog::sort_following_posts_by_discovery(&mut posts);
+		crate::materialized_catalog::sort_posts_by_daemon_discovery(&mut posts);
 		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["newly-found", "old"]);
 
-		crate::materialized_catalog::record_following_discoveries(&source, &[old, newly_found]);
-		crate::materialized_catalog::sort_following_posts_by_discovery(&mut posts);
+		crate::materialized_catalog::record_daemon_discoveries(&source, &[old, newly_found]);
+		crate::materialized_catalog::sort_posts_by_daemon_discovery(&mut posts);
 		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["newly-found", "old"]);
 	}
 
 	#[test]
-	fn following_discovery_migration_uses_one_deployment_baseline_without_dropping_posts() {
+	fn daemon_discovery_order_tracks_regular_home_sources() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let source = FeedSource::subreddit("rust", FeedSort::New);
+		let old = test_post("old", "rust", 300);
+		let newly_found = test_post("newly-found", "rust", 100);
+
+		crate::materialized_catalog::mark_posts_seen_before_daemon(&source, std::slice::from_ref(&old));
+		crate::materialized_catalog::record_daemon_discoveries(&source, &[old.clone(), newly_found.clone()]);
+
+		let mut posts = vec![old, newly_found];
+		crate::materialized_catalog::sort_posts_by_daemon_discovery(&mut posts);
+		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), vec!["newly-found", "old"]);
+	}
+
+	#[test]
+	fn daemon_discovery_migration_uses_one_deployment_baseline_without_dropping_posts() {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let first_source = FeedSource::subreddit("u_first", FeedSort::New);
+		let first_source = FeedSource::subreddit("rust", FeedSort::New);
 		let second_source = FeedSource::subreddit("u_second", FeedSort::New);
 		let first = crate::cache_persistence::PersistedPost::from_runtime(&test_post("first", "community", 100));
 		let second = crate::cache_persistence::PersistedPost::from_runtime(&test_post("second", "community", 200));
@@ -6894,8 +6910,10 @@ mod tests {
 
 		let mut discovered = base_session;
 		discovered.request.merge_sort = Some(FeedSort::New);
+		discovered.request.daemon_discovery_order = true;
+		assert_eq!(sqlite_timeline_selection(&discovered), Some((1, crate::cache_sqlite::TimelineSort::Discovered)));
+
 		discovered.request.bundle_followed_user_comments = true;
-		discovered.request.following_discovery_order = true;
 		assert_eq!(sqlite_timeline_selection(&discovered), Some((2, crate::cache_sqlite::TimelineSort::Discovered)));
 	}
 
@@ -7751,7 +7769,7 @@ mod tests {
 					profile_id: String::new(),
 					cache_revision: 0,
 					bundle_followed_user_comments: true,
-					following_discovery_order: false,
+					daemon_discovery_order: false,
 					random_rotation_seed: 0,
 					merge_sort: None,
 				},
