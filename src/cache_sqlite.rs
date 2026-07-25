@@ -26,6 +26,9 @@ const INTERACTIVE_ORIGIN: i64 = 2;
 const RETAINED_PROFILE_GENERATIONS: i64 = 128;
 const ACTIVE_PROFILE_IDLE_SECS: i64 = 10_800;
 const PROFILE_CURSOR_PIN_TTL_SECS: u64 = 10_800;
+const MIGRATION_SOURCE_STATUS_PENDING: i64 = 0;
+const MIGRATION_SOURCE_STATUS_IMPORTED: i64 = 1;
+const MIGRATION_SOURCE_STATUS_QUARANTINED: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS cache_meta (
@@ -318,6 +321,7 @@ pub(crate) struct ImportStats {
 	pub scanned_sources: usize,
 	pub imported_sources: usize,
 	pub skipped_sources: usize,
+	pub quarantined_sources: usize,
 	pub objects_seen: usize,
 }
 
@@ -454,11 +458,12 @@ pub(crate) fn init(cache_dir: &Path) -> Result<ImportStats, String> {
 		.map_err(|_| "SQLite shadow cache initialized concurrently".to_string())?;
 	SQLITE_READS_HEALTHY.store(true, AtomicOrdering::Release);
 	info!(
-		"cache_sqlite: shadow ready at {} (scanned={}, imported={}, skipped={}, objects={})",
+		"cache_sqlite: shadow ready at {} (scanned={}, imported={}, skipped={}, quarantined={}, objects={})",
 		path.display(),
 		stats.scanned_sources,
 		stats.imported_sources,
 		stats.skipped_sources,
+		stats.quarantined_sources,
 		stats.objects_seen
 	);
 	Ok(stats)
@@ -803,7 +808,9 @@ fn reconcile_deleted_media_tombstone_revision(connection: &mut Connection) -> Re
 		.optional()
 		.map_err(|error| error.to_string())?;
 	if previous.as_deref() != Some(revision.as_slice()) {
-		transaction.execute("UPDATE migration_sources SET status=0", []).map_err(|error| error.to_string())?;
+		transaction
+			.execute("UPDATE migration_sources SET status=?1", [MIGRATION_SOURCE_STATUS_PENDING])
+			.map_err(|error| error.to_string())?;
 		transaction
 			.execute(
 				"INSERT INTO cache_meta(key,value) VALUES('deleted_media_tombstone_revision',?1)
@@ -834,14 +841,36 @@ fn import_legacy_sources(connection: &mut Connection, cache_dir: &Path, payload_
 			)
 			.optional()
 			.map_err(|error| error.to_string())?;
-		let bytes = fs::read(&descriptor.path).map_err(|error| format!("{}: {error}", descriptor.path.display()))?;
+		let bytes = match fs::read(&descriptor.path) {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				stats.skipped_sources += 1;
+				warn!("cache_sqlite: skipped unreadable source cache file {}: {error}", descriptor.path.display());
+				continue;
+			}
+		};
 		let source_hash = sha256(&bytes);
 		let mtime = i64::try_from(descriptor.mtime_ns).unwrap_or(i64::MAX);
-		if previous.is_some_and(|(size, mtime_ns, hash, status)| status == 1 && size == descriptor.size as i64 && mtime_ns == mtime && hash == source_hash) {
+		if previous.is_some_and(|(size, mtime_ns, hash, status)| {
+			matches!(status, MIGRATION_SOURCE_STATUS_IMPORTED | MIGRATION_SOURCE_STATUS_QUARANTINED) && size == descriptor.size as i64 && mtime_ns == mtime && hash == source_hash
+		}) {
 			stats.skipped_sources += 1;
 			continue;
 		}
-		let mut entry: PersistedSourceCacheEntry = bincode::deserialize(&bytes).map_err(|error| format!("{}: {error}", descriptor.path.display()))?;
+		let mut entry: PersistedSourceCacheEntry = match bincode::deserialize(&bytes) {
+			Ok(entry) => entry,
+			Err(error) => {
+				record_quarantined_source(connection, &descriptor, &source_hash)?;
+				stats.skipped_sources += 1;
+				stats.quarantined_sources += 1;
+				warn!(
+					"cache_sqlite: quarantined unreadable source cache file {} (cache_key={}): {error}",
+					descriptor.path.display(),
+					descriptor.cache_key
+				);
+				continue;
+			}
+		};
 		crate::post_cache::prune_known_deleted_media_from_persisted_posts(&mut entry.posts);
 		let metadata = SourceWriteMetadata {
 			size: descriptor.size,
@@ -863,6 +892,30 @@ fn import_legacy_sources(connection: &mut Connection, cache_dir: &Path, payload_
 		commit_import_batch(connection, &pending, payload_codec, &mut stats)?;
 	}
 	Ok(stats)
+}
+
+fn record_quarantined_source(connection: &Connection, descriptor: &SourceDescriptor, source_hash: &[u8]) -> Result<(), String> {
+	connection
+		.execute(
+			"INSERT INTO migration_sources(cache_key,source_size,source_mtime_ns,source_hash,imported_generation,imported_at,object_count,status)
+			 VALUES(?1,?2,?3,?4,0,?5,0,?6)
+			 ON CONFLICT(cache_key) DO UPDATE SET
+			   source_size=excluded.source_size,
+			   source_mtime_ns=excluded.source_mtime_ns,
+			   source_hash=excluded.source_hash,
+			   imported_at=excluded.imported_at,
+			   status=excluded.status",
+			params![
+				descriptor.cache_key,
+				descriptor.size as i64,
+				i64::try_from(descriptor.mtime_ns).unwrap_or(i64::MAX),
+				source_hash,
+				unix_now() as i64,
+				MIGRATION_SOURCE_STATUS_QUARANTINED
+			],
+		)
+		.map_err(|error| error.to_string())?;
+	Ok(())
 }
 
 fn commit_import_batch(connection: &mut Connection, pending: &[PreparedSourceImport], payload_codec: PayloadCodec, stats: &mut ImportStats) -> Result<(), String> {
@@ -1521,7 +1574,7 @@ fn apply_source_in_transaction(
 	transaction
 		.execute(
 			"INSERT INTO migration_sources(cache_key,source_size,source_mtime_ns,source_hash,imported_generation,imported_at,object_count,status)
-			 VALUES(?1,?2,?3,?4,?5,?6,?7,1)
+			 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
 			 ON CONFLICT(cache_key) DO UPDATE SET
 			   source_size=excluded.source_size,
 			   source_mtime_ns=excluded.source_mtime_ns,
@@ -1529,7 +1582,7 @@ fn apply_source_in_transaction(
 			   imported_generation=excluded.imported_generation,
 			   imported_at=excluded.imported_at,
 			   object_count=excluded.object_count,
-			   status=1",
+			   status=excluded.status",
 			params![
 				cache_key,
 				metadata.size as i64,
@@ -1537,7 +1590,8 @@ fn apply_source_in_transaction(
 				metadata.hash,
 				generation,
 				metadata.imported_at as i64,
-				entry.posts.len() as i64
+				entry.posts.len() as i64,
+				MIGRATION_SOURCE_STATUS_IMPORTED
 			],
 		)
 		.map_err(|error| error.to_string())?;
@@ -2807,7 +2861,7 @@ pub fn run_shadow_verifier() -> Result<(), String> {
 		.map_err(|error| error.to_string())?;
 	let db_bytes = fs::metadata(&db_path).map_err(|error| error.to_string())?.len();
 	println!(
-		"VERIFY codec={:?} page_size={} sync={} migration_batch={} scanned={} imported={} skipped={} objects_seen={} canonical_objects={} memberships={} active_feed_entries={} db_bytes={} import_ms={} materialize_ms={} new_us_p50={} new_us_p95={} new_us_p99={} discovered_us_p50={} random_us_p50={} videos_us_p50={} deep_pages={} deep_us_p50={} deep_us_p95={} deep_us_p99={} render25_us_p50={} render25_us_p95={} render25_us_p99={} rendered_cards={} rendered_bytes={} quick_check={}",
+		"VERIFY codec={:?} page_size={} sync={} migration_batch={} scanned={} imported={} skipped={} quarantined={} objects_seen={} canonical_objects={} memberships={} active_feed_entries={} db_bytes={} import_ms={} materialize_ms={} new_us_p50={} new_us_p95={} new_us_p99={} discovered_us_p50={} random_us_p50={} videos_us_p50={} deep_pages={} deep_us_p50={} deep_us_p95={} deep_us_p99={} render25_us_p50={} render25_us_p95={} render25_us_p99={} rendered_cards={} rendered_bytes={} quick_check={}",
 		payload_codec,
 		page_size,
 		configured_synchronous()?,
@@ -2815,6 +2869,7 @@ pub fn run_shadow_verifier() -> Result<(), String> {
 		import_stats.scanned_sources,
 		import_stats.imported_sources,
 		import_stats.skipped_sources,
+		import_stats.quarantined_sources,
 		import_stats.objects_seen,
 		object_count,
 		membership_count,
@@ -3513,6 +3568,51 @@ mod tests {
 		assert_eq!((third.imported_sources, third.skipped_sources), (1, 1));
 		let baselines: i64 = connection.query_row("SELECT COUNT(DISTINCT discovery_seq) FROM objects", [], |row| row.get(0)).unwrap();
 		assert_eq!(baselines, 1);
+		drop(connection);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn file_importer_quarantines_malformed_v1_only_source_and_retries_changed_payload() {
+		let root = std::env::temp_dir().join(format!("redlib-cache-sqlite-v1-quarantine-test-{}", uuid::Uuid::new_v4()));
+		let source_v2_dir = root.join("sources.v2");
+		let source_v1_dir = root.join("sources.v1");
+		fs::create_dir_all(&source_v2_dir).unwrap();
+		fs::create_dir_all(&source_v1_dir).unwrap();
+		let valid_key = "subreddit:rust:new";
+		let malformed_key = "flair:femalegazeporn:lesbian:new";
+		let valid_path = source_v2_dir.join(format!("{}.bin", URL_SAFE_NO_PAD.encode(valid_key)));
+		let malformed_path = source_v1_dir.join(format!("{}.bin", URL_SAFE_NO_PAD.encode(malformed_key)));
+		fs::write(&valid_path, bincode::serialize(&source(vec![post("rust", 10)], None)).unwrap()).unwrap();
+		fs::write(&malformed_path, [0xff_u8; 32]).unwrap();
+
+		let mut connection = open_database(&root.join("cache.sqlite3")).unwrap();
+		let first = import_legacy_sources(&mut connection, &root, PayloadCodec::Raw).unwrap();
+		assert_eq!(
+			(first.scanned_sources, first.imported_sources, first.skipped_sources, first.quarantined_sources),
+			(2, 1, 1, 1)
+		);
+		assert_eq!(
+			connection
+				.query_row("SELECT status FROM migration_sources WHERE cache_key=?1", [malformed_key], |row| row.get::<_, i64>(0))
+				.unwrap(),
+			MIGRATION_SOURCE_STATUS_QUARANTINED
+		);
+		assert_eq!(connection.query_row("SELECT COUNT(*) FROM sources", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+
+		let warm = import_legacy_sources(&mut connection, &root, PayloadCodec::Raw).unwrap();
+		assert_eq!((warm.imported_sources, warm.skipped_sources, warm.quarantined_sources), (0, 2, 0));
+
+		fs::write(&malformed_path, bincode::serialize(&source(vec![post("recovered", 20)], None)).unwrap()).unwrap();
+		let recovered = import_legacy_sources(&mut connection, &root, PayloadCodec::Raw).unwrap();
+		assert_eq!((recovered.imported_sources, recovered.skipped_sources, recovered.quarantined_sources), (1, 1, 0));
+		assert_eq!(
+			connection
+				.query_row("SELECT status FROM migration_sources WHERE cache_key=?1", [malformed_key], |row| row.get::<_, i64>(0))
+				.unwrap(),
+			MIGRATION_SOURCE_STATUS_IMPORTED
+		);
+		assert_eq!(connection.query_row("SELECT COUNT(*) FROM sources", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
 		drop(connection);
 		fs::remove_dir_all(root).unwrap();
 	}
