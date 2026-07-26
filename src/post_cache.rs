@@ -1,5 +1,6 @@
 use crate::cache_persistence::{
 	instant_to_unix, option_instant_to_unix, option_unix_to_instant, unix_to_instant, PersistedRefreshOrigin, PersistedRememberedSubredditEntry, PersistedSourceCacheEntry,
+	PersistedSourceUnavailableState,
 };
 use crate::materialized_catalog;
 use crate::oauth::oauth_is_available;
@@ -42,8 +43,11 @@ const FEEDBACK_PRIORITY_MAX_SCORE: f64 = 3.0;
 const FEEDBACK_PRIORITY_MIN_SCORE: f64 = -3.0;
 const FEEDBACK_PRIORITY_SENSITIVITY: f64 = 0.08;
 const RECENT_REQUEST_PRIORITY_SECS: u64 = 6 * 60 * 60;
-const BANNED_REFRESH_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
-const PERMANENT_FAILURE_BACKOFF_SECS: u64 = 14 * 24 * 60 * 60;
+const DURABLE_UNAVAILABLE_BACKOFF_SECS: u64 = 30 * 24 * 60 * 60;
+/// One in every four daemon selections is the least-recently-served eligible
+/// source. The other three retain cadence, overdue, visit and feedback priority.
+const FAIRNESS_SELECTION_STRIDE: u64 = 4;
+const UNFOLLOWED_DECAY_GRACE_SECS: u64 = 6 * 60 * 60;
 const ACTIVE_BROWSER_SESSION_TTL_SECS: u64 = 20;
 const DEFAULT_ESTIMATED_POST_INTERVAL_SECS: u64 = 21_600;
 const MIN_ESTIMATED_POST_INTERVAL_SECS: u64 = 60;
@@ -315,6 +319,7 @@ pub struct RememberedSubredditEntry {
 	pub last_refresh_succeeded_at: Option<Instant>,
 	pub last_refresh_failed_at: Option<Instant>,
 	pub banned_until: Option<Instant>,
+	pub unavailable_reason: Option<String>,
 	pub consecutive_failures: u32,
 	pub estimated_post_interval_secs: u64,
 	pub refresh_in_flight: bool,
@@ -325,6 +330,8 @@ pub struct RememberedSubredditEntry {
 	/// Accumulated rating-feedback score. Positive values mildly promote, negative values mildly defer.
 	pub feedback_priority_score: f64,
 	pub feedback_priority_last_update_at: Option<Instant>,
+	pub profile_followers: usize,
+	pub unfollowed_decay: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,8 +344,7 @@ pub enum RefreshOrigin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RememberedFailureDisposition {
 	Transient,
-	Permanent,
-	Banned,
+	DurableUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -395,6 +401,12 @@ pub struct CacheStatusSource {
 	pub queue_position: Option<usize>,
 	pub predicted_next_fetch_in_secs: Option<u64>,
 	pub blocked_until_secs: Option<u64>,
+	pub retry_at_unix: Option<u64>,
+	pub unavailable_reason: Option<String>,
+	pub scheduling_reason: String,
+	pub fairness_slot: bool,
+	pub lifecycle_state: String,
+	pub profile_followers: usize,
 	pub consecutive_failures: u32,
 }
 
@@ -552,6 +564,8 @@ static SQLITE_SESSION_CURSORS: LazyLock<Mutex<HashMap<String, SqliteSessionCurso
 pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+static REMEMBERED_DAEMON_SELECTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PROFILE_SOURCE_MEMBERSHIPS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SOURCE_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
 static DELETED_MEDIA_TOMBSTONES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static DELETED_MEDIA_PERSIST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -707,6 +721,7 @@ fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 		last_refresh_succeeded_at: None,
 		last_refresh_failed_at: None,
 		banned_until: None,
+		unavailable_reason: None,
 		consecutive_failures: 0,
 		estimated_post_interval_secs: DEFAULT_ESTIMATED_POST_INTERVAL_SECS,
 		refresh_in_flight: false,
@@ -715,6 +730,8 @@ fn new_remembered_subreddit_entry(name: String) -> RememberedSubredditEntry {
 		visit_signal_last_applied_at: None,
 		feedback_priority_score: 0.0,
 		feedback_priority_last_update_at: None,
+		profile_followers: 0,
+		unfollowed_decay: false,
 	}
 }
 
@@ -882,6 +899,66 @@ pub fn remember_frontpage_subreddits(preferences: &Preferences, include_followed
 			record_remembered_feed_visit_signal(&source);
 		}
 	}
+}
+
+fn membership_source_keys(preferences: &Preferences) -> HashSet<String> {
+	let mut keys = HashSet::new();
+	for subscription in &preferences.subscriptions {
+		if let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subscription.clone(), FeedSort::New)) {
+			if let Some(key) = remembered_feed_key_for_source(&source) {
+				keys.insert(key);
+			}
+		}
+	}
+	for subscription in &preferences.flair_subscriptions {
+		if let Some(source) = normalize_remembered_source(&FeedSource::flair(subscription.subreddit.clone(), subscription.flair.clone(), FeedSort::New)) {
+			if let Some(key) = remembered_feed_key_for_source(&source) {
+				keys.insert(key);
+			}
+		}
+	}
+	keys
+}
+
+pub(crate) fn reconcile_profile_memberships(profiles: Vec<(String, Preferences)>) {
+	let next = profiles
+		.into_iter()
+		.map(|(profile, preferences)| (profile, membership_source_keys(&preferences)))
+		.collect::<HashMap<_, _>>();
+	let previous_keys = {
+		let mut memberships = PROFILE_SOURCE_MEMBERSHIPS.lock().unwrap_or_else(|error| error.into_inner());
+		let previous = memberships.values().flat_map(|keys| keys.iter().cloned()).collect::<HashSet<_>>();
+		*memberships = next.clone();
+		previous
+	};
+	let counts = next.values().flat_map(|keys| keys.iter()).fold(HashMap::<String, usize>::new(), |mut counts, key| {
+		*counts.entry(key.clone()).or_default() += 1;
+		counts
+	});
+	let now = Instant::now();
+	let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|error| error.into_inner());
+	for (key, count) in &counts {
+		let entry = remembered.entry(key.clone()).or_insert_with(|| new_remembered_subreddit_entry(key.clone()));
+		entry.profile_followers = *count;
+		entry.unfollowed_decay = false;
+		entry.last_requested_at = now;
+	}
+	for key in previous_keys {
+		if counts.contains_key(&key) {
+			continue;
+		}
+		if let Some(entry) = remembered.get_mut(&key) {
+			entry.profile_followers = 0;
+			entry.unfollowed_decay = true;
+			entry.visit_priority_score = 0.0;
+			entry.visit_priority_last_update_at = None;
+			entry.visit_signal_last_applied_at = None;
+			entry.feedback_priority_score = entry.feedback_priority_score.min(0.0);
+			entry.last_requested_at = now - Duration::from_secs(REMEMBERED_SUBREDDIT_TTL_SECS.saturating_sub(UNFOLLOWED_DECAY_GRACE_SECS));
+		}
+	}
+	drop(remembered);
+	crate::cache_persistence::mark_dirty();
 }
 
 fn sqlite_active_profile_sources(preferences: &Preferences) -> Vec<(String, i64)> {
@@ -1208,21 +1285,11 @@ fn load_source_entry_from_disk(source: &FeedSource, mode: CacheServeMode) -> Opt
 	}
 }
 
-fn median_u64(values: &mut [u64]) -> u64 {
-	values.sort_unstable();
-	let mid = values.len() / 2;
-	if values.len() % 2 == 0 {
-		(values[mid - 1] + values[mid]) / 2
-	} else {
-		values[mid]
-	}
-}
-
 fn estimate_post_interval_secs(posts: &[Post], prior: u64) -> u64 {
 	let mut timestamps = posts.iter().map(|post| post.created_ts).collect::<Vec<_>>();
 	timestamps.sort_unstable_by(|left, right| right.cmp(left));
 
-	let mut deltas = timestamps
+	let deltas = timestamps
 		.windows(2)
 		.filter_map(|window| {
 			let delta = window[0].saturating_sub(window[1]);
@@ -1234,7 +1301,8 @@ fn estimate_post_interval_secs(posts: &[Post], prior: u64) -> u64 {
 		return prior.clamp(MIN_ESTIMATED_POST_INTERVAL_SECS, MAX_ESTIMATED_POST_INTERVAL_SECS);
 	}
 
-	median_u64(&mut deltas).clamp(MIN_ESTIMATED_POST_INTERVAL_SECS, MAX_ESTIMATED_POST_INTERVAL_SECS)
+	let average = deltas.iter().map(|value| *value as u128).sum::<u128>() / deltas.len() as u128;
+	(average.min(u64::MAX as u128) as u64).clamp(MIN_ESTIMATED_POST_INTERVAL_SECS, MAX_ESTIMATED_POST_INTERVAL_SECS)
 }
 
 fn freshness_target_secs(estimated_post_interval_secs: u64) -> u64 {
@@ -1329,6 +1397,47 @@ fn remembered_refresh_priority_at(left: &RememberedSubredditEntry, right: &Remem
 	}
 
 	left.name.cmp(&right.name)
+}
+
+fn fairness_service_age_secs_at(entry: &RememberedSubredditEntry, now: Instant) -> u64 {
+	entry
+		.last_refresh_started_at
+		.or(entry.last_refresh_succeeded_at)
+		.map(|instant| elapsed_secs_at(now, instant))
+		.unwrap_or_else(|| elapsed_secs_at(now, entry.last_requested_at))
+}
+
+fn fairness_priority_at(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry, now: Instant) -> Ordering {
+	fairness_service_age_secs_at(right, now)
+		.cmp(&fairness_service_age_secs_at(left, now))
+		.then_with(|| left.name.cmp(&right.name))
+}
+
+fn fairness_slot_for_sequence(sequence: u64) -> bool {
+	sequence % FAIRNESS_SELECTION_STRIDE == FAIRNESS_SELECTION_STRIDE - 1
+}
+
+fn ordered_refresh_entries_with_fairness(mut entries: Vec<RememberedSubredditEntry>, now: Instant, start_sequence: u64) -> Vec<(RememberedSubredditEntry, bool)> {
+	let mut ordered = Vec::with_capacity(entries.len());
+	let mut sequence = start_sequence;
+	while !entries.is_empty() {
+		let fairness_slot = fairness_slot_for_sequence(sequence);
+		let selected = entries
+			.iter()
+			.enumerate()
+			.min_by(|(_, left), (_, right)| {
+				if fairness_slot {
+					fairness_priority_at(left, right, now)
+				} else {
+					remembered_refresh_priority_at(left, right, now)
+				}
+			})
+			.map(|(index, _)| index)
+			.unwrap_or_default();
+		ordered.push((entries.remove(selected), fairness_slot));
+		sequence = sequence.saturating_add(1);
+	}
+	ordered
 }
 
 pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) -> Option<SourceRefreshToken> {
@@ -1724,6 +1833,7 @@ where
 			entry.last_refresh_succeeded_at = Some(Instant::now());
 			entry.last_refresh_failed_at = None;
 			entry.banned_until = None;
+			entry.unavailable_reason = None;
 			entry.consecutive_failures = 0;
 			entry.estimated_post_interval_secs = estimate_post_interval_secs(committed_posts, entry.estimated_post_interval_secs);
 			entry.refresh_in_flight = false;
@@ -1799,25 +1909,20 @@ where
 	publish_remembered_source_refresh_with_token_and_effects(&source, posts, after, refresh_origin, observation_source, token, on_committed)
 }
 
+fn durable_unavailable_reason(error: &str) -> Option<&'static str> {
+	match crate::client::source_unavailable_from_error(error)? {
+		crate::client::SourceUnavailable::Banned => Some("banned"),
+		crate::client::SourceUnavailable::Private => Some("private"),
+		crate::client::SourceUnavailable::Suspended => Some("suspended"),
+		crate::client::SourceUnavailable::NotFound => Some("not_found"),
+		// A generic 403 can reflect temporary OAuth or access trouble.
+		crate::client::SourceUnavailable::Forbidden => None,
+	}
+}
+
 fn refresh_failure_disposition(error: &str) -> RememberedFailureDisposition {
-	let normalized = error.trim().to_ascii_lowercase();
-	if normalized == "banned" || normalized.contains("banned") {
-		RememberedFailureDisposition::Banned
-	} else if normalized == "private"
-		|| normalized.contains("private")
-		|| normalized == "gated"
-		|| normalized.contains("gated")
-		|| normalized.contains("403")
-		|| normalized.contains("forbidden")
-		|| normalized.contains("404")
-		|| normalized == "not_found"
-		|| normalized.contains("not_found")
-		|| normalized == "not-found"
-		|| normalized.contains("not-found")
-		|| normalized.contains("not found")
-		|| normalized.contains("no posts found")
-	{
-		RememberedFailureDisposition::Permanent
+	if durable_unavailable_reason(error).is_some() {
+		RememberedFailureDisposition::DurableUnavailable
 	} else {
 		RememberedFailureDisposition::Transient
 	}
@@ -1866,14 +1971,9 @@ fn record_remembered_source_refresh_failure(source: &FeedSource, error: &str, re
 	};
 
 	entry.last_refresh_failed_at = Some(now);
-	match disposition {
-		RememberedFailureDisposition::Banned => {
-			entry.banned_until = Some(now + Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
-		}
-		RememberedFailureDisposition::Permanent => {
-			entry.banned_until = Some(now + Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
-		}
-		RememberedFailureDisposition::Transient => {}
+	if let Some(reason) = durable_unavailable_reason(error) {
+		entry.banned_until = Some(now + Duration::from_secs(DURABLE_UNAVAILABLE_BACKOFF_SECS));
+		entry.unavailable_reason = Some(reason.to_string());
 	}
 	entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
 	entry.refresh_in_flight = false;
@@ -2003,6 +2103,23 @@ pub(crate) fn snapshot_persisted_remembered_subreddits(now_unix: u64) -> Vec<Per
 		.collect()
 }
 
+pub(crate) fn snapshot_persisted_source_unavailability() -> Vec<PersistedSourceUnavailableState> {
+	let Ok(remembered) = REMEMBERED_SUBREDDITS.lock() else {
+		return Vec::new();
+	};
+	let mut states = remembered
+		.values()
+		.filter_map(|entry| {
+			entry.unavailable_reason.as_ref().map(|reason| PersistedSourceUnavailableState {
+				name: entry.name.clone(),
+				reason: reason.clone(),
+			})
+		})
+		.collect::<Vec<_>>();
+	states.sort_by(|left, right| left.name.cmp(&right.name));
+	states
+}
+
 #[cfg(not(test))]
 pub(crate) fn reset_persisted_mixed_feed_index() {
 	materialized_catalog::reset_mixed_feed_catalog();
@@ -2020,9 +2137,11 @@ pub(crate) fn index_persisted_source_for_mixed_feed(entry: &PersistedSourceCache
 pub(crate) fn restore_persisted_state(
 	source_entries: Vec<PersistedSourceCacheEntry>,
 	remembered_entries: Vec<PersistedRememberedSubredditEntry>,
+	unavailability: Vec<PersistedSourceUnavailableState>,
 	_saved_at_unix: u64,
 	now_unix: u64,
 ) {
+	let unavailable_by_name = unavailability.into_iter().map(|state| (state.name, state.reason)).collect::<HashMap<_, _>>();
 	let restored_remembered = remembered_entries
 		.into_iter()
 		.filter_map(|entry| {
@@ -2032,12 +2151,13 @@ pub(crate) fn restore_persisted_state(
 			(age_secs <= REMEMBERED_SUBREDDIT_TTL_SECS).then_some((
 				normalized.clone(),
 				RememberedSubredditEntry {
-					name: normalized,
+					name: normalized.clone(),
 					last_requested_at: unix_to_instant(entry.last_requested_at_unix, now_unix),
 					last_refresh_started_at: option_unix_to_instant(entry.last_refresh_started_at_unix, now_unix),
 					last_refresh_succeeded_at: option_unix_to_instant(entry.last_refresh_succeeded_at_unix, now_unix),
 					last_refresh_failed_at: option_unix_to_instant(entry.last_refresh_failed_at_unix, now_unix),
 					banned_until: option_unix_to_instant(entry.banned_until_unix, now_unix),
+					unavailable_reason: unavailable_by_name.get(&normalized).cloned(),
 					consecutive_failures: entry.consecutive_failures,
 					estimated_post_interval_secs: entry.estimated_post_interval_secs,
 					refresh_in_flight: false,
@@ -2046,6 +2166,8 @@ pub(crate) fn restore_persisted_state(
 					visit_signal_last_applied_at: option_unix_to_instant(entry.visit_signal_last_applied_unix, now_unix),
 					feedback_priority_score: entry.feedback_priority_score,
 					feedback_priority_last_update_at: option_unix_to_instant(entry.feedback_priority_last_update_unix, now_unix),
+					profile_followers: 0,
+					unfollowed_decay: false,
 				},
 			))
 		})
@@ -2184,14 +2306,16 @@ enum RememberedFeedPickMode {
 fn pick_next_remembered_feed_to_refresh_with_mode(mode: RememberedFeedPickMode) -> Option<FeedSource> {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let now = Instant::now();
-	let mut entries = remembered
+	let entries = remembered
 		.values()
 		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked_at(entry, now) && !entry.refresh_in_flight)
 		.filter(|entry| mode == RememberedFeedPickMode::AnyEligible || entry.last_refresh_succeeded_at.is_some())
 		.cloned()
 		.collect::<Vec<_>>();
-	entries.sort_by(|left, right| remembered_refresh_priority_at(left, right, now));
-	entries.into_iter().find_map(|entry| remembered_feed_source_from_key(&entry.name))
+	let selection_sequence = REMEMBERED_DAEMON_SELECTION_SEQUENCE.load(AtomicOrdering::Relaxed);
+	ordered_refresh_entries_with_fairness(entries, now, selection_sequence)
+		.into_iter()
+		.find_map(|(entry, _)| remembered_feed_source_from_key(&entry.name))
 }
 
 pub fn pick_next_remembered_subreddit_to_refresh() -> Option<FeedSource> {
@@ -2271,7 +2395,7 @@ fn daemon_should_continue_after_refresh(outcome: RememberedRefreshOutcome, attem
 
 	match outcome {
 		RememberedRefreshOutcome::Succeeded => successes < REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
-		RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Permanent | RememberedFailureDisposition::Banned) => true,
+		RememberedRefreshOutcome::Failed(RememberedFailureDisposition::DurableUnavailable) => true,
 		RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Transient) => false,
 	}
 }
@@ -2332,17 +2456,14 @@ pub fn spawn_remembered_feed_daemon() {
 				}
 
 				attempts += 1;
+				REMEMBERED_DAEMON_SELECTION_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
 				let source_had_success = remembered_source_had_success(&source);
 				info!("post_cache: remembered feed daemon refreshing {}", source.display_name());
 				let outcome = refresh_remembered_feed(&source).await;
 				if matches!(outcome, RememberedRefreshOutcome::Succeeded) {
 					successes += 1;
 				}
-				if matches!(
-					outcome,
-					RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Permanent | RememberedFailureDisposition::Banned)
-				) && !source_had_success
-				{
+				if matches!(outcome, RememberedRefreshOutcome::Failed(RememberedFailureDisposition::DurableUnavailable)) && !source_had_success {
 					unproven_permanent_failures += 1;
 				}
 				let should_continue = daemon_should_continue_after_refresh(outcome, attempts, successes);
@@ -4367,22 +4488,27 @@ fn persisted_source_entry_is_servable(entry: &PersistedSourceCacheEntry, remembe
 	remembered_entry.is_some_and(remembered_entry_is_active) || now_unix.saturating_sub(entry.fetched_at_unix) <= CACHE_TTL_SECS
 }
 
-fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>) {
+fn daemon_next_fetch_map() -> (u64, HashMap<String, usize>, HashSet<String>) {
 	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let now = Instant::now();
-	let mut entries = remembered
+	let entries = remembered
 		.values()
 		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked_at(entry, now) && !entry.refresh_in_flight)
 		.filter(|entry| remembered_feed_source_from_key(&entry.name).is_some())
 		.cloned()
 		.collect::<Vec<_>>();
-	entries.sort_by(|left, right| remembered_refresh_priority_at(left, right, now));
+	let selection_sequence = REMEMBERED_DAEMON_SELECTION_SEQUENCE.load(AtomicOrdering::Relaxed);
+	let entries = ordered_refresh_entries_with_fairness(entries, now, selection_sequence);
 
 	let seconds_until_tick = cache_status_seconds_until_daemon_tick();
+	let fairness_sources = entries
+		.iter()
+		.filter(|(_, fairness)| *fairness)
+		.map(|(entry, _)| entry.name.clone())
+		.collect::<HashSet<_>>();
+	let positions = entries.into_iter().enumerate().map(|(index, (entry, _))| (entry.name, index)).collect::<HashMap<_, _>>();
 
-	let positions = entries.into_iter().enumerate().map(|(index, entry)| (entry.name, index)).collect::<HashMap<_, _>>();
-
-	(seconds_until_tick, positions)
+	(seconds_until_tick, positions, fairness_sources)
 }
 
 fn predicted_next_fetch_secs_for_position(seconds_until_tick: u64, position: usize) -> u64 {
@@ -4398,7 +4524,7 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 		.map(|duration| duration.as_secs())
 		.unwrap_or_default();
 	let visible_sources = visible_sources_from_preferences(preferences);
-	let (seconds_until_tick, queue_positions) = daemon_next_fetch_map();
+	let (seconds_until_tick, queue_positions, fairness_sources) = daemon_next_fetch_map();
 	// Snapshot only the small fields used below, then release SOURCE_CACHE
 	// before acquiring REMEMBERED_SUBREDDITS. Decay cleanup deliberately uses
 	// the reverse data-flow (remembered eligibility before cache deletion), so
@@ -4457,6 +4583,7 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			.and_then(|entry| entry.banned_until)
 			.map(|until| until.saturating_duration_since(now).as_secs())
 			.filter(|seconds| *seconds > 0);
+		let retry_at_unix = blocked_until_secs.map(|seconds| generated_at_unix.saturating_add(seconds));
 		let queue_position = remembered_entry.and_then(|entry| queue_positions.get(&entry.name).copied());
 		let predicted_next_fetch_in_secs = if let Some(entry) = remembered_entry {
 			if entry.refresh_in_flight {
@@ -4483,6 +4610,27 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			"not_cached"
 		} else {
 			"session_only"
+		};
+		let fairness_slot = remembered_entry.is_some_and(|entry| fairness_sources.contains(&entry.name));
+		let scheduling_reason = if let (Some(reason), Some(_)) = (remembered_entry.and_then(|entry| entry.unavailable_reason.as_deref()), blocked_until_secs) {
+			format!("30-day {reason} suspension")
+		} else if let Some(reason) = remembered_entry.and_then(|entry| entry.unavailable_reason.as_deref()) {
+			format!("previously {reason}; retry is eligible")
+		} else if fairness_slot {
+			"fairness slot (least recently served)".to_string()
+		} else if remembered_entry.is_some_and(|entry| recent_request_priority_at(entry, now)) {
+			"recent visit boost; decays over time".to_string()
+		} else if remembered_entry.is_some_and(|entry| entry.last_refresh_succeeded_at.is_none()) {
+			"not refreshed successfully yet".to_string()
+		} else {
+			"posting cadence and overdue age".to_string()
+		};
+		let lifecycle_state = match remembered_entry {
+			Some(entry) if entry.unfollowed_decay => "unfollowed; cache interest is decaying".to_string(),
+			Some(entry) if entry.profile_followers > 1 => format!("followed by {} profiles", entry.profile_followers),
+			Some(entry) if entry.profile_followers == 1 => "followed by one profile".to_string(),
+			Some(_) => "remembered from recent browsing".to_string(),
+			None => "not remembered".to_string(),
 		};
 
 		sources.push(CacheStatusSource {
@@ -4520,6 +4668,12 @@ pub fn cache_status_for_preferences(preferences: &Preferences) -> CacheStatusRes
 			queue_position,
 			predicted_next_fetch_in_secs,
 			blocked_until_secs,
+			retry_at_unix,
+			unavailable_reason: remembered_entry.and_then(|entry| entry.unavailable_reason.clone()),
+			scheduling_reason,
+			fairness_slot,
+			lifecycle_state,
+			profile_followers: remembered_entry.map(|entry| entry.profile_followers).unwrap_or_default(),
 			consecutive_failures: remembered_entry.map(|entry| entry.consecutive_failures).unwrap_or_default(),
 		});
 	}
@@ -4549,24 +4703,26 @@ mod tests {
 		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, begin_remembered_source_refresh,
 		begin_source_refresh, build_session_id, cache_status_for_preferences, catalog_source_candidates, cleanup_decayed_remembered_subreddits, continue_feed_session_with_budget,
 		count_sources_in_state, daemon_should_continue_after_refresh, effective_freshness_target_secs, enforce_source_cache_limits_locked, ensure_feed_session_with_budget,
-		feed_page, feed_status, followup_source_budget, freeze_feed_page, get_cached_source_page, has_active_browser_sessions, initial_source_budget_target,
-		mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session, merged_posts_for_session_live,
-		pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode,
-		predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh, publish_remembered_source_refresh_with_token,
-		random_rotation_seed_for_time, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
-		record_remembered_feed_visit_signal, record_remembered_source_refresh_failure_with_token, remember_flair_request, remember_frontpage_subreddits,
-		remember_subreddit_request, remembered_refresh_priority_at, resolve_source_refresh_result, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries,
-		seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
-		snapshot_persisted_source_entries, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target,
+		estimate_post_interval_secs, feed_page, feed_status, followup_source_budget, freeze_feed_page, get_cached_source_page, has_active_browser_sessions,
+		initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
+		merged_posts_for_session_live, ordered_refresh_entries_with_fairness, pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode,
+		pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache,
+		publish_plain_subreddit_refresh, publish_remembered_source_refresh_with_token, random_rotation_seed_for_time, reconcile_profile_memberships,
+		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal,
+		record_remembered_source_refresh_failure_with_token, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at,
+		resolve_source_refresh_result, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys,
+		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries,
+		snapshot_persisted_source_unavailability, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target,
 		source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin,
 		store_source_posts_with_token, store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession,
 		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry,
 		SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES,
-		BANNED_REFRESH_BACKOFF_SECS, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES,
-		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, PERMANENT_FAILURE_BACKOFF_SECS, POSTS_PER_PAGE, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_SUBREDDITS,
-		REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
-		REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT,
-		TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,
+		CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES,
+		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
+		REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK,
+		REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE,
+		TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL,
+		TEST_TOMBSTONE_WRITE_FAIL,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4585,6 +4741,8 @@ mod tests {
 		SOURCE_REFRESH_STATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		PROFILE_SOURCE_MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		REMEMBERED_DAEMON_SELECTION_SEQUENCE.store(0, AtomicOrdering::Relaxed);
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		DELETED_MEDIA_SAFETY_HEALTHY.store(true, AtomicOrdering::Release);
@@ -4657,6 +4815,7 @@ mod tests {
 			last_refresh_succeeded_at: None,
 			last_refresh_failed_at: None,
 			banned_until: None,
+			unavailable_reason: None,
 			consecutive_failures: 0,
 			estimated_post_interval_secs: 21_600,
 			refresh_in_flight: false,
@@ -4665,6 +4824,8 @@ mod tests {
 			visit_signal_last_applied_at: None,
 			feedback_priority_score: 0.0,
 			feedback_priority_last_update_at: None,
+			profile_followers: 0,
+			unfollowed_decay: false,
 		}
 	}
 
@@ -5143,7 +5304,7 @@ mod tests {
 		let remembered_entries = snapshot_persisted_remembered_subreddits(1_000_100);
 
 		reset_test_caches();
-		restore_persisted_state(source_entries, remembered_entries, 1_000_100, 1_000_100);
+		restore_persisted_state(source_entries, remembered_entries, Vec::new(), 1_000_100, 1_000_100);
 
 		assert!(SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
 		assert!(catalog_source_candidates(&[source], &HashSet::new()).unwrap().is_empty());
@@ -5624,7 +5785,7 @@ mod tests {
 		let remembered_entries = snapshot_persisted_remembered_subreddits(now_unix);
 
 		reset_test_caches();
-		restore_persisted_state(source_entries, remembered_entries, now_unix, now_unix);
+		restore_persisted_state(source_entries, remembered_entries, Vec::new(), now_unix, now_unix);
 
 		assert_eq!(crate::user::cached_avg_video_length("author_restore"), None);
 	}
@@ -5658,6 +5819,55 @@ mod tests {
 		let after = REMEMBERED_SUBREDDITS.lock().unwrap()["rust"].clone();
 		let target_after = effective_freshness_target_secs(&after);
 		assert!(target_after < target_before, "visit signal should increase refresh priority (lower freshness target secs)");
+	}
+
+	#[test]
+	fn visit_priority_boost_decays_by_half_after_one_half_life() {
+		let now = Instant::now();
+		let mut entry = remembered_entry("rust");
+		entry.visit_priority_score = 2.0;
+		entry.visit_priority_last_update_at = Some(now);
+
+		let decayed = super::visit_priority_score_at(&entry, now + Duration::from_secs(super::VISIT_PRIORITY_HALFLIFE_SECS));
+
+		assert!((decayed - 1.0).abs() < 0.000_001);
+	}
+
+	#[test]
+	fn average_post_gap_drives_explainable_cadence() {
+		let posts = vec![
+			test_post("one", "rust", 600),
+			test_post("two", "rust", 480),
+			test_post("three", "rust", 240),
+			test_post("four", "rust", 120),
+		];
+
+		assert_eq!(estimate_post_interval_secs(&posts, 999), 160);
+	}
+
+	#[test]
+	fn fairness_slot_selects_least_recently_served_source() {
+		let now = Instant::now();
+		let mut popular = remembered_entry("popular");
+		popular.last_requested_at = now;
+		popular.last_refresh_started_at = Some(now - Duration::from_secs(60));
+		popular.visit_priority_score = 10.0;
+		popular.visit_priority_last_update_at = Some(now);
+		let mut rarely_viewed = remembered_entry("rarely_viewed");
+		rarely_viewed.last_requested_at = now - Duration::from_secs(7 * 24 * 60 * 60);
+		rarely_viewed.last_refresh_started_at = Some(now - Duration::from_secs(6 * 24 * 60 * 60));
+
+		let ordered = ordered_refresh_entries_with_fairness(vec![popular, rarely_viewed], now, super::FAIRNESS_SELECTION_STRIDE - 1);
+
+		assert_eq!(ordered[0].0.name, "rarely_viewed");
+		assert!(ordered[0].1);
+	}
+
+	#[test]
+	fn bounded_exploration_occurs_every_fourth_selection() {
+		let slots = (0..12).filter(|sequence| super::fairness_slot_for_sequence(*sequence)).collect::<Vec<_>>();
+
+		assert_eq!(slots, vec![3, 7, 11]);
 	}
 
 	#[test]
@@ -6176,7 +6386,7 @@ mod tests {
 	}
 
 	#[test]
-	fn failure_recording_uses_long_backoff_for_permanent_failures() {
+	fn failure_recording_uses_durable_backoff_for_not_found() {
 		let _guard = test_lock();
 		reset_test_caches();
 
@@ -6185,10 +6395,11 @@ mod tests {
 
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		let entry = remembered.get("rust").unwrap();
-		let banned_until = entry.banned_until.expect("permanent backoff");
+		let banned_until = entry.banned_until.expect("durable backoff");
 		let remaining = banned_until.saturating_duration_since(Instant::now());
-		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
-		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
+		assert!(remaining <= Duration::from_secs(DURABLE_UNAVAILABLE_BACKOFF_SECS));
+		assert!(remaining > Duration::from_secs(DURABLE_UNAVAILABLE_BACKOFF_SECS.saturating_sub(5)));
+		assert_eq!(entry.unavailable_reason.as_deref(), Some("not_found"));
 	}
 
 	#[test]
@@ -6201,10 +6412,11 @@ mod tests {
 
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		let entry = remembered.get("couplescumshots").unwrap();
-		let banned_until = entry.banned_until.expect("not_found should get permanent backoff");
+		let banned_until = entry.banned_until.expect("not_found should get durable backoff");
 		let remaining = banned_until.saturating_duration_since(Instant::now());
-		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
-		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
+		assert!(remaining <= Duration::from_secs(DURABLE_UNAVAILABLE_BACKOFF_SECS));
+		assert!(remaining > Duration::from_secs(DURABLE_UNAVAILABLE_BACKOFF_SECS.saturating_sub(5)));
+		assert_eq!(entry.unavailable_reason.as_deref(), Some("not_found"));
 	}
 
 	#[test]
@@ -6220,7 +6432,7 @@ mod tests {
 	}
 
 	#[test]
-	fn failure_recording_uses_long_backoff_for_forbidden_failures() {
+	fn failure_recording_keeps_unclassified_forbidden_transient() {
 		let _guard = test_lock();
 		reset_test_caches();
 
@@ -6229,10 +6441,8 @@ mod tests {
 
 		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
 		let entry = remembered.get("u_forbidden").unwrap();
-		let banned_until = entry.banned_until.expect("forbidden backoff");
-		let remaining = banned_until.saturating_duration_since(Instant::now());
-		assert!(remaining <= Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS));
-		assert!(remaining > Duration::from_secs(PERMANENT_FAILURE_BACKOFF_SECS.saturating_sub(5)));
+		assert!(entry.banned_until.is_none());
+		assert!(entry.unavailable_reason.is_none());
 	}
 
 	#[test]
@@ -6247,24 +6457,128 @@ mod tests {
 		let entry = remembered.get("rust").unwrap();
 		let banned_until = entry.banned_until.expect("banned backoff");
 		let remaining = banned_until.saturating_duration_since(Instant::now());
-		assert!(remaining <= Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS));
-		assert!(remaining > Duration::from_secs(BANNED_REFRESH_BACKOFF_SECS.saturating_sub(5)));
+		assert!(remaining <= Duration::from_secs(DURABLE_UNAVAILABLE_BACKOFF_SECS));
+		assert!(remaining > Duration::from_secs(DURABLE_UNAVAILABLE_BACKOFF_SECS.saturating_sub(5)));
+		assert_eq!(entry.unavailable_reason.as_deref(), Some("banned"));
+	}
+
+	#[test]
+	fn failure_recording_uses_durable_backoff_for_explicit_private_state() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("closed");
+		record_plain_subreddit_refresh_failure("closed", "private", RefreshOrigin::Daemon);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("closed").unwrap();
+		assert_eq!(entry.unavailable_reason.as_deref(), Some("private"));
+		assert!(entry.banned_until.is_some_and(|until| until > Instant::now()));
+	}
+
+	#[test]
+	fn durable_backoff_expiry_makes_source_eligible_again() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		{
+			let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+			let entry = remembered.get_mut("rust").unwrap();
+			entry.banned_until = Some(Instant::now() - Duration::from_secs(1));
+			entry.unavailable_reason = Some("banned".to_string());
+		}
+
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("rust".to_string()));
+	}
+
+	#[test]
+	fn durable_backoff_and_reason_survive_snapshot_restore() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		remember_subreddit_request("rust");
+		record_plain_subreddit_refresh_failure("rust", "banned", RefreshOrigin::Daemon);
+		let remembered = snapshot_persisted_remembered_subreddits(1_000_000);
+		let unavailable = snapshot_persisted_source_unavailability();
+
+		reset_test_caches();
+		restore_persisted_state(Vec::new(), remembered, unavailable, 1_000_000, 1_000_100);
+
+		let restored = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = restored.get("rust").expect("restored remembered source");
+		assert_eq!(entry.unavailable_reason.as_deref(), Some("banned"));
+		assert!(entry.banned_until.is_some_and(|until| until > Instant::now()));
+		assert!(!entry.refresh_in_flight);
+	}
+
+	#[test]
+	fn unsubscribe_preserves_shared_source_when_another_profile_follows() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let followed = Preferences {
+			subscriptions: vec!["rust".to_string()],
+			..Preferences::default()
+		};
+		reconcile_profile_memberships(vec![("one".to_string(), followed.clone()), ("two".to_string(), followed)]);
+		record_remembered_feed_visit_signal(&new_source("rust"));
+
+		reconcile_profile_memberships(vec![
+			("one".to_string(), Preferences::default()),
+			(
+				"two".to_string(),
+				Preferences {
+					subscriptions: vec!["rust".to_string()],
+					..Preferences::default()
+				},
+			),
+		]);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("rust").unwrap();
+		assert_eq!(entry.profile_followers, 1);
+		assert!(!entry.unfollowed_decay);
+		assert!(entry.visit_priority_score > 0.0);
+	}
+
+	#[test]
+	fn last_unsubscribe_removes_interest_and_enters_fast_decay() {
+		let _guard = test_lock();
+		reset_test_caches();
+		reconcile_profile_memberships(vec![(
+			"one".to_string(),
+			Preferences {
+				subscriptions: vec!["rust".to_string()],
+				..Preferences::default()
+			},
+		)]);
+		record_remembered_feed_visit_signal(&new_source("rust"));
+
+		reconcile_profile_memberships(vec![("one".to_string(), Preferences::default())]);
+
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap();
+		let entry = remembered.get("rust").unwrap();
+		assert_eq!(entry.profile_followers, 0);
+		assert!(entry.unfollowed_decay);
+		assert_eq!(entry.visit_priority_score, 0.0);
+		assert!(entry.last_requested_at.elapsed() >= Duration::from_secs(REMEMBERED_SUBREDDIT_TTL_SECS - super::UNFOLLOWED_DECAY_GRACE_SECS));
+		assert!(entry.banned_until.is_none());
 	}
 
 	#[test]
 	fn daemon_continues_after_permanent_failures_and_successes_until_budget() {
 		assert!(daemon_should_continue_after_refresh(
-			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Permanent),
+			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::DurableUnavailable),
 			1,
 			0
 		));
 		assert!(daemon_should_continue_after_refresh(
-			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Banned),
+			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::DurableUnavailable),
 			REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK - 1,
 			0
 		));
 		assert!(!daemon_should_continue_after_refresh(
-			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::Permanent),
+			RememberedRefreshOutcome::Failed(RememberedFailureDisposition::DurableUnavailable),
 			REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK,
 			0
 		));
@@ -8009,7 +8323,7 @@ mod tests {
 
 		let stale_snapshot = snapshot_persisted_source_entries(1_000_000);
 		SOURCE_CACHE.lock().unwrap().clear();
-		restore_persisted_state(stale_snapshot, Vec::new(), 1_000_000, 1_000_000);
+		restore_persisted_state(stale_snapshot, Vec::new(), Vec::new(), 1_000_000, 1_000_000);
 		assert!(SOURCE_CACHE.lock().unwrap().is_empty());
 
 		remember_subreddit_request("remembered");
@@ -8021,7 +8335,7 @@ mod tests {
 		let remembered_state = snapshot_persisted_remembered_subreddits(1_000_100);
 		SOURCE_CACHE.lock().unwrap().clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
-		restore_persisted_state(remembered_snapshot, remembered_state, 1_000_100, 1_000_100);
+		restore_persisted_state(remembered_snapshot, remembered_state, Vec::new(), 1_000_100, 1_000_100);
 		assert!(SOURCE_CACHE.lock().unwrap().get(&remembered_source.cache_key()).is_none());
 		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().contains_key("remembered"));
 	}
@@ -8040,7 +8354,7 @@ mod tests {
 		let remembered_snapshot = snapshot_persisted_remembered_subreddits(3_000_000);
 		SOURCE_CACHE.lock().unwrap().clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap().clear();
-		restore_persisted_state(posts_snapshot, remembered_snapshot, 3_000_000, 3_000_000);
+		restore_persisted_state(posts_snapshot, remembered_snapshot, Vec::new(), 3_000_000, 3_000_000);
 
 		assert!(SOURCE_CACHE.lock().unwrap().get(&user_source.cache_key()).is_none());
 		assert!(REMEMBERED_SUBREDDITS.lock().unwrap().contains_key("u_followeduser"));

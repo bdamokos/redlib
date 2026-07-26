@@ -16,7 +16,8 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-const SNAPSHOT_VERSION: u8 = 9;
+const SNAPSHOT_VERSION: u8 = 10;
+const LEGACY_SNAPSHOT_VERSION_V9: u8 = 9;
 const LEGACY_SNAPSHOT_VERSION_V8: u8 = 8;
 const LEGACY_SNAPSHOT_VERSION_V7: u8 = 7;
 const LEGACY_SNAPSHOT_VERSION_V6: u8 = 6;
@@ -302,6 +303,12 @@ pub(crate) struct PersistedRememberedSubredditEntry {
 	pub feedback_priority_last_update_unix: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PersistedSourceUnavailableState {
+	pub name: String,
+	pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedRememberedSubredditEntryWithoutFeedback {
 	pub name: String,
@@ -371,6 +378,25 @@ pub(crate) struct PersistedSubredditUsersEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCacheSnapshot {
+	version: u8,
+	saved_at_unix: u64,
+	source_entries: Vec<PersistedSourceCacheEntry>,
+	remembered_subreddits: Vec<PersistedRememberedSubredditEntry>,
+	subreddit_metadata: Vec<PersistedSubredditMetadataEntry>,
+	subreddit_nsfw: Vec<PersistedSubredditNsfwEntry>,
+	subreddit_flairs: Vec<PersistedSubredditFlairsEntry>,
+	subreddit_users: Vec<PersistedSubredditUsersEntry>,
+	author_history: Vec<crate::materialized_catalog::PersistedAuthorHistoryEntry>,
+	rejected_author_redgifs_profiles: Vec<crate::materialized_catalog::PersistedRejectedAuthorRedgifsProfileEntry>,
+	subreddit_semantic_embeddings: Vec<crate::subreddit_semantics::PersistedSubredditSemanticEmbedding>,
+	promo_markers: Vec<crate::promo_detection::PersistedPromoMarker>,
+	content_filter_observations: Vec<crate::promo_detection::PersistedContentFilterObservation>,
+	following_discoveries: Vec<crate::materialized_catalog::PersistedFollowingDiscoveryEntry>,
+	source_unavailability: Vec<PersistedSourceUnavailableState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedCacheSnapshotV9 {
 	version: u8,
 	saved_at_unix: u64,
 	source_entries: Vec<PersistedSourceCacheEntry>,
@@ -743,7 +769,12 @@ fn persistence_read_only() -> bool {
 }
 
 pub(crate) fn instant_to_unix(instant: Instant, now_unix: u64) -> u64 {
-	now_unix.saturating_sub(instant.elapsed().as_secs())
+	let now = Instant::now();
+	if instant > now {
+		now_unix.saturating_add(instant.duration_since(now).as_secs())
+	} else {
+		now_unix.saturating_sub(now.duration_since(instant).as_secs())
+	}
 }
 
 pub(crate) fn option_instant_to_unix(instant: Option<Instant>, now_unix: u64) -> Option<u64> {
@@ -751,7 +782,12 @@ pub(crate) fn option_instant_to_unix(instant: Option<Instant>, now_unix: u64) ->
 }
 
 pub(crate) fn unix_to_instant(timestamp_unix: u64, now_unix: u64) -> Instant {
-	Instant::now() - Duration::from_secs(now_unix.saturating_sub(timestamp_unix))
+	let now = Instant::now();
+	if timestamp_unix > now_unix {
+		now + Duration::from_secs(timestamp_unix - now_unix)
+	} else {
+		now - Duration::from_secs(now_unix - timestamp_unix)
+	}
 }
 
 pub(crate) fn option_unix_to_instant(timestamp_unix: Option<u64>, now_unix: u64) -> Option<Instant> {
@@ -1066,6 +1102,7 @@ fn load_snapshot() -> Result<(), String> {
 	post_cache::restore_persisted_state(
 		if durable_content_safe { snapshot.source_entries } else { Vec::new() },
 		snapshot.remembered_subreddits,
+		snapshot.source_unavailability,
 		snapshot.saved_at_unix,
 		now_unix,
 	);
@@ -1097,6 +1134,7 @@ fn write_snapshot() -> Result<(), String> {
 		promo_markers: crate::promo_detection::snapshot_markers(),
 		content_filter_observations: crate::promo_detection::snapshot_observations(),
 		following_discoveries: crate::materialized_catalog::snapshot_following_discoveries(),
+		source_unavailability: post_cache::snapshot_persisted_source_unavailability(),
 	};
 
 	let final_path = &*PERSISTENCE_PATH;
@@ -1142,6 +1180,28 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 		Err(error) => error.to_string(),
 	};
 
+	if let Ok(legacy) = bincode::deserialize::<PersistedCacheSnapshotV9>(bytes) {
+		if legacy.version == LEGACY_SNAPSHOT_VERSION_V9 {
+			return Ok(PersistedCacheSnapshot {
+				version: SNAPSHOT_VERSION,
+				saved_at_unix: legacy.saved_at_unix,
+				source_entries: legacy.source_entries,
+				remembered_subreddits: legacy.remembered_subreddits,
+				subreddit_metadata: legacy.subreddit_metadata,
+				subreddit_nsfw: legacy.subreddit_nsfw,
+				subreddit_flairs: legacy.subreddit_flairs,
+				subreddit_users: legacy.subreddit_users,
+				author_history: legacy.author_history,
+				rejected_author_redgifs_profiles: legacy.rejected_author_redgifs_profiles,
+				subreddit_semantic_embeddings: legacy.subreddit_semantic_embeddings,
+				promo_markers: legacy.promo_markers,
+				content_filter_observations: legacy.content_filter_observations,
+				following_discoveries: legacy.following_discoveries,
+				source_unavailability: Vec::new(),
+			});
+		}
+	}
+
 	if let Ok(legacy) = bincode::deserialize::<PersistedCacheSnapshotV8>(bytes) {
 		if legacy.version == LEGACY_SNAPSHOT_VERSION_V8 {
 			return Ok(PersistedCacheSnapshot {
@@ -1159,6 +1219,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				promo_markers: legacy.promo_markers,
 				content_filter_observations: legacy.content_filter_observations,
 				following_discoveries: Vec::new(),
+				source_unavailability: Vec::new(),
 			});
 		}
 	}
@@ -1180,6 +1241,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				promo_markers: legacy.promo_markers,
 				content_filter_observations: Vec::new(),
 				following_discoveries: Vec::new(),
+				source_unavailability: Vec::new(),
 			});
 		}
 	}
@@ -1201,6 +1263,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				promo_markers: Vec::new(),
 				content_filter_observations: Vec::new(),
 				following_discoveries: Vec::new(),
+				source_unavailability: Vec::new(),
 			});
 		}
 	}
@@ -1222,6 +1285,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				promo_markers: Vec::new(),
 				content_filter_observations: Vec::new(),
 				following_discoveries: Vec::new(),
+				source_unavailability: Vec::new(),
 			});
 		}
 	}
@@ -1243,6 +1307,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				promo_markers: Vec::new(),
 				content_filter_observations: Vec::new(),
 				following_discoveries: Vec::new(),
+				source_unavailability: Vec::new(),
 			});
 		}
 	}
@@ -1264,6 +1329,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 				promo_markers: Vec::new(),
 				content_filter_observations: Vec::new(),
 				following_discoveries: Vec::new(),
+				source_unavailability: Vec::new(),
 			});
 		}
 	}
@@ -1287,6 +1353,7 @@ fn deserialize_snapshot(bytes: &[u8]) -> Result<PersistedCacheSnapshot, String> 
 		promo_markers: Vec::new(),
 		content_filter_observations: Vec::new(),
 		following_discoveries: Vec::new(),
+		source_unavailability: Vec::new(),
 	})
 }
 
@@ -1328,9 +1395,10 @@ mod tests {
 	use super::{
 		deserialize_catalog_snapshot, deserialize_deleted_media_tombstones, deserialize_snapshot, serialize_catalog_snapshot, serialize_deleted_media_tombstones,
 		serialize_snapshot, write_deleted_media_tombstones_at, write_deleted_media_tombstones_with_marker_at, PersistedCacheSnapshot, PersistedCacheSnapshotV2,
-		PersistedCacheSnapshotV3, PersistedCacheSnapshotV4WithoutFeedback, PersistedCacheSnapshotV6, PersistedCacheSnapshotV7, PersistedCacheSnapshotV8,
-		PersistedCatalogSnapshotFile, PersistedRememberedSubredditEntry, PersistedRememberedSubredditEntryWithoutFeedback, LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3,
-		LEGACY_SNAPSHOT_VERSION_V4, LEGACY_SNAPSHOT_VERSION_V7, LEGACY_SNAPSHOT_VERSION_V8, SNAPSHOT_VERSION,
+		PersistedCacheSnapshotV3, PersistedCacheSnapshotV4WithoutFeedback, PersistedCacheSnapshotV6, PersistedCacheSnapshotV7, PersistedCacheSnapshotV8, PersistedCacheSnapshotV9,
+		PersistedCatalogSnapshotFile, PersistedRememberedSubredditEntry, PersistedRememberedSubredditEntryWithoutFeedback, PersistedSourceUnavailableState,
+		LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3, LEGACY_SNAPSHOT_VERSION_V4, LEGACY_SNAPSHOT_VERSION_V7, LEGACY_SNAPSHOT_VERSION_V8, LEGACY_SNAPSHOT_VERSION_V9,
+		SNAPSHOT_VERSION,
 	};
 	use crate::materialized_catalog::PersistedCatalogSnapshot;
 
@@ -1350,6 +1418,7 @@ mod tests {
 			promo_markers: Vec::new(),
 			content_filter_observations: Vec::new(),
 			following_discoveries: Vec::new(),
+			source_unavailability: Vec::new(),
 		}
 	}
 
@@ -1460,6 +1529,10 @@ mod tests {
 			discovered_at_unix: 999_999,
 			sequence: 7,
 		});
+		snapshot.source_unavailability.push(PersistedSourceUnavailableState {
+			name: "rust".to_string(),
+			reason: "private".to_string(),
+		});
 		let bytes = serialize_snapshot(&snapshot).expect("serialize snapshot");
 		let decoded = deserialize_snapshot(&bytes).expect("deserialize snapshot");
 		assert_eq!(decoded.version, SNAPSHOT_VERSION);
@@ -1468,6 +1541,34 @@ mod tests {
 		assert!(decoded.author_history.is_empty());
 		assert!(decoded.rejected_author_redgifs_profiles.is_empty());
 		assert_eq!(decoded.following_discoveries, snapshot.following_discoveries);
+		assert_eq!(decoded.source_unavailability, snapshot.source_unavailability);
+	}
+
+	#[test]
+	fn legacy_v9_snapshot_preserves_existing_state_and_starts_unavailability_empty() {
+		let legacy = PersistedCacheSnapshotV9 {
+			version: LEGACY_SNAPSHOT_VERSION_V9,
+			saved_at_unix: 1_000_000,
+			source_entries: Vec::new(),
+			remembered_subreddits: vec![remembered_entry_with_feedback()],
+			subreddit_metadata: Vec::new(),
+			subreddit_nsfw: Vec::new(),
+			subreddit_flairs: Vec::new(),
+			subreddit_users: Vec::new(),
+			author_history: Vec::new(),
+			rejected_author_redgifs_profiles: Vec::new(),
+			subreddit_semantic_embeddings: Vec::new(),
+			promo_markers: Vec::new(),
+			content_filter_observations: Vec::new(),
+			following_discoveries: Vec::new(),
+		};
+
+		let bytes = bincode::serialize(&legacy).expect("serialize v9 snapshot");
+		let decoded = deserialize_snapshot(&bytes).expect("migrate v9 snapshot");
+
+		assert_eq!(decoded.version, SNAPSHOT_VERSION);
+		assert_eq!(decoded.remembered_subreddits.len(), 1);
+		assert!(decoded.source_unavailability.is_empty());
 	}
 
 	#[test]

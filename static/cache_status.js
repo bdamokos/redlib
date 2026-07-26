@@ -1,4 +1,33 @@
 document.addEventListener("DOMContentLoaded", function () {
+	const relativeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+	const dateFormatter = new Intl.DateTimeFormat(undefined, {
+		dateStyle: "medium",
+		timeStyle: "short",
+	});
+	const relativeTime = (unixSeconds) => {
+		const deltaSeconds = unixSeconds - Date.now() / 1000;
+		const ranges = [
+			["year", 365 * 24 * 60 * 60],
+			["month", 30 * 24 * 60 * 60],
+			["day", 24 * 60 * 60],
+			["hour", 60 * 60],
+			["minute", 60],
+			["second", 1],
+		];
+		const [unit, seconds] = ranges.find(([, size]) => Math.abs(deltaSeconds) >= size) || ranges[ranges.length - 1];
+		return relativeFormatter.format(Math.round(deltaSeconds / seconds), unit);
+	};
+	document.querySelectorAll("time[data-local-time]").forEach((element) => {
+		const unixSeconds = Number(element.dataset.localTime);
+		if (!Number.isFinite(unixSeconds) || unixSeconds <= 0) {
+			return;
+		}
+		const date = new Date(unixSeconds * 1000);
+		element.dateTime = date.toISOString();
+		element.textContent = `${dateFormatter.format(date)} (${relativeTime(unixSeconds)})`;
+		element.title = `${date.toLocaleString()} · Unix ${Math.trunc(unixSeconds)}`;
+	});
+
 	const table = document.querySelector("[data-sortable-table]");
 	if (!table) {
 		return;

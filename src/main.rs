@@ -17,7 +17,7 @@ use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{
 	bookmarks, cache_persistence, config, creator_links, duplicates, headers, instance_info, observed_semantic_backfill, post, post_cache, post_components, post_feedback,
-	promo_detection, search, settings, site_icon, subreddit, suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
+	prefs_store, promo_detection, search, settings, site_icon, subreddit, suggested_profiles, suggested_subreddits, user, video_mode_api, video_preview,
 };
 use url::Url;
 
@@ -438,6 +438,7 @@ async fn main() {
 	spawn_oauth_maintenance();
 	video_preview::init();
 	cache_persistence::init();
+	prefs_store::restore_profile_memberships();
 	if post_cache::remembered_feed_daemon_enabled() {
 		post_cache::spawn_remembered_feed_daemon();
 	} else {

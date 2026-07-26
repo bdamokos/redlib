@@ -20,7 +20,7 @@
 <main class="cache_status_page">
 	<h1>Cache Status</h1>
 	<p>This page shows the feeds Redlib can currently keep warm for this browser's saved subscriptions and flair subscriptions.</p>
-	<p>Generated at Unix time {{ generated_at_unix }}.</p>
+	<p class="cache_status_generated">Updated <time data-local-time="{{ generated_at_unix }}">{{ generated_at_unix }}</time>.</p>
 
 	<div class="panel">
 		<p><strong>Visible feeds:</strong> {{ summary.sources_total }}</p>
@@ -57,16 +57,16 @@
 		</p>
 		<p><strong>Last sidecar write:</strong>
 			{% match semantic_database.sidecar_modified_age_secs %}{% when Some with (seconds) %}about {{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}
-			{% match semantic_database.sidecar_saved_at_unix %}{% when Some with (timestamp) %}(saved at Unix time {{ timestamp }}){% when None %}{% endmatch %}
+			{% match semantic_database.sidecar_saved_at_unix %}{% when Some with (timestamp) %}(<time data-local-time="{{ timestamp }}">{{ timestamp }}</time>){% when None %}{% endmatch %}
 		</p>
 		<p><strong>Embedding age range:</strong>
-			newest {% match semantic_database.newest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %};
-			oldest {% match semantic_database.oldest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %}
+			newest {% match semantic_database.newest_embedding_at_unix %}{% when Some with (timestamp) %}<time data-local-time="{{ timestamp }}">{{ timestamp }}</time>{% when None %}-{% endmatch %};
+			oldest {% match semantic_database.oldest_embedding_at_unix %}{% when Some with (timestamp) %}<time data-local-time="{{ timestamp }}">{{ timestamp }}</time>{% when None %}-{% endmatch %}
 		</p>
 		{% match semantic_database.last_run %}
 		{% when Some with (run) %}
 		<p><strong>Last backfill run:</strong> {{ self.backfill_state_label(run.state.as_str()) }} for {{ run.model }}
-			{% match run.finished_at_unix %}{% when Some with (timestamp) %}finished at Unix time {{ timestamp }}{% when None %}started at Unix time {{ run.started_at_unix }}{% endmatch %}
+			{% match run.finished_at_unix %}{% when Some with (timestamp) %}finished <time data-local-time="{{ timestamp }}">{{ timestamp }}</time>{% when None %}started <time data-local-time="{{ run.started_at_unix }}">{{ run.started_at_unix }}</time>{% endmatch %}
 			{% if run.dry_run %}(dry run){% endif %}{% if run.force %}(forced){% endif %}
 		</p>
 		<p><strong>Run totals:</strong> {{ run.counters.total_candidates }} candidates, {{ run.counters.embedded }} embedded, {{ run.counters.already_current }} already current, {{ run.counters.failed }} failed, {{ run.counters.missing_metadata }} missing metadata.</p>
@@ -114,16 +114,16 @@
 			</p>
 			<p><strong>Last sidecar write:</strong>
 				{% match content_semantic_database.sidecar_modified_age_secs %}{% when Some with (seconds) %}about {{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}
-				{% match content_semantic_database.sidecar_saved_at_unix %}{% when Some with (timestamp) %}(saved at Unix time {{ timestamp }}){% when None %}{% endmatch %}
+				{% match content_semantic_database.sidecar_saved_at_unix %}{% when Some with (timestamp) %}(<time data-local-time="{{ timestamp }}">{{ timestamp }}</time>){% when None %}{% endmatch %}
 			</p>
 			<p><strong>Embedding age range:</strong>
-				newest {% match content_semantic_database.newest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %};
-				oldest {% match content_semantic_database.oldest_embedding_at_unix %}{% when Some with (timestamp) %}Unix time {{ timestamp }}{% when None %}-{% endmatch %}
+				newest {% match content_semantic_database.newest_embedding_at_unix %}{% when Some with (timestamp) %}<time data-local-time="{{ timestamp }}">{{ timestamp }}</time>{% when None %}-{% endmatch %};
+				oldest {% match content_semantic_database.oldest_embedding_at_unix %}{% when Some with (timestamp) %}<time data-local-time="{{ timestamp }}">{{ timestamp }}</time>{% when None %}-{% endmatch %}
 			</p>
 			{% match content_semantic_database.last_run %}
 			{% when Some with (run) %}
 			<p><strong>Last backfill run:</strong> {{ self.backfill_state_label(run.state.as_str()) }} for {{ run.model }}
-				{% match run.finished_at_unix %}{% when Some with (timestamp) %}finished at Unix time {{ timestamp }}{% when None %}started at Unix time {{ run.started_at_unix }}{% endmatch %}
+				{% match run.finished_at_unix %}{% when Some with (timestamp) %}finished <time data-local-time="{{ timestamp }}">{{ timestamp }}</time>{% when None %}started <time data-local-time="{{ run.started_at_unix }}">{{ run.started_at_unix }}</time>{% endmatch %}
 				{% if run.dry_run %}(dry run){% endif %}{% if run.force %}(forced){% endif %}
 			</p>
 			<p><strong>Run totals:</strong> {{ run.counters.source_files }} source files, {{ run.counters.unique_posts }} unique candidate posts, {{ run.counters.candidate_subreddits }} candidate subreddits, {{ run.counters.embedded }} posts embedded into running aggregates, {{ run.counters.already_current }} already at or before the saved cursor, {{ run.counters.too_small_subreddits }} too small, {{ run.counters.failed }} failed.</p>
@@ -146,9 +146,9 @@
 
 		<div class="panel">
 			<p><strong>How the next update time is calculated:</strong> the background daemon's next wake-up is in about {{ self.human_duration(seconds_until_daemon_tick) }}, and each wake-up refreshes one eligible remembered feed.</p>
-		<p>It does <em>not</em> simply walk uncached feeds in order. Feeds that have never refreshed successfully go first, then overdue feeds, then feeds with the highest age-vs-target freshness ratio, with recent user requests used as a tiebreaker.</p>
+		<p>Three of every four selections prioritize recent (decaying) visit interest, sources not yet refreshed, expected posting cadence, and overdue age. Every fourth selection is a fairness slot for the least recently served eligible source, so quiet or rarely viewed feeds cannot starve.</p>
 		<p>So a feed's “Next Fetch” time is roughly: <em>time until the next daemon tick + (its queue position × one daemon interval)</em>.</p>
-		<p>The per-feed “Refresh frequency” is adaptive: it is estimated from how often that feed posts, clamped to a minimum and maximum, and stretched further after repeated failures.</p>
+		<p>The per-feed target is adaptive: Redlib averages the gaps between cached post timestamps and aims to fetch after about 20 expected posts, clamped between 30 minutes and 48 hours. Ordinary failures stretch this target; confirmed banned, nonexistent, suspended, or private sources instead receive a separate durable 30-day suspension. Generic 403, quota, 429, and network errors remain transient.</p>
 		<p><strong>Freshest cached post</strong> is how long ago the <em>newest</em> timestamp among all posts in that cache snapshot was (including bundled comment activity and collapsed duplicates), not necessarily the first row you see on a re-sorted view such as video mode.</p>
 	</div>
 
@@ -189,39 +189,50 @@
 	{% if sources.is_empty() %}
 	<p>No saved subscriptions or flair subscriptions are available for this client.</p>
 	{% else %}
-	<div class="table_scroll_x">
+	<div class="cache_status_table_wrap">
 		<table class="sortable_table" data-sortable-table>
 			<thead>
 				<tr>
 					<th data-sort-type="text"><button type="button" class="sort_button">Source</button></th>
-					<th data-sort-type="text"><button type="button" class="sort_button">Type</button></th>
-					<th data-sort-type="text"><button type="button" class="sort_button">Cached</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Posts</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Freshest cached post</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Cache Expires In</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Last Fetched</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Refresh Frequency</button></th>
-					<th data-sort-type="text"><button type="button" class="sort_button">Schedule State</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Queue</button></th>
+					<th data-sort-type="text"><button type="button" class="sort_button">Status</button></th>
+					<th data-sort-type="number"><button type="button" class="sort_button">Cache</button></th>
 					<th data-sort-type="number"><button type="button" class="sort_button">Next Fetch</button></th>
-					<th data-sort-type="number"><button type="button" class="sort_button">Failures</button></th>
+					<th>Details</th>
 				</tr>
 			</thead>
 			<tbody>
 				{% for source in sources %}
 				<tr>
-					<td data-sort-value="{{ source.display_name.to_lowercase() }}"><a href="{{ source.feed_url }}">{{ source.display_name }}</a></td>
-					<td data-sort-value="{{ source.source_type.to_lowercase() }}">{{ source.source_type }}</td>
-					<td data-sort-value="{% if source.cached %}1{% else %}0{% endif %}">{% if source.cached %}yes{% else %}no{% endif %}</td>
-					<td data-sort-value="{{ source.cached_posts }}">{{ source.cached_posts }}</td>
-					<td{% match source.head_post_age_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.head_post_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
-					<td{% match source.cache_expires_in_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.cache_expires_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
-					<td{% match source.cached_age_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.cached_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</td>
-					<td{% match source.refresh_frequency_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.refresh_frequency_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
-					<td data-sort-value="{{ source.schedule_state.to_lowercase() }}">{{ self.schedule_state_label(source.schedule_state.as_str()) }}</td>
-					<td{% match source.queue_position %}{% when Some with (position) %} data-sort-value="{{ position + 1 }}"{% when None %}{% endmatch %}>{% match source.queue_position %}{% when Some with (position) %}#{{ position + 1 }}{% when None %}-{% endmatch %}</td>
-					<td{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
-					<td data-sort-value="{{ source.consecutive_failures }}">{{ source.consecutive_failures }}</td>
+					<td data-label="Source" data-sort-value="{{ source.display_name.to_lowercase() }}">
+						<a href="{{ source.feed_url }}">{{ source.display_name }}</a>
+						<small>{{ source.source_type }}</small>
+					</td>
+					<td data-label="Status" data-sort-value="{{ source.schedule_state.to_lowercase() }}">
+						<span class="cache_status_chip cache_status_chip--{{ source.schedule_state }}">{{ self.schedule_state_label(source.schedule_state.as_str()) }}</span>
+						{% match source.unavailable_reason %}{% when Some with (reason) %}<span class="cache_status_reason">{{ reason }}</span>{% when None %}{% endmatch %}
+					</td>
+					<td data-label="Cache" data-sort-value="{{ source.cached_posts }}">
+						<strong>{{ source.cached_posts }}</strong> posts
+						<small>{% match source.cached_age_secs %}{% when Some with (seconds) %}fetched {{ self.human_duration(seconds) }} ago{% when None %}not cached{% endmatch %}</small>
+					</td>
+					<td data-label="Next Fetch"{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %} data-sort-value="{{ seconds }}"{% when None %}{% endmatch %}>{% match source.predicted_next_fetch_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</td>
+					<td data-label="Details">
+						<details class="cache_source_details">
+							<summary>Why / more</summary>
+							<dl>
+								<dt>Scheduling</dt><dd>{{ source.scheduling_reason }}</dd>
+								{% match source.retry_at_unix %}{% when Some with (timestamp) %}
+								<dt>Retry resumes</dt><dd><time data-local-time="{{ timestamp }}">{{ timestamp }}</time>. Keep the subscription to retry automatically, or unsubscribe from the source page if you no longer want it.</dd>
+								{% when None %}{% endmatch %}
+								<dt>Lifecycle</dt><dd>{{ source.lifecycle_state }}</dd>
+								<dt>Target cadence</dt><dd>{% match source.refresh_frequency_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</dd>
+								<dt>Freshest post</dt><dd>{% match source.head_post_age_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }} ago{% when None %}-{% endmatch %}</dd>
+								<dt>Cache expires</dt><dd>{% match source.cache_expires_in_secs %}{% when Some with (seconds) %}{{ self.human_duration(seconds) }}{% when None %}-{% endmatch %}</dd>
+								<dt>Queue</dt><dd>{% match source.queue_position %}{% when Some with (position) %}#{{ position + 1 }}{% when None %}-{% endmatch %}</dd>
+								<dt>Failures</dt><dd>{{ source.consecutive_failures }}</dd>
+							</dl>
+						</details>
+					</td>
 				</tr>
 				{% endfor %}
 			</tbody>

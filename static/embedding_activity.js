@@ -10,6 +10,7 @@
     const metaSelector = "[data-embedding-activity-meta]";
     const averageMetaSelector = "[data-embedding-average-meta]";
     const averageStateSelector = "[data-embedding-average-state]";
+    const labelSelector = "[data-embedding-activity-label]";
     const gridSize = 30;
     const activePollMs = 500;
     const idlePollMs = 2500;
@@ -249,16 +250,23 @@
         Boolean(status?.enabled && (status.state === "active" || status.state === "queued" || status.queued_candidates > 0 || status.active_remaining > 0));
 
     const renderStatus = (container, status) => {
+        const active = Boolean(status.state === "active" || status.state === "queued" || status.active_remaining > 0 || status.queued_candidates > 0);
         const previousEmbedded = Number.parseInt(container.dataset.embeddingLastEmbedded || "0", 10);
         const currentEmbedded = Number(status.embedded || 0);
         container.dataset.embeddingLastEmbedded = String(currentEmbedded);
         container.dataset.embeddingReady = shouldShow(status) ? "true" : "false";
+        container.dataset.embeddingDisplay = active ? "live" : "average";
         setContainerState(container, status);
-        setText(container, embeddedSelector, String(status.embedded || 0));
+        setText(container, labelSelector, active ? "Embedding stream" : "Average vibe");
+        setText(container, embeddedSelector, String(active ? (status.embedded || 0) : (status.aggregate_embedding?.post_count || status.embedded || 0)));
         setText(container, remainingSelector, String(status.active_remaining || 0));
         setText(container, queuedSelector, String(status.queued_candidates || 0));
         updateMeta(container, status);
         updateAverageMeta(container, status);
+        const averagePanel = container.querySelector(averagePanelSelector);
+        if (averagePanel) {
+            averagePanel.open = !active && Boolean(status.aggregate_embedding);
+        }
         if (currentEmbedded > previousEmbedded) {
             document.dispatchEvent(new CustomEvent("redlib:content-progress", {
                 detail: { embedded: currentEmbedded },

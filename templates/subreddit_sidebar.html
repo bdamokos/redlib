@@ -202,7 +202,7 @@
 				data-embedding-activity-subreddit="{{ sub.name }}"
 				data-embedding-ready="false">
 				<div class="sub_flairs_header">
-					<label>Embedding stream</label>
+					<label data-embedding-activity-label>Average vibe</label>
 					<span data-embedding-activity-state>idle</span>
 				</div>
 				<div class="embedding_activity_stats">
@@ -210,9 +210,11 @@
 					<span><strong data-embedding-activity-remaining>0</strong> active</span>
 					<span><strong data-embedding-activity-queued>0</strong> queued</span>
 				</div>
-				<div class="embedding_vector_grid" data-embedding-vector-grid aria-label="Latest embedding vector values"></div>
-				<div class="embedding_activity_meta" data-embedding-activity-meta>Waiting for vectors</div>
-				<details class="embedding_average_panel" data-embedding-average-panel>
+				<div data-embedding-live-view>
+					<div class="embedding_vector_grid" data-embedding-vector-grid aria-label="Latest embedding vector values"></div>
+					<div class="embedding_activity_meta" data-embedding-activity-meta>Waiting for vectors</div>
+				</div>
+				<details class="embedding_average_panel" data-embedding-average-panel open>
 					<summary>
 						<span>Aggregate vibe</span>
 						<small data-embedding-average-state>waiting</small>

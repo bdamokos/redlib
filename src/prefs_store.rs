@@ -359,7 +359,39 @@ fn save_record(id: &str, prefs: &Preferences) -> Result<(), String> {
 			params![id, i64::from(RECORD_VERSION), u64_to_db(now), prefs_json],
 		)
 		.map_err(|error| error.to_string())?;
+	let profiles = load_all_profile_preferences(&conn)?;
+	drop(store);
+	crate::post_cache::reconcile_profile_memberships(profiles);
 	Ok(())
+}
+
+fn load_all_profile_preferences(conn: &Connection) -> Result<Vec<(String, Preferences)>, String> {
+	let cutoff = now_unix().saturating_sub(config_u64("REDLIB_PREFS_MAX_AGE_DAYS", DEFAULT_MAX_AGE_DAYS).saturating_mul(24 * 60 * 60));
+	let mut stmt = conn
+		.prepare("SELECT id, prefs_json FROM preferences WHERE last_visit_unix >= ?1")
+		.map_err(|error| error.to_string())?;
+	let rows = stmt
+		.query_map(params![u64_to_db(cutoff)], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+		.map_err(|error| error.to_string())?;
+	let mut profiles = Vec::new();
+	for row in rows {
+		let (id, prefs_json) = row.map_err(|error| error.to_string())?;
+		match serde_json::from_str::<Preferences>(&prefs_json) {
+			Ok(mut prefs) => {
+				prefs.prepare_for_runtime();
+				profiles.push((id, prefs));
+			}
+			Err(error) => warn!("preference store: skipping unparsable membership record {id}: {error}"),
+		}
+	}
+	Ok(profiles)
+}
+
+pub fn restore_profile_memberships() {
+	match open_db().and_then(|connection| load_all_profile_preferences(&connection)) {
+		Ok(profiles) => crate::post_cache::reconcile_profile_memberships(profiles),
+		Err(error) => warn!("preference store: failed to restore profile memberships: {error}"),
+	}
 }
 
 fn find_recent_superset_record_for_legacy(req: &Request<Body>, legacy_prefs: &Preferences, exclude_id: Option<&str>) -> Result<Option<(String, PreferenceRecord)>, String> {

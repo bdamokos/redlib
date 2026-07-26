@@ -27,7 +27,8 @@ static OBSERVED_BACKFILL_QUEUE: LazyLock<Mutex<ObservedBackfillQueue>> = LazyLoc
 static OBSERVED_BACKFILL_ACTIVITY: LazyLock<Mutex<HashMap<String, ObservedBackfillActivity>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static OBSERVED_BACKFILL_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static OBSERVED_BACKFILL_STARTED: AtomicBool = AtomicBool::new(false);
-static OBSERVED_BACKFILL_SIDECAR_DIRTY: AtomicBool = AtomicBool::new(false);
+static OBSERVED_CONTENT_SIDECAR_DIRTY: AtomicBool = AtomicBool::new(false);
+static OBSERVED_METADATA_SIDECAR_DIRTY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObservedBackfillPriority {
@@ -52,6 +53,8 @@ struct ObservedBackfillQueue {
 
 #[derive(Debug, Default)]
 struct ObservedBackfillOutcome {
+	metadata_embedded: usize,
+	metadata_failed: usize,
 	embedded: usize,
 	already_current: usize,
 	failed: usize,
@@ -310,11 +313,14 @@ fn queued_counts_for_subreddit(subreddit: &str) -> (usize, usize) {
 pub fn activity_snapshot(subreddit: &str) -> ObservedBackfillActivitySnapshot {
 	let subreddit = crate::subreddit_semantics::normalize_subreddit_name(subreddit);
 	let (queued_candidates, queued_jobs) = queued_counts_for_subreddit(&subreddit);
-	let activity = OBSERVED_BACKFILL_ACTIVITY
+	let mut activity = OBSERVED_BACKFILL_ACTIVITY
 		.lock()
 		.ok()
 		.and_then(|activity| activity.get(&subreddit).cloned())
 		.unwrap_or_default();
+	if activity.aggregate_embedding.is_none() {
+		activity.aggregate_embedding = aggregate_preview(&subreddit, &crate::subreddit_semantics::embedding_model());
+	}
 	let state = if matches!(activity.state, ObservedBackfillState::Idle) && queued_jobs > 0 {
 		ObservedBackfillState::Queued
 	} else {
@@ -352,9 +358,27 @@ pub async fn activity_api(req: Request<Body>) -> Result<Response<Body>, String> 
 	)
 }
 
-fn enqueue_candidates(candidates: Vec<SubredditContentPostEmbeddingCandidate>, priority: ObservedBackfillPriority) -> usize {
+fn metadata_embedding_needed(subreddit: &str) -> bool {
+	if subreddit.is_empty() || subreddit.starts_with("u_") {
+		return false;
+	}
+	let model = crate::subreddit_semantics::embedding_model();
+	crate::subreddit::cached_subreddit_metadata_for_name(subreddit).is_some_and(|metadata| !crate::subreddit_semantics::has_current_embedding(&metadata, &model))
+}
+
+fn enqueue_candidates_with_metadata_targets(
+	candidates: Vec<SubredditContentPostEmbeddingCandidate>,
+	metadata_targets: impl IntoIterator<Item = String>,
+	priority: ObservedBackfillPriority,
+) -> usize {
 	let mut queued = 0usize;
-	let grouped = group_candidates_by_subreddit(candidates);
+	let mut grouped = group_candidates_by_subreddit(candidates);
+	for subreddit in metadata_targets {
+		let subreddit = crate::subreddit_semantics::normalize_subreddit_name(&subreddit);
+		if metadata_embedding_needed(&subreddit) {
+			grouped.entry(subreddit).or_default();
+		}
+	}
 	if grouped.is_empty() {
 		return 0;
 	}
@@ -363,9 +387,6 @@ fn enqueue_candidates(candidates: Vec<SubredditContentPostEmbeddingCandidate>, p
 		return 0;
 	};
 	for (subreddit, candidates) in grouped {
-		if candidates.is_empty() {
-			continue;
-		}
 		if !queue.jobs.contains_key(&subreddit) {
 			if queue.jobs.len() >= MAX_QUEUE_SUBREDDITS {
 				if let Some(oldest) = queue.order.pop_front() {
@@ -389,18 +410,23 @@ fn enqueue_candidates(candidates: Vec<SubredditContentPostEmbeddingCandidate>, p
 	queued
 }
 
+fn enqueue_candidates(candidates: Vec<SubredditContentPostEmbeddingCandidate>, priority: ObservedBackfillPriority) -> usize {
+	enqueue_candidates_with_metadata_targets(candidates, Vec::new(), priority)
+}
+
 pub fn enqueue_observed_posts(source_key: &str, posts: &[Post], priority: ObservedBackfillPriority) {
 	if !observed_backfill_enabled() || posts.is_empty() {
 		return;
 	}
 
+	let metadata_targets = posts.iter().map(|post| post.community.clone()).collect::<Vec<_>>();
 	let options = subreddit_content_semantics::corpus_options_from_env();
 	let candidates = subreddit_content_semantics::runtime_post_embedding_candidates(source_key, posts, options.max_text_chars_per_post)
 		.into_iter()
 		.filter(|candidate| subreddit_content_semantics::post_candidate_needs_embedding(candidate, &crate::subreddit_semantics::embedding_model()))
 		.collect::<Vec<_>>();
 	let candidate_count = candidates.len();
-	let queued = enqueue_candidates(candidates, priority);
+	let queued = enqueue_candidates_with_metadata_targets(candidates, metadata_targets, priority);
 	if queued > 0 {
 		info!(
 			"observed_semantic_backfill: queued {} post candidates across {} subreddits from {} ({:?})",
@@ -505,6 +531,28 @@ async fn process_job(client: &Client<hyper::client::HttpConnector>, job: Observe
 	let started = Instant::now();
 	let mut outcome = ObservedBackfillOutcome::default();
 	mark_active_activity(&job);
+	if !job.subreddit.starts_with("u_") {
+		if let Some(metadata) = crate::subreddit::cached_subreddit_metadata_for_name(&job.subreddit) {
+			if !crate::subreddit_semantics::has_current_embedding(&metadata, &model) {
+				let text = crate::subreddit_semantics::semantic_text_for_subreddit(&metadata);
+				if !text.is_empty() {
+					let text_hash = crate::subreddit_semantics::semantic_text_hash(&text);
+					let prompt = format!("r/{}\nSubreddit title and description:\n{text}", job.subreddit);
+					match ollama_embedding(client, &base_url, &model, &prompt).await {
+						Ok(embedding) => {
+							crate::subreddit_semantics::store_embedding(&job.subreddit, &model, &text_hash, embedding, now_unix())?;
+							OBSERVED_METADATA_SIDECAR_DIRTY.store(true, AtomicOrdering::Release);
+							outcome.metadata_embedded = 1;
+						}
+						Err(error) => {
+							outcome.metadata_failed = 1;
+							warn!("observed_semantic_backfill: metadata embedding failed for r/{}: {}", job.subreddit, error);
+						}
+					}
+				}
+			}
+		}
+	}
 
 	for candidate in job.candidates {
 		if budget.is_some_and(|budget| started.elapsed() >= budget) {
@@ -526,7 +574,7 @@ async fn process_job(client: &Client<hyper::client::HttpConnector>, job: Observe
 				match subreddit_content_semantics::store_post_aggregate_embedding(&candidate, &model, embedding, embedded_at_unix) {
 					Ok(true) => {
 						outcome.embedded += 1;
-						OBSERVED_BACKFILL_SIDECAR_DIRTY.store(true, AtomicOrdering::Release);
+						OBSERVED_CONTENT_SIDECAR_DIRTY.store(true, AtomicOrdering::Release);
 						mark_embedded_activity(&candidate, &model, latest_embedding);
 					}
 					Ok(false) => {
@@ -557,11 +605,26 @@ fn should_flush_sidecar(dirty: bool, queue_empty: bool, elapsed: Duration, max_d
 	dirty && (queue_empty || elapsed >= max_delay)
 }
 
-async fn flush_sidecar_and_trim_allocator() -> Result<bool, String> {
-	tokio::task::spawn_blocking(|| {
-		let result = subreddit_content_semantics::write_persisted_embeddings_sidecar_now();
-		let trimmed = crate::memory::trim_allocator();
-		result.map(|()| trimmed)
+#[derive(Default)]
+struct SidecarFlushOutcome {
+	metadata_flushed: bool,
+	content_flushed: bool,
+	allocator_trimmed: bool,
+}
+
+async fn flush_sidecars_and_trim_allocator(flush_metadata: bool, flush_content: bool) -> Result<SidecarFlushOutcome, String> {
+	tokio::task::spawn_blocking(move || -> Result<SidecarFlushOutcome, String> {
+		let mut outcome = SidecarFlushOutcome::default();
+		if flush_metadata {
+			crate::subreddit_semantics::write_persisted_embeddings_sidecar_now()?;
+			outcome.metadata_flushed = true;
+		}
+		if flush_content {
+			subreddit_content_semantics::write_persisted_embeddings_sidecar_now()?;
+			outcome.content_flushed = true;
+		}
+		outcome.allocator_trimmed = crate::memory::trim_allocator();
+		Ok(outcome)
 	})
 	.await
 	.map_err(|error| format!("embedding sidecar writer stopped: {error}"))?
@@ -591,7 +654,9 @@ async fn worker_loop() {
 	let mut mutation_guard = None;
 	loop {
 		let Some(job) = pop_next_job() else {
-			let dirty = OBSERVED_BACKFILL_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+			let metadata_dirty = OBSERVED_METADATA_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+			let content_dirty = OBSERVED_CONTENT_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+			let dirty = metadata_dirty || content_dirty;
 			if should_flush_sidecar(dirty, true, last_flush_attempt.elapsed(), flush_max_delay) {
 				if mutation_guard.is_none() {
 					// Dirty memory must never be replaced by a disk refresh. This
@@ -608,10 +673,18 @@ async fn worker_loop() {
 					}
 				}
 				last_flush_attempt = Instant::now();
-				match flush_sidecar_and_trim_allocator().await {
-					Ok(trimmed) => {
-						OBSERVED_BACKFILL_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
-						info!("observed_semantic_backfill: persisted drained embedding burst (allocator_trimmed={trimmed})");
+				match flush_sidecars_and_trim_allocator(metadata_dirty, content_dirty).await {
+					Ok(flushed) => {
+						if flushed.metadata_flushed {
+							OBSERVED_METADATA_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
+						}
+						if flushed.content_flushed {
+							OBSERVED_CONTENT_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
+						}
+						info!(
+							"observed_semantic_backfill: persisted drained embedding burst (metadata={}, content={}, allocator_trimmed={})",
+							flushed.metadata_flushed, flushed.content_flushed, flushed.allocator_trimmed
+						);
 						mutation_guard.take();
 					}
 					Err(error) => {
@@ -660,8 +733,8 @@ async fn worker_loop() {
 			Ok(outcome) => {
 				mark_finished_activity(&subreddit, &outcome);
 				info!(
-					"observed_semantic_backfill: finished r/{} ({:?}): embedded={}, already_current={}, failed={}, timed_out={}",
-					subreddit, priority, outcome.embedded, outcome.already_current, outcome.failed, outcome.timed_out
+					"observed_semantic_backfill: finished r/{} ({:?}): metadata_embedded={}, metadata_failed={}, content_embedded={}, already_current={}, failed={}, timed_out={}",
+					subreddit, priority, outcome.metadata_embedded, outcome.metadata_failed, outcome.embedded, outcome.already_current, outcome.failed, outcome.timed_out
 				);
 				!outcome.timed_out
 			}
@@ -690,13 +763,23 @@ async fn worker_loop() {
 			}
 		}
 
-		let dirty = OBSERVED_BACKFILL_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+		let metadata_dirty = OBSERVED_METADATA_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+		let content_dirty = OBSERVED_CONTENT_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
+		let dirty = metadata_dirty || content_dirty;
 		if should_flush_sidecar(dirty, false, last_flush_attempt.elapsed(), flush_max_delay) {
 			last_flush_attempt = Instant::now();
-			match flush_sidecar_and_trim_allocator().await {
-				Ok(trimmed) => {
-					OBSERVED_BACKFILL_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
-					info!("observed_semantic_backfill: persisted active embedding burst (allocator_trimmed={trimmed})");
+			match flush_sidecars_and_trim_allocator(metadata_dirty, content_dirty).await {
+				Ok(flushed) => {
+					if flushed.metadata_flushed {
+						OBSERVED_METADATA_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
+					}
+					if flushed.content_flushed {
+						OBSERVED_CONTENT_SIDECAR_DIRTY.store(false, AtomicOrdering::Release);
+					}
+					info!(
+						"observed_semantic_backfill: persisted active embedding burst (metadata={}, content={}, allocator_trimmed={})",
+						flushed.metadata_flushed, flushed.content_flushed, flushed.allocator_trimmed
+					);
 					mutation_guard.take();
 				}
 				Err(error) => warn!("observed_semantic_backfill: failed to persist active embedding burst: {error}"),
@@ -751,6 +834,27 @@ mod tests {
 	}
 
 	#[test]
+	fn metadata_only_work_uses_the_same_observed_worker_queue() {
+		let subreddit = "observed_metadata_only_queue_test";
+		crate::subreddit::cache_subreddit_metadata(&crate::utils::Subreddit {
+			name: subreddit.to_string(),
+			title: "Observed metadata queue".to_string(),
+			description: "Metadata should not depend on a missing content candidate.".to_string(),
+			..crate::utils::Subreddit::default()
+		});
+
+		assert_eq!(
+			enqueue_candidates_with_metadata_targets(Vec::new(), vec![subreddit.to_string()], ObservedBackfillPriority::Background),
+			1
+		);
+		let mut queue = OBSERVED_BACKFILL_QUEUE.lock().unwrap();
+		let job = queue.jobs.remove(subreddit).expect("metadata-only job");
+		queue.order.retain(|name| name != subreddit);
+		assert!(job.candidates.is_empty());
+		assert_eq!(job.priority, ObservedBackfillPriority::Background);
+	}
+
+	#[test]
 	fn semantic_target_label_distinguishes_users_from_subreddits() {
 		assert_eq!(semantic_target_label("rust"), "r/rust");
 		assert_eq!(semantic_target_label("u_exampleuser"), "u/exampleuser");
@@ -763,6 +867,23 @@ mod tests {
 		assert!(should_flush_sidecar(true, true, Duration::ZERO, max_delay));
 		assert!(!should_flush_sidecar(true, false, Duration::from_secs(59), max_delay));
 		assert!(should_flush_sidecar(true, false, Duration::from_secs(60), max_delay));
+	}
+
+	#[test]
+	fn idle_activity_uses_persisted_average_vibe_and_total_post_count() {
+		let subreddit = "observed_activity_idle_average_test";
+		let model = crate::subreddit_semantics::embedding_model();
+		let first = candidate(subreddit, "first", 1);
+		let second = candidate(subreddit, "second", 2);
+		subreddit_content_semantics::store_post_aggregate_embedding(&first, &model, vec![1.0, 0.0], 100).unwrap();
+		subreddit_content_semantics::store_post_aggregate_embedding(&second, &model, vec![0.0, 1.0], 200).unwrap();
+
+		let snapshot = activity_snapshot(subreddit);
+		let average = snapshot.aggregate_embedding.expect("idle average should be available");
+
+		assert!(matches!(snapshot.state, ObservedBackfillState::Idle));
+		assert_eq!(average.post_count, 2);
+		assert_eq!(snapshot.embedded, 0, "run-local count must not masquerade as the persisted total");
 	}
 
 	#[test]

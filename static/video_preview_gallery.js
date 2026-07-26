@@ -9,6 +9,7 @@
     var PREVIEW_FALLBACK_POLL_MS = 500;
     var DESKTOP_PREVIEW_FALLBACK_QUERY = "(min-width: 1000px) and (hover: hover) and (pointer: fine)";
     var PREVIEW_SOUND_STORAGE_KEY = "redlib_video_preview_sound";
+    var PREVIEW_SOUND_CHANNEL_NAME = "redlib-video-preview-sound";
     var UNNORMALIZED_PREVIEW_VOLUME = 0.65;
 
     function createPageSessionId() {
@@ -29,6 +30,7 @@
     var pageSettledTimer = null;
     var previewSoundEnabled = false;
     var previewSoundButton = null;
+    var previewSoundChannel = "BroadcastChannel" in window ? new BroadcastChannel(PREVIEW_SOUND_CHANNEL_NAME) : null;
     var FILTERED_AUTHOR_SELECTOR = "[data-temporary-author-filtered='true'], [data-permanent-author-filtered='true']";
 
     function jsonHeaders() {
@@ -85,6 +87,17 @@
         try {
             window.localStorage.setItem(PREVIEW_SOUND_STORAGE_KEY, enabled ? "on" : "off");
         } catch (error) {}
+    }
+
+    function applyPreviewSoundPreference(enabled) {
+        previewSoundEnabled = Boolean(enabled);
+        syncPreviewSoundMode();
+    }
+
+    function broadcastPreviewSoundEnabled(enabled) {
+        if (previewSoundChannel) {
+            previewSoundChannel.postMessage({ enabled: Boolean(enabled) });
+        }
     }
 
     function scrollPaddingTop() {
@@ -214,6 +227,7 @@
         previewSoundButton.addEventListener("click", function () {
             previewSoundEnabled = !previewSoundEnabled;
             writePreviewSoundEnabled(previewSoundEnabled);
+            broadcastPreviewSoundEnabled(previewSoundEnabled);
             var normalizer = window.RedlibPreviewAudioNormalizer;
             if (previewSoundEnabled && normalizer) {
                 normalizer.unlock().then(function () {
@@ -223,6 +237,19 @@
             syncPreviewSoundMode();
         });
     }
+
+    if (previewSoundChannel) {
+        previewSoundChannel.addEventListener("message", function (event) {
+            if (event.data && typeof event.data.enabled === "boolean") {
+                applyPreviewSoundPreference(event.data.enabled);
+            }
+        });
+    }
+    window.addEventListener("storage", function (event) {
+        if (event.key === PREVIEW_SOUND_STORAGE_KEY && event.newValue !== null) {
+            applyPreviewSoundPreference(event.newValue === "on");
+        }
+    });
 
     function isInitialPausedFrame(video) {
         return Boolean(video && video.paused && video.currentTime <= 0.05);
