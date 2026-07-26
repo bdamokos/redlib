@@ -1661,13 +1661,15 @@ fn feed_page_url(current_url: &str, session_id: &str, page: usize) -> String {
 }
 
 async fn ensure_contextual_feed_session(requested_session_id: String, request: FeedSessionRequest, cache_page: usize) -> String {
-	if crate::post_cache::continue_feed_session_with_budget(
-		&requested_session_id,
-		cache_page,
-		crate::post_cache::POSTS_PER_PAGE,
-		contextual_front_page_sync_source_budget(cache_page),
-	)
-	.await
+	let expected_session_id = crate::post_cache::feed_session_id_for_request(&request);
+	if requested_session_id == expected_session_id
+		&& crate::post_cache::continue_feed_session_with_budget(
+			&requested_session_id,
+			cache_page,
+			crate::post_cache::POSTS_PER_PAGE,
+			contextual_front_page_sync_source_budget(cache_page),
+		)
+		.await
 	{
 		return requested_session_id;
 	}
@@ -4602,6 +4604,50 @@ mod tests {
 		assert!(links.iter().all(|link| link.label.starts_with('~')));
 		let unique = links.iter().map(|link| link.label.clone()).collect::<HashSet<_>>();
 		assert_eq!(unique.len(), links.len());
+	}
+
+	#[tokio::test]
+	async fn contextual_session_rejects_stale_sources_after_unfollow() {
+		let stale_source = FeedSource::subreddit("u_contextual-unfollowed", FeedSort::New);
+		let current_source = FeedSource::subreddit("u_contextual-followed", FeedSort::New);
+		post_cache::store_source_posts_for_cache(
+			&stale_source,
+			vec![metric_post("stale-unfollowed-post", "contextual-unfollowed", 1_000, 10, false)],
+			String::new(),
+			Some(RefreshOrigin::FrontPageSession),
+		);
+		post_cache::store_source_posts_for_cache(
+			&current_source,
+			vec![metric_post("current-followed-post", "contextual-followed", 2_000, 20, false)],
+			String::new(),
+			Some(RefreshOrigin::FrontPageSession),
+		);
+
+		let stale_session_id = post_cache::ensure_feed_session(
+			FeedSessionRequest {
+				sources: vec![stale_source],
+				query_fingerprint: "following-new".to_string(),
+				bundle_followed_user_comments: true,
+				merge_sort: Some(FeedSort::New),
+				..Default::default()
+			},
+			0,
+			post_cache::POSTS_PER_PAGE,
+		)
+		.await;
+		let current_request = FeedSessionRequest {
+			sources: vec![current_source],
+			query_fingerprint: "following-new".to_string(),
+			bundle_followed_user_comments: true,
+			merge_sort: Some(FeedSort::New),
+			..Default::default()
+		};
+
+		let current_session_id = super::ensure_contextual_feed_session(stale_session_id.clone(), current_request, 0).await;
+		assert_ne!(current_session_id, stale_session_id);
+		let page = post_cache::feed_page(&current_session_id, 0, post_cache::POSTS_PER_PAGE).expect("current session page");
+		let ids = page.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>();
+		assert_eq!(ids, vec!["current-followed-post"]);
 	}
 
 	#[tokio::test]

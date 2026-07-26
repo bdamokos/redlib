@@ -2757,6 +2757,10 @@ fn build_session_id(request: &FeedSessionRequest) -> String {
 	format!("{:x}", hasher.finish())
 }
 
+pub(crate) fn feed_session_id_for_request(request: &FeedSessionRequest) -> String {
+	build_session_id(request)
+}
+
 fn session_merge_sort(session: &FeedSession) -> FeedSort {
 	session
 		.request
