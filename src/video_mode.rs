@@ -224,7 +224,7 @@ pub fn is_video_post(post: &Post) -> bool {
 pub fn build_listing(posts: &[Post], filters: &HashSet<String>, query: &VideoModeQuery, now_unix: u64) -> VideoModeListing {
 	let eligible_posts = posts
 		.iter()
-		.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+		.filter(|post| !crate::utils::post_matches_filter_policy(post, filters))
 		.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
 		.filter(|post| is_video_post(post))
 		.cloned()

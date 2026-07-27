@@ -549,6 +549,30 @@ fn qualifying_filter_reasons(state: &DetectionState, author: &str) -> Vec<&'stat
 	reasons
 }
 
+pub fn author_is_redgifs_only_auto_filter(author: &str) -> bool {
+	let author = normalize_author(author);
+	if author.is_empty() {
+		return false;
+	}
+	let Ok(state) = STATE.lock() else { return false };
+	let redgifs_qualifies = state.redgifs_profiles_by_author.get(&author).map(|profiles| profiles.len()).unwrap_or_default() >= REDGIFS_AUTO_FILTER_THRESHOLD;
+	let promotion_qualifies = state.promo_by_author.get(&author).map(HashSet::len).unwrap_or_default() >= PROMOTION_AUTO_FILTER_THRESHOLD;
+	redgifs_qualifies && !promotion_qualifies
+}
+
+fn post_is_redgifs_filter_exempt(post_id: &str, prefs: &Preferences) -> bool {
+	let Ok(state) = STATE.lock() else { return false };
+	let Some(observation) = state.observations.get(post_id) else {
+		return false;
+	};
+	prefs.has_redgifs_filter_exemption(&observation.community)
+		&& state
+			.redgifs_profiles_by_author
+			.get(&observation.author)
+			.is_some_and(|profiles| profiles.len() >= REDGIFS_AUTO_FILTER_THRESHOLD)
+		&& state.promo_by_author.get(&observation.author).map(HashSet::len).unwrap_or_default() < PROMOTION_AUTO_FILTER_THRESHOLD
+}
+
 pub fn qualifying_author_counts() -> (usize, usize) {
 	let Ok(state) = STATE.lock() else { return (0, 0) };
 	let promotion = state.promo_by_author.values().filter(|post_ids| post_ids.len() >= PROMOTION_AUTO_FILTER_THRESHOLD).count();
@@ -588,6 +612,7 @@ pub async fn status(req: Request<Body>) -> Result<Response<Body>, String> {
 		})
 		.unwrap_or_default();
 	let mut signals = serde_json::Map::new();
+	let mut redgifs_exempt_post_ids = Vec::new();
 	let parsed_ids = ids
 		.split(',')
 		.take(100)
@@ -604,6 +629,9 @@ pub async fn status(req: Request<Body>) -> Result<Response<Body>, String> {
 		}
 		if let Some(marker) = marker_for(id) {
 			signals.insert(id.clone(), json!({ "signal": marker.signal }));
+		}
+		if post_is_redgifs_filter_exempt(id, &prefs) {
+			redgifs_exempt_post_ids.push(id.clone());
 		}
 	}
 
@@ -642,6 +670,7 @@ pub async fn status(req: Request<Body>) -> Result<Response<Body>, String> {
 			json!({
 				"signals": signals,
 				"auto_filters": auto_filters,
+				"redgifs_exempt_post_ids": redgifs_exempt_post_ids,
 				"stats": {
 					"promotion_filtered_users": promotion_filtered_users,
 					"redgifs_filtered_users": redgifs_filtered_users,
@@ -819,5 +848,31 @@ mod tests {
 		assert_eq!(state.redgifs_profiles_by_author["phase2reposter"].len(), REDGIFS_AUTO_FILTER_THRESHOLD);
 		assert_eq!(qualifying_filter_reasons(&state, "phase2promoter"), ["promotion_spam"]);
 		assert_eq!(qualifying_filter_reasons(&state, "phase2reposter"), ["redgifs_reposter"]);
+	}
+
+	#[test]
+	fn client_exempt_ids_exclude_authors_with_an_independent_promotion_reason() {
+		let mut prefs = crate::utils::Preferences::default();
+		prefs.redgifs_filter_exempt_subreddits = vec!["FanCommunity".to_string()];
+		prefs.prepare_for_runtime();
+
+		for (author, prefix, promotional) in [("client_redgifs_only", "clientonly", false), ("client_dual_reason", "clientdual", true)] {
+			for index in 0..REDGIFS_AUTO_FILTER_THRESHOLD {
+				let mut post = Post::default();
+				post.id = format!("{prefix}{index}");
+				post.title = if promotional && index < PROMOTION_AUTO_FILTER_THRESHOLD {
+					"first 50 to say yes gets my free nudes".to_string()
+				} else {
+					"ordinary title".to_string()
+				};
+				post.community = "FanCommunity".to_string();
+				post.author.name = author.to_string();
+				post.media.redgifs_username = format!("{prefix}_profile_{index}");
+				observe_post(&post);
+			}
+		}
+
+		assert!(super::post_is_redgifs_filter_exempt("clientonly0", &prefs));
+		assert!(!super::post_is_redgifs_filter_exempt("clientdual0", &prefs));
 	}
 }

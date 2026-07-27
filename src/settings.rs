@@ -24,7 +24,7 @@ crate::impl_template_str_eq!(SettingsTemplate);
 
 // CONSTANTS
 
-const PREFS: [&str; 24] = [
+const PREFS: [&str; 25] = [
 	"theme",
 	"front_page",
 	"layout",
@@ -41,6 +41,7 @@ const PREFS: [&str; 24] = [
 	"video_previews",
 	"direct_redgifs_media",
 	"redgifs_poster_quality",
+	"redgifs_filter_exempt_subreddits",
 	"hide_sidebar_and_summary",
 	"fixed_navbar",
 	"hide_awards",
@@ -209,6 +210,9 @@ fn apply_standard_preference(prefs: &mut Preferences, name: &str, value: &str) {
 		"video_previews" => prefs.video_previews = value.to_string(),
 		"direct_redgifs_media" => prefs.direct_redgifs_media = value.to_string(),
 		"redgifs_poster_quality" => prefs.redgifs_poster_quality = value.to_string(),
+		"redgifs_filter_exempt_subreddits" => {
+			prefs.redgifs_filter_exempt_subreddits = plus_list(&value.replace(',', "+"));
+		}
 		"hide_sidebar_and_summary" => prefs.hide_sidebar_and_summary = value.to_string(),
 		"fixed_navbar" => prefs.fixed_navbar = value.to_string(),
 		"hide_awards" => prefs.hide_awards = value.to_string(),
@@ -262,5 +266,13 @@ mod tests {
 		let req = Request::builder().uri("/settings?status=imported").body(Body::empty()).unwrap();
 
 		assert_eq!(settings_status(&req), Some("imported".to_string()));
+	}
+
+	#[test]
+	fn settings_save_normalizes_redgifs_filter_exemptions() {
+		let mut prefs = Preferences::default();
+		let form = HashMap::from([("redgifs_filter_exempt_subreddits".to_string(), "r/FanCommunity, anotherCommunity+fancommunity".to_string())]);
+		apply_standard_preferences(&mut prefs, &form, false);
+		assert_eq!(prefs.redgifs_filter_exempt_subreddits, ["anothercommunity".to_string(), "fancommunity".to_string()]);
 	}
 }

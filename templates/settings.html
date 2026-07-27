@@ -151,6 +151,21 @@
 							%}checked{% endif %}>
 					</div>
 					<div class="prefs-group">
+						<label for="redgifs_filter_exempt_subreddits">Communities exempt from the multiple-RedGIF-profile filter</label>
+						<details class="feeds">
+							<summary>How does this work?</summary>
+							<div class="feed_list helper">
+								Enter subreddit names separated by <code>+</code> or commas. Posts in these communities remain visible when their author is automatically classified as a multiple-profile RedGIF reposter. The author remains filtered elsewhere. For qualifying reposters, this exemption also wins over an existing author filter inside the listed community so legacy automatic filters can be reversed without deleting that filter.
+							</div>
+						</details>
+						<input
+							type="text"
+							name="redgifs_filter_exempt_subreddits"
+							id="redgifs_filter_exempt_subreddits"
+							placeholder="FanCommunity+AnotherCommunity"
+							value="{{ prefs.redgifs_filter_exempt_subreddits.join("+") }}">
+					</div>
+					<div class="prefs-group">
 						<label for="fixed_navbar">Keep navbar fixed</label>
 						<input type="hidden" value="off" name="fixed_navbar">
 						<input type="checkbox" name="fixed_navbar" {% if prefs.fixed_navbar=="on" %}checked{% endif %}>

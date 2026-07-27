@@ -1183,13 +1183,13 @@ fn paginate_posts(posts: &[Post], page: usize, per_page: usize) -> (Vec<Post>, b
 fn video_mode_visibility_counts(posts: &[Post], filters: &HashSet<String>, now_unix: u64) -> (usize, usize) {
 	let eligible = posts
 		.iter()
-		.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+		.filter(|post| !crate::utils::post_matches_filter_policy(post, filters))
 		.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
 		.filter(|post| video_mode::is_video_post(post))
 		.count();
 	let eligible_with_timestamp = posts
 		.iter()
-		.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+		.filter(|post| !crate::utils::post_matches_filter_policy(post, filters))
 		.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
 		.filter(|post| video_mode::is_video_post(post))
 		.filter(|post| now_unix >= post.created_ts)
@@ -1868,7 +1868,7 @@ fn merge_chunk_posts(
 		empty_streak = 0;
 		next_source_index = (cursor + 1) % chunk_buffers.len();
 
-		let is_filtered = filters.contains(&post.community) || filters.contains(&format!("u_{}", post.author.name));
+		let is_filtered = crate::utils::post_matches_filter_policy(&post, filters);
 		if !is_filtered {
 			*any_post_after_filter = true;
 			if crate::utils::is_deleted_reddit_placeholder_post(&post) {

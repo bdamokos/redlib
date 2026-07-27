@@ -22,10 +22,11 @@
 		else if (previous && previous.matches(".sep")) previous.remove();
 	}
 
-	function eliminateAuthor(author) {
+	function eliminateAuthor(author, exemptPostIds, candidates) {
 		const normalized = (author || "").trim().toLowerCase();
 		if (!normalized) return;
-		for (const post of posts()) {
+		for (const post of candidates) {
+			if (exemptPostIds.has(post.dataset.postId || "")) continue;
 			if (authorFromPost(post) === normalized) eliminatePost(post);
 		}
 	}
@@ -46,11 +47,12 @@
 				});
 				if (!response.ok) continue;
 				const payload = await response.json();
+				const exemptPostIds = new Set(payload.redgifs_exempt_post_ids || []);
 				for (const post of batch) {
 					const result = payload.signals && payload.signals[post.dataset.postId];
 					if (result && result.signal) eliminatePost(post);
 				}
-				for (const author of Object.keys(payload.auto_filters || {})) eliminateAuthor(author);
+				for (const author of Object.keys(payload.auto_filters || {})) eliminateAuthor(author, exemptPostIds, batch);
 			}
 		} catch (_) {
 			// Detection is advisory and must never interfere with rendering.

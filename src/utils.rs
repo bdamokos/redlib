@@ -1865,7 +1865,7 @@ pub struct Params {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[revisioned(revision = 7)]
+#[revisioned(revision = 8)]
 pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(skip_serializing, skip_deserializing)]
@@ -1922,6 +1922,9 @@ pub struct Preferences {
 	#[revision(start = 1)]
 	#[serde(serialize_with = "serialize_vec_with_plus", deserialize_with = "deserialize_vec_with_plus")]
 	pub filters: Vec<String>,
+	#[revision(start = 8)]
+	#[serde(default, serialize_with = "serialize_vec_with_plus", deserialize_with = "deserialize_vec_with_plus")]
+	pub redgifs_filter_exempt_subreddits: Vec<String>,
 	#[revision(start = 4)]
 	#[serde(default, skip_serializing, skip_deserializing)]
 	pub filters_lc: HashSet<String>,
@@ -1995,6 +1998,7 @@ impl From<LegacyPreferencesV1> for Preferences {
 			subscriptions: value.subscriptions,
 			subscriptions_lc: HashSet::new(),
 			filters: value.filters,
+			redgifs_filter_exempt_subreddits: Vec::new(),
 			filters_lc: HashSet::new(),
 			flair_subscriptions: Vec::new(),
 			hide_awards: value.hide_awards,
@@ -2062,6 +2066,7 @@ impl From<LegacyPreferencesV0> for Preferences {
 			subscriptions: value.subscriptions,
 			subscriptions_lc: HashSet::new(),
 			filters: value.filters,
+			redgifs_filter_exempt_subreddits: Vec::new(),
 			filters_lc: HashSet::new(),
 			flair_subscriptions: Vec::new(),
 			hide_awards: value.hide_awards,
@@ -2590,6 +2595,7 @@ impl Preferences {
 
 	pub(crate) fn prepare_for_runtime(&mut self) {
 		self.available_themes = AVAILABLE_THEMES.clone();
+		normalize_redgifs_filter_exempt_subreddits(&mut self.redgifs_filter_exempt_subreddits);
 		self.rebuild_indexes();
 		self.normalize_post_feedback_entries();
 	}
@@ -2599,6 +2605,7 @@ impl Preferences {
 		prefs.available_themes = Vec::new();
 		prefs.subscriptions_lc = HashSet::new();
 		prefs.filters_lc = HashSet::new();
+		normalize_redgifs_filter_exempt_subreddits(&mut prefs.redgifs_filter_exempt_subreddits);
 		prefs.normalize_post_feedback_entries();
 		prefs
 	}
@@ -2648,6 +2655,7 @@ impl Preferences {
 			"post_sort" => Some(self.post_sort.clone()),
 			"subscriptions" => Some(self.subscriptions.join("+")),
 			"filters" => Some(self.filters.join("+")),
+			"redgifs_filter_exempt_subreddits" => Some(self.redgifs_filter_exempt_subreddits.join("+")),
 			"flair_subscriptions" => encode_flair_subscriptions(&self.flair_subscriptions).ok(),
 			"hide_awards" => Some(self.hide_awards.clone()),
 			"hide_score" => Some(self.hide_score.clone()),
@@ -2692,6 +2700,11 @@ impl Preferences {
 			subscriptions: setting(req, "subscriptions").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
 			subscriptions_lc: HashSet::new(),
 			filters: setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+			redgifs_filter_exempt_subreddits: setting(req, "redgifs_filter_exempt_subreddits")
+				.split('+')
+				.map(String::from)
+				.filter(|s| !s.is_empty())
+				.collect(),
 			filters_lc: HashSet::new(),
 			flair_subscriptions: decode_flair_subscriptions(&setting(req, "flair_subscriptions")).unwrap_or_default(),
 			hide_awards: setting(req, "hide_awards"),
@@ -2699,6 +2712,7 @@ impl Preferences {
 			remove_default_feeds: setting(req, "remove_default_feeds"),
 			post_feedback: Vec::new(),
 		};
+		normalize_redgifs_filter_exempt_subreddits(&mut prefs.redgifs_filter_exempt_subreddits);
 		prefs.rebuild_indexes();
 		prefs
 	}
@@ -2727,6 +2741,17 @@ impl Preferences {
 
 	pub fn has_filter(&self, value: &str) -> bool {
 		self.filters_lc.contains(&value.to_ascii_lowercase())
+	}
+
+	pub fn has_redgifs_filter_exemption(&self, community: &str) -> bool {
+		let community = normalize_redgifs_filter_exempt_subreddit(community);
+		!community.is_empty() && self.redgifs_filter_exempt_subreddits.binary_search(&community).is_ok()
+	}
+
+	pub fn post_filters(&self) -> HashSet<String> {
+		let mut filters = self.filters_lc.clone();
+		filters.extend(self.redgifs_filter_exempt_subreddits.iter().map(|community| redgifs_filter_exemption_token(community)));
+		filters
 	}
 
 	pub fn post_feedback_signal(&self, post_id: &str, model: &str) -> String {
@@ -2833,6 +2858,7 @@ pub fn preferences_from_bincode(bytes: &[u8]) -> Result<Preferences, String> {
 				.map(Preferences::from)
 		});
 	if let Ok(mut preferences) = legacy {
+		normalize_redgifs_filter_exempt_subreddits(&mut preferences.redgifs_filter_exempt_subreddits);
 		preferences.rebuild_indexes();
 		return Ok(preferences);
 	}
@@ -2840,6 +2866,7 @@ pub fn preferences_from_bincode(bytes: &[u8]) -> Result<Preferences, String> {
 	let mut reader = bytes;
 	match Preferences::deserialize_revisioned(&mut reader) {
 		Ok(mut preferences) if reader.is_empty() => {
+			normalize_redgifs_filter_exempt_subreddits(&mut preferences.redgifs_filter_exempt_subreddits);
 			preferences.rebuild_indexes();
 			Ok(preferences)
 		}
@@ -2936,7 +2963,79 @@ async fn read_optional_external_text(response: Response<Body>) -> Result<String,
 
 /// Gets a `HashSet` of filters from the cookie in the given `Request`.
 pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
-	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+	Preferences::new(req).post_filters()
+}
+
+const REDGIFS_FILTER_EXEMPTION_TOKEN_PREFIX: &str = "\u{1f}redgifs-exempt:";
+const MAX_REDGIFS_FILTER_EXEMPT_SUBREDDITS: usize = 512;
+
+fn normalize_redgifs_filter_exempt_subreddit(value: &str) -> String {
+	let value = value.trim().to_ascii_lowercase();
+	value
+		.trim_start_matches("r/")
+		.trim_start_matches("/r/")
+		.trim_start_matches("r_")
+		.trim_matches('/')
+		.to_string()
+}
+
+fn normalize_redgifs_filter_exempt_subreddits(values: &mut Vec<String>) {
+	for value in values.iter_mut() {
+		*value = normalize_redgifs_filter_exempt_subreddit(value);
+	}
+	values.retain(|value| !value.is_empty());
+	values.sort();
+	values.dedup();
+	values.truncate(MAX_REDGIFS_FILTER_EXEMPT_SUBREDDITS);
+}
+
+fn redgifs_filter_exemption_token(community: &str) -> String {
+	format!("{REDGIFS_FILTER_EXEMPTION_TOKEN_PREFIX}{}", normalize_redgifs_filter_exempt_subreddit(community))
+}
+
+fn filter_has_redgifs_exemption(filters_lc: &HashSet<String>, community: &str) -> bool {
+	filters_lc.contains(&redgifs_filter_exemption_token(community))
+}
+
+/// Returns whether a post is hidden by a viewer's explicit/automatic feed
+/// filters. A subreddit exemption wins over an author filter only when the
+/// author currently qualifies for the multiple-RedGIF-profile policy. This
+/// deliberately leaves the stored `u_<author>` row intact: old automatic rows
+/// are reversed in the exempt community without deleting a possibly manual
+/// filter, and the same author remains filtered everywhere else.
+pub fn post_matches_filter_policy(post: &Post, filters: &HashSet<String>) -> bool {
+	let filters_lc = filters.iter().map(|value| value.to_ascii_lowercase()).collect::<HashSet<_>>();
+	post_identity_matches_filter_policy(&post.community, &post.author.name, &filters_lc)
+}
+
+pub(crate) fn post_identity_matches_filter_policy(community: &str, author: &str, filters_lc: &HashSet<String>) -> bool {
+	let community = community.to_ascii_lowercase();
+	if filters_lc.contains(&community) {
+		return true;
+	}
+	let author = author.trim().trim_start_matches("u/").trim_start_matches("u_").to_ascii_lowercase();
+	let author_filter = format!("u_{author}");
+	if !filters_lc.contains(&author_filter) {
+		return false;
+	}
+	!(filter_has_redgifs_exemption(filters_lc, &community) && crate::promo_detection::author_is_redgifs_only_auto_filter(&author))
+}
+
+/// Filters safe to apply before a complete post is hydrated. Scoped RedGIF
+/// exemptions require the qualifying author's rows to survive early SQL or
+/// materialization filters; the final post-level policy hides their rows in
+/// every non-exempt community.
+pub(crate) fn post_filter_prefilter_values(filters: &HashSet<String>) -> Vec<String> {
+	let has_exemptions = filters.iter().any(|value| value.starts_with(REDGIFS_FILTER_EXEMPTION_TOKEN_PREFIX));
+	let mut values = filters
+		.iter()
+		.map(|value| value.trim().to_ascii_lowercase())
+		.filter(|value| !value.is_empty() && !value.starts_with(REDGIFS_FILTER_EXEMPTION_TOKEN_PREFIX))
+		.filter(|value| !has_exemptions || !value.strip_prefix("u_").is_some_and(crate::promo_detection::author_is_redgifs_only_auto_filter))
+		.collect::<Vec<_>>();
+	values.sort();
+	values.dedup();
+	values
 }
 
 /// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being
@@ -2952,15 +3051,10 @@ pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, b
 	if posts.is_empty() {
 		(0, false)
 	} else {
-		let filters_lc = filters.iter().map(|value| value.to_ascii_lowercase()).collect::<HashSet<_>>();
 		for post in posts.iter() {
 			crate::promo_detection::observe_post(post);
 		}
-		posts.retain(|p| {
-			!crate::promo_detection::post_is_promotional(&p.id)
-				&& !filters_lc.contains(&p.community.to_ascii_lowercase())
-				&& !filters_lc.contains(&format!("u_{}", p.author.name.to_ascii_lowercase()))
-		});
+		posts.retain(|p| !crate::promo_detection::post_is_promotional(&p.id) && !post_matches_filter_policy(p, filters));
 
 		// Get the length of the Vec<Post> after applying the filter.
 		// If lb > la, then at least one post was removed.
@@ -6172,6 +6266,74 @@ mod tests {
 		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), ["phase2normal2"]);
 	}
 
+	#[test]
+	fn redgifs_subreddit_exemption_restores_only_redgifs_only_automatic_filters() {
+		let reposter = "exemption_reposter";
+		for index in 0..crate::promo_detection::REDGIFS_AUTO_FILTER_THRESHOLD {
+			let mut observed = Post::default();
+			observed.id = format!("rgexempt{index}");
+			observed.title = "ordinary post".to_string();
+			observed.community = if index == 0 { "FanCommunity".to_string() } else { "Elsewhere".to_string() };
+			observed.author.name = reposter.to_string();
+			observed.media.redgifs_username = format!("borrowed_profile_{index}");
+			crate::promo_detection::observe_post(&observed);
+		}
+
+		let dual_reason_author = "exemption_dual_reason";
+		for index in 0..crate::promo_detection::REDGIFS_AUTO_FILTER_THRESHOLD {
+			let mut observed = Post::default();
+			observed.id = format!("rgdual{index}");
+			observed.title = if index < crate::promo_detection::PROMOTION_AUTO_FILTER_THRESHOLD {
+				"first 50 to say yes gets my free nudes".to_string()
+			} else {
+				"ordinary post".to_string()
+			};
+			observed.community = "FanCommunity".to_string();
+			observed.author.name = dual_reason_author.to_string();
+			observed.media.redgifs_username = format!("dual_profile_{index}");
+			crate::promo_detection::observe_post(&observed);
+		}
+
+		let mut prefs = Preferences::default();
+		prefs.filters = vec![format!("u_{reposter}"), "u_manual_only".to_string(), format!("u_{dual_reason_author}")];
+		prefs.redgifs_filter_exempt_subreddits = vec!["r/FanCommunity".to_string()];
+		prefs.prepare_for_runtime();
+		let filters = prefs.post_filters();
+		let early_filters = super::post_filter_prefilter_values(&filters);
+		assert!(!early_filters.contains(&format!("u_{reposter}")));
+		assert!(early_filters.contains(&"u_manual_only".to_string()));
+		assert!(early_filters.contains(&format!("u_{dual_reason_author}")));
+
+		let post = |id: &str, community: &str, author: &str| {
+			let mut post = Post::default();
+			post.id = id.to_string();
+			post.title = "ordinary post".to_string();
+			post.community = community.to_string();
+			post.author.name = author.to_string();
+			post
+		};
+		let mut posts = vec![
+			post("rgrestore1", "FanCommunity", reposter),
+			post("rgrestore2", "Elsewhere", reposter),
+			post("rgrestore3", "FanCommunity", "manual_only"),
+			post("rgrestore4", "FanCommunity", dual_reason_author),
+		];
+		let (removed, all_removed) = filter_posts(&mut posts, &filters);
+		assert_eq!(removed, 3);
+		assert!(!all_removed);
+		assert_eq!(posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>(), ["rgrestore1"]);
+		assert_eq!(prefs.filters.len(), 3, "the scoped reversal must not delete stored author filters");
+	}
+
+	#[test]
+	fn redgifs_exemption_names_are_normalized_deduplicated_and_bounded() {
+		let mut prefs = Preferences::default();
+		prefs.redgifs_filter_exempt_subreddits = vec!["r/FanCommunity".to_string(), "/r/fancommunity/".to_string(), "AnotherCommunity".to_string()];
+		prefs.prepare_for_runtime();
+		assert_eq!(prefs.redgifs_filter_exempt_subreddits, ["anothercommunity".to_string(), "fancommunity".to_string()]);
+		assert!(prefs.has_redgifs_filter_exemption("R/FANCOMMUNITY"));
+	}
+
 	async fn always_exists(_: String) -> bool {
 		true
 	}
@@ -7500,6 +7662,7 @@ mod tests {
 			subscriptions: vec!["memes".to_owned(), "mildlyinteresting".to_owned()],
 			subscriptions_lc: ["memes".to_owned(), "mildlyinteresting".to_owned()].into_iter().collect(),
 			filters: vec![],
+			redgifs_filter_exempt_subreddits: vec![],
 			filters_lc: HashSet::new(),
 			flair_subscriptions: vec![],
 			hide_awards: "off".to_owned(),
@@ -7509,7 +7672,7 @@ mod tests {
 		};
 		let urlencoded = serde_urlencoded::to_string(prefs).expect("Failed to serialize Prefs");
 
-		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&redgifs_poster_quality=hd&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off&post_feedback=");
+		assert_eq!(urlencoded, "theme=laserwave&front_page=default&layout=compact&wide=on&blur_spoiler=on&show_nsfw=off&blur_nsfw=on&hide_hls_notification=off&image_quality=auto&video_quality=best&hide_sidebar_and_summary=off&use_dash=on&use_hls=on&autoplay_videos=on&video_previews=on&direct_redgifs_media=on&redgifs_poster_quality=hd&fixed_navbar=on&disable_visit_reddit_confirmation=on&comment_sort=confidence&post_sort=top&subscriptions=memes%2Bmildlyinteresting&filters=&redgifs_filter_exempt_subreddits=&flair_subscriptions=&hide_awards=off&hide_score=off&remove_default_feeds=off&post_feedback=");
 	}
 
 	#[test]
@@ -8064,6 +8227,16 @@ fn test_default_prefs_serialization_loop_bincode() {
 	let prefs = Preferences::default();
 	test_round_trip(&prefs, false);
 	test_round_trip(&prefs, true);
+}
+
+#[test]
+fn test_redgifs_filter_exemptions_revisioned_round_trip() {
+	let mut prefs = Preferences::default();
+	prefs.redgifs_filter_exempt_subreddits = vec!["r/FanCommunity".to_string(), "anothercommunity".to_string()];
+	prefs.prepare_for_runtime();
+	let encoded = prefs.to_bincode().unwrap();
+	let decoded = preferences_from_bincode(&encoded).unwrap();
+	assert_eq!(decoded.redgifs_filter_exempt_subreddits, ["anothercommunity", "fancommunity"]);
 }
 
 static KNOWN_GOOD_CONFIGS: &[&str] = &[

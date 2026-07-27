@@ -192,7 +192,7 @@ pub async fn item_fragment(req: Request<Body>) -> Result<Response<Body>, String>
 			}
 
 			let prefs = Preferences::new(&req);
-			let filters: HashSet<String> = prefs.filters.iter().cloned().collect();
+			let filters: HashSet<String> = prefs.post_filters();
 			let (duplicates, num_posts_filtered, all_posts_filtered) = parse_duplicates(&response[1], &filters).await;
 
 			// These are the values for the "before=", "after=", and "sort="

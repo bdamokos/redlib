@@ -3536,7 +3536,7 @@ pub async fn profile_fragment(req: Request<Body>) -> Result<Response<Body>, Stri
 		let all_posts_hidden_nsfw = !posts.is_empty() && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 		let eligible_video_posts = source_posts
 			.iter()
-			.filter(|post| !filters.contains(&post.community) && !filters.contains(&format!("u_{}", post.author.name)))
+			.filter(|post| !crate::utils::post_matches_filter_policy(post, &filters))
 			.filter(|post| !crate::utils::is_deleted_reddit_placeholder_post(post))
 			.filter(|post| video_mode::is_video_post(post))
 			.count();

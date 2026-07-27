@@ -1139,13 +1139,7 @@ pub(crate) fn query_profile_video_candidates(fingerprint: &[u8], view_kind: i64,
 }
 
 fn profile_filters_match(connection: &Connection, profile_pk: i64, filters: &HashSet<String>) -> Result<bool, ShadowReadError> {
-	let mut requested = filters
-		.iter()
-		.map(|value| value.trim().to_ascii_lowercase())
-		.filter(|value| !value.is_empty())
-		.collect::<Vec<_>>();
-	requested.sort();
-	requested.dedup();
+	let requested = crate::utils::post_filter_prefilter_values(filters);
 	let mut statement = connection.prepare("SELECT filter_lc FROM profile_filters WHERE profile_pk=?1 ORDER BY filter_lc")?;
 	let stored = statement.query_map([profile_pk], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
 	Ok(stored == requested)
@@ -1210,13 +1204,7 @@ fn query_profile_timeline_on(
 	}
 	let limit = if sort == TimelineSort::Videos { limit.clamp(1, 8_000) } else { limit.clamp(1, 250) };
 	let scan_limit = limit.saturating_mul(4).min(if sort == TimelineSort::Videos { 32_000 } else { 1_000 });
-	let mut normalized_filters = filters
-		.iter()
-		.map(|value| value.trim().to_ascii_lowercase())
-		.filter(|value| !value.is_empty())
-		.collect::<Vec<_>>();
-	normalized_filters.sort();
-	normalized_filters.dedup();
+	let normalized_filters = crate::utils::post_filter_prefilter_values(filters);
 	let member_filter_clause = if normalized_filters.is_empty() {
 		String::new()
 	} else {
@@ -1325,7 +1313,7 @@ fn query_profile_timeline_on(
 			sort_secondary,
 			card_key: card_key.clone(),
 		});
-		let Some(post) = hydrate_profile_card(connection, profile_pk, view_kind, &card_key, version, sort, &normalized_filters)? else {
+		let Some(post) = hydrate_profile_card(connection, profile_pk, view_kind, &card_key, version, sort, filters)? else {
 			continue;
 		};
 		posts.push(post);
@@ -1343,7 +1331,7 @@ fn hydrate_profile_card(
 	card_key: &str,
 	version: i64,
 	sort: TimelineSort,
-	filters: &[String],
+	filters: &HashSet<String>,
 ) -> Result<Option<PersistedPost>, ShadowReadError> {
 	let mut object_statement = connection.prepare_cached(
 		"SELECT members.community_lc,members.author_lc,o.duration_seconds,o.created_utc,
@@ -1369,7 +1357,7 @@ fn hydrate_profile_card(
 	})?;
 	for row in rows {
 		let (community_lc, author_lc, duration, created, object_pk, codec, payload) = row?;
-		if filters.binary_search(&community_lc).is_ok() || filters.binary_search(&format!("u_{author_lc}")).is_ok() {
+		if crate::utils::post_identity_matches_filter_policy(&community_lc, &author_lc, filters) {
 			continue;
 		}
 		candidates.push((duration, created, object_pk, codec, payload));
@@ -1424,13 +1412,8 @@ fn query_submitted_on(
 ) -> Result<(Vec<PersistedPost>, Option<SubmittedCursor>), ShadowReadError> {
 	let author = author.trim().trim_start_matches("u_").to_ascii_lowercase();
 	let limit = limit.clamp(1, 250);
-	let mut normalized_filters = filters
-		.iter()
-		.map(|value| value.trim().to_ascii_lowercase())
-		.filter(|value| !value.is_empty())
-		.collect::<Vec<_>>();
-	normalized_filters.sort();
-	normalized_filters.dedup();
+	let scan_limit = limit.saturating_mul(4).min(1_000);
+	let normalized_filters = crate::utils::post_filter_prefilter_values(filters);
 	let filter_clause = if normalized_filters.is_empty() {
 		String::new()
 	} else {
@@ -1452,15 +1435,22 @@ fn query_submitted_on(
 	);
 	let (cursor_created, cursor_pk) = cursor.map(|value| (value.created_utc, value.object_pk)).unwrap_or((0, 0));
 	let mut statement = connection.prepare(&sql)?;
-	let rows = statement.query_map(params![author, cursor_created, cursor_pk, limit as i64], |row| {
+	let rows = statement.query_map(params![author, cursor_created, cursor_pk, scan_limit as i64], |row| {
 		Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?))
 	})?;
 	let mut posts = Vec::new();
 	let mut next = None;
 	for row in rows {
 		let (object_pk, created_utc, codec, payload) = row?;
-		posts.push(decode_payload(codec, &payload)?);
 		next = Some(SubmittedCursor { created_utc, object_pk });
+		let post = decode_payload(codec, &payload)?;
+		if crate::utils::post_identity_matches_filter_policy(&post.community, &post.author.name, filters) {
+			continue;
+		}
+		posts.push(post);
+		if posts.len() >= limit {
+			break;
+		}
 	}
 	Ok((posts, next))
 }
@@ -2258,13 +2248,8 @@ fn sync_active_profile_on_with_filters(connection: &mut Connection, fingerprint:
 	transaction
 		.execute("DELETE FROM profile_filters WHERE profile_pk=?1", [profile_pk])
 		.map_err(|error| error.to_string())?;
-	let mut normalized_filters = filters
-		.iter()
-		.map(|value| value.trim().to_ascii_lowercase())
-		.filter(|value| !value.is_empty())
-		.collect::<Vec<_>>();
-	normalized_filters.sort();
-	normalized_filters.dedup();
+	let requested_filters = filters.iter().cloned().collect::<HashSet<_>>();
+	let normalized_filters = crate::utils::post_filter_prefilter_values(&requested_filters);
 	for filter in normalized_filters {
 		transaction
 			.execute("INSERT INTO profile_filters(profile_pk,filter_lc) VALUES(?1,?2)", params![profile_pk, filter])

@@ -1563,10 +1563,7 @@ fn catalog_record_is_visible(record: &CatalogRecord, allowed_keys: &HashSet<Cata
 	if crate::promo_detection::post_is_promotional(&record.post.id) {
 		return false;
 	}
-	if filters
-		.iter()
-		.any(|filter| filter.eq_ignore_ascii_case(&record.post.community) || filter.eq_ignore_ascii_case(&format!("u_{}", record.post.author.name)))
-	{
+	if crate::utils::post_matches_filter_policy(&record.post, filters) {
 		return false;
 	}
 	if crate::utils::is_deleted_reddit_placeholder_post(&record.post) {
@@ -1633,7 +1630,7 @@ fn mixed_feed_record_is_visible(record: &MixedFeedRecord, allowed_keys: &HashSet
 	if record.source_keys.is_disjoint(allowed_keys) {
 		return false;
 	}
-	if filters.contains(&record.post.community) || filters.contains(&format!("u_{}", record.post.author.name)) {
+	if crate::utils::post_matches_filter_policy(&record.post, filters) {
 		return false;
 	}
 	!crate::utils::is_deleted_reddit_placeholder_post(&record.post)
@@ -1819,7 +1816,7 @@ pub(crate) fn query_author_posts_limited(username: &str, filters: &HashSet<Strin
 		let Some(record) = catalog.posts_by_id.get(&entry.post_id) else {
 			continue;
 		};
-		if filters.contains(&record.post.community) || filters.contains(&format!("u_{}", record.post.author.name)) {
+		if crate::utils::post_matches_filter_policy(&record.post, filters) {
 			continue;
 		}
 		if crate::utils::is_deleted_reddit_placeholder_post(&record.post) {
