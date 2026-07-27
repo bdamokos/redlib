@@ -312,6 +312,19 @@
 					{% endif %}
 				</div>
 
+				<div id="sub_redgifs_filter_exemption">
+					{% if prefs.has_redgifs_filter_exemption(sub.name) %}
+						<form action="/r/{{ sub.name }}/redgifs-unexempt?redirect={{ redirect_url }}" method="POST">
+							<button class="unsubscribe" title="Resume filtering multi-profile RedGIF reposters in this community">Use multi-profile RedGIF filter</button>
+						</form>
+						<small>Multi-profile RedGIF reposters are allowed in this community only.</small>
+					{% else %}
+						<form action="/r/{{ sub.name }}/redgifs-exempt?redirect={{ redirect_url }}" method="POST">
+							<button class="subscribe" title="Keep posts in this community visible when their author uses multiple RedGIF profiles">Allow multi-profile RedGIF posters</button>
+						</form>
+					{% endif %}
+				</div>
+
 				{% if !active_flair_filter.is_empty() %}
 				<div id="sub_flair_subscription">
 					{% if is_flair_subscribed %}

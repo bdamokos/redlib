@@ -662,6 +662,8 @@ async fn main() {
 	app.at("/r/:sub/flair/unsubscribe").post(|r| subreddit::flair_subscriptions(r).boxed());
 	app.at("/r/:sub/filter").post(|r| subreddit::subscriptions_filters(r).boxed());
 	app.at("/r/:sub/unfilter").post(|r| subreddit::subscriptions_filters(r).boxed());
+	app.at("/r/:sub/redgifs-exempt").post(|r| subreddit::redgifs_filter_exemption(r).boxed());
+	app.at("/r/:sub/redgifs-unexempt").post(|r| subreddit::redgifs_filter_exemption(r).boxed());
 	app.at("/feed-status").get(|r| subreddit::feed_status_api(r).boxed());
 	app.at("/cache-status").get(|r| subreddit::cache_status_page(r).boxed());
 	app.at("/cache-status.json").get(|r| subreddit::cache_status_api(r).boxed());

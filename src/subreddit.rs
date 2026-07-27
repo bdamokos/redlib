@@ -4230,6 +4230,71 @@ mod tests {
 		.unwrap();
 
 		assert!(html.contains("data-subscription-target=\"subreddit:rust\""));
+		assert!(html.contains("action=\"/r/rust/redgifs-exempt?redirect=r/rust\""));
+		assert!(html.contains(">Allow multi-profile RedGIF posters</button>"));
+	}
+
+	#[test]
+	fn subreddit_sidebar_renders_active_redgifs_exemption_and_toggle() {
+		let mut prefs = test_prefs();
+		prefs.redgifs_filter_exempt_subreddits = vec!["rust".to_string()];
+		prefs.prepare_for_runtime();
+		let html = super::SubredditShellTemplate {
+			sub: Subreddit {
+				name: "rust".to_string(),
+				..Default::default()
+			},
+			top_users: Vec::new(),
+			related_subreddits: Default::default(),
+			flair_filters: Vec::new(),
+			active_flair_filter: String::new(),
+			active_flair_filter_encoded: String::new(),
+			clear_flair_filter_url: String::new(),
+			prefs,
+			url: "/r/rust".to_string(),
+			redirect_url: "r/rust".to_string(),
+			is_filtered: false,
+			is_flair_subscribed: false,
+			fragment_url: "/subreddit-fragment/r/rust".to_string(),
+			loading_message: "Loading posts...".to_string(),
+			placeholder_message: "Loading posts...".to_string(),
+			replace_selector: "#column_one".to_string(),
+			video_mode_enabled: false,
+			video_mode_sidebar: super::empty_video_mode_sidebar(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("action=\"/r/rust/redgifs-unexempt?redirect=r/rust\""));
+		assert!(html.contains(">Use multi-profile RedGIF filter</button>"));
+		assert!(html.contains("allowed in this community only"));
+	}
+
+	#[test]
+	fn subreddit_redgifs_exemption_toggle_preserves_unrelated_preferences() {
+		let mut prefs = test_prefs();
+		prefs.filters = vec!["u_reposter".to_string(), "anothercommunity".to_string()];
+		prefs.subscriptions = vec!["rust".to_string()];
+		prefs.prepare_for_runtime();
+		let filters = prefs.filters.clone();
+		let subscriptions = prefs.subscriptions.clone();
+
+		super::update_redgifs_filter_exemption(&mut prefs, "R/Rust", true);
+		assert!(prefs.has_redgifs_filter_exemption("rust"));
+		assert_eq!(prefs.filters, filters);
+		assert_eq!(prefs.subscriptions, subscriptions);
+
+		super::update_redgifs_filter_exemption(&mut prefs, "rust", false);
+		assert!(!prefs.has_redgifs_filter_exemption("rust"));
+		assert_eq!(prefs.filters, filters);
+		assert_eq!(prefs.subscriptions, subscriptions);
+	}
+
+	#[test]
+	fn subreddit_redgifs_exemption_routes_map_to_explicit_actions() {
+		assert_eq!(super::redgifs_filter_exemption_action("/r/rust/redgifs-exempt"), Some(true));
+		assert_eq!(super::redgifs_filter_exemption_action("/r/rust/redgifs-unexempt"), Some(false));
+		assert_eq!(super::redgifs_filter_exemption_action("/r/rust"), None);
 	}
 
 	#[test]
@@ -5840,6 +5905,53 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	preferences.prepare_for_runtime();
 	prefs_store::save_preferences(&mut response, &req, &preferences)?;
 
+	Ok(response)
+}
+
+fn update_redgifs_filter_exemption(preferences: &mut Preferences, subreddit: &str, exempt: bool) {
+	let subreddit = subreddit.trim().trim_start_matches("r/").trim_start_matches("/r/").trim_matches('/');
+	if exempt {
+		if !preferences.has_redgifs_filter_exemption(subreddit) {
+			preferences.redgifs_filter_exempt_subreddits.push(subreddit.to_string());
+		}
+	} else {
+		preferences.redgifs_filter_exempt_subreddits.retain(|value| {
+			!value
+				.trim()
+				.trim_start_matches("r/")
+				.trim_start_matches("/r/")
+				.trim_matches('/')
+				.eq_ignore_ascii_case(subreddit)
+		});
+	}
+	preferences.prepare_for_runtime();
+}
+
+fn redgifs_filter_exemption_action(path: &str) -> Option<bool> {
+	if path.ends_with("/redgifs-exempt") {
+		Some(true)
+	} else if path.ends_with("/redgifs-unexempt") {
+		Some(false)
+	} else {
+		None
+	}
+}
+
+/// Toggle the multiple-RedGIF-profile filter exemption directly from a
+/// subreddit sidebar. This changes only the scoped exemption list; the stored
+/// author filters and all other preferences remain untouched.
+pub async fn redgifs_filter_exemption(req: Request<Body>) -> Result<Response<Body>, String> {
+	let subreddit = req.param("sub").unwrap_or_default();
+	if subreddit.is_empty() || subreddit.contains('+') || matches!(subreddit.to_ascii_lowercase().as_str(), "all" | "popular" | "random" | "randnsfw") {
+		return Err("A single subreddit is required for this exemption.".to_string());
+	}
+	let exempt = redgifs_filter_exemption_action(req.uri().path()).ok_or_else(|| "Invalid RedGIF exemption action.".to_string())?;
+	let query = req.uri().query().unwrap_or_default();
+	let path = param(&format!("?{query}"), "redirect").map_or_else(|| format!("/r/{subreddit}"), |redirect_path| format!("/{redirect_path}"));
+	let mut preferences = Preferences::new(&req);
+	update_redgifs_filter_exemption(&mut preferences, &subreddit, exempt);
+	let mut response = redirect(&path);
+	prefs_store::save_preferences(&mut response, &req, &preferences)?;
 	Ok(response)
 }
 
