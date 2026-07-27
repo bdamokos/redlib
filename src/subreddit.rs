@@ -4177,7 +4177,8 @@ mod tests {
 		let username = "u_following_daemon_cache";
 		let submitted_source = FeedSource::subreddit(username, FeedSort::New);
 		let comments_source = FeedSource::user_comments(username, FeedSort::New);
-		let cached_post = metric_post("following-daemon-cache-submission", username, 1_000, 42, false);
+		let mut cached_post = metric_post("following-daemon-cache-submission", username, 1_000, 42, false);
+		cached_post.author.name = username.trim_start_matches("u_").to_string();
 
 		post_cache::store_source_posts_for_cache(&submitted_source, vec![cached_post], String::new(), Some(RefreshOrigin::Daemon));
 		post_cache::store_source_posts_for_cache(&comments_source, Vec::new(), String::new(), Some(RefreshOrigin::Daemon));

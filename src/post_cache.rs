@@ -2999,6 +2999,21 @@ fn merged_posts_for_session_live(session: &FeedSession) -> Vec<Post> {
 	finalize_session_posts(session, all_posts)
 }
 
+fn retain_following_membership(session: &FeedSession, posts: &mut Vec<Post>) {
+	if session.request.bundle_followed_user_comments {
+		let followed_authors = session
+			.request
+			.sources
+			.iter()
+			.filter_map(|source| match source {
+				FeedSource::Subreddit { name, .. } => name.strip_prefix("u_").map(str::to_ascii_lowercase),
+				_ => None,
+			})
+			.collect::<HashSet<_>>();
+		posts.retain(|post| !post.following_comments.is_empty() || followed_authors.contains(&post.author.name.to_ascii_lowercase()));
+	}
+}
+
 fn finalize_session_posts_with_order(session: &FeedSession, all_posts: Vec<Post>, preserve_random_order: bool) -> Vec<Post> {
 	let merge_sort = session_merge_sort(session);
 	let mut merged = if session.request.bundle_followed_user_comments {
@@ -3007,6 +3022,7 @@ fn finalize_session_posts_with_order(session: &FeedSession, all_posts: Vec<Post>
 		all_posts
 	};
 	merged = collapse_duplicate_submissions(merged);
+	retain_following_membership(session, &mut merged);
 	if merge_sort == FeedSort::Random && !preserve_random_order {
 		sort_posts_by_deterministic_random_with_seed(&mut merged, session.request.random_rotation_seed);
 		return merged;
@@ -3107,7 +3123,9 @@ fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page
 			if let Some(cursor) = batch.next.as_ref() {
 				crate::cache_sqlite::pin_profile_generation(session.request.profile_id.as_bytes(), &session.id, cursor.generation);
 			}
-			posts.extend(batch.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime));
+			let mut batch_posts = batch.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
+			retain_following_membership(session, &mut batch_posts);
+			posts.extend(batch_posts);
 			after = batch.next;
 			if after.is_none() {
 				break;
@@ -4707,22 +4725,22 @@ mod tests {
 		active_browser_session_paths, age_source_cache_for_test, attempted_source_count, background_target_reached, background_target_sources, begin_remembered_source_refresh,
 		begin_source_refresh, build_session_id, cache_status_for_preferences, catalog_source_candidates, cleanup_decayed_remembered_subreddits, continue_feed_session_with_budget,
 		count_sources_in_state, daemon_should_continue_after_refresh, effective_freshness_target_secs, enforce_source_cache_limits_locked, ensure_feed_session_with_budget,
-		estimate_post_interval_secs, feed_page, feed_status, followup_source_budget, freeze_feed_page, get_cached_source_page, has_active_browser_sessions,
-		initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
+		estimate_post_interval_secs, feed_page, feed_status, finalize_session_posts, followup_source_budget, freeze_feed_page, get_cached_source_page,
+		has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
 		merged_posts_for_session_live, ordered_refresh_entries_with_fairness, pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode,
 		pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache,
 		publish_plain_subreddit_refresh, publish_remembered_source_refresh_with_token, random_rotation_seed_for_time, reconcile_profile_memberships,
 		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal,
 		record_remembered_source_refresh_failure_with_token, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at,
-		resolve_source_refresh_result, restore_persisted_state, seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys,
-		servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries,
-		snapshot_persisted_source_unavailability, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target,
-		source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin,
-		store_source_posts_with_token, store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession,
-		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry,
-		SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES,
-		CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES,
-		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
+		resolve_source_refresh_result, restore_persisted_state, retain_following_membership, seed_remembered_feeds_from_source_cache_entries,
+		seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
+		snapshot_persisted_source_entries, snapshot_persisted_source_unavailability, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed,
+		sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts,
+		store_source_posts_with_origin, store_source_posts_with_token, store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession,
+		CachedSourcePosts, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome,
+		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
+		BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS,
+		MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
 		REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK,
 		REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE,
 		TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL,
@@ -5107,6 +5125,90 @@ mod tests {
 			live.iter().map(|post| post.id.as_str()).collect::<Vec<_>>()
 		);
 		assert_eq!(catalog.first().map(|post| post.following_comments.len()), Some(1));
+	}
+
+	#[test]
+	fn following_feed_rejects_plain_posts_from_non_followed_authors() {
+		let submitted_source = FeedSource::subreddit("u_Alice".to_string(), FeedSort::New);
+		let comments_source = FeedSource::user_comments("u_Alice".to_string(), FeedSort::New);
+		let session = FeedSession {
+			id: "following-author-invariant".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![submitted_source.clone(), comments_source.clone()],
+				bundle_followed_user_comments: true,
+				..Default::default()
+			},
+			sources: vec![
+				session_entry(submitted_source, SessionSourceState::Ready),
+				session_entry(comments_source, SessionSourceState::Ready),
+			],
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let mut followed_submission = test_post("followed-submission", "community", 300);
+		followed_submission.author.name = "alice".to_string();
+		let mut stray_submission = test_post("stray-submission", "community", 250);
+		stray_submission.author.name = "not-followed".to_string();
+		let mut commented_thread = test_post("commented-thread", "community", 200);
+		commented_thread.author.name = "thread-author".to_string();
+		let followed_comment = test_comment_post("followed-comment", "Alice", "community", "commented-thread", 350);
+
+		let merged = finalize_session_posts(&session, vec![followed_submission, stray_submission, commented_thread, followed_comment]);
+		assert_eq!(
+			merged.iter().map(|post| post.id.as_str()).collect::<HashSet<_>>(),
+			HashSet::from(["followed-submission", "commented-thread"])
+		);
+		let bundle = merged.iter().find(|post| post.id == "commented-thread").expect("followed comment bundle");
+		assert_eq!(bundle.following_comments.len(), 1);
+	}
+
+	#[test]
+	fn following_membership_filter_rejects_plain_sqlite_rows() {
+		let session = FeedSession {
+			id: "following-sqlite-author-invariant".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![
+					FeedSource::subreddit("u_Alice".to_string(), FeedSort::New),
+					FeedSource::user_comments("u_Alice".to_string(), FeedSort::New),
+				],
+				profile_id: "sqlite-profile".to_string(),
+				bundle_followed_user_comments: true,
+				..Default::default()
+			},
+			sources: Vec::new(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+		let mut followed = test_post("followed-sqlite", "community", 300);
+		followed.author.name = "ALICE".to_string();
+		let mut stray = test_post("stray-sqlite", "community", 200);
+		stray.author.name = "not-followed".to_string();
+		let mut bundle = test_post("bundle-sqlite", "community", 100);
+		bundle.author.name = "thread-author".to_string();
+		bundle.following_comments.push(crate::user::following_comment_from_listing_post(test_comment_post(
+			"comment-sqlite",
+			"Alice",
+			"community",
+			"bundle-sqlite",
+			350,
+		)));
+		let mut posts = vec![followed, stray, bundle];
+
+		retain_following_membership(&session, &mut posts);
+
+		assert_eq!(
+			posts.iter().map(|post| post.id.as_str()).collect::<HashSet<_>>(),
+			HashSet::from(["followed-sqlite", "bundle-sqlite"])
+		);
 	}
 
 	#[test]
