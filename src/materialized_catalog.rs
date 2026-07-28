@@ -3395,7 +3395,10 @@ pub(crate) fn catalog_video_stats(username: &str) -> Option<crate::user::UserVid
 		return None;
 	}
 
-	let catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	// Video-length badges are optional page enrichment. Do not delay the response
+	// behind catalog refreshes or deleted-media maintenance; a later request can
+	// hydrate the badge once the catalog is available again.
+	let catalog = MATERIALIZED_CATALOG.try_lock().ok()?;
 	let stats = catalog.author_video_stats.get(&username)?.clone();
 
 	if stats.avg_video_length().is_some() {
@@ -3623,6 +3626,15 @@ mod tests {
 			background_color: String::new(),
 			foreground_color: String::new(),
 		}
+	}
+
+	#[test]
+	fn video_badge_lookup_skips_busy_catalog() {
+		let _guard = test_lock();
+		reset_catalog();
+		let _catalog_guard = super::MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+
+		assert!(super::catalog_video_stats("demo").is_none());
 	}
 
 	fn test_post(id: &str, subreddit: &str, author: &str, created_ts: u64) -> Post {

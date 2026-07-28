@@ -3060,10 +3060,6 @@ fn sqlite_timeline_selection(session: &FeedSession) -> Option<(i64, crate::cache
 }
 
 fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page: usize) -> Result<Option<(Vec<Post>, bool)>, String> {
-	const MAX_CURSOR_SESSIONS: usize = 64;
-	const MAX_CURSOR_PAGES_PER_SESSION: usize = 2_048;
-	const MAX_FILTER_FILL_SCANS: usize = 4;
-
 	let Some((view_kind, sort)) = sqlite_timeline_selection(session) else {
 		return Ok(None);
 	};
@@ -3071,9 +3067,25 @@ fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page
 		let random_epoch = i64::try_from(session.request.random_rotation_seed).unwrap_or(i64::MAX);
 		crate::cache_sqlite::ensure_profile_random_epoch(session.request.profile_id.as_bytes(), random_epoch)?;
 	}
+	sqlite_timeline_page_for_session_with_query(session, page, per_page, |cursor, limit| {
+		crate::cache_sqlite::query_profile_timeline(session.request.profile_id.as_bytes(), view_kind, sort, cursor, limit, &session.request.filters)
+	})
+}
+
+fn sqlite_timeline_page_for_session_with_query<F>(session: &FeedSession, page: usize, per_page: usize, mut query: F) -> Result<Option<(Vec<Post>, bool)>, String>
+where
+	F: FnMut(Option<&crate::cache_sqlite::TimelineCursor>, usize) -> Result<Option<crate::cache_sqlite::TimelinePage>, String>,
+{
+	const MAX_CURSOR_SESSIONS: usize = 64;
+	const MAX_CURSOR_PAGES_PER_SESSION: usize = 2_048;
+	const MAX_FILTER_FILL_SCANS: usize = 4;
+
 	if page >= MAX_CURSOR_PAGES_PER_SESSION {
 		return Err(format!("SQLite timeline page {page} exceeds the bounded cursor window"));
 	}
+	let excluded_prior_ids = frozen_post_ids_before_page(session, page);
+	let exclusion_fill_scans = excluded_prior_ids.len().saturating_add(per_page.saturating_sub(1)) / per_page.max(1);
+	let max_filter_fill_scans = MAX_FILTER_FILL_SCANS.saturating_add(exclusion_fill_scans);
 	let mut cursors = SQLITE_SESSION_CURSORS.lock().map_err(|_| "SQLite session cursor lock poisoned".to_string())?;
 	cursors.retain(|_, state| state.last_accessed.elapsed().as_secs() <= CACHE_TTL_SECS);
 	if !cursors.contains_key(&session.id) && cursors.len() >= MAX_CURSOR_SESSIONS {
@@ -3091,6 +3103,12 @@ fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page
 		(0, None)
 	} else if let Some(cursor) = state.after_page.get(&(page - 1)).cloned() {
 		(page, Some(cursor))
+	} else if !excluded_prior_ids.is_empty() {
+		// A missing exact continuation cursor can follow cursor eviction, a prior
+		// legacy fallback, or a process discontinuity. Restart at the current head
+		// for the requested page and explicitly remove every already-painted ID;
+		// replaying logical pages here would skip an extra page after exclusions.
+		(page, None)
 	} else if let Some((prior_page, cursor)) = state
 		.after_page
 		.iter()
@@ -3106,20 +3124,19 @@ fn sqlite_timeline_page_for_session(session: &FeedSession, page: usize, per_page
 	loop {
 		let mut posts = Vec::with_capacity(per_page);
 		let mut after = cursor.clone();
-		for _ in 0..MAX_FILTER_FILL_SCANS {
+		for _ in 0..max_filter_fill_scans {
 			let remaining = per_page.saturating_sub(posts.len());
 			if remaining == 0 {
 				break;
 			}
-			let Some(batch) =
-				crate::cache_sqlite::query_profile_timeline(session.request.profile_id.as_bytes(), view_kind, sort, after.as_ref(), remaining, &session.request.filters)?
-			else {
+			let Some(batch) = query(after.as_ref(), remaining)? else {
 				return Ok(None);
 			};
 			if let Some(cursor) = batch.next.as_ref() {
 				crate::cache_sqlite::pin_profile_generation(session.request.profile_id.as_bytes(), &session.id, cursor.generation);
 			}
 			let mut batch_posts = batch.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
+			batch_posts.retain(|post| !excluded_prior_ids.contains(&post.id));
 			retain_following_membership(session, &mut batch_posts);
 			posts.extend(batch_posts);
 			after = batch.next;
@@ -3756,22 +3773,25 @@ fn warm_targets(session: &FeedSession, target_count: usize) -> Vec<usize> {
 		.iter()
 		.enumerate()
 		.filter(|(_, entry)| entry.state == SessionSourceState::Unstarted)
-		.map(|(index, _)| index)
+		.map(|(index, entry)| (index, remembered_entry_for_source(&remembered, &entry.source).cloned()))
+		.collect::<Vec<_>>();
+	drop(remembered);
+	let mut targets = targets
+		.drain(..)
+		.map(|(index, remembered_entry)| (index, source_has_persisted_cache_entry(&session.sources[index].source), remembered_entry))
 		.collect::<Vec<_>>();
 
-	targets.sort_by(|left_index, right_index| {
+	targets.sort_by(|(left_index, left_persisted, left_entry), (right_index, right_persisted, right_entry)| {
 		let left_source = &session.sources[*left_index].source;
 		let right_source = &session.sources[*right_index].source;
-		match source_has_persisted_cache_entry(right_source).cmp(&source_has_persisted_cache_entry(left_source)) {
+		match right_persisted.cmp(left_persisted) {
 			Ordering::Equal => {}
 			ordering => return ordering,
 		}
-		let left_entry = remembered_entry_for_source(&remembered, left_source);
-		let right_entry = remembered_entry_for_source(&remembered, right_source);
-		compare_warm_target_priority(*left_index, left_source, left_entry, *right_index, right_source, right_entry)
+		compare_warm_target_priority(*left_index, left_source, left_entry.as_ref(), *right_index, right_source, right_entry.as_ref())
 	});
 	targets.truncate(target_count);
-	targets
+	targets.into_iter().map(|(index, _, _)| index).collect()
 }
 
 async fn warm_session_indices(session_id: &str, indices: Vec<usize>) {
@@ -3870,15 +3890,20 @@ async fn reconcile_stuck_fetching_sources(session_id: &str) {
 async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, max_sources: usize) {
 	loop {
 		let (page_ready, attempted_sources, remaining) = {
-			let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-			let Some(session) = sessions.get(session_id) else {
+			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+			let Some(session) = sessions.get_mut(session_id) else {
 				return;
 			};
 			let merged = merged_posts_for_session(session);
 			let target = (page + 1) * per_page;
 			let attempted_sources = attempted_source_count(session);
 			let remaining_budget = max_sources.saturating_sub(attempted_sources).min(PAGE_FILL_BATCH);
-			(merged.len() >= target, attempted_sources, warm_targets(session, remaining_budget))
+			let page_ready = merged.len() >= target;
+			if page_ready {
+				freeze_feed_page_from_merged_if_available(session, page, per_page, &merged);
+			}
+			let remaining = if page_ready { Vec::new() } else { warm_targets(session, remaining_budget) };
+			(page_ready, attempted_sources, remaining)
 		};
 
 		if page_ready || attempted_sources >= max_sources || remaining.is_empty() {
@@ -3897,18 +3922,16 @@ async fn warm_session_to_fill(session_id: &str, page: usize, per_page: usize, ma
 async fn warm_session_background(session_id: String) {
 	loop {
 		reconcile_stuck_fetching_sources(&session_id).await;
-		let (remaining, target_reached, remaining_persisted_cache_sources) = {
+		let session = {
 			let sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(session) = sessions.get(&session_id) else {
 				return;
 			};
-			let target_reached = background_target_reached(session);
-			(
-				warm_targets(session, PAGE_FILL_BATCH),
-				target_reached,
-				session_has_remaining_persisted_cache_sources(session),
-			)
+			session.clone()
 		};
+		let target_reached = background_target_reached(&session);
+		let remaining = warm_targets(&session, PAGE_FILL_BATCH);
+		let remaining_persisted_cache_sources = session_has_remaining_persisted_cache_sources(&session);
 
 		if remaining.is_empty() {
 			let mut sessions = FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3936,6 +3959,9 @@ async fn warm_session_background(session_id: String) {
 }
 
 fn session_requested_page_ready(session: &FeedSession, page: usize, per_page: usize) -> bool {
+	if session.frozen_pages.contains_key(&page) {
+		return true;
+	}
 	let merged_posts = merged_posts_for_session(session);
 	current_page_is_ready(session, &merged_posts, page, per_page)
 }
@@ -3952,9 +3978,6 @@ fn plan_session_warm_mode(session: &mut FeedSession, page: usize, per_page: usiz
 	}
 
 	if session_is_new {
-		if background_target_reached(session) {
-			return None;
-		}
 		session.background_complete = false;
 		session.background_active = true;
 		return Some(SessionWarmMode::InitialLoad);
@@ -4216,6 +4239,22 @@ fn freeze_feed_page(session: &mut FeedSession, page: usize, posts: Vec<Post>) {
 	}
 }
 
+fn freeze_feed_page_from_merged_if_available(session: &mut FeedSession, page: usize, per_page: usize, merged_posts: &[Post]) {
+	if session.frozen_pages.contains_key(&page) {
+		return;
+	}
+	let sort = session_merge_sort(session);
+	let bundle_activity = session.request.bundle_followed_user_comments;
+	let tail_for_page = merged_tail_excluding_frozen_prior_pages(session, page, merged_posts);
+	let chunk: Vec<Post> = tail_for_page.into_iter().take(per_page).collect();
+	if chunk.is_empty() {
+		return;
+	}
+	let finalized = finalize_page_posts(sort, bundle_activity, session.request.daemon_discovery_order, chunk);
+	freeze_feed_page(session, page, finalized);
+	touch_session(session);
+}
+
 fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: usize) {
 	let Ok(mut sessions) = FEED_SESSIONS.lock() else {
 		return;
@@ -4227,17 +4266,8 @@ fn seal_feed_page_for_paint_if_needed(session_id: &str, page: usize, per_page: u
 		return;
 	}
 	reconcile_session_with_source_cache(session);
-	let sort = session_merge_sort(session);
-	let bundle_activity = session.request.bundle_followed_user_comments;
 	let merged_posts = merged_posts_for_session(session);
-	let tail_for_page = merged_tail_excluding_frozen_prior_pages(session, page, &merged_posts);
-	let chunk: Vec<Post> = tail_for_page.into_iter().take(per_page).collect();
-	if chunk.is_empty() {
-		return;
-	}
-	let finalized = finalize_page_posts(sort, bundle_activity, session.request.daemon_discovery_order, chunk);
-	freeze_feed_page(session, page, finalized);
-	touch_session(session);
+	freeze_feed_page_from_merged_if_available(session, page, per_page, &merged_posts);
 }
 
 /// Blocks the response until the contextual feed page is ready (full window or background
@@ -4731,16 +4761,17 @@ mod tests {
 		resolve_source_refresh_result, restore_persisted_state, retain_following_membership, seed_remembered_feeds_from_source_cache_entries,
 		seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
 		snapshot_persisted_source_entries, snapshot_persisted_source_unavailability, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed,
-		sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_selection, store_source_posts,
-		store_source_posts_with_origin, store_source_posts_with_token, store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession,
-		CachedSourcePosts, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome,
-		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
-		BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS,
-		MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
+		sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_page_for_session_with_query,
+		sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin, store_source_posts_with_token, store_source_posts_with_token_and_effects,
+		sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
+		RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
+		SourceRefreshOutcome, SqliteSessionCursorState, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS,
+		DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES,
+		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
 		REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK,
-		REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, TEST_DURABLE_WRITE_ACTIVE,
-		TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL,
-		TEST_TOMBSTONE_WRITE_FAIL,
+		REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, SQLITE_SESSION_CURSORS,
+		TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS,
+		TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4758,6 +4789,7 @@ mod tests {
 		SOURCE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		SOURCE_REFRESH_STATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		SQLITE_SESSION_CURSORS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		PROFILE_SOURCE_MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_DAEMON_SELECTION_SEQUENCE.store(0, AtomicOrdering::Relaxed);
@@ -5556,6 +5588,14 @@ mod tests {
 			POSTS_PER_PAGE,
 			1,
 		));
+		assert!(
+			FEED_SESSIONS
+				.lock()
+				.unwrap()
+				.get(&old_session_id)
+				.is_some_and(|session| session.frozen_pages.contains_key(&0)),
+			"synchronous fill should freeze the ready first page"
+		);
 		let old_page = feed_page(&old_session_id, 0, POSTS_PER_PAGE).expect("old page");
 		assert_eq!(old_page.posts.first().map(|post| post.id.as_str()), Some("old-0"));
 
@@ -7033,6 +7073,74 @@ mod tests {
 	}
 
 	#[test]
+	fn frozen_requested_page_skips_remerging_large_session() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let frozen_post = test_post("frozen", "rust", chrono::Utc::now().timestamp() as u64);
+		let mut session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+				..Default::default()
+			},
+			sources: (0..1_200)
+				.map(|index| session_entry(new_source(&format!("subreddit{index}")), SessionSourceState::Unstarted))
+				.collect(),
+			frozen_pages: HashMap::from([(0, vec![frozen_post])]),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let warm_mode = plan_session_warm_mode(&mut session, 0, POSTS_PER_PAGE, false);
+
+		assert_eq!(warm_mode, None);
+		assert!(!session.background_active);
+	}
+
+	#[test]
+	fn new_session_defers_background_target_check_to_background_worker() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let hot_source = new_source("rust");
+		seed_source(
+			&hot_source,
+			(0..100)
+				.map(|index| test_post(&format!("post-{index}"), "rust", chrono::Utc::now().timestamp() as u64 - index as u64))
+				.collect(),
+		);
+		let mut session = FeedSession {
+			id: "demo".to_string(),
+			request: FeedSessionRequest {
+				sources: vec![],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "demo".to_string(),
+				..Default::default()
+			},
+			sources: std::iter::once(session_entry(hot_source, SessionSourceState::Ready))
+				.chain((1..1_200).map(|index| session_entry(new_source(&format!("subreddit{index}")), SessionSourceState::Unstarted)))
+				.collect(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+
+		let warm_mode = plan_session_warm_mode(&mut session, 0, POSTS_PER_PAGE, true);
+
+		assert_eq!(warm_mode, Some(SessionWarmMode::InitialLoad));
+		assert!(session.background_active);
+	}
+
+	#[test]
 	fn existing_session_with_unready_page_uses_cache_preferred_followup_mode() {
 		let _guard = test_lock();
 		reset_test_caches();
@@ -7995,29 +8103,29 @@ mod tests {
 		assert_eq!(ids, vec!["shared", "fresh-next", "dup-next"]);
 	}
 
-	#[test]
-	fn ready_pages_remain_stable_after_more_sources_finish_warming() {
-		let _guard = test_lock();
-		reset_test_caches();
+	fn assert_frozen_chronological_pages_do_not_repeat_after_newer_posts_arrive(following: bool) {
 		let now = chrono::Utc::now().timestamp() as u64;
-		let older_source = new_source("older");
-		let newer_source = new_source("newer");
-		let older_posts = (0..30)
-			.map(|index| test_post(&format!("older-{index}"), "older", now - 1_000 - index as u64))
+		let older_source = new_source(if following { "u_older" } else { "older" });
+		let newer_source = new_source(if following { "u_newer" } else { "newer" });
+		let older_posts = (0..50)
+			.map(|index| {
+				let mut post = test_post(&format!("older-{index}"), "older", now - 1_000 - index as u64);
+				post.author.name = "older".to_string();
+				post
+			})
 			.collect::<Vec<_>>();
-		let newer_posts = (0..30).map(|index| test_post(&format!("newer-{index}"), "newer", now - index as u64)).collect::<Vec<_>>();
 		seed_source(&older_source, older_posts);
-		seed_source(&newer_source, newer_posts);
 
 		FEED_SESSIONS.lock().unwrap().insert(
 			"demo".to_string(),
 			FeedSession {
 				id: "demo".to_string(),
 				request: FeedSessionRequest {
-					sources: vec![],
+					sources: vec![older_source.clone(), newer_source.clone()],
 					filters: HashSet::new(),
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
+					bundle_followed_user_comments: following,
 					..Default::default()
 				},
 				sources: vec![
@@ -8035,18 +8143,152 @@ mod tests {
 
 		let first_page = feed_page("demo", 0, POSTS_PER_PAGE).expect("initial page");
 		let initial_ids = first_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
-		assert_eq!(initial_ids[0], "newer-0");
+		assert_eq!(initial_ids[0], "older-0");
+		assert_eq!(initial_ids.len(), POSTS_PER_PAGE);
 
-		{
-			let mut sessions = FEED_SESSIONS.lock().unwrap();
-			let session = sessions.get_mut("demo").expect("session");
-			session.sources[1].state = SessionSourceState::Ready;
-		}
+		let newer_posts = (0..30)
+			.map(|index| {
+				let mut post = test_post(&format!("newer-{index}"), "newer", now - index as u64);
+				post.author.name = "newer".to_string();
+				post
+			})
+			.collect::<Vec<_>>();
+		seed_source(&newer_source, newer_posts);
 
-		let second_page = feed_page("demo", 0, POSTS_PER_PAGE).expect("stable page");
-		let refreshed_ids = second_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+		let refreshed_first_page = feed_page("demo", 0, POSTS_PER_PAGE).expect("stable first page");
+		let refreshed_ids = refreshed_first_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+		let next_page = feed_page("demo", 1, POSTS_PER_PAGE).expect("next page");
+		let next_ids = next_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+		let frozen_ids = initial_ids.iter().collect::<HashSet<_>>();
 
 		assert_eq!(refreshed_ids, initial_ids);
+		assert_eq!(next_ids[0], "newer-0");
+		assert_eq!(next_ids.len(), POSTS_PER_PAGE);
+		assert!(next_ids.iter().all(|id| !frozen_ids.contains(id)), "next page repeated a frozen page-zero post");
+	}
+
+	#[test]
+	fn home_next_page_excludes_frozen_ids_after_newer_posts_arrive() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_frozen_chronological_pages_do_not_repeat_after_newer_posts_arrive(false);
+	}
+
+	#[test]
+	fn following_next_page_excludes_frozen_ids_after_newer_posts_arrive() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_frozen_chronological_pages_do_not_repeat_after_newer_posts_arrive(true);
+	}
+
+	fn assert_sqlite_lost_cursor_excludes_frozen_ids_and_fills_page(following: bool) {
+		let now = chrono::Utc::now().timestamp() as u64;
+		let older_source = new_source("u_older");
+		let newer_source = new_source("u_newer");
+		let mut older_posts = (0..50)
+			.map(|index| {
+				let mut post = test_post(&format!("older-{index}"), "older", now - 1_000 - index as u64);
+				post.author.name = "older".to_string();
+				post
+			})
+			.collect::<Vec<_>>();
+		let mut newer_posts = (0..10)
+			.map(|index| {
+				let mut post = test_post(&format!("newer-{index}"), "newer", now - index as u64);
+				post.author.name = "newer".to_string();
+				post
+			})
+			.collect::<Vec<_>>();
+		let frozen_page = older_posts[..POSTS_PER_PAGE].to_vec();
+		let frozen_ids = frozen_page.iter().map(|post| post.id.clone()).collect::<HashSet<_>>();
+		newer_posts.append(&mut older_posts);
+		let current_generation = newer_posts;
+		let session_id = if following { "sqlite-following-lost-cursor" } else { "sqlite-home-lost-cursor" };
+		let session = FeedSession {
+			id: session_id.to_string(),
+			request: FeedSessionRequest {
+				sources: vec![older_source, newer_source],
+				filters: HashSet::new(),
+				quarantine: false,
+				query_fingerprint: "sqlite-lost-cursor".to_string(),
+				profile_id: session_id.to_string(),
+				bundle_followed_user_comments: following,
+				merge_sort: Some(FeedSort::New),
+				..Default::default()
+			},
+			sources: Vec::new(),
+			frozen_pages: HashMap::from([(0, frozen_page)]),
+			background_active: false,
+			background_complete: true,
+			requested_page: 1,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+		let expected_view_kind = if following { 2 } else { 1 };
+		assert_eq!(sqlite_timeline_selection(&session), Some((expected_view_kind, crate::cache_sqlite::TimelineSort::New)));
+
+		// Model a page-zero cursor pinned to the old generation, followed by the
+		// in-memory cursor registry being lost before querying generation two.
+		SQLITE_SESSION_CURSORS.lock().unwrap().insert(
+			session.id.clone(),
+			SqliteSessionCursorState {
+				last_accessed: Instant::now(),
+				after_page: HashMap::from([(
+					0,
+					crate::cache_sqlite::TimelineCursor {
+						generation: 1,
+						random_epoch: 0,
+						sort_primary: 0,
+						sort_secondary: 0,
+						card_key: "older-24".to_string(),
+					},
+				)]),
+			},
+		);
+		SQLITE_SESSION_CURSORS.lock().unwrap().clear();
+
+		let mut query_count = 0usize;
+		let result = sqlite_timeline_page_for_session_with_query(&session, 1, POSTS_PER_PAGE, |cursor, limit| {
+			query_count += 1;
+			let start = cursor
+				.and_then(|cursor| current_generation.iter().position(|post| post.id == cursor.card_key))
+				.map_or(0, |index| index + 1);
+			let end = start.saturating_add(limit).min(current_generation.len());
+			let batch = &current_generation[start..end];
+			let next = batch.last().map(|post| crate::cache_sqlite::TimelineCursor {
+				generation: 2,
+				random_epoch: 0,
+				sort_primary: i64::try_from(post.created_ts).unwrap_or(i64::MAX),
+				sort_secondary: 0,
+				card_key: post.id.clone(),
+			});
+			Ok(Some(crate::cache_sqlite::TimelinePage {
+				posts: batch.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
+				next,
+			}))
+		})
+		.expect("SQLite page query")
+		.expect("SQLite page");
+		let ids = result.0.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
+
+		assert_eq!(ids.len(), POSTS_PER_PAGE);
+		assert_eq!(ids.first().map(String::as_str), Some("newer-0"));
+		assert!(ids.iter().all(|id| !frozen_ids.contains(id)), "SQLite continuation repeated a frozen page-zero post");
+		assert!(query_count > 1, "excluded SQLite rows should be scanned past to fill the page");
+	}
+
+	#[test]
+	fn sqlite_home_lost_cursor_excludes_frozen_ids_after_generation_advance() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_sqlite_lost_cursor_excludes_frozen_ids_and_fills_page(false);
+	}
+
+	#[test]
+	fn sqlite_following_lost_cursor_excludes_frozen_ids_after_generation_advance() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_sqlite_lost_cursor_excludes_frozen_ids_and_fills_page(true);
 	}
 
 	#[test]
