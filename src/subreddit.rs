@@ -4139,7 +4139,7 @@ mod tests {
 
 	#[test]
 	fn renders_home_new_shell_with_feed_warmup_message() {
-		let loading_message = "Loading followed feeds in the background. Warmed 12 of 48 feeds.".to_string();
+		let loading_message = "Loading followed feeds in the background.".to_string();
 		let html = super::SubredditShellTemplate {
 			sub: Subreddit {
 				name: "rust+programming".to_string(),
@@ -4195,7 +4195,7 @@ mod tests {
 		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
 
 		assert!(html.contains("Post following-daemon-cache-submission"), "{html}");
-		assert!(html.contains("from daemon cache"), "{html}");
+		assert!(!html.contains("from daemon cache"), "{html}");
 	}
 
 	#[test]

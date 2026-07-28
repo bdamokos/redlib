@@ -3317,7 +3317,6 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 	} else {
 		(session.sources.len(), raw_ready_sources)
 	};
-	let feed_word = if bundle_accounts.is_some() { "followed accounts" } else { "feeds" };
 	let user_feeds_still_loading = if let Some((total, ready)) = bundle_accounts {
 		ready < total
 	} else {
@@ -3327,42 +3326,18 @@ fn session_status_from_posts(session: &FeedSession, posts: &[Post], page: usize,
 	let tail_next = merged_tail_excluding_frozen_prior_pages(session, page.saturating_add(1), posts);
 	let next_page_ready = tail_next.len() >= per_page || session.background_complete;
 	let warming = session.background_active;
-	let daemon_cache_suffix = if daemon_cached_sources > 0 {
-		format!(" ({daemon_cached_sources} from daemon cache)")
-	} else {
-		String::new()
-	};
 	let status_message = if warming {
 		if user_feeds_still_loading {
-			format!(
-				"Loading followed feeds in the background. Warmed {} of {} {}{}.",
-				status_ready, status_total, feed_word, daemon_cache_suffix
-			)
+			"Loading followed feeds in the background.".to_string()
 		} else if !current_page_ready {
-			format!(
-				"Warmed {} of {} {}{}. Filling this page with newer posts.",
-				status_ready, status_total, feed_word, daemon_cache_suffix
-			)
+			"Filling this page with newer posts.".to_string()
 		} else if next_page_ready {
-			format!("Warmed {} of {} {}{}. Next page is ready.", status_ready, status_total, feed_word, daemon_cache_suffix)
+			"Next page is ready.".to_string()
 		} else {
-			format!(
-				"Warmed {} of {} {}{}. Preparing the next page in the background.",
-				status_ready, status_total, feed_word, daemon_cache_suffix
-			)
+			"Preparing the next page in the background.".to_string()
 		}
-	} else if session.background_complete {
-		format!("Warmed all {} {}{}.", status_total, feed_word, daemon_cache_suffix)
-	} else if next_page_ready {
-		format!(
-			"Warmed {} of {} {}{}. More feeds will load as you paginate.",
-			status_ready, status_total, feed_word, daemon_cache_suffix
-		)
 	} else {
-		format!(
-			"Warmed {} of {} {}{} for now. More feeds will load as needed.",
-			status_ready, status_total, feed_word, daemon_cache_suffix
-		)
+		String::new()
 	};
 
 	FeedSessionStatus {
@@ -8449,7 +8424,7 @@ mod tests {
 		let status = feed_status("demo", 0, POSTS_PER_PAGE).expect("session status");
 		assert_eq!(status.ready_sources, 1);
 		assert_eq!(status.total_sources, 2);
-		assert!(status.status_message.contains("1 of 2 followed accounts"));
+		assert_eq!(status.status_message, "Loading followed feeds in the background.");
 	}
 
 	#[test]
@@ -8486,7 +8461,7 @@ mod tests {
 		let status = feed_status("demo", 0, POSTS_PER_PAGE).expect("session status");
 		assert_eq!(status.ready_sources, 1);
 		assert_eq!(status.daemon_cached_sources, 1);
-		assert!(status.status_message.contains("1 from daemon cache"));
+		assert!(status.status_message.is_empty());
 		assert_eq!(feed_page("demo", 0, POSTS_PER_PAGE).expect("page").posts.len(), 1);
 	}
 

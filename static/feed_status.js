@@ -124,7 +124,8 @@
 
                 const status = await statusResponse.json();
                 if (banner && typeof status.status_message === "string") {
-                    setBannerVisible(banner, true);
+                    const hasStatusMessage = status.status_message.trim().length > 0;
+                    setBannerVisible(banner, hasStatusMessage);
                     banner.textContent = status.status_message;
                     banner.classList.toggle("warming", !!status.warming);
                 }
