@@ -12,6 +12,10 @@
             }
 
             let activeMarker = null;
+            let previewMarker = null;
+            let armedMarker = null;
+            let touchGesture = null;
+            let suppressClickUntil = 0;
             let labelTimer = 0;
             const targets = markers
                 .map((marker) => ({
@@ -21,39 +25,139 @@
                 .filter(({ target }) => target);
             const currentPage = Number.parseInt(navigation.dataset.discoveryCurrentPage || "0", 10);
 
+            const clearPreview = () => {
+                window.clearTimeout(labelTimer);
+                previewMarker?.classList.remove("show-label");
+                previewMarker = null;
+                armedMarker = null;
+            };
+
+            const showPreview = (marker, arm = false) => {
+                window.clearTimeout(labelTimer);
+                if (previewMarker !== marker) {
+                    previewMarker?.classList.remove("show-label");
+                    previewMarker = marker;
+                }
+                previewMarker.classList.add("show-label");
+                if (armedMarker !== marker) {
+                    armedMarker = null;
+                }
+                if (arm) {
+                    armedMarker = marker;
+                }
+            };
+
             const activate = (marker, announce = false) => {
                 if (activeMarker === marker) {
                     return;
                 }
                 activeMarker?.removeAttribute("aria-current");
-                activeMarker?.classList.remove("is-active", "show-label");
+                activeMarker?.classList.remove("is-active");
                 activeMarker = marker;
                 activeMarker.classList.add("is-active");
                 activeMarker.setAttribute("aria-current", "location");
                 activeMarker.scrollIntoView({ block: "nearest" });
                 if (announce && window.matchMedia?.("(pointer: coarse)")?.matches) {
-                    activeMarker.classList.add("show-label");
-                    window.clearTimeout(labelTimer);
-                    labelTimer = window.setTimeout(() => activeMarker?.classList.remove("show-label"), 1600);
+                    showPreview(activeMarker);
+                    labelTimer = window.setTimeout(clearPreview, 1600);
                 }
+            };
+
+            const navigateToMarker = (marker) => {
+                const targetId = marker.dataset.discoveryTarget || "";
+                const target = document.getElementById(targetId);
+                if (!target || marker.getAttribute("href") !== `#${targetId}`) {
+                    window.location.assign(marker.href);
+                    return;
+                }
+                clearPreview();
+                window.history.replaceState(null, "", `#${targetId}`);
+                target.scrollIntoView({
+                    behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ? "auto" : "smooth",
+                    block: "start",
+                });
+                activate(marker);
             };
 
             for (const marker of markers) {
                 marker.addEventListener("click", (event) => {
+                    if (Date.now() < suppressClickUntil) {
+                        event.preventDefault();
+                        return;
+                    }
                     const targetId = marker.dataset.discoveryTarget || "";
                     const target = document.getElementById(targetId);
                     if (!target || marker.getAttribute("href") !== `#${targetId}`) {
                         return;
                     }
                     event.preventDefault();
-                    window.history.replaceState(null, "", `#${targetId}`);
-                    target.scrollIntoView({
-                        behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ? "auto" : "smooth",
-                        block: "start",
-                    });
-                    activate(marker, true);
+                    navigateToMarker(marker);
                 });
             }
+
+            const markerAtTouch = (touch, fallbackTarget) =>
+                document.elementFromPoint(touch.clientX, touch.clientY)?.closest?.(".discovery_navigation_marker")
+                || fallbackTarget?.closest?.(".discovery_navigation_marker")
+                || null;
+
+            navigation.addEventListener("touchstart", (event) => {
+                if (event.touches.length !== 1) {
+                    touchGesture = null;
+                    return;
+                }
+                const marker = markerAtTouch(event.touches[0], event.target);
+                if (!marker || !navigation.contains(marker)) {
+                    touchGesture = null;
+                    return;
+                }
+                touchGesture = {
+                    lastMarker: marker,
+                    scrubbed: false,
+                };
+                showPreview(marker);
+            }, { passive: true });
+
+            navigation.addEventListener("touchmove", (event) => {
+                if (!touchGesture || event.touches.length !== 1) {
+                    return;
+                }
+                const marker = markerAtTouch(event.touches[0], event.target);
+                if (!marker || !navigation.contains(marker) || marker === touchGesture.lastMarker) {
+                    return;
+                }
+                touchGesture.lastMarker = marker;
+                touchGesture.scrubbed = true;
+                showPreview(marker);
+            }, { passive: true });
+
+            const finishTouch = (event, cancelled = false) => {
+                if (!touchGesture) {
+                    return;
+                }
+                const { lastMarker, scrubbed } = touchGesture;
+                touchGesture = null;
+                if (event.cancelable) {
+                    event.preventDefault();
+                }
+                suppressClickUntil = Date.now() + 800;
+                if (!cancelled && !scrubbed && armedMarker === lastMarker) {
+                    navigateToMarker(lastMarker);
+                    return;
+                }
+                showPreview(lastMarker, true);
+            };
+            navigation.addEventListener("touchend", (event) => finishTouch(event), { passive: false });
+            navigation.addEventListener("touchcancel", (event) => finishTouch(event, true), { passive: false });
+            document.addEventListener("pointerdown", (event) => {
+                if (!navigation.contains(event.target)) {
+                    clearPreview();
+                }
+            }, { passive: true });
+            document.addEventListener("keydown", (event) => {
+                if (event.key === "Escape") {
+                    clearPreview();
+                }
+            });
 
             const initialMarker =
                 markers.filter((marker) => Number.parseInt(marker.dataset.discoveryPage || "0", 10) <= currentPage).at(-1)
