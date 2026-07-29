@@ -1,6 +1,7 @@
 (() => {
     const initialize = (root = document) => {
         window.initializeFeedStatus?.(root);
+        window.initializeDiscoveryNavigation?.(root);
         window.initializeSubscriptionForms?.(root);
         window.initializePostFeedback?.(root);
         window.initializePostAuthorActions?.(root);

@@ -4304,6 +4304,38 @@ pub fn feed_merged_posts(session_id: &str) -> Option<Vec<Post>> {
 	Some(merged_posts_for_session(session))
 }
 
+/// Returns a bounded, sequential view of a session for navigation controls.
+///
+/// Already-painted pages keep their frozen contents. Unpainted pages are
+/// projected from the current merged timeline while excluding every post
+/// assigned to an earlier page, matching the no-overlap pagination contract.
+pub fn feed_navigation_pages(session_id: &str, per_page: usize) -> Option<Vec<Vec<Post>>> {
+	if per_page == 0 {
+		return Some(Vec::new());
+	}
+	let mut sessions = FEED_SESSIONS.lock().ok()?;
+	let session = sessions.get_mut(session_id)?;
+	if session_is_expired(session) {
+		return None;
+	}
+	reconcile_session_with_source_cache(session);
+	let merged = merged_posts_for_session(session);
+	let max_frozen_page = session.frozen_pages.keys().copied().max().unwrap_or(0);
+	let page_count = merged.len().div_ceil(per_page).max(max_frozen_page + 1);
+	let mut seen_ids = HashSet::new();
+	let mut navigation_pages = Vec::with_capacity(page_count);
+
+	for page in 0..page_count {
+		let page_posts = session
+			.frozen_pages
+			.get(&page)
+			.cloned()
+			.unwrap_or_else(|| merged.iter().filter(|post| !seen_ids.contains(&post.id)).take(per_page).cloned().collect::<Vec<_>>());
+		navigation_pages.push(page_posts.into_iter().filter(|post| seen_ids.insert(post.id.clone())).collect());
+	}
+	Some(navigation_pages)
+}
+
 pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Vec<FeedSessionPageMetric>> {
 	let mut sessions = FEED_SESSIONS.lock().ok()?;
 	let session = sessions.get_mut(session_id)?;

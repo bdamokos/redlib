@@ -656,6 +656,151 @@ main > * > footer > a {
     font-weight: 700;
 }
 
+/* Discovery-order feed outline, adapted from shadcn MessageScroller's
+   addressable-item and visibility-tracking pattern. */
+.discovery_navigation {
+    position: fixed;
+    display: block;
+    z-index: 30;
+    top: 50%;
+    right: max(8px, env(safe-area-inset-right));
+    box-sizing: border-box;
+    width: min(300px, calc(100vw - 16px));
+    min-height: 0;
+    max-height: min(62vh, 520px);
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    box-shadow: none;
+    font-size: inherit;
+    pointer-events: none;
+    transform: translateY(-50%);
+}
+
+.discovery_navigation_items {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    width: 100%;
+    max-height: min(62vh, 520px);
+    padding: 5px 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+}
+
+.discovery_navigation_items::-webkit-scrollbar {
+    display: none;
+}
+
+.discovery_navigation_marker {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    width: 34px;
+    min-height: 18px;
+    margin-left: auto;
+    color: var(--text);
+    text-decoration: none;
+    pointer-events: auto;
+    touch-action: manipulation;
+}
+
+.discovery_navigation_line {
+    width: 14px;
+    height: 2px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--text) 42%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--outside) 72%, transparent);
+    transition: width 120ms ease, background-color 120ms ease, opacity 120ms ease;
+}
+
+.discovery_navigation_marker:hover .discovery_navigation_line,
+.discovery_navigation_marker:focus-visible .discovery_navigation_line,
+.discovery_navigation_marker.is-active .discovery_navigation_line {
+    width: 24px;
+    background: var(--accent);
+    opacity: 1;
+}
+
+.discovery_navigation_label {
+    position: absolute;
+    right: 38px;
+    max-width: min(260px, calc(100vw - 80px));
+    padding: 5px 8px;
+    border: 1px solid var(--highlighted);
+    border-radius: 6px;
+    background: var(--outside);
+    box-shadow: var(--shadow);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.2;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(4px);
+    transition: opacity 100ms ease, transform 100ms ease;
+    white-space: nowrap;
+}
+
+.discovery_navigation_marker:hover .discovery_navigation_label,
+.discovery_navigation_marker:focus-visible .discovery_navigation_label,
+.discovery_navigation_marker.show-label .discovery_navigation_label {
+    opacity: 1;
+    transform: translateX(0);
+}
+
+.discovery_navigation_marker:focus-visible {
+    border-radius: 4px;
+}
+
+.discovery_navigation ~ #posts .post,
+#posts .post {
+    scroll-margin-top: 72px;
+}
+
+html.fixed_navbar #posts .post {
+    scroll-margin-top: 0;
+}
+
+@media (pointer: coarse), screen and (max-width: 800px) {
+    .discovery_navigation {
+        right: max(2px, env(safe-area-inset-right));
+        max-height: min(58dvh, 440px);
+    }
+
+    .discovery_navigation_items {
+        max-height: min(58dvh, 440px);
+    }
+
+    .discovery_navigation_marker {
+        width: 36px;
+        min-height: 24px;
+    }
+
+    .discovery_navigation_line {
+        width: 12px;
+        height: 3px;
+    }
+
+    .discovery_navigation_marker.is-active .discovery_navigation_line {
+        width: 25px;
+    }
+
+    .discovery_navigation_label {
+        right: 40px;
+        font-size: 13px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .discovery_navigation_line,
+    .discovery_navigation_label {
+        transition: none;
+    }
+}
+
 /* / Footer in content block. */
 
 button {

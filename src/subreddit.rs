@@ -244,6 +244,14 @@ struct ContextualPageLink {
 	title: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveryNavigationMarker {
+	label: String,
+	post_id: String,
+	page: usize,
+	href: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 enum AggregateFeedSource {
 	SubredditChunk { chunk: String },
@@ -795,6 +803,99 @@ fn feed_fragment_url(current_url: &str, session_id: &str, page: usize) -> String
 			("current_url", Some(current_url)),
 		],
 	)
+}
+
+fn build_discovery_navigation_markers(
+	current_url: &str,
+	session_id: &str,
+	current_page: usize,
+	ordered_pages: &[Vec<Post>],
+	current_posts: &[Post],
+	following: bool,
+	show_nsfw: bool,
+	per_page: usize,
+) -> Vec<DiscoveryNavigationMarker> {
+	if per_page == 0 {
+		return Vec::new();
+	}
+
+	let mut pages = ordered_pages.to_vec();
+	pages.resize_with(pages.len().max(current_page + 1), Vec::new);
+	pages[current_page] = current_posts.to_vec();
+
+	let mut markers = Vec::new();
+	let mut previous_label = String::new();
+	for (page, posts) in pages.iter().enumerate() {
+		for post in posts {
+			if post.flags.nsfw && !show_nsfw {
+				continue;
+			}
+			let label = crate::materialized_catalog::discovery_navigation_group(post, following);
+			if label == previous_label {
+				continue;
+			}
+			previous_label.clone_from(&label);
+			let href = if page == current_page {
+				format!("#{}", post.id)
+			} else {
+				format!("{}#{}", feed_page_url(current_url, session_id, page), post.id)
+			};
+			markers.push(DiscoveryNavigationMarker {
+				label,
+				post_id: post.id.clone(),
+				page,
+				href,
+			});
+		}
+	}
+	markers
+}
+
+fn escape_html_attribute(value: &str) -> String {
+	value.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Renders the shadcn MessageScroller-style outline used by discovery-ordered
+/// feeds. Kept as a helper so the existing Askama listing templates do not need
+/// parallel navigation fields threaded through every non-discovery renderer.
+pub fn discovery_navigation_html(url: &str, session_id: &str, posts: &[Post], show_nsfw: bool) -> String {
+	if session_id.is_empty() || !url.split('?').next().unwrap_or_default().ends_with("/discovered") {
+		return String::new();
+	}
+	let current_page = param(&format!("?{}", url.split_once('?').map(|(_, query)| query).unwrap_or_default()), "cache_page")
+		.and_then(|page| page.parse::<usize>().ok())
+		.unwrap_or(0);
+	let Some(ordered_pages) = crate::post_cache::feed_navigation_pages(session_id, crate::post_cache::POSTS_PER_PAGE) else {
+		return String::new();
+	};
+	let markers = build_discovery_navigation_markers(
+		url,
+		session_id,
+		current_page,
+		&ordered_pages,
+		posts,
+		is_following_route(url),
+		show_nsfw,
+		crate::post_cache::POSTS_PER_PAGE,
+	);
+	if markers.len() < 2 {
+		return String::new();
+	}
+
+	let mut html = format!(
+		"<nav class=\"discovery_navigation\" data-discovery-current-page=\"{current_page}\" aria-label=\"Discovery order navigation\"><div class=\"discovery_navigation_items\">"
+	);
+	for marker in markers {
+		let label = escape_html_attribute(&marker.label);
+		let post_id = escape_html_attribute(&marker.post_id);
+		let href = escape_html_attribute(&marker.href);
+		html.push_str(&format!(
+			"<a class=\"discovery_navigation_marker\" href=\"{href}\" data-discovery-target=\"{post_id}\" data-discovery-page=\"{}\" aria-label=\"Jump to {label}\" title=\"{label}\"><span class=\"discovery_navigation_line\" aria-hidden=\"true\"></span><span class=\"discovery_navigation_label\">{label}</span></a>",
+			marker.page
+		));
+	}
+	html.push_str("</div></nav>");
+	html
 }
 
 fn subreddit_fragment_path(req: &Request<Body>) -> String {
@@ -3573,8 +3674,9 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 #[cfg(test)]
 mod tests {
 	use super::{
-		canonical_new_sort_url, decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts, split_subscriptions_for_listing,
-		update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, FeedFragmentTemplate, SubredditTemplate, FRONT_CURSOR_PARAM,
+		build_discovery_navigation_markers, canonical_new_sort_url, decode_front_cursor, encode_front_cursor, filter_posts_by_flair, listing_query_fingerprint, merge_chunk_posts,
+		split_subscriptions_for_listing, update_url_query, AggregateFeedSource, AggregateFrontCursor, AggregateFrontPageState, FeedFragmentTemplate, SubredditTemplate,
+		FRONT_CURSOR_PARAM,
 	};
 	use askama::Template;
 	use hyper::{body, Body, Request};
@@ -3653,6 +3755,60 @@ mod tests {
 			bookmarked: false,
 			bookmark_new_comments: None,
 		}
+	}
+
+	fn discovery_post(id: &str, community: &str, author: &str) -> Post {
+		let mut post = test_post();
+		post.id = id.to_string();
+		post.community = community.to_string();
+		post.author.name = author.to_string();
+		post
+	}
+
+	#[test]
+	fn discovery_navigation_marks_source_changes_and_links_across_pages() {
+		let ordered = vec![
+			vec![discovery_post("a1", "alpha", "one"), discovery_post("a2", "alpha", "two")],
+			vec![discovery_post("b1", "beta", "three"), discovery_post("c1", "charlie", "four")],
+		];
+		let current_posts = ordered[0].clone();
+		let markers = build_discovery_navigation_markers("/discovered?t=day", "session-1", 0, &ordered, &current_posts, false, true, 2);
+
+		assert_eq!(
+			markers.iter().map(|marker| marker.label.as_str()).collect::<Vec<_>>(),
+			vec!["r/alpha", "r/beta", "r/charlie"]
+		);
+		assert_eq!(markers[0].href, "#a1");
+		assert!(markers[1].href.starts_with("/discovered?t=day&"));
+		assert!(markers[1].href.contains("feed_session=session-1"));
+		assert!(markers[1].href.contains("cache_page=1"));
+		assert!(markers[1].href.ends_with("#b1"));
+	}
+
+	#[test]
+	fn discovery_navigation_uses_same_page_anchors_and_followed_users() {
+		let ordered = vec![
+			vec![discovery_post("a1", "alpha", "alice"), discovery_post("a2", "beta", "alice")],
+			vec![discovery_post("b1", "gamma", "bob"), discovery_post("b2", "delta", "bob")],
+		];
+		let current_posts = ordered[1].clone();
+		let markers = build_discovery_navigation_markers("/following/discovered?cache_page=1", "session-2", 1, &ordered, &current_posts, true, true, 2);
+
+		assert_eq!(markers.iter().map(|marker| marker.label.as_str()).collect::<Vec<_>>(), vec!["u/alice", "u/bob"]);
+		assert!(markers[0].href.contains("cache_page=0"));
+		assert_eq!(markers[1].href, "#b1");
+	}
+
+	#[test]
+	fn discovery_navigation_skips_hidden_nsfw_targets() {
+		let visible = discovery_post("visible", "alpha", "one");
+		let mut hidden = discovery_post("hidden", "beta", "two");
+		hidden.flags.nsfw = true;
+		let final_post = discovery_post("final", "charlie", "three");
+		let ordered = vec![vec![visible, hidden, final_post]];
+		let markers = build_discovery_navigation_markers("/discovered", "session-3", 0, &ordered, &ordered[0], false, false, 3);
+
+		assert_eq!(markers.iter().map(|marker| marker.post_id.as_str()).collect::<Vec<_>>(), vec!["visible", "final"]);
 	}
 
 	#[test]

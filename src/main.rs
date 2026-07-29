@@ -321,6 +321,7 @@ async fn redlib_versioned_static_asset(req: Request<Body>) -> Result<Response<Bo
 		"suggested_subreddits.js" => resource(include_str!("../static/suggested_subreddits.js"), "text/javascript", false).await,
 		"embedding_activity.js" => resource(include_str!("../static/embedding_activity.js"), "text/javascript", false).await,
 		"feed_status.js" => resource(include_str!("../static/feed_status.js"), "text/javascript", false).await,
+		"discovery_navigation.js" => resource(include_str!("../static/discovery_navigation.js"), "text/javascript", false).await,
 		"page_fragment.js" => resource(include_str!("../static/page_fragment.js"), "text/javascript", false).await,
 		"post_components.js" => resource(include_str!("../static/post_components.js"), "text/javascript", false).await,
 		"dynamic_content.js" => resource(include_str!("../static/dynamic_content.js"), "text/javascript", false).await,
@@ -551,6 +552,9 @@ async fn main() {
 	app
 		.at("/feed_status.js")
 		.get(|_| resource(include_str!("../static/feed_status.js"), "text/javascript", false).boxed());
+	app
+		.at("/discovery_navigation.js")
+		.get(|_| resource(include_str!("../static/discovery_navigation.js"), "text/javascript", false).boxed());
 	app
 		.at("/page_fragment.js")
 		.get(|_| resource(include_str!("../static/page_fragment.js"), "text/javascript", false).boxed());

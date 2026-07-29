@@ -72,6 +72,9 @@
 				data-feed-status-url="{{ feed_status_url }}"
 				data-feed-fragment-url="{{ feed_fragment_url }}"
 				{% endif %}>
+				{% if str_eq(sort.0, "discovered") && !feed_session_id.is_empty() %}
+				{{ crate::subreddit::discovery_navigation_html(url.as_str(), feed_session_id.as_str(), posts.as_slice(), str_eq(prefs.show_nsfw, "on"))|safe }}
+				{% endif %}
 				<div id="posts">
 				{% for post in posts %}
 				{% if !(post.flags.nsfw && !str_eq(prefs.show_nsfw, "on")) %}

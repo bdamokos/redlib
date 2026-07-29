@@ -446,6 +446,39 @@ pub(crate) fn sort_posts_by_daemon_discovery(posts: &mut [Post]) {
 	});
 }
 
+/// Returns the source label that best represents why a post appears in a
+/// discovery-ordered aggregate feed.
+///
+/// Home discovery groups by subreddit. Following discovery groups by the
+/// followed user whose submission or comment has the newest durable discovery
+/// stamp for the bundled row.
+pub(crate) fn discovery_navigation_group(post: &Post, following: bool) -> String {
+	if !following {
+		return post
+			.community
+			.strip_prefix("u_")
+			.map(|name| format!("u/{name}"))
+			.unwrap_or_else(|| format!("r/{}", post.community));
+	}
+
+	let discovery = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let mut selected = discovery.posts.get(&post.id).copied().map(|stamp| (stamp, post.author.name.as_str()));
+	for comment in &post.following_comments {
+		let Some(stamp) = discovery.posts.get(&comment.id).copied() else {
+			continue;
+		};
+		if selected.is_none_or(|(selected_stamp, _)| (stamp.discovered_at_unix, stamp.sequence) > (selected_stamp.discovered_at_unix, selected_stamp.sequence)) {
+			selected = Some((stamp, comment.author.as_str()));
+		}
+	}
+
+	let author = selected
+		.map(|(_, author)| author)
+		.or_else(|| post.following_comments.first().map(|comment| comment.author.as_str()))
+		.unwrap_or(post.author.name.as_str());
+	format!("u/{author}")
+}
+
 fn catalog_record(post: &Post) -> CatalogRecord {
 	CatalogRecord {
 		post: post.clone(),
