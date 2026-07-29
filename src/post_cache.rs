@@ -4151,7 +4151,24 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	reconcile_session_with_source_cache(session);
 	let has_more_available = session.background_active || page < session.requested_page || session_has_remaining_sources(session);
 	if let Some(posts) = session.frozen_pages.get(&page).cloned() {
-		let has_next = has_more_available || posts.len() >= per_page;
+		// A full frozen page is not proof that another page exists. In particular,
+		// the SQLite timeline can end on an exact page boundary. Advertising NEXT
+		// there sends the following request through the lost-cursor recovery path;
+		// once old frozen pages have been evicted, that recovery correctly starts
+		// at the current head and the feed appears to wrap back to the beginning.
+		//
+		// Query the cursor timeline even though the painted posts themselves stay
+		// frozen. Besides returning the authoritative terminal bit, this records
+		// the continuation cursor needed by the next page.
+		let sqlite_has_next = match sqlite_timeline_page_for_session(session, page, per_page) {
+			Ok(Some((_, has_next))) => Some(has_next),
+			Ok(None) => None,
+			Err(error) => {
+				warn!("post_cache: SQLite frozen-page continuation check failed; using legacy pagination: {error}");
+				None
+			}
+		};
+		let has_next = resolve_frozen_page_has_next(sqlite_has_next, has_more_available, posts.len(), per_page);
 		return Some(FeedPage {
 			posts,
 			has_prev: page > 0,
@@ -4196,6 +4213,10 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 		has_next: has_next_from_feed || has_more_available,
 		ready: page_ready,
 	})
+}
+
+fn resolve_frozen_page_has_next(sqlite_has_next: Option<bool>, has_more_available: bool, posts_len: usize, per_page: usize) -> bool {
+	has_more_available || sqlite_has_next.unwrap_or(posts_len >= per_page)
 }
 
 fn freeze_feed_page(session: &mut FeedSession, page: usize, posts: Vec<Post>) {
@@ -7481,6 +7502,72 @@ mod tests {
 		}
 		assert_eq!(session.frozen_pages.len(), MAX_FROZEN_FEED_PAGES);
 		assert!(session.frozen_pages.contains_key(&(MAX_FROZEN_FEED_PAGES + 7)));
+		assert!(!session.frozen_pages.contains_key(&0));
+	}
+
+	#[test]
+	fn sqlite_terminal_state_wins_over_full_frozen_page_heuristic() {
+		assert!(super::resolve_frozen_page_has_next(None, false, POSTS_PER_PAGE, POSTS_PER_PAGE));
+		assert!(!super::resolve_frozen_page_has_next(Some(false), false, POSTS_PER_PAGE, POSTS_PER_PAGE));
+		assert!(super::resolve_frozen_page_has_next(Some(false), true, POSTS_PER_PAGE, POSTS_PER_PAGE));
+		assert!(super::resolve_frozen_page_has_next(Some(true), false, 1, POSTS_PER_PAGE));
+	}
+
+	#[test]
+	fn sqlite_cursor_traverses_beyond_merged_projection_and_frozen_page_cap() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let total_posts: usize = 500;
+		let timeline = (0..total_posts)
+			.map(|index| test_post(&format!("timeline-{index}"), "rust", (total_posts - index) as u64))
+			.collect::<Vec<_>>();
+		let mut session = FeedSession {
+			id: "sqlite-deep-pagination".to_string(),
+			request: FeedSessionRequest {
+				profile_id: "sqlite-deep-pagination".to_string(),
+				merge_sort: Some(FeedSort::New),
+				..Default::default()
+			},
+			sources: Vec::new(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+		let mut traversed_ids = Vec::new();
+
+		for page in 0..total_posts.div_ceil(POSTS_PER_PAGE) {
+			let result = sqlite_timeline_page_for_session_with_query(&session, page, POSTS_PER_PAGE, |cursor, limit| {
+				let start = cursor
+					.and_then(|cursor| timeline.iter().position(|post| post.id == cursor.card_key))
+					.map_or(0, |index| index + 1);
+				let end = start.saturating_add(limit).min(timeline.len());
+				let batch = &timeline[start..end];
+				let next = (end < timeline.len()).then(|| crate::cache_sqlite::TimelineCursor {
+					generation: 1,
+					random_epoch: 0,
+					sort_primary: batch.last().map(|post| post.created_ts as i64).unwrap_or_default(),
+					sort_secondary: 0,
+					card_key: batch.last().map(|post| post.id.clone()).unwrap_or_default(),
+				});
+				Ok(Some(crate::cache_sqlite::TimelinePage {
+					posts: batch.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
+					next,
+				}))
+			})
+			.expect("SQLite page query")
+			.expect("SQLite page");
+			assert_eq!(result.0.len(), POSTS_PER_PAGE);
+			assert_eq!(result.1, page + 1 < total_posts.div_ceil(POSTS_PER_PAGE));
+			traversed_ids.extend(result.0.iter().map(|post| post.id.clone()));
+			freeze_feed_page(&mut session, page, result.0);
+		}
+
+		assert_eq!(traversed_ids.len(), total_posts);
+		assert_eq!(traversed_ids.iter().collect::<HashSet<_>>().len(), total_posts);
+		assert_eq!(session.frozen_pages.len(), MAX_FROZEN_FEED_PAGES);
 		assert!(!session.frozen_pages.contains_key(&0));
 	}
 
