@@ -702,7 +702,7 @@
 {%- endmacro %}
 
 {% macro post_in_list_hybrid(post, show_subscription_button, redirect_url, auto_expand_followed_users, defer_stable) -%}
-{% if defer_stable && post.kind == "t3" %}
+{% if defer_stable && post.kind == "t3" && post.following_comments.len() == 0 %}
 {% set revision = crate::post_components::revision_for_post(post) %}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
 {% set auto_expand_preview = auto_expand_followed_users && prefs.has_followed_user(post.author.name.as_str()) -%}

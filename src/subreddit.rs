@@ -4585,6 +4585,46 @@ mod tests {
 	}
 
 	#[test]
+	fn following_comment_bundle_after_initial_cards_is_not_deferred() {
+		let mut posts = (0..6)
+			.map(|index| {
+				let mut post = test_post();
+				post.id = format!("initial-{index}");
+				post
+			})
+			.collect::<Vec<_>>();
+		let mut bundle = test_post();
+		bundle.id = "bundle-after-fold".to_string();
+		bundle.following_comments.push(test_following_comment());
+		posts.push(bundle);
+		let mut plain = test_post();
+		plain.id = "plain-after-fold".to_string();
+		posts.push(plain);
+
+		let html = super::FeedFragmentTemplate {
+			posts,
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/following/new".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains("id=\"bundle-after-fold\""));
+		assert!(html.contains("post_following_bundle"));
+		assert!(html.contains("post_following_comments"));
+		assert!(html.contains("<a class=\"post_following_comment_author\" href=\"/u/followed_user\">u/followed_user</a>"));
+		assert!(!html.contains("data-post-component-id=\"bundle-after-fold\""));
+		assert!(html.contains("data-post-component-id=\"plain-after-fold\""));
+	}
+
+	#[test]
 	fn feed_preview_from_followed_author_renders_expanded() {
 		let mut post = test_post();
 		post.preview_body = "<div class=\"md\"><p>Long followed-author preview.</p></div>".to_string();
