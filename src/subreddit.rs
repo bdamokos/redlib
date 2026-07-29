@@ -4577,6 +4577,9 @@ mod tests {
 		assert!(html.contains("<a class=\"post_subreddit\" href=\"/r/demo_sub\">r/demo_sub</a>"));
 		assert!(html.contains("<a class=\"post_author \" href=\"/u/demo_user\">u/demo_user</a>"));
 		assert!(html.contains("post_following_comments"));
+		assert!(html.contains("Comments from followed users on this thread"));
+		assert!(html.contains("<a class=\"post_following_comment_author\" href=\"/u/followed_user\">u/followed_user</a>"));
+		assert!(html.contains("class=\"followed_author_marker\">followed</span>"));
 		assert!(!html.contains("post_header_following_thread"));
 		assert!(!html.contains("post_following_thread_meta"));
 	}

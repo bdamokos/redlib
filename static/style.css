@@ -2607,6 +2607,10 @@ form[data-subscription-form][data-subscription-pending="true"] button {
     margin-bottom: 4px;
 }
 
+.post_following_comment_author {
+    font-weight: 600;
+}
+
 .post_following_comment_parent {
     margin: 0 0 8px;
     padding: 7px 9px;

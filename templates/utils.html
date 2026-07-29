@@ -592,7 +592,7 @@
 	</div>
 	{% if post.following_comments.len() > 0 %}
 	<div class="post_following_comments">
-		<p class="post_following_comments_label">Their comments on this thread</p>
+		<p class="post_following_comments_label">Comments from followed users on this thread</p>
 		<ul class="post_following_comments_list">
 			{% for c in post.following_comments %}
 			<li class="post_following_comment">
@@ -600,6 +600,13 @@
 				<div class="post_following_comment_sub"><a href="/r/{{ c.community }}">r/{{ c.community }}</a></div>
 				{% endif %}
 				<div class="post_following_comment_meta">
+					{% if !c.author.is_empty() && !str_eq(c.author, "[deleted]") %}
+					<a class="post_following_comment_author" href="/u/{{ c.author }}">u/{{ c.author }}</a>
+					{% else %}
+					<span class="post_following_comment_author">u/[deleted]</span>
+					{% endif %}
+					<span class="followed_author_marker">followed</span>
+					&middot;
 					<a href="{{ c.permalink }}">{{ c.rel_time }}</a>
 					{% if !str_eq(prefs.hide_score, "on") %}
 					&middot; {{ c.score.0 }}
