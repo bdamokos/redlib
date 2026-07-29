@@ -54,6 +54,10 @@ const MIN_ESTIMATED_POST_INTERVAL_SECS: u64 = 60;
 const MAX_ESTIMATED_POST_INTERVAL_SECS: u64 = 86_400;
 const MIN_FRESHNESS_TARGET_SECS: u64 = 1_800;
 const MAX_FRESHNESS_TARGET_SECS: u64 = 172_800;
+/// Temporarily demote transient failures behind ready sources. Repeated
+/// failures extend the demotion without turning a generic 403/429 into the
+/// durable unavailable-source suspension.
+const MAX_TRANSIENT_FAILURE_PRIORITY_BACKOFF_MULTIPLIER: u64 = 8;
 const FETCH_CONCURRENCY: usize = 8;
 const PER_SOURCE_LIMIT: usize = 40;
 const INITIAL_SOURCE_WINDOW: usize = 32;
@@ -1352,7 +1356,36 @@ fn recent_request_priority_at(entry: &RememberedSubredditEntry, now: Instant) ->
 	elapsed_secs_at(now, entry.last_requested_at) <= RECENT_REQUEST_PRIORITY_SECS
 }
 
+fn transient_failure_priority_deferred_at(entry: &RememberedSubredditEntry, now: Instant) -> bool {
+	let Some(last_failure) = entry.last_refresh_failed_at else {
+		return false;
+	};
+	if entry.last_refresh_succeeded_at.is_some_and(|last_success| last_success >= last_failure) {
+		return false;
+	}
+
+	let multiplier = u64::from(entry.consecutive_failures.max(1)).min(MAX_TRANSIENT_FAILURE_PRIORITY_BACKOFF_MULTIPLIER);
+	let backoff_secs = MIN_FRESHNESS_TARGET_SECS.saturating_mul(multiplier);
+	elapsed_secs_at(now, last_failure) < backoff_secs
+}
+
 fn remembered_refresh_priority_at(left: &RememberedSubredditEntry, right: &RememberedSubredditEntry, now: Instant) -> Ordering {
+	let left_failure_deferred = transient_failure_priority_deferred_at(left, now);
+	let right_failure_deferred = transient_failure_priority_deferred_at(right, now);
+	match left_failure_deferred.cmp(&right_failure_deferred) {
+		Ordering::Equal => {}
+		ordering => return ordering,
+	}
+	if left_failure_deferred {
+		match (left.last_refresh_failed_at, right.last_refresh_failed_at) {
+			(Some(left_failure), Some(right_failure)) => match left_failure.cmp(&right_failure) {
+				Ordering::Equal => {}
+				ordering => return ordering,
+			},
+			_ => {}
+		}
+	}
+
 	let left_recent = recent_request_priority_at(left, now);
 	let right_recent = recent_request_priority_at(right, now);
 	match right_recent.cmp(&left_recent) {
@@ -6450,6 +6483,52 @@ mod tests {
 		failing.consecutive_failures = 4;
 
 		assert_eq!(remembered_refresh_priority_at(&steady, &failing, Instant::now()), Ordering::Less);
+	}
+
+	#[test]
+	fn remembered_feed_picker_defers_recent_transient_failure_behind_ready_source() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = Instant::now();
+
+		let mut failing = remembered_entry("failing");
+		failing.last_requested_at = now;
+		failing.last_refresh_started_at = Some(now - Duration::from_secs(5));
+		failing.last_refresh_failed_at = Some(now - Duration::from_secs(5));
+		failing.consecutive_failures = 1;
+
+		let mut ready = remembered_entry("ready");
+		ready.last_requested_at = now - Duration::from_secs(24 * 60 * 60);
+
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		remembered.insert(failing.name.clone(), failing);
+		remembered.insert(ready.name.clone(), ready);
+		drop(remembered);
+
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("ready".to_string()));
+	}
+
+	#[test]
+	fn remembered_feed_picker_retries_transient_failure_after_priority_backoff() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let now = Instant::now();
+
+		let mut retry = remembered_entry("retry");
+		retry.last_requested_at = now;
+		retry.last_refresh_started_at = Some(now - Duration::from_secs(MIN_FRESHNESS_TARGET_SECS + 5));
+		retry.last_refresh_failed_at = Some(now - Duration::from_secs(MIN_FRESHNESS_TARGET_SECS + 5));
+		retry.consecutive_failures = 1;
+
+		let mut ready = remembered_entry("ready");
+		ready.last_requested_at = now - Duration::from_secs(24 * 60 * 60);
+
+		let mut remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		remembered.insert(retry.name.clone(), retry);
+		remembered.insert(ready.name.clone(), ready);
+		drop(remembered);
+
+		assert_eq!(pick_next_remembered_feed_to_refresh().map(|source| source.display_name()), Some("retry".to_string()));
 	}
 
 	#[test]
