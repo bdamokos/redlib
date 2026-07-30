@@ -13,6 +13,7 @@
 - Persistent deployment thread:
   The designated Redlib deployment coordinator thread is `019f5149-0985-7970-8bc9-3b8d72d5905b`.
   The previous coordinator threads `019f4cf0-4037-7101-addd-8dd170284f6b` and `019f0411-87a6-7112-a4a8-a005a28d3ee6` are archived and must not receive new deployment requests.
+  The active cross-project Deployment Coordination Hub / arch-coordinator is `019fb326-93e0-7091-9da9-3da8daeb4972`. Send deployment-impacting holds, shared-slot requests, releases, and terminal process-clear notices there. Its predecessor `019f3295-d84e-7893-b29f-9cd16df38707` is archived and must not receive new coordination messages.
   Defer Raspberry Pi deployment requests to that thread instead of running `./deploy.sh` directly from feature or fix threads, unless the user explicitly tells the current thread to bypass the coordinator.
   Deployment requests should include the originating thread id, branch, commit SHA, validation summary, and whether the request is urgent.
   The deployment coordinator queues requests, batches compatible requests when practical, and runs `./deploy.sh` from the repo root once the deployable work is committed.
