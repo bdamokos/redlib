@@ -1547,27 +1547,27 @@ fn record_semantic_bundle_attempt(key: &str) {
 	}
 }
 
-fn record_semantic_bundle_outcome(source: &FeedSource, outcome: RememberedRefreshOutcome, allow_start: bool) -> bool {
+fn record_semantic_bundle_outcome(source: &FeedSource, outcome: RememberedRefreshOutcome, successes_before: usize) {
 	let Some(key) = remembered_feed_key_for_source(source) else {
-		return false;
+		return;
 	};
 	let Ok(mut bundle) = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock() else {
-		return false;
+		return;
 	};
 	if bundle.seed_key.is_some() {
 		if outcome == RememberedRefreshOutcome::Succeeded {
 			bundle.remaining_successes = bundle.remaining_successes.saturating_sub(1);
 			if bundle.remaining_successes == 0 {
 				*bundle = RememberedDaemonSemanticBundle::default();
-				return true;
 			}
 		}
-	} else if allow_start && outcome == RememberedRefreshOutcome::Succeeded {
+	} else if outcome == RememberedRefreshOutcome::Succeeded {
 		bundle.seed_key = Some(key.clone());
-		bundle.remaining_successes = REMEMBERED_DAEMON_SEMANTIC_BUNDLE_SIZE.saturating_sub(1);
+		bundle.remaining_successes = (REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK * 2)
+			.saturating_sub(successes_before.saturating_add(1))
+			.min(REMEMBERED_DAEMON_SEMANTIC_BUNDLE_SIZE.saturating_sub(1));
 		bundle.attempted_keys = HashSet::from([key]);
 	}
-	false
 }
 
 pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) -> Option<SourceRefreshToken> {
@@ -2620,14 +2620,14 @@ pub fn spawn_remembered_feed_daemon() {
 				let source_had_success = remembered_source_had_success(&source);
 				info!("post_cache: remembered feed daemon refreshing {}", source.display_name());
 				let outcome = refresh_remembered_feed(&source).await;
-				let semantic_bundle_completed = record_semantic_bundle_outcome(&source, outcome, successes == 0);
+				record_semantic_bundle_outcome(&source, outcome, successes);
 				if matches!(outcome, RememberedRefreshOutcome::Succeeded) {
 					successes += 1;
 				}
 				if matches!(outcome, RememberedRefreshOutcome::Failed(RememberedFailureDisposition::DurableUnavailable)) && !source_had_success {
 					unproven_permanent_failures += 1;
 				}
-				let should_continue = !semantic_bundle_completed && daemon_should_continue_after_refresh(outcome, attempts, successes);
+				let should_continue = daemon_should_continue_after_refresh(outcome, attempts, successes);
 				match outcome {
 					RememberedRefreshOutcome::Succeeded => {
 						if should_continue {
@@ -6221,10 +6221,10 @@ mod tests {
 		reset_test_caches();
 		let seed = new_source("seed");
 
-		super::record_semantic_bundle_outcome(&seed, RememberedRefreshOutcome::Succeeded, true);
+		super::record_semantic_bundle_outcome(&seed, RememberedRefreshOutcome::Succeeded, 0);
 		for name in ["near_one", "near_two"] {
 			super::record_semantic_bundle_attempt(name);
-			super::record_semantic_bundle_outcome(&new_source(name), RememberedRefreshOutcome::Succeeded, false);
+			super::record_semantic_bundle_outcome(&new_source(name), RememberedRefreshOutcome::Succeeded, 0);
 		}
 
 		{
@@ -6235,7 +6235,7 @@ mod tests {
 
 		for name in ["near_three", "near_four", "near_five"] {
 			super::record_semantic_bundle_attempt(name);
-			super::record_semantic_bundle_outcome(&new_source(name), RememberedRefreshOutcome::Succeeded, false);
+			super::record_semantic_bundle_outcome(&new_source(name), RememberedRefreshOutcome::Succeeded, 0);
 		}
 
 		let bundle = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().unwrap();
@@ -6244,17 +6244,23 @@ mod tests {
 	}
 
 	#[test]
-	fn semantic_bundle_does_not_start_mid_tick() {
+	fn semantic_bundle_truncates_when_seed_starts_mid_tick() {
 		let _guard = test_lock();
 		reset_test_caches();
 
-		let completed = super::record_semantic_bundle_outcome(&new_source("mid_tick"), RememberedRefreshOutcome::Succeeded, false);
+		super::record_semantic_bundle_outcome(&new_source("mid_tick"), RememberedRefreshOutcome::Succeeded, 1);
 
-		assert!(!completed);
-		let bundle = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().unwrap();
-		assert!(bundle.seed_key.is_none());
-		assert_eq!(bundle.remaining_successes, 0);
+		{
+			let bundle = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().unwrap();
+			assert_eq!(bundle.seed_key.as_deref(), Some("mid_tick"));
+			assert_eq!(bundle.remaining_successes, 4, "slot-two seed plus four neighbours fits in two ticks");
+		}
+		for name in ["near_one", "near_two", "near_three", "near_four"] {
+			super::record_semantic_bundle_outcome(&new_source(name), RememberedRefreshOutcome::Succeeded, 0);
+		}
+		assert!(REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().unwrap().seed_key.is_none());
 	}
+
 	#[test]
 	fn visit_signal_cooldown_prevents_immediate_second_bump() {
 		let _guard = test_lock();
