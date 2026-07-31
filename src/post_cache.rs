@@ -26,6 +26,9 @@ const MAX_FROZEN_FEED_PAGES: usize = 16;
 pub(crate) const REMEMBERED_SUBREDDIT_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 pub(crate) const REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS: u64 = 5 * 60;
 const REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK: usize = 3;
+/// One priority-selected seed plus five content/vibe-nearest neighbours. The
+/// existing three-success tick budget therefore serves one bundle in two ticks.
+const REMEMBERED_DAEMON_SEMANTIC_BUNDLE_SIZE: usize = 6;
 const REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK: usize = 20;
 const REMEMBERED_SUBREDDIT_DAEMON_MAX_UNPROVEN_PERMANENT_FAILURES_PER_TICK: usize = 3;
 /// Visit-interest boost decays with this half-life so manual browsing lifts refresh priority temporarily.
@@ -569,6 +572,13 @@ pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubre
 static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 static REMEMBERED_DAEMON_SELECTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Debug, Default)]
+struct RememberedDaemonSemanticBundle {
+	seed_key: Option<String>,
+	remaining_successes: usize,
+	attempted_keys: HashSet<String>,
+}
+static REMEMBERED_DAEMON_SEMANTIC_BUNDLE: LazyLock<Mutex<RememberedDaemonSemanticBundle>> = LazyLock::new(|| Mutex::new(RememberedDaemonSemanticBundle::default()));
 static PROFILE_SOURCE_MEMBERSHIPS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SOURCE_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
 static DELETED_MEDIA_TOMBSTONES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -1473,6 +1483,91 @@ fn ordered_refresh_entries_with_fairness(mut entries: Vec<RememberedSubredditEnt
 	ordered
 }
 
+fn semantic_identity_for_remembered_key(key: &str) -> Option<String> {
+	if let Some(name) = key.strip_prefix("user_comments:") {
+		return normalize_user_subscription_name(name);
+	}
+	if let Some(rest) = key.strip_prefix("flair:") {
+		return rest.split_once(':').map(|(subreddit, _)| subreddit.to_string());
+	}
+	normalize_remembered_feed_name(key)
+}
+
+fn embedding_cosine(left: &[f32], right: &[f32]) -> Option<f64> {
+	if left.len() != right.len() || left.is_empty() {
+		return None;
+	}
+	let mut dot = 0.0_f64;
+	let mut left_norm = 0.0_f64;
+	let mut right_norm = 0.0_f64;
+	for (left, right) in left.iter().zip(right.iter()) {
+		if !left.is_finite() || !right.is_finite() {
+			return None;
+		}
+		let left = f64::from(*left);
+		let right = f64::from(*right);
+		dot += left * right;
+		left_norm += left * left;
+		right_norm += right * right;
+	}
+	(left_norm > 0.0 && right_norm > 0.0).then(|| dot / (left_norm.sqrt() * right_norm.sqrt()))
+}
+
+fn nearest_semantic_entry_index(
+	entries: &[RememberedSubredditEntry],
+	seed_key: &str,
+	attempted_keys: &HashSet<String>,
+	now: Instant,
+	embedding_for: impl Fn(&str) -> Option<Vec<f32>>,
+) -> Option<(usize, f64)> {
+	let seed_identity = semantic_identity_for_remembered_key(seed_key)?;
+	let seed_embedding = embedding_for(&seed_identity)?;
+	entries
+		.iter()
+		.enumerate()
+		.filter(|(_, entry)| !attempted_keys.contains(&entry.name) && !transient_failure_priority_deferred_at(entry, now))
+		.filter_map(|(index, entry)| {
+			let identity = semantic_identity_for_remembered_key(&entry.name)?;
+			let embedding = embedding_for(&identity)?;
+			let similarity = embedding_cosine(&seed_embedding, &embedding)?;
+			Some((index, similarity, entry))
+		})
+		.max_by(|(_, left_similarity, left), (_, right_similarity, right)| {
+			left_similarity
+				.partial_cmp(right_similarity)
+				.unwrap_or(Ordering::Equal)
+				.then_with(|| remembered_refresh_priority_at(right, left, now))
+		})
+		.map(|(index, similarity, _)| (index, similarity))
+}
+
+fn record_semantic_bundle_attempt(key: &str) {
+	if let Ok(mut bundle) = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock() {
+		bundle.attempted_keys.insert(key.to_string());
+	}
+}
+
+fn record_semantic_bundle_outcome(source: &FeedSource, outcome: RememberedRefreshOutcome) {
+	let Some(key) = remembered_feed_key_for_source(source) else {
+		return;
+	};
+	let Ok(mut bundle) = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock() else {
+		return;
+	};
+	if bundle.seed_key.is_some() {
+		if outcome == RememberedRefreshOutcome::Succeeded {
+			bundle.remaining_successes = bundle.remaining_successes.saturating_sub(1);
+			if bundle.remaining_successes == 0 {
+				*bundle = RememberedDaemonSemanticBundle::default();
+			}
+		}
+	} else if outcome == RememberedRefreshOutcome::Succeeded {
+		bundle.seed_key = Some(key.clone());
+		bundle.remaining_successes = REMEMBERED_DAEMON_SEMANTIC_BUNDLE_SIZE.saturating_sub(1);
+		bundle.attempted_keys = HashSet::from([key]);
+	}
+}
+
 pub(crate) fn mark_plain_subreddit_refresh_started(subreddit: &str) -> Option<SourceRefreshToken> {
 	let Some(source) = normalize_remembered_source(&FeedSource::subreddit(subreddit.to_string(), FeedSort::New)) else {
 		return None;
@@ -2337,18 +2432,48 @@ enum RememberedFeedPickMode {
 }
 
 fn pick_next_remembered_feed_to_refresh_with_mode(mode: RememberedFeedPickMode) -> Option<FeedSource> {
-	let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
 	let now = Instant::now();
-	let entries = remembered
-		.values()
-		.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked_at(entry, now) && !entry.refresh_in_flight)
-		.filter(|entry| mode == RememberedFeedPickMode::AnyEligible || entry.last_refresh_succeeded_at.is_some())
-		.cloned()
-		.collect::<Vec<_>>();
+	let entries = {
+		let remembered = REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner());
+		remembered
+			.values()
+			.filter(|entry| remembered_entry_is_active(entry) && !remembered_entry_refresh_blocked_at(entry, now) && !entry.refresh_in_flight)
+			.filter(|entry| mode == RememberedFeedPickMode::AnyEligible || entry.last_refresh_succeeded_at.is_some())
+			.cloned()
+			.collect::<Vec<_>>()
+	};
+
+	let bundle = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().ok().map(|bundle| bundle.clone()).unwrap_or_default();
+	if let Some(seed_key) = bundle.seed_key.as_deref() {
+		let model = crate::subreddit_semantics::embedding_model();
+		if let Some((index, similarity)) = nearest_semantic_entry_index(&entries, seed_key, &bundle.attempted_keys, now, |identity| {
+			crate::subreddit_content_semantics::embedding_for_subreddit_model(identity, &model)
+		}) {
+			let entry = &entries[index];
+			record_semantic_bundle_attempt(&entry.name);
+			info!(
+				"post_cache: semantic refresh bundle selected {} near seed {} (similarity={:.3}, remaining_after_success={})",
+				entry.name,
+				seed_key,
+				similarity,
+				bundle.remaining_successes.saturating_sub(1)
+			);
+			return remembered_feed_source_from_key(&entry.name);
+		}
+		if let Ok(mut active_bundle) = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock() {
+			*active_bundle = RememberedDaemonSemanticBundle::default();
+		}
+	}
 	let selection_sequence = REMEMBERED_DAEMON_SELECTION_SEQUENCE.load(AtomicOrdering::Relaxed);
-	ordered_refresh_entries_with_fairness(entries, now, selection_sequence)
+	let selected = ordered_refresh_entries_with_fairness(entries, now, selection_sequence)
 		.into_iter()
-		.find_map(|(entry, _)| remembered_feed_source_from_key(&entry.name))
+		.find_map(|(entry, _)| remembered_feed_source_from_key(&entry.name));
+	if let Some(source) = selected.as_ref() {
+		if let Some(key) = remembered_feed_key_for_source(source) {
+			record_semantic_bundle_attempt(&key);
+		}
+	}
+	selected
 }
 
 pub fn pick_next_remembered_subreddit_to_refresh() -> Option<FeedSource> {
@@ -2493,6 +2618,7 @@ pub fn spawn_remembered_feed_daemon() {
 				let source_had_success = remembered_source_had_success(&source);
 				info!("post_cache: remembered feed daemon refreshing {}", source.display_name());
 				let outcome = refresh_remembered_feed(&source).await;
+				record_semantic_bundle_outcome(&source, outcome);
 				if matches!(outcome, RememberedRefreshOutcome::Succeeded) {
 					successes += 1;
 				}
@@ -4814,25 +4940,25 @@ mod tests {
 		count_sources_in_state, daemon_should_continue_after_refresh, effective_freshness_target_secs, enforce_source_cache_limits_locked, ensure_feed_session_with_budget,
 		estimate_post_interval_secs, feed_page, feed_status, finalize_session_posts, followup_source_budget, freeze_feed_page, get_cached_source_page,
 		has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
-		merged_posts_for_session_live, ordered_refresh_entries_with_fairness, pick_next_remembered_feed_to_refresh, pick_next_remembered_feed_to_refresh_with_mode,
-		pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position, prune_feed_sessions_locked, prune_source_cache,
-		publish_plain_subreddit_refresh, publish_remembered_source_refresh_with_token, random_rotation_seed_for_time, reconcile_profile_memberships,
-		reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta, record_remembered_feed_visit_signal,
-		record_remembered_source_refresh_failure_with_token, remember_flair_request, remember_frontpage_subreddits, remember_subreddit_request, remembered_refresh_priority_at,
-		resolve_source_refresh_result, restore_persisted_state, retain_following_membership, seed_remembered_feeds_from_source_cache_entries,
-		seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts, snapshot_persisted_remembered_subreddits,
-		snapshot_persisted_source_entries, snapshot_persisted_source_unavailability, sort_posts_by_deterministic_random, sort_posts_by_deterministic_random_with_seed,
-		sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id, sqlite_timeline_page_for_session_with_query,
-		sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin, store_source_posts_with_token, store_source_posts_with_token_and_effects,
-		sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession, FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin,
-		RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode,
-		SourceRefreshOutcome, SqliteSessionCursorState, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS,
-		DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES,
-		MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
-		REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK,
-		REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, SQLITE_SESSION_CURSORS,
-		TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS,
-		TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,
+		merged_posts_for_session_live, nearest_semantic_entry_index, ordered_refresh_entries_with_fairness, pick_next_remembered_feed_to_refresh,
+		pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position,
+		prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh, publish_remembered_source_refresh_with_token, random_rotation_seed_for_time,
+		reconcile_profile_memberships, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
+		record_remembered_feed_visit_signal, record_remembered_source_refresh_failure_with_token, remember_flair_request, remember_frontpage_subreddits,
+		remember_subreddit_request, remembered_refresh_priority_at, resolve_source_refresh_result, restore_persisted_state, retain_following_membership,
+		seed_remembered_feeds_from_source_cache_entries, seed_remembered_feeds_from_source_cache_keys, servable_cached_source_posts, session_status_from_posts,
+		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, snapshot_persisted_source_unavailability, sort_posts_by_deterministic_random,
+		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id,
+		sqlite_timeline_page_for_session_with_query, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin, store_source_posts_with_token,
+		store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession, FeedSessionRequest, FeedSort,
+		FeedSource, RefreshOrigin, RememberedDaemonSemanticBundle, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry,
+		SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, SqliteSessionCursorState, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
+		BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS,
+		MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
+		REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_DAEMON_SEMANTIC_BUNDLE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS,
+		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION,
+		SOURCE_REFRESH_STATES, SQLITE_SESSION_CURSORS, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL,
+		TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -4854,6 +4980,7 @@ mod tests {
 		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		PROFILE_SOURCE_MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_DAEMON_SELECTION_SEQUENCE.store(0, AtomicOrdering::Relaxed);
+		*REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()) = RememberedDaemonSemanticBundle::default();
 		ACTIVE_BROWSER_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		DELETED_MEDIA_TOMBSTONES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		DELETED_MEDIA_SAFETY_HEALTHY.store(true, AtomicOrdering::Release);
@@ -6071,6 +6198,47 @@ mod tests {
 		let slots = (0..12).filter(|sequence| super::fairness_slot_for_sequence(*sequence)).collect::<Vec<_>>();
 
 		assert_eq!(slots, vec![3, 7, 11]);
+	}
+
+	#[test]
+	fn semantic_bundle_picks_the_closest_unattempted_vibe_neighbor() {
+		let now = Instant::now();
+		let entries = vec![remembered_entry("rust"), remembered_entry("programming"), remembered_entry("baking")];
+		let embeddings = HashMap::from([("rust", vec![1.0_f32, 0.0]), ("programming", vec![0.95_f32, 0.05]), ("baking", vec![0.0_f32, 1.0])]);
+		let attempted = HashSet::from(["rust".to_string()]);
+
+		let (index, similarity) = nearest_semantic_entry_index(&entries, "rust", &attempted, now, |identity| embeddings.get(identity).cloned()).unwrap();
+
+		assert_eq!(entries[index].name, "programming");
+		assert!(similarity > 0.99);
+	}
+
+	#[test]
+	fn semantic_bundle_spans_two_three_success_ticks() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let seed = new_source("seed");
+
+		super::record_semantic_bundle_outcome(&seed, RememberedRefreshOutcome::Succeeded);
+		for name in ["near_one", "near_two"] {
+			super::record_semantic_bundle_attempt(name);
+			super::record_semantic_bundle_outcome(&new_source(name), RememberedRefreshOutcome::Succeeded);
+		}
+
+		{
+			let bundle = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().unwrap();
+			assert_eq!(bundle.seed_key.as_deref(), Some("seed"));
+			assert_eq!(bundle.remaining_successes, 3, "seed plus two neighbours consume the first tick");
+		}
+
+		for name in ["near_three", "near_four", "near_five"] {
+			super::record_semantic_bundle_attempt(name);
+			super::record_semantic_bundle_outcome(&new_source(name), RememberedRefreshOutcome::Succeeded);
+		}
+
+		let bundle = REMEMBERED_DAEMON_SEMANTIC_BUNDLE.lock().unwrap();
+		assert!(bundle.seed_key.is_none(), "the six-feed bundle should close after the second tick");
+		assert_eq!(bundle.remaining_successes, 0);
 	}
 
 	#[test]
