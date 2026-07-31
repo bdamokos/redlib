@@ -3243,18 +3243,6 @@ a.redgifs_uploader_mismatch {
     opacity: 1;
 }
 
-.gallery.post_preview.truncated::after {
-    height: 48px;
-    line-height: 48px;
-    font-size: 12px;
-    font-weight: 600;
-    background: linear-gradient(transparent, var(--post) 30%);
-}
-
-.gallery.post_preview.truncated:not(.expanded) figure:nth-of-type(n+3) {
-    display: none;
-}
-
 .post_preview.expanded {
     max-height: none;
 }

@@ -1,17 +1,6 @@
-function isUserPagePath() {
-    const { pathname } = window.location;
-    return pathname.startsWith("/user/") || pathname.startsWith("/u/");
-}
-
 function shouldTruncatePreview(preview) {
     const isGallery = preview.classList.contains("gallery");
-    if (isGallery && isUserPagePath()) {
-        return false;
-    }
-
-    return isGallery
-        ? preview.querySelectorAll("figure").length > 2
-        : preview.scrollHeight > preview.clientHeight;
+    return !isGallery && preview.scrollHeight > preview.clientHeight;
 }
 
 function markTruncatedPreviews() {
@@ -39,24 +28,11 @@ document.addEventListener("click", (event) => {
         return;
     }
 
-    const isGallery = preview.classList.contains("gallery");
     const clickedLink = event.target.closest("a");
 
-    if (isGallery) {
-        const rect = preview.getBoundingClientRect();
-        const clickY = event.clientY - rect.top;
-        const threshold = rect.height - 48;
-        if (clickY >= threshold) {
-            event.preventDefault();
-            preview.classList.add("expanded");
-            preview.classList.remove("truncated");
-            return;
-        }
-    } else {
-        if (clickedLink) {
-            return;
-        }
-        preview.classList.add("expanded");
-        preview.classList.remove("truncated");
+    if (clickedLink) {
+        return;
     }
+    preview.classList.add("expanded");
+    preview.classList.remove("truncated");
 });
