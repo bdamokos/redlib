@@ -1087,6 +1087,119 @@ pub(crate) struct TimelinePage {
 	pub next: Option<TimelineCursor>,
 }
 
+/// Lightweight card metadata for discovery navigation. This deliberately
+/// excludes the persisted payload so a long rail does not hydrate `Post`s.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoveryOutlineEntry {
+	pub post_id: String,
+	pub community: String,
+	pub author: String,
+}
+
+pub(crate) fn query_profile_discovery_outline(
+	fingerprint: &[u8],
+	view_kind: i64,
+	snapshot_generation: Option<i64>,
+	limit: usize,
+	filters: &HashSet<String>,
+) -> Result<Option<Vec<DiscoveryOutlineEntry>>, String> {
+	if !reads_enabled() {
+		return Ok(None);
+	}
+	let Some(cache) = SHADOW_CACHE.get() else {
+		return Err("SQLite reads enabled but shadow store is unavailable".to_string());
+	};
+	with_read_connection(cache, |connection| {
+		query_profile_discovery_outline_on(connection, fingerprint, view_kind, snapshot_generation, limit, filters)
+	})
+}
+
+fn query_profile_discovery_outline_on(
+	connection: &Connection,
+	fingerprint: &[u8],
+	view_kind: i64,
+	snapshot_generation: Option<i64>,
+	limit: usize,
+	filters: &HashSet<String>,
+) -> Result<Option<Vec<DiscoveryOutlineEntry>>, ShadowReadError> {
+	let profile = connection
+		.query_row("SELECT profile_pk,generation FROM active_profiles WHERE fingerprint=?1", [fingerprint], |row| {
+			Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+		})
+		.optional()?;
+	let Some((profile_pk, current_generation)) = profile else {
+		return Ok(None);
+	};
+	let generation = snapshot_generation.unwrap_or(current_generation);
+	if generation > current_generation {
+		return Err("discovery outline generation is newer than the active profile".to_string().into());
+	}
+	if !profile_filters_match(connection, profile_pk, filters)? {
+		return Ok(None);
+	}
+	if !matches!(view_kind, 1 | 2) {
+		return Err(format!("invalid profile view kind {view_kind}").into());
+	}
+
+	let normalized_filters = crate::utils::post_filter_prefilter_values(filters);
+	let member_filter_clause = if normalized_filters.is_empty() {
+		String::new()
+	} else {
+		let values = normalized_filters
+			.iter()
+			.map(|value| format!("'{}'", value.replace('\'', "''")))
+			.collect::<Vec<_>>()
+			.join(",");
+		format!(
+			" AND EXISTS(
+				   SELECT 1 FROM profile_feed_entry_members filter_members
+				   WHERE filter_members.profile_pk=feed.profile_pk
+				     AND filter_members.view_kind=feed.view_kind
+				     AND filter_members.card_key=feed.card_key
+				     AND filter_members.version=feed.version
+				     AND filter_members.community_lc NOT IN ({values})
+				     AND ('u_' || filter_members.author_lc) NOT IN ({values})
+				 )"
+		)
+	};
+	let sql = format!(
+		"SELECT CASE WHEN representative.kind=1
+			             THEN representative.submission_fullname
+			             ELSE representative.fullname END,
+			        feed.community_lc,
+			        CASE WHEN feed.view_kind=2 THEN COALESCE((
+			          SELECT members.author_lc
+			          FROM profile_feed_entry_members members
+			          JOIN objects member_object ON member_object.object_pk=members.object_pk
+			          WHERE members.profile_pk=feed.profile_pk
+			            AND members.view_kind=feed.view_kind
+			            AND members.card_key=feed.card_key
+			            AND members.version=feed.version
+			          ORDER BY member_object.discovery_seq DESC,member_object.object_pk DESC
+			          LIMIT 1
+			        ),feed.author_lc) ELSE feed.author_lc END
+			 FROM profile_feed_entries feed
+			 JOIN objects representative ON representative.object_pk=feed.representative_pk
+			 WHERE feed.profile_pk=?1 AND feed.view_kind=?2
+			   AND feed.valid_from_generation<=?3
+			   AND (feed.valid_to_generation IS NULL OR feed.valid_to_generation>?3)
+			   AND feed.discovery_sort>0{member_filter_clause}
+			 ORDER BY feed.discovery_sort DESC,feed.card_key DESC
+			 LIMIT ?4"
+	);
+	let mut statement = connection.prepare(&sql)?;
+	let rows = statement.query_map(params![profile_pk, view_kind, generation, limit.clamp(1, 250) as i64], |row| {
+		Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+	})?;
+	let mut entries = Vec::new();
+	for row in rows {
+		let (fullname, community, author) = row?;
+		let post_id = fullname.split_once('_').map_or(fullname.as_str(), |(_, id)| id).to_string();
+		entries.push(DiscoveryOutlineEntry { post_id, community, author });
+	}
+	Ok(Some(entries))
+}
+
 pub(crate) fn query_profile_timeline(
 	fingerprint: &[u8],
 	view_kind: i64,
@@ -3386,6 +3499,41 @@ mod tests {
 		let page = query_profile_timeline_on(&connection, b"profile-comments", 2, TimelineSort::New, None, 25, &HashSet::new()).unwrap();
 		assert_eq!(page.posts.len(), 1);
 		assert_eq!(page.posts[0].following_comments.len(), 2);
+		let outline = query_profile_discovery_outline_on(&connection, b"profile-comments", 2, None, 25, &HashSet::new())
+			.unwrap()
+			.unwrap();
+		assert_eq!(outline.len(), 1);
+		assert_eq!(outline[0].post_id, "submission");
+		assert_eq!(outline[0].author, "bob");
+	}
+
+	#[test]
+	fn discovery_outline_is_bounded_and_does_not_decode_payloads() {
+		let mut connection = test_connection();
+		let mut posts = (0..300).map(|index| post(&format!("outline-{index:03}"), 1_000 - index as u64)).collect::<Vec<_>>();
+		for (index, post) in posts.iter_mut().enumerate() {
+			post.community = format!("community-{index:03}");
+		}
+		apply_source(
+			&mut connection,
+			"subreddit:outline:new",
+			&source(posts, Some(PersistedRefreshOrigin::Daemon)),
+			&metadata(b"outline", 100),
+			FirstSeen::Daemon,
+		)
+		.unwrap();
+		sync_active_profile_on(&mut connection, b"outline-profile", &[("subreddit:outline:new".to_string(), 0)]).unwrap();
+
+		// An outline query must remain independent of the compressed Post blobs.
+		connection.execute("UPDATE objects SET payload=x'00',payload_codec=99", []).unwrap();
+		let outline = query_profile_discovery_outline_on(&connection, b"outline-profile", 1, None, 10_000, &HashSet::new())
+			.unwrap()
+			.unwrap();
+
+		assert_eq!(outline.len(), 250);
+		assert_eq!(outline[0].post_id, "outline-000");
+		assert_eq!(outline[0].community, "community-000");
+		assert_eq!(outline[249].post_id, "outline-249");
 	}
 
 	#[test]

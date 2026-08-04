@@ -809,7 +809,7 @@ fn build_discovery_navigation_markers(
 	current_url: &str,
 	session_id: &str,
 	current_page: usize,
-	ordered_pages: &[Vec<Post>],
+	ordered_pages: &[Vec<crate::post_cache::FeedNavigationTarget>],
 	current_posts: &[Post],
 	following: bool,
 	show_nsfw: bool,
@@ -821,28 +821,35 @@ fn build_discovery_navigation_markers(
 
 	let mut pages = ordered_pages.to_vec();
 	pages.resize_with(pages.len().max(current_page + 1), Vec::new);
-	pages[current_page] = current_posts.to_vec();
+	pages[current_page] = current_posts
+		.iter()
+		.map(|post| crate::post_cache::FeedNavigationTarget {
+			post_id: post.id.clone(),
+			label: crate::materialized_catalog::discovery_navigation_group(post, following),
+			nsfw: post.flags.nsfw,
+		})
+		.collect();
 
 	let mut markers = Vec::new();
 	let mut previous_label = String::new();
-	for (page, posts) in pages.iter().enumerate() {
-		for post in posts {
-			if post.flags.nsfw && !show_nsfw {
+	for (page, targets) in pages.iter().enumerate() {
+		for target in targets {
+			if target.nsfw && !show_nsfw {
 				continue;
 			}
-			let label = crate::materialized_catalog::discovery_navigation_group(post, following);
+			let label = target.label.clone();
 			if label == previous_label {
 				continue;
 			}
 			previous_label.clone_from(&label);
 			let href = if page == current_page {
-				format!("#{}", post.id)
+				format!("#{}", target.post_id)
 			} else {
-				format!("{}#{}", feed_page_url(current_url, session_id, page), post.id)
+				format!("{}#{}", feed_page_url(current_url, session_id, page), target.post_id)
 			};
 			markers.push(DiscoveryNavigationMarker {
 				label,
-				post_id: post.id.clone(),
+				post_id: target.post_id.clone(),
 				page,
 				href,
 			});
@@ -865,7 +872,7 @@ pub fn discovery_navigation_html(url: &str, session_id: &str, posts: &[Post], sh
 	let current_page = param(&format!("?{}", url.split_once('?').map(|(_, query)| query).unwrap_or_default()), "cache_page")
 		.and_then(|page| page.parse::<usize>().ok())
 		.unwrap_or(0);
-	let Some(ordered_pages) = crate::post_cache::feed_navigation_pages(session_id, crate::post_cache::POSTS_PER_PAGE) else {
+	let Some(ordered_pages) = crate::post_cache::feed_navigation_targets(session_id, crate::post_cache::POSTS_PER_PAGE) else {
 		return String::new();
 	};
 	let markers = build_discovery_navigation_markers(
@@ -3765,6 +3772,22 @@ mod tests {
 		post
 	}
 
+	fn discovery_targets(pages: &[Vec<Post>], following: bool) -> Vec<Vec<crate::post_cache::FeedNavigationTarget>> {
+		pages
+			.iter()
+			.map(|posts| {
+				posts
+					.iter()
+					.map(|post| crate::post_cache::FeedNavigationTarget {
+						post_id: post.id.clone(),
+						label: crate::materialized_catalog::discovery_navigation_group(post, following),
+						nsfw: post.flags.nsfw,
+					})
+					.collect()
+			})
+			.collect()
+	}
+
 	#[test]
 	fn discovery_navigation_marks_source_changes_and_links_across_pages() {
 		let ordered = vec![
@@ -3772,7 +3795,7 @@ mod tests {
 			vec![discovery_post("b1", "beta", "three"), discovery_post("c1", "charlie", "four")],
 		];
 		let current_posts = ordered[0].clone();
-		let markers = build_discovery_navigation_markers("/discovered?t=day", "session-1", 0, &ordered, &current_posts, false, true, 2);
+		let markers = build_discovery_navigation_markers("/discovered?t=day", "session-1", 0, &discovery_targets(&ordered, false), &current_posts, false, true, 2);
 
 		assert_eq!(
 			markers.iter().map(|marker| marker.label.as_str()).collect::<Vec<_>>(),
@@ -3786,13 +3809,46 @@ mod tests {
 	}
 
 	#[test]
+	fn discovery_navigation_links_the_tenth_bounded_page_with_the_same_session() {
+		let ordered = (0..10)
+			.map(|page| vec![discovery_post(&format!("post-{page}"), &format!("source-{page}"), "author")])
+			.collect::<Vec<_>>();
+		let current_posts = ordered[0].clone();
+		let markers = build_discovery_navigation_markers(
+			"/discovered?t=day",
+			"frozen-session",
+			0,
+			&discovery_targets(&ordered, false),
+			&current_posts,
+			false,
+			true,
+			25,
+		);
+
+		assert_eq!(markers.len(), 10);
+		assert_eq!(markers[0].href, "#post-0");
+		assert!(markers[9].href.contains("cache_page=9"));
+		assert!(markers[9].href.contains("feed_session=frozen-session"));
+		assert!(markers[9].href.ends_with("#post-9"));
+	}
+
+	#[test]
 	fn discovery_navigation_uses_same_page_anchors_and_followed_users() {
 		let ordered = vec![
 			vec![discovery_post("a1", "alpha", "alice"), discovery_post("a2", "beta", "alice")],
 			vec![discovery_post("b1", "gamma", "bob"), discovery_post("b2", "delta", "bob")],
 		];
 		let current_posts = ordered[1].clone();
-		let markers = build_discovery_navigation_markers("/following/discovered?cache_page=1", "session-2", 1, &ordered, &current_posts, true, true, 2);
+		let markers = build_discovery_navigation_markers(
+			"/following/discovered?cache_page=1",
+			"session-2",
+			1,
+			&discovery_targets(&ordered, true),
+			&current_posts,
+			true,
+			true,
+			2,
+		);
 
 		assert_eq!(markers.iter().map(|marker| marker.label.as_str()).collect::<Vec<_>>(), vec!["u/alice", "u/bob"]);
 		assert!(markers[0].href.contains("cache_page=0"));
@@ -3806,7 +3862,7 @@ mod tests {
 		hidden.flags.nsfw = true;
 		let final_post = discovery_post("final", "charlie", "three");
 		let ordered = vec![vec![visible, hidden, final_post]];
-		let markers = build_discovery_navigation_markers("/discovered", "session-3", 0, &ordered, &ordered[0], false, false, 3);
+		let markers = build_discovery_navigation_markers("/discovered", "session-3", 0, &discovery_targets(&ordered, false), &ordered[0], false, false, 3);
 
 		assert_eq!(markers.iter().map(|marker| marker.post_id.as_str()).collect::<Vec<_>>(), vec!["visible", "final"]);
 	}

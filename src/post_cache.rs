@@ -527,6 +527,13 @@ pub struct FeedPage {
 	pub ready: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedNavigationTarget {
+	pub post_id: String,
+	pub label: String,
+	pub nsfw: bool,
+}
+
 #[derive(Clone, Serialize)]
 pub struct FeedSessionStatus {
 	pub session_id: String,
@@ -4486,12 +4493,73 @@ pub fn feed_merged_posts(session_id: &str) -> Option<Vec<Post>> {
 	Some(merged_posts_for_session(session))
 }
 
-/// Returns a bounded, sequential view of a session for navigation controls.
+const DISCOVERY_NAVIGATION_MAX_POSTS: usize = 250;
+
+fn feed_navigation_target(post: &Post, following: bool) -> FeedNavigationTarget {
+	FeedNavigationTarget {
+		post_id: post.id.clone(),
+		label: materialized_catalog::discovery_navigation_group(post, following),
+		nsfw: post.flags.nsfw,
+	}
+}
+
+fn outline_navigation_target(entry: crate::cache_sqlite::DiscoveryOutlineEntry, following: bool) -> FeedNavigationTarget {
+	let label = if following {
+		format!("u/{}", entry.author)
+	} else {
+		entry
+			.community
+			.strip_prefix("u_")
+			.map(|name| format!("u/{name}"))
+			.unwrap_or_else(|| format!("r/{}", entry.community))
+	};
+	FeedNavigationTarget {
+		post_id: entry.post_id,
+		label,
+		// The SQLite outline intentionally never reads payload blobs. Painted
+		// pages below replace these projections with authoritative NSFW flags.
+		nsfw: false,
+	}
+}
+
+fn paginate_navigation_targets(
+	projected_targets: &[FeedNavigationTarget],
+	frozen_pages: &HashMap<usize, Vec<FeedNavigationTarget>>,
+	per_page: usize,
+) -> Vec<Vec<FeedNavigationTarget>> {
+	if per_page == 0 {
+		return Vec::new();
+	}
+	let max_frozen_page = frozen_pages.keys().copied().max().unwrap_or(0);
+	let union_count = projected_targets
+		.iter()
+		.map(|target| target.post_id.as_str())
+		.chain(frozen_pages.values().flatten().map(|target| target.post_id.as_str()))
+		.collect::<HashSet<_>>()
+		.len();
+	let page_count = union_count.div_ceil(per_page).max(max_frozen_page + 1);
+	let mut seen_ids = HashSet::new();
+	let mut navigation_pages = Vec::with_capacity(page_count);
+	for page in 0..page_count {
+		let page_targets = frozen_pages.get(&page).cloned().unwrap_or_else(|| {
+			projected_targets
+				.iter()
+				.filter(|target| !seen_ids.contains(&target.post_id))
+				.take(per_page)
+				.cloned()
+				.collect()
+		});
+		navigation_pages.push(page_targets.into_iter().filter(|target| seen_ids.insert(target.post_id.clone())).collect());
+	}
+	navigation_pages
+}
+
+/// Returns a bounded sequential outline for discovery navigation.
 ///
-/// Already-painted pages keep their frozen contents. Unpainted pages are
-/// projected from the current merged timeline while excluding every post
-/// assigned to an earlier page, matching the no-overlap pagination contract.
-pub fn feed_navigation_pages(session_id: &str, per_page: usize) -> Option<Vec<Vec<Post>>> {
+/// SQLite-backed discovery sessions project up to ten normal pages from card
+/// metadata only. Already-painted pages keep their exact frozen targets. The
+/// legacy path remains bounded by the session's existing merged window.
+pub fn feed_navigation_targets(session_id: &str, per_page: usize) -> Option<Vec<Vec<FeedNavigationTarget>>> {
 	if per_page == 0 {
 		return Some(Vec::new());
 	}
@@ -4501,21 +4569,38 @@ pub fn feed_navigation_pages(session_id: &str, per_page: usize) -> Option<Vec<Ve
 		return None;
 	}
 	reconcile_session_with_source_cache(session);
-	let merged = merged_posts_for_session(session);
-	let max_frozen_page = session.frozen_pages.keys().copied().max().unwrap_or(0);
-	let page_count = merged.len().div_ceil(per_page).max(max_frozen_page + 1);
-	let mut seen_ids = HashSet::new();
-	let mut navigation_pages = Vec::with_capacity(page_count);
-
-	for page in 0..page_count {
-		let page_posts = session
-			.frozen_pages
-			.get(&page)
-			.cloned()
-			.unwrap_or_else(|| merged.iter().filter(|post| !seen_ids.contains(&post.id)).take(per_page).cloned().collect::<Vec<_>>());
-		navigation_pages.push(page_posts.into_iter().filter(|post| seen_ids.insert(post.id.clone())).collect());
-	}
-	Some(navigation_pages)
+	let following = session.request.bundle_followed_user_comments;
+	let snapshot_generation = SQLITE_SESSION_CURSORS
+		.lock()
+		.ok()
+		.and_then(|cursors| cursors.get(&session.id).and_then(|state| state.after_page.values().next()).map(|cursor| cursor.generation));
+	let sqlite_outline = sqlite_timeline_selection(session)
+		.filter(|(_, sort)| *sort == crate::cache_sqlite::TimelineSort::Discovered)
+		.and_then(|(view_kind, _)| {
+			match crate::cache_sqlite::query_profile_discovery_outline(
+				session.request.profile_id.as_bytes(),
+				view_kind,
+				snapshot_generation,
+				DISCOVERY_NAVIGATION_MAX_POSTS,
+				&session.request.filters,
+			) {
+				Ok(outline) => outline,
+				Err(error) => {
+					warn!("post_cache: SQLite discovery outline read failed; using the hydrated navigation window: {error}");
+					None
+				}
+			}
+		});
+	let merged = sqlite_outline.is_none().then(|| merged_posts_for_session(session));
+	let mut projected_targets = sqlite_outline
+		.map(|entries| entries.into_iter().map(|entry| outline_navigation_target(entry, following)).collect::<Vec<_>>())
+		.unwrap_or_else(|| merged.unwrap_or_default().iter().map(|post| feed_navigation_target(post, following)).collect());
+	let frozen_targets = session
+		.frozen_pages
+		.iter()
+		.map(|(page, posts)| (*page, posts.iter().map(|post| feed_navigation_target(post, following)).collect()))
+		.collect();
+	Some(paginate_navigation_targets(&projected_targets, &frozen_targets, per_page))
 }
 
 pub fn feed_session_page_metrics(session_id: &str, per_page: usize) -> Option<Vec<FeedSessionPageMetric>> {
@@ -4942,7 +5027,7 @@ mod tests {
 		count_sources_in_state, daemon_should_continue_after_refresh, effective_freshness_target_secs, enforce_source_cache_limits_locked, ensure_feed_session_with_budget,
 		estimate_post_interval_secs, feed_page, feed_status, finalize_session_posts, followup_source_budget, freeze_feed_page, get_cached_source_page,
 		has_active_browser_sessions, initial_source_budget_target, mark_deleted_reddit_media_url, mark_fetching_sources_failed, max_sync_source_budget, merged_posts_for_session,
-		merged_posts_for_session_live, nearest_semantic_entry_index, ordered_refresh_entries_with_fairness, pick_next_remembered_feed_to_refresh,
+		merged_posts_for_session_live, nearest_semantic_entry_index, ordered_refresh_entries_with_fairness, paginate_navigation_targets, pick_next_remembered_feed_to_refresh,
 		pick_next_remembered_feed_to_refresh_with_mode, pick_next_remembered_subreddit_to_refresh, plan_session_warm_mode, predicted_next_fetch_secs_for_position,
 		prune_feed_sessions_locked, prune_source_cache, publish_plain_subreddit_refresh, publish_remembered_source_refresh_with_token, random_rotation_seed_for_time,
 		reconcile_profile_memberships, reconcile_session_with_source_cache, record_plain_subreddit_refresh_failure, record_remembered_feed_feedback_signal_delta,
@@ -4952,7 +5037,8 @@ mod tests {
 		snapshot_persisted_remembered_subreddits, snapshot_persisted_source_entries, snapshot_persisted_source_unavailability, sort_posts_by_deterministic_random,
 		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id,
 		sqlite_timeline_page_for_session_with_query, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin, store_source_posts_with_token,
-		store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedSession, FeedSessionRequest, FeedSort,
+		store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedNavigationTarget, FeedSession,
+		FeedSessionRequest, FeedSort,
 		FeedSource, RefreshOrigin, RememberedDaemonSemanticBundle, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry,
 		SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, SqliteSessionCursorState, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
 		BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS,
@@ -7734,6 +7820,24 @@ mod tests {
 
 		discovered.request.bundle_followed_user_comments = true;
 		assert_eq!(sqlite_timeline_selection(&discovered), Some((2, crate::cache_sqlite::TimelineSort::Discovered)));
+	}
+
+	#[test]
+	fn navigation_projection_fills_future_pages_after_frozen_ids() {
+		let target = |id: &str| FeedNavigationTarget {
+			post_id: id.to_string(),
+			label: format!("r/{id}"),
+			nsfw: false,
+		};
+		let projected = ["a", "b", "c", "d", "e"].into_iter().map(target).collect::<Vec<_>>();
+		let frozen = HashMap::from([(0, vec![target("b"), target("c")])]);
+
+		let pages = paginate_navigation_targets(&projected, &frozen, 2);
+
+		assert_eq!(pages.len(), 3);
+		assert_eq!(pages[0].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
+		assert_eq!(pages[1].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["a", "d"]);
+		assert_eq!(pages[2].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["e"]);
 	}
 
 	#[test]
