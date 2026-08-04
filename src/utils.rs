@@ -1446,6 +1446,13 @@ pub async fn author_external_links(name: &str) -> Vec<ExternalLink> {
 	links
 }
 
+/// Whether an author name can safely use the existing `u_<name>` preference
+/// semantics. Listing actions must not offer filters for deleted, unknown, or
+/// otherwise unusable author identities.
+pub fn filterable_author_name(name: &str) -> bool {
+	!name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 pub fn cached_author_external_links(name: &str) -> Vec<ExternalLink> {
 	cached_author_links(name).unwrap_or_default()
 }

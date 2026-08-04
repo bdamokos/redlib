@@ -3930,6 +3930,94 @@ mod tests {
 	}
 
 	#[test]
+	fn listing_renders_identified_author_filter_actions_for_full_and_deferred_cards() {
+		let posts = (1..=7)
+			.map(|index| {
+				let mut post = test_post();
+				post.id = format!("filter{index}");
+				post.permalink = format!("/r/demo_sub/comments/filter{index}/");
+				post
+			})
+			.collect();
+		let html = FeedFragmentTemplate {
+			posts,
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert_eq!(html.matches("data-post-author-action=\"permanent-filter\"").count(), 7);
+		assert_eq!(html.matches("data-post-author-action=\"temporary-filter\"").count(), 7);
+		assert_eq!(html.matches("data-subscription-target=\"user:u_demo_user\"").count(), 7);
+		assert_eq!(html.matches("Filter u/demo_user</span>").count(), 7);
+		assert!(html.contains("data-post-component-id=\"filter7\""));
+	}
+
+	#[test]
+	fn listing_author_filter_action_handles_gallery_and_followed_comment_bundle_cards() {
+		let mut gallery = test_post();
+		gallery.id = "gallery-filter".to_string();
+		gallery.post_type = "gallery".to_string();
+		let mut bundle = test_post();
+		bundle.id = "bundle-filter".to_string();
+		bundle.following_comments = vec![test_following_comment()];
+
+		let html = FeedFragmentTemplate {
+			posts: vec![gallery, bundle],
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/following".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert_eq!(html.matches("data-post-author-action=\"permanent-filter\"").count(), 2);
+		assert!(html.contains("class=\"post post_following_bundle\""));
+	}
+
+	#[test]
+	fn listing_omits_author_actions_for_deleted_and_unknown_authors() {
+		let mut deleted = test_post();
+		deleted.id = "deleted-author".to_string();
+		deleted.author.name = "[deleted]".to_string();
+		let mut unknown = test_post();
+		unknown.id = "unknown-author".to_string();
+		unknown.author.name = "[unknown]".to_string();
+
+		let html = FeedFragmentTemplate {
+			posts: vec![deleted, unknown],
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert!(!html.contains("data-post-author-actions"));
+		assert!(!html.contains("data-post-author-action=\"permanent-filter\""));
+	}
+
+	#[test]
 	fn deferred_feed_rows_mark_followed_authors() {
 		let posts = (1..=7)
 			.map(|index| {

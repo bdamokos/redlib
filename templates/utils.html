@@ -351,7 +351,7 @@
 {%- endmacro %}
 
 {% macro mobile_post_author_actions(post, redirect_url) -%}
-{% if !post.author.name.is_empty() && !str_eq(post.author.name, "[deleted]") %}
+{% if crate::utils::filterable_author_name(post.author.name.as_str()) %}
 {% set is_followed_author = prefs.has_followed_user(post.author.name.as_str()) %}
 <div class="mobile_post_author_actions" data-post-author-actions>
 	<button
@@ -366,9 +366,12 @@
 		class="post_author_action_button post_author_permanent_filter_button"
 		type="button"
 		data-post-author-action="permanent-filter"
-		aria-label="Permanently filter u/{{ post.author.name }}"
-		title="Permanently filter u/{{ post.author.name }}">
-		X
+		aria-label="Filter posts from u/{{ post.author.name }}"
+		title="Filter posts from u/{{ post.author.name }}">
+		<svg class="post_author_filter_icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+			<path d="M2 3h12l-4.6 5.1v3.7l-2.8 1.4V8.1L2 3Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+		</svg>
+		<span>Filter u/{{ post.author.name }}</span>
 	</button>
 	<form
 		class="inline_subscription_form post_author_follow_form"

@@ -2471,6 +2471,12 @@ a.search_subreddit_link:hover {
 }
 
 .mobile_post_author_actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+}
+
+.mobile_post_author_actions > :not(.post_author_permanent_filter_button) {
     display: none;
 }
 
@@ -2513,8 +2519,26 @@ a.search_subreddit_link:hover {
 }
 
 .post_author_permanent_filter_button {
+    width: auto;
+    padding: 0 7px;
+    gap: 4px;
     border-color: color-mix(in srgb, #d73a49 55%, transparent);
     color: color-mix(in srgb, #d73a49 78%, var(--text) 22%);
+    opacity: 1;
+}
+
+.post_author_filter_icon {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+}
+
+@media (max-width: 1024px), (pointer: coarse) {
+    .post_author_permanent_filter_button {
+        min-width: 44px;
+        min-height: 44px;
+        padding-inline: 10px;
+    }
 }
 
 .post_author_follow_form[data-subscription-state="subscribed"] .post_author_follow_button {
@@ -5186,6 +5210,19 @@ th {
         display: inline-flex;
         align-items: center;
         gap: 3px;
+    }
+
+    .mobile_post_author_actions > :not(.post_author_permanent_filter_button) {
+        display: inline-flex;
+    }
+
+    .post_author_action_button {
+        min-width: 44px;
+        min-height: 44px;
+    }
+
+    .post_author_permanent_filter_button {
+        padding-inline: 10px;
     }
 
     .replies > .comment {
