@@ -8230,6 +8230,13 @@ fn test_default_prefs_serialization_loop_bincode() {
 }
 
 #[test]
+fn top_feed_dropdown_home_targets_discovered() {
+	let template = include_str!("../templates/utils.html");
+	assert!(template.contains(r#"<a href="/discovered">Home</a>"#));
+	assert!(!template.contains(r#"<a href="/new">Home</a>"#));
+}
+
+#[test]
 fn test_redgifs_filter_exemptions_revisioned_round_trip() {
 	let mut prefs = Preferences::default();
 	prefs.redgifs_filter_exempt_subreddits = vec!["r/FanCommunity".to_string(), "anothercommunity".to_string()];
