@@ -4592,7 +4592,7 @@ pub fn feed_navigation_targets(session_id: &str, per_page: usize) -> Option<Vec<
 			}
 		});
 	let merged = sqlite_outline.is_none().then(|| merged_posts_for_session(session));
-	let mut projected_targets = sqlite_outline
+	let projected_targets = sqlite_outline
 		.map(|entries| entries.into_iter().map(|entry| outline_navigation_target(entry, following)).collect::<Vec<_>>())
 		.unwrap_or_else(|| merged.unwrap_or_default().iter().map(|post| feed_navigation_target(post, following)).collect());
 	let frozen_targets = session
@@ -5038,12 +5038,11 @@ mod tests {
 		sort_posts_by_deterministic_random_with_seed, sort_sources, source_budget_target, source_cache_is_servable, source_cache_revision, sqlite_active_profile_id,
 		sqlite_timeline_page_for_session_with_query, sqlite_timeline_selection, store_source_posts, store_source_posts_with_origin, store_source_posts_with_token,
 		store_source_posts_with_token_and_effects, sync_sources_to_request, warm_targets, ActiveBrowserSession, CachedSourcePosts, FeedNavigationTarget, FeedSession,
-		FeedSessionRequest, FeedSort,
-		FeedSource, RefreshOrigin, RememberedDaemonSemanticBundle, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome, RememberedSubredditEntry,
-		SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, SqliteSessionCursorState, ACTIVE_BROWSER_SESSIONS, ACTIVE_BROWSER_SESSION_TTL_SECS,
-		BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS, FEED_SESSIONS, MAX_FEED_SESSIONS,
-		MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS,
-		REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_DAEMON_SEMANTIC_BUNDLE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS,
+		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedDaemonSemanticBundle, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome,
+		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, SqliteSessionCursorState, ACTIVE_BROWSER_SESSIONS,
+		ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS,
+		FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS,
+		RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_DAEMON_SEMANTIC_BUNDLE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS,
 		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION,
 		SOURCE_REFRESH_STATES, SQLITE_SESSION_CURSORS, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL,
 		TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,

@@ -3930,6 +3930,38 @@ mod tests {
 	}
 
 	#[test]
+	fn listing_renders_compact_popup_free_author_actions_for_full_and_deferred_cards() {
+		let posts = (1..=7)
+			.map(|index| {
+				let mut post = test_post();
+				post.id = format!("filter{index}");
+				post.permalink = format!("/r/demo_sub/comments/filter{index}/");
+				post
+			})
+			.collect();
+		let html = FeedFragmentTemplate {
+			posts,
+			prev_page_url: String::new(),
+			next_page_url: String::new(),
+			prefs: test_prefs(),
+			url: "/discovered".to_string(),
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			show_contextual_pagination: false,
+			contextual_pagination: Vec::new(),
+		}
+		.render()
+		.unwrap();
+
+		assert_eq!(html.matches("data-post-author-action=\"temporary-filter\"").count(), 7);
+		assert_eq!(html.matches("data-post-author-action=\"permanent-filter\"").count(), 7);
+		assert_eq!(html.matches("data-subscribe-label=\"F\"").count(), 7);
+		assert!(!html.contains("Filter u/demo_user</span>"));
+		assert!(html.contains("data-post-component-id=\"filter7\""));
+	}
+
+	#[test]
 	fn deferred_feed_rows_mark_followed_authors() {
 		let posts = (1..=7)
 			.map(|index| {
