@@ -2471,7 +2471,9 @@ a.search_subreddit_link:hover {
 }
 
 .mobile_post_author_actions {
-    display: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
 }
 
 .post_author_follow_form {
