@@ -691,6 +691,14 @@ fn default_post_sort_setting(prefs: &Preferences) -> String {
 	}
 }
 
+fn default_front_page_sort(front_page_is_default: bool, front_page_is_following: bool, prefs: &Preferences) -> String {
+	if front_page_is_default || front_page_is_following {
+		"discovered".to_string()
+	} else {
+		default_post_sort_setting(prefs)
+	}
+}
+
 fn sort_option_label(method: &str) -> String {
 	match method {
 		"video-length" => "Video Length".to_string(),
@@ -2169,11 +2177,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let front_page_is_following = is_following_front_page(&front_page);
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
-	let post_sort = if front_page_is_following {
-		"new".to_string()
-	} else {
-		default_post_sort_setting(&prefs)
-	};
+	let post_sort = default_front_page_sort(front_page_is_default, front_page_is_following, &prefs);
 	let requested_sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 	if req.param("sub").is_some() && is_random_sort(&requested_sort) {
 		return Ok(redirect(&canonical_new_sort_url(&path, req.uri().query())));
@@ -2504,11 +2508,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 	let front_page_is_following = is_following_front_page(&front_page);
 	let followed_users = followed_user_subscriptions(&prefs);
 	let has_followed_users = !followed_users.is_empty();
-	let post_sort = if front_page_is_following {
-		"new".to_string()
-	} else {
-		default_post_sort_setting(&prefs)
-	};
+	let post_sort = default_front_page_sort(front_page_is_default, front_page_is_following, &prefs);
 	let requested_sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 	if is_subreddit_route && is_random_sort(&requested_sort) {
 		return Ok(redirect(&canonical_new_sort_url(&request_path, req.uri().query())));
@@ -4442,6 +4442,53 @@ mod tests {
 		assert!(!html.contains("from daemon cache"), "{html}");
 	}
 
+	#[tokio::test]
+	async fn personalized_home_without_explicit_sort_selects_discovered() {
+		let source = FeedSource::subreddit("home_discovered_default", FeedSort::New);
+		post_cache::store_source_posts_for_cache(
+			&source,
+			vec![metric_post("home-discovered-default-post", "home_discovered_default", 1_000, 42, false)],
+			String::new(),
+			Some(RefreshOrigin::Daemon),
+		);
+
+		let req = Request::builder()
+			.uri("/")
+			.header("cookie", "subscriptions=home_discovered_default; post_sort=new")
+			.body(Body::empty())
+			.unwrap();
+		let response = super::community(req).await.expect("home response");
+		let body = hyper::body::to_bytes(response.into_body()).await.expect("home body");
+		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
+
+		assert!(html.contains("class=\"selected\" href=\"/discovered\">Discovered</a>"), "{html}");
+		assert!(!html.contains("class=\"selected\" href=\"/new\">Chronological</a>"), "{html}");
+	}
+
+	#[tokio::test]
+	async fn following_without_explicit_sort_selects_discovered() {
+		let username = "u_following_discovered_default";
+		let submitted_source = FeedSource::subreddit(username, FeedSort::New);
+		let comments_source = FeedSource::user_comments(username, FeedSort::New);
+		let mut cached_post = metric_post("following-discovered-default-post", username, 1_000, 42, false);
+		cached_post.author.name = username.trim_start_matches("u_").to_string();
+
+		post_cache::store_source_posts_for_cache(&submitted_source, vec![cached_post], String::new(), Some(RefreshOrigin::Daemon));
+		post_cache::store_source_posts_for_cache(&comments_source, Vec::new(), String::new(), Some(RefreshOrigin::Daemon));
+
+		let req = Request::builder()
+			.uri("/following")
+			.header("cookie", format!("subscriptions={username}; post_sort=new"))
+			.body(Body::empty())
+			.unwrap();
+		let response = super::community(req).await.expect("following response");
+		let body = hyper::body::to_bytes(response.into_body()).await.expect("following body");
+		let html = String::from_utf8(body.to_vec()).expect("utf-8 html");
+
+		assert!(html.contains("class=\"selected\" href=\"/following/discovered\">Discovered</a>"), "{html}");
+		assert!(!html.contains("class=\"selected\" href=\"/following/new\">Chronological</a>"), "{html}");
+	}
+
 	#[test]
 	fn subreddit_shell_keeps_subscription_controls_available() {
 		let mut prefs = test_prefs();
@@ -5270,6 +5317,16 @@ mod tests {
 		assert!(sources
 			.iter()
 			.all(|source| matches!(source, FeedSource::Subreddit { sort: FeedSort::New, .. } | FeedSource::Flair { sort: FeedSort::New, .. })));
+	}
+
+	#[test]
+	fn personalized_front_pages_default_to_discovered_without_changing_subreddits() {
+		let mut prefs = test_prefs();
+		prefs.post_sort = "new".to_string();
+
+		assert_eq!(super::default_front_page_sort(true, false, &prefs), "discovered");
+		assert_eq!(super::default_front_page_sort(false, true, &prefs), "discovered");
+		assert_eq!(super::default_front_page_sort(false, false, &prefs), "new");
 	}
 
 	#[test]
