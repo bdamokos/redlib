@@ -874,7 +874,11 @@ fn escape_html_attribute(value: &str) -> String {
 /// feeds. Kept as a helper so the existing Askama listing templates do not need
 /// parallel navigation fields threaded through every non-discovery renderer.
 pub fn discovery_navigation_html(url: &str, session_id: &str, posts: &[Post], show_nsfw: bool) -> String {
-	if session_id.is_empty() || !url.split('?').next().unwrap_or_default().ends_with("/discovered") {
+	// The listing template calls this helper only when the effective sort is
+	// Discovered. Bare Home and Following routes can resolve to that sort without
+	// carrying `/discovered` in the URL, so the session—not the literal path—is
+	// the authority for whether navigation can be rendered.
+	if session_id.is_empty() {
 		return String::new();
 	}
 	let current_page = param(&format!("?{}", url.split_once('?').map(|(_, query)| query).unwrap_or_default()), "cache_page")
@@ -3809,6 +3813,32 @@ mod tests {
 	}
 
 	#[test]
+	fn bare_home_discovery_navigation_preserves_cross_page_session_links() {
+		let ordered = vec![vec![discovery_post("home-a", "alpha", "one")], vec![discovery_post("home-b", "beta", "two")]];
+		let markers = build_discovery_navigation_markers("/", "bare-home-session", 0, &discovery_targets(&ordered, false), &ordered[0], false, true, 1);
+
+		assert_eq!(markers.len(), 2);
+		assert_eq!(markers[0].href, "#home-a");
+		assert!(markers[1].href.starts_with("/?"));
+		assert!(markers[1].href.contains("feed_session=bare-home-session"));
+		assert!(markers[1].href.contains("cache_page=1"));
+		assert!(markers[1].href.ends_with("#home-b"));
+	}
+
+	#[test]
+	fn bare_following_discovery_navigation_preserves_cross_page_session_links() {
+		let ordered = vec![vec![discovery_post("following-a", "alpha", "alice")], vec![discovery_post("following-b", "beta", "bob")]];
+		let markers = build_discovery_navigation_markers("/following", "bare-following-session", 0, &discovery_targets(&ordered, true), &ordered[0], true, true, 1);
+
+		assert_eq!(markers.iter().map(|marker| marker.label.as_str()).collect::<Vec<_>>(), vec!["u/alice", "u/bob"]);
+		assert_eq!(markers[0].href, "#following-a");
+		assert!(markers[1].href.starts_with("/following?"));
+		assert!(markers[1].href.contains("feed_session=bare-following-session"));
+		assert!(markers[1].href.contains("cache_page=1"));
+		assert!(markers[1].href.ends_with("#following-b"));
+	}
+
+	#[test]
 	fn discovery_navigation_links_the_tenth_bounded_page_with_the_same_session() {
 		let ordered = (0..10)
 			.map(|page| vec![discovery_post(&format!("post-{page}"), &format!("source-{page}"), "author")])
@@ -4444,17 +4474,21 @@ mod tests {
 
 	#[tokio::test]
 	async fn personalized_home_without_explicit_sort_selects_discovered() {
-		let source = FeedSource::subreddit("home_discovered_default", FeedSort::New);
-		post_cache::store_source_posts_for_cache(
-			&source,
-			vec![metric_post("home-discovered-default-post", "home_discovered_default", 1_000, 42, false)],
-			String::new(),
-			Some(RefreshOrigin::Daemon),
-		);
+		for (source_name, post_id, created) in [
+			("home_discovered_default_a", "home-discovered-default-a", 1_001),
+			("home_discovered_default_b", "home-discovered-default-b", 1_000),
+		] {
+			post_cache::store_source_posts_for_cache(
+				&FeedSource::subreddit(source_name, FeedSort::New),
+				vec![metric_post(post_id, source_name, created, 42, false)],
+				String::new(),
+				Some(RefreshOrigin::Daemon),
+			);
+		}
 
 		let req = Request::builder()
 			.uri("/")
-			.header("cookie", "subscriptions=home_discovered_default; post_sort=new")
+			.header("cookie", "subscriptions=home_discovered_default_a%2Bhome_discovered_default_b; post_sort=new")
 			.body(Body::empty())
 			.unwrap();
 		let response = super::community(req).await.expect("home response");
@@ -4463,22 +4497,28 @@ mod tests {
 
 		assert!(html.contains("class=\"selected\" href=\"/discovered\">Discovered</a>"), "{html}");
 		assert!(!html.contains("class=\"selected\" href=\"/new\">Chronological</a>"), "{html}");
+		assert!(html.contains("class=\"discovery_navigation\""), "{html}");
+		assert!(html.matches("discovery_navigation_marker").count() >= 2, "{html}");
 	}
 
 	#[tokio::test]
 	async fn following_without_explicit_sort_selects_discovered() {
-		let username = "u_following_discovered_default";
-		let submitted_source = FeedSource::subreddit(username, FeedSort::New);
-		let comments_source = FeedSource::user_comments(username, FeedSort::New);
-		let mut cached_post = metric_post("following-discovered-default-post", username, 1_000, 42, false);
-		cached_post.author.name = username.trim_start_matches("u_").to_string();
-
-		post_cache::store_source_posts_for_cache(&submitted_source, vec![cached_post], String::new(), Some(RefreshOrigin::Daemon));
-		post_cache::store_source_posts_for_cache(&comments_source, Vec::new(), String::new(), Some(RefreshOrigin::Daemon));
+		let usernames = ["u_following_discovered_default_a", "u_following_discovered_default_b"];
+		for (index, username) in usernames.iter().enumerate() {
+			let mut cached_post = metric_post(&format!("following-discovered-default-{index}"), username, 1_001 - index as u64, 42, false);
+			cached_post.author.name = username.trim_start_matches("u_").to_string();
+			post_cache::store_source_posts_for_cache(
+				&FeedSource::subreddit(*username, FeedSort::New),
+				vec![cached_post],
+				String::new(),
+				Some(RefreshOrigin::Daemon),
+			);
+			post_cache::store_source_posts_for_cache(&FeedSource::user_comments(*username, FeedSort::New), Vec::new(), String::new(), Some(RefreshOrigin::Daemon));
+		}
 
 		let req = Request::builder()
 			.uri("/following")
-			.header("cookie", format!("subscriptions={username}; post_sort=new"))
+			.header("cookie", "subscriptions=u_following_discovered_default_a%2Bu_following_discovered_default_b; post_sort=new")
 			.body(Body::empty())
 			.unwrap();
 		let response = super::community(req).await.expect("following response");
@@ -4487,6 +4527,8 @@ mod tests {
 
 		assert!(html.contains("class=\"selected\" href=\"/following/discovered\">Discovered</a>"), "{html}");
 		assert!(!html.contains("class=\"selected\" href=\"/following/new\">Chronological</a>"), "{html}");
+		assert!(html.contains("class=\"discovery_navigation\""), "{html}");
+		assert!(html.matches("discovery_navigation_marker").count() >= 2, "{html}");
 	}
 
 	#[test]
