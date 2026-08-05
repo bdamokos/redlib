@@ -4522,6 +4522,14 @@ fn outline_navigation_target(entry: crate::cache_sqlite::DiscoveryOutlineEntry, 
 	}
 }
 
+fn catalog_navigation_target(entry: materialized_catalog::CatalogDiscoveryNavigationTarget) -> FeedNavigationTarget {
+	FeedNavigationTarget {
+		post_id: entry.post_id,
+		label: entry.label,
+		nsfw: entry.nsfw,
+	}
+}
+
 fn paginate_navigation_targets(
 	projected_targets: &[FeedNavigationTarget],
 	frozen_pages: &HashMap<usize, Vec<FeedNavigationTarget>>,
@@ -4591,9 +4599,14 @@ pub fn feed_navigation_targets(session_id: &str, per_page: usize) -> Option<Vec<
 				}
 			}
 		});
-	let merged = sqlite_outline.is_none().then(|| merged_posts_for_session(session));
+	let catalog_outline = sqlite_outline
+		.is_none()
+		.then(|| materialized_catalog::query_mixed_feed_session_discovery_navigation(session, DISCOVERY_NAVIGATION_MAX_POSTS))
+		.flatten();
+	let merged = (sqlite_outline.is_none() && catalog_outline.is_none()).then(|| merged_posts_for_session(session));
 	let projected_targets = sqlite_outline
 		.map(|entries| entries.into_iter().map(|entry| outline_navigation_target(entry, following)).collect::<Vec<_>>())
+		.or_else(|| catalog_outline.map(|entries| entries.into_iter().map(catalog_navigation_target).collect::<Vec<_>>()))
 		.unwrap_or_else(|| merged.unwrap_or_default().iter().map(|post| feed_navigation_target(post, following)).collect());
 	let frozen_targets = session
 		.frozen_pages
@@ -7837,6 +7850,60 @@ mod tests {
 		assert_eq!(pages[0].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
 		assert_eq!(pages[1].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["a", "d"]);
 		assert_eq!(pages[2].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["e"]);
+	}
+
+	#[test]
+	fn legacy_discovery_navigation_uses_compact_metadata_through_page_nine_without_resident_sources() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let sources = (0..40)
+			.map(|source_index| {
+				let community = format!("outline-{source_index:02}");
+				let source = new_source(&community);
+				let posts = (0..8)
+					.map(|post_index| {
+						test_post(
+							&format!("outline-{source_index:02}-{post_index:02}"),
+							&community,
+							10_000 - (source_index * 8 + post_index) as u64,
+						)
+					})
+					.collect::<Vec<_>>();
+				crate::materialized_catalog::apply_mixed_feed_source_refresh(&source, &posts);
+				source
+			})
+			.collect::<Vec<_>>();
+		assert!(SOURCE_CACHE.lock().unwrap_or_else(|err| err.into_inner()).is_empty());
+
+		let session_id = "legacy-discovery-outline".to_string();
+		let session = FeedSession {
+			id: session_id.clone(),
+			request: FeedSessionRequest {
+				profile_id: "no-sqlite-outline".to_string(),
+				sources: sources.clone(),
+				filters: HashSet::new(),
+				merge_sort: Some(FeedSort::New),
+				daemon_discovery_order: true,
+				..Default::default()
+			},
+			sources: sources.into_iter().map(|source| session_entry(source, SessionSourceState::Unstarted)).collect(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: false,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+		FEED_SESSIONS.lock().unwrap_or_else(|err| err.into_inner()).insert(session_id.clone(), session);
+
+		let pages = super::feed_navigation_targets(&session_id, POSTS_PER_PAGE).expect("legacy outline");
+		assert_eq!(pages.len(), 10);
+		assert_eq!(pages.iter().map(Vec::len).sum::<usize>(), 250);
+		assert_eq!(pages[9].len(), POSTS_PER_PAGE);
+		assert!(pages[9].iter().all(|target| target.label.starts_with("r/outline-")));
+		assert!(SOURCE_CACHE.lock().unwrap_or_else(|err| err.into_inner()).is_empty());
+		reset_test_caches();
 	}
 
 	#[test]

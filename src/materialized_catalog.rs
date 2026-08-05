@@ -272,6 +272,16 @@ pub(crate) struct CatalogPageMetricCandidate {
 	pub stickied: bool,
 }
 
+/// Lightweight discovery-rail metadata sourced from the bounded persisted-feed
+/// index. It deliberately excludes bodies, media, comments, and other `Post`
+/// payload data so extending the rail never hydrates or clones full cards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogDiscoveryNavigationTarget {
+	pub post_id: String,
+	pub label: String,
+	pub nsfw: bool,
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedCatalogRecord {
@@ -1669,6 +1679,17 @@ fn mixed_feed_record_is_visible(record: &MixedFeedRecord, allowed_keys: &HashSet
 	!crate::utils::is_deleted_reddit_placeholder_post(&record.post)
 }
 
+fn mixed_feed_discovery_stamp(record: &MixedFeedRecord, discovery: &FollowingDiscoveryState) -> FollowingDiscoveryStamp {
+	std::iter::once(record.post.id.as_str())
+		.chain(record.post.following_comments.iter().map(|comment| comment.id.as_str()))
+		.filter_map(|post_id| discovery.posts.get(post_id).copied())
+		.max_by_key(|stamp| (stamp.discovered_at_unix, stamp.sequence))
+		.unwrap_or(FollowingDiscoveryStamp {
+			discovered_at_unix: 0,
+			sequence: 0,
+		})
+}
+
 fn query_mixed_feed_for_keys_limited(
 	catalog: &MixedFeedCatalog,
 	allowed_keys: &HashSet<CatalogSourceKey>,
@@ -1728,17 +1749,7 @@ fn query_mixed_feed_for_keys_limited(
 			.posts_by_id
 			.values()
 			.filter(|record| mixed_feed_record_is_visible(record, allowed_keys, filters))
-			.map(|record| {
-				let stamp = std::iter::once(record.post.id.as_str())
-					.chain(record.post.following_comments.iter().map(|comment| comment.id.as_str()))
-					.filter_map(|post_id| discovery.posts.get(post_id).copied())
-					.max_by_key(|stamp| (stamp.discovered_at_unix, stamp.sequence))
-					.unwrap_or(FollowingDiscoveryStamp {
-						discovered_at_unix: 0,
-						sequence: 0,
-					});
-				(stamp, record.post.clone())
-			})
+			.map(|record| (mixed_feed_discovery_stamp(record, &discovery), record.post.clone()))
 			.collect::<Vec<_>>();
 		posts.sort_by(|left, right| {
 			right
@@ -1774,6 +1785,64 @@ fn query_mixed_feed_for_keys_limited(
 	});
 	posts.truncate(limit);
 	Some(posts)
+}
+
+/// Query Home discovery navigation from the compact persisted-feed index
+/// without cloning any `Post`. The index is already bounded to a soft 4,096
+/// records (with one protected record per source), while callers bound the
+/// returned outline to ten normal pages.
+pub(crate) fn query_mixed_feed_session_discovery_navigation(session: &FeedSession, limit: usize) -> Option<Vec<CatalogDiscoveryNavigationTarget>> {
+	if session.request.bundle_followed_user_comments || !session.request.daemon_discovery_order || limit == 0 {
+		return None;
+	}
+	let allowed_keys = requested_source_keys_for_session(session);
+	if allowed_keys.is_empty() {
+		return Some(Vec::new());
+	}
+	let catalog = MIXED_FEED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
+	let has_cached_source = allowed_keys
+		.iter()
+		.any(|source_key| catalog.source_to_post_ids.get(source_key).is_some_and(|post_ids| !post_ids.is_empty()));
+	if !has_cached_source {
+		return None;
+	}
+
+	let discovery = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let mut targets = catalog
+		.posts_by_id
+		.values()
+		.filter(|record| mixed_feed_record_is_visible(record, &allowed_keys, &session.request.filters))
+		.map(|record| {
+			let stamp = mixed_feed_discovery_stamp(record, &discovery);
+			let post = &record.post;
+			let label = post
+				.community
+				.strip_prefix("u_")
+				.map(|name| format!("u/{name}"))
+				.unwrap_or_else(|| format!("r/{}", post.community));
+			(
+				stamp,
+				post.created_ts,
+				post.id.clone(),
+				CatalogDiscoveryNavigationTarget {
+					post_id: post.id.clone(),
+					label,
+					nsfw: post.flags.nsfw,
+				},
+			)
+		})
+		.collect::<Vec<_>>();
+	targets.sort_by(|left, right| {
+		right
+			.0
+			.discovered_at_unix
+			.cmp(&left.0.discovered_at_unix)
+			.then_with(|| right.0.sequence.cmp(&left.0.sequence))
+			.then_with(|| right.1.cmp(&left.1))
+			.then_with(|| right.2.cmp(&left.2))
+	});
+	targets.truncate(limit.min(250));
+	Some(targets.into_iter().map(|(_, _, _, target)| target).collect())
 }
 
 fn query_page_metric_candidates_for_keys_limited(
