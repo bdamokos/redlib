@@ -985,11 +985,6 @@ function filterPostAuthor(post) {
         return false;
     }
 
-    const displayName = temporaryAuthorFilterDisplayName(filterValue);
-    if (!window.confirm(`Filter all posts from ${displayName}?\n\nYou can undo this later in Settings.`)) {
-        return false;
-    }
-
     window.filterPreferenceValue(filterValue);
     const author = normalizeTemporaryAuthorFilterAuthor(filterValue);
     let filteredAnyPost = false;

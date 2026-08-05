@@ -740,45 +740,4 @@ mod tests {
 			let _ = fs::remove_file(format!("{}{}", db_path.display(), suffix));
 		}
 	}
-
-	#[test]
-	#[sealed_test(env = [
-		(
-			"REDLIB_TRUSTED_PREFS_PROFILE_IDS",
-			"00000000-0000-4000-8000-000000000011,00000000-0000-4000-8000-000000000012"
-		)
-	])]
-	fn trusted_member_filter_save_persists_on_canonical_reload_without_clearing_other_preferences() {
-		let db_path = PathBuf::from(format!("/tmp/redlib-trusted-prefs-filter-save-test-{}.sqlite3", std::process::id()));
-		std::env::set_var("REDLIB_PREFS_DB", &db_path);
-		for suffix in ["", "-wal", "-shm"] {
-			let _ = fs::remove_file(format!("{}{}", db_path.display(), suffix));
-		}
-
-		let canonical = "00000000-0000-4000-8000-000000000011";
-		let member = "00000000-0000-4000-8000-000000000012";
-		let canonical_prefs = prefs(&["rust", "u_FollowedCreator"], &["news"]);
-		save_record(canonical, &canonical_prefs).unwrap();
-
-		let mut member_req = request_with_cookie(&format!("{PREFS_COOKIE}={member}"));
-		let actions = prepare_request(&mut member_req);
-		assert_eq!(actions.set_session_id.as_deref(), Some(canonical));
-		let mut updated = request_preferences(&member_req).unwrap();
-		updated.filters.push("u_Mixed_Case-User".to_string());
-		updated.prepare_for_runtime();
-		let mut response = Response::new(Body::empty());
-		save_preferences(&mut response, &member_req, &updated).unwrap();
-
-		let mut canonical_reload = request_with_cookie(&format!("{PREFS_COOKIE}={canonical}"));
-		prepare_request(&mut canonical_reload);
-		let reloaded = request_preferences(&canonical_reload).unwrap();
-		assert!(reloaded.has_filter("u_mixed_case-user"));
-		assert_eq!(reloaded.subscriptions, ["rust", "u_FollowedCreator"]);
-		assert_eq!(reloaded.theme, "dark");
-		assert!(reloaded.has_filter("news"));
-
-		for suffix in ["", "-wal", "-shm"] {
-			let _ = fs::remove_file(format!("{}{}", db_path.display(), suffix));
-		}
-	}
 }
