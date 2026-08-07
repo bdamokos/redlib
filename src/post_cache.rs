@@ -575,6 +575,36 @@ struct SqliteSessionCursorState {
 }
 
 static SQLITE_SESSION_CURSORS: LazyLock<Mutex<HashMap<String, SqliteSessionCursorState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct DeliveredFeedPage {
+	ids: Vec<String>,
+	has_next: Option<bool>,
+	cursor: Option<DeliveredFeedCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeliveredFeedCursor {
+	Chronological {
+		primary: u64,
+		post_id: String,
+	},
+	Discovered {
+		discovered_at_unix: u64,
+		sequence: u64,
+		activity_ts: u64,
+		post_id: String,
+	},
+}
+
+struct FeedPageHistory {
+	last_accessed: Instant,
+	pages: HashMap<usize, DeliveredFeedPage>,
+}
+
+/// Keep lightweight delivery identity beyond the much smaller full-post freeze window.
+/// A followed feed can span thousands of pages, while retaining every full `Post`
+/// for every browser session would consume unbounded memory.
+static FEED_PAGE_HISTORIES: LazyLock<Mutex<HashMap<String, FeedPageHistory>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static REMEMBERED_SUBREDDITS: LazyLock<Mutex<HashMap<String, RememberedSubredditEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_BROWSER_SESSIONS: LazyLock<Mutex<HashMap<String, ActiveBrowserSession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static REMEMBERED_SUBREDDIT_DAEMON_NEXT_TICK_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
@@ -3251,7 +3281,8 @@ where
 	if page >= MAX_CURSOR_PAGES_PER_SESSION {
 		return Err(format!("SQLite timeline page {page} exceeds the bounded cursor window"));
 	}
-	let excluded_prior_ids = frozen_post_ids_before_page(session, page);
+	let excluded_prior_ids = delivered_post_ids_before_page(session, page);
+	let continuation_cursor = (page > 0).then(|| delivered_feed_cursor_for_page(&session.id, page - 1)).flatten();
 	let exclusion_fill_scans = excluded_prior_ids.len().saturating_add(per_page.saturating_sub(1)) / per_page.max(1);
 	let max_filter_fill_scans = MAX_FILTER_FILL_SCANS.saturating_add(exclusion_fill_scans);
 	let mut cursors = SQLITE_SESSION_CURSORS.lock().map_err(|_| "SQLite session cursor lock poisoned".to_string())?;
@@ -3288,6 +3319,7 @@ where
 	} else {
 		(0, None)
 	};
+	let apply_history_cursor = page > 0 && cursor.is_none() && !excluded_prior_ids.is_empty() && continuation_cursor.is_some();
 
 	loop {
 		let mut posts = Vec::with_capacity(per_page);
@@ -3305,6 +3337,10 @@ where
 			}
 			let mut batch_posts = batch.posts.into_iter().map(crate::cache_persistence::PersistedPost::into_runtime).collect::<Vec<_>>();
 			batch_posts.retain(|post| !excluded_prior_ids.contains(&post.id));
+			if apply_history_cursor {
+				let cursor = continuation_cursor.as_ref().expect("history cursor checked above");
+				batch_posts.retain(|post| post_is_strictly_older_than_cursor(session, post, cursor));
+			}
 			retain_following_membership(session, &mut batch_posts);
 			posts.extend(batch_posts);
 			after = batch.next;
@@ -3376,21 +3412,96 @@ fn merged_posts_for_session(session: &FeedSession) -> Vec<Post> {
 	merged_posts_for_session_live(session)
 }
 
-fn frozen_post_ids_before_page(session: &FeedSession, page: usize) -> HashSet<String> {
-	session
-		.frozen_pages
-		.iter()
-		.filter(|(p, _)| **p < page)
-		.flat_map(|(_, posts)| posts.iter().map(|post| post.id.clone()))
-		.collect()
+fn delivered_post_ids_before_page(session: &FeedSession, page: usize) -> HashSet<String> {
+	let mut delivered = FEED_PAGE_HISTORIES
+		.lock()
+		.ok()
+		.and_then(|mut histories| {
+			let history = histories.get_mut(&session.id)?;
+			history.last_accessed = Instant::now();
+			Some(
+				history
+					.pages
+					.iter()
+					.filter(|(completed_page, _)| **completed_page < page)
+					.flat_map(|(_, delivered_page)| delivered_page.ids.iter().cloned())
+					.collect::<HashSet<_>>(),
+			)
+		})
+		.unwrap_or_default();
+	// Sessions created before this process learned a page's lightweight history still
+	// have the retained full-post window available as a safe fallback.
+	delivered.extend(
+		session
+			.frozen_pages
+			.iter()
+			.filter(|(completed_page, _)| **completed_page < page)
+			.flat_map(|(_, posts)| posts.iter().map(|post| post.id.clone())),
+	);
+	delivered
+}
+
+fn delivered_feed_cursor_for_page(session_id: &str, page: usize) -> Option<DeliveredFeedCursor> {
+	let mut histories = FEED_PAGE_HISTORIES.lock().ok()?;
+	let history = histories.get_mut(session_id)?;
+	history.last_accessed = Instant::now();
+	history.pages.get(&page)?.cursor.clone()
+}
+
+fn delivered_feed_cursor(session: &FeedSession, posts: &[Post]) -> Option<DeliveredFeedCursor> {
+	if session.request.daemon_discovery_order {
+		let post = posts.last()?;
+		let (discovered_at_unix, sequence, activity_ts, post_id) = materialized_catalog::daemon_discovery_sort_key(post);
+		return Some(DeliveredFeedCursor::Discovered {
+			discovered_at_unix,
+			sequence,
+			activity_ts,
+			post_id,
+		});
+	}
+	if session_merge_sort(session) != FeedSort::New {
+		return None;
+	}
+	let post = posts.last()?;
+	let primary = if session.request.bundle_followed_user_comments {
+		crate::user::post_feed_activity_ts(post)
+	} else {
+		post.created_ts
+	};
+	Some(DeliveredFeedCursor::Chronological {
+		primary,
+		post_id: post.id.clone(),
+	})
+}
+
+fn post_is_strictly_older_than_cursor(session: &FeedSession, post: &Post, cursor: &DeliveredFeedCursor) -> bool {
+	match cursor {
+		DeliveredFeedCursor::Chronological { primary: cursor_primary, post_id } => {
+			let primary = if session.request.bundle_followed_user_comments {
+				crate::user::post_feed_activity_ts(post)
+			} else {
+				post.created_ts
+			};
+			primary < *cursor_primary || (primary == *cursor_primary && post.id < *post_id)
+		}
+		DeliveredFeedCursor::Discovered {
+			discovered_at_unix,
+			sequence,
+			activity_ts,
+			post_id,
+		} => materialized_catalog::daemon_discovery_sort_key(post) < (*discovered_at_unix, *sequence, *activity_ts, post_id.clone()),
+	}
 }
 
 fn merged_tail_excluding_frozen_prior_pages(session: &FeedSession, page: usize, merged: &[Post]) -> Vec<Post> {
-	let exclude = frozen_post_ids_before_page(session, page);
-	if exclude.is_empty() {
-		return merged.to_vec();
-	}
-	merged.iter().filter(|post| !exclude.contains(&post.id)).cloned().collect()
+	let exclude = delivered_post_ids_before_page(session, page);
+	let continuation_cursor = page.checked_sub(1).and_then(|previous_page| delivered_feed_cursor_for_page(&session.id, previous_page));
+	merged
+		.iter()
+		.filter(|post| !exclude.contains(&post.id))
+		.filter(|post| continuation_cursor.as_ref().is_none_or(|cursor| post_is_strictly_older_than_cursor(session, post, cursor)))
+		.cloned()
+		.collect()
 }
 
 fn current_page_is_ready(session: &FeedSession, posts: &[Post], page: usize, per_page: usize) -> bool {
@@ -4307,6 +4418,37 @@ pub async fn begin_feed_session(request: FeedSessionRequest, page: usize, per_pa
 	session_id
 }
 
+/// Drop painted-page and keyset state before a deliberate return to page zero.
+/// Background refreshes may have advanced the Discover head while the browser was
+/// paging backward in time; a full page-zero navigation should reopen that current
+/// head, while fragment/status polling must keep the already-painted page stable.
+pub fn restart_feed_session_at_current_head(session_id: &str) -> bool {
+	let restarted = {
+		let Ok(mut sessions) = FEED_SESSIONS.lock() else {
+			return false;
+		};
+		let Some(session) = sessions.get_mut(session_id) else {
+			return false;
+		};
+		if session_is_expired(session) {
+			return false;
+		}
+		session.frozen_pages.clear();
+		session.requested_page = 0;
+		touch_session(session);
+		true
+	};
+	if restarted {
+		if let Ok(mut histories) = FEED_PAGE_HISTORIES.lock() {
+			histories.remove(session_id);
+		}
+		if let Ok(mut cursors) = SQLITE_SESSION_CURSORS.lock() {
+			cursors.remove(session_id);
+		}
+	}
+	restarted
+}
+
 pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedPage> {
 	if !deleted_media_safety_healthy() {
 		return None;
@@ -4336,7 +4478,9 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 				None
 			}
 		};
-		let has_next = resolve_frozen_page_has_next(sqlite_has_next, has_more_available, posts.len(), per_page);
+		let authoritative_has_next = sqlite_has_next.or_else(|| recorded_feed_page_has_next(&session.id, page));
+		let has_next = resolve_frozen_page_has_next(authoritative_has_next, has_more_available, posts.len(), per_page);
+		record_feed_page_history(session, page, &posts, Some(has_next));
 		return Some(FeedPage {
 			posts,
 			has_prev: page > 0,
@@ -4347,6 +4491,7 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	match sqlite_timeline_page_for_session(session, page, per_page) {
 		Ok(Some((posts, has_next))) => {
 			freeze_feed_page(session, page, posts.clone());
+			record_feed_page_history(session, page, &posts, Some(has_next));
 			return Some(FeedPage {
 				posts,
 				has_prev: page > 0,
@@ -4375,10 +4520,12 @@ pub fn feed_page(session_id: &str, page: usize, per_page: usize) -> Option<FeedP
 	};
 	let shown_ids: HashSet<String> = posts.iter().map(|post| post.id.clone()).collect();
 	let has_next_from_feed = tail_for_page.iter().any(|post| !shown_ids.contains(&post.id));
+	let has_next = has_next_from_feed || has_more_available;
+	record_feed_page_history(session, page, &posts, Some(has_next));
 	Some(FeedPage {
 		posts,
 		has_prev: page > 0,
-		has_next: has_next_from_feed || has_more_available,
+		has_next,
 		ready: page_ready,
 	})
 }
@@ -4387,7 +4534,45 @@ fn resolve_frozen_page_has_next(sqlite_has_next: Option<bool>, has_more_availabl
 	has_more_available || sqlite_has_next.unwrap_or(posts_len >= per_page)
 }
 
+fn record_feed_page_history(session: &FeedSession, page: usize, posts: &[Post], has_next: Option<bool>) {
+	const MAX_FEED_PAGE_HISTORIES: usize = MAX_FEED_SESSIONS * 4;
+	const MAX_DELIVERED_PAGES_PER_SESSION: usize = 4_096;
+	let Ok(mut histories) = FEED_PAGE_HISTORIES.lock() else {
+		return;
+	};
+	histories.retain(|_, history| history.last_accessed.elapsed().as_secs() <= CACHE_TTL_SECS);
+	if !histories.contains_key(&session.id) && histories.len() >= MAX_FEED_PAGE_HISTORIES {
+		if let Some(oldest) = histories.iter().max_by_key(|(_, history)| history.last_accessed.elapsed()).map(|(id, _)| id.clone()) {
+			histories.remove(&oldest);
+		}
+	}
+	let history = histories.entry(session.id.clone()).or_insert_with(|| FeedPageHistory {
+		last_accessed: Instant::now(),
+		pages: HashMap::new(),
+	});
+	history.last_accessed = Instant::now();
+	if page >= MAX_DELIVERED_PAGES_PER_SESSION {
+		return;
+	}
+	let delivered = history.pages.entry(page).or_default();
+	if !posts.is_empty() {
+		delivered.ids = posts.iter().map(|post| post.id.clone()).collect();
+		delivered.cursor = delivered_feed_cursor(session, posts);
+	}
+	if has_next.is_some() {
+		delivered.has_next = has_next;
+	}
+}
+
+fn recorded_feed_page_has_next(session_id: &str, page: usize) -> Option<bool> {
+	let mut histories = FEED_PAGE_HISTORIES.lock().ok()?;
+	let history = histories.get_mut(session_id)?;
+	history.last_accessed = Instant::now();
+	history.pages.get(&page)?.has_next
+}
+
 fn freeze_feed_page(session: &mut FeedSession, page: usize, posts: Vec<Post>) {
+	record_feed_page_history(session, page, &posts, None);
 	session.frozen_pages.insert(page, posts);
 	while session.frozen_pages.len() > MAX_FROZEN_FEED_PAGES {
 		let Some(evict_page) = session
@@ -5054,11 +5239,11 @@ mod tests {
 		FeedSessionRequest, FeedSort, FeedSource, RefreshOrigin, RememberedDaemonSemanticBundle, RememberedFailureDisposition, RememberedFeedPickMode, RememberedRefreshOutcome,
 		RememberedSubredditEntry, SessionSourceEntry, SessionSourceState, SessionWarmMode, SourceRefreshOutcome, SqliteSessionCursorState, ACTIVE_BROWSER_SESSIONS,
 		ACTIVE_BROWSER_SESSION_TTL_SECS, BACKGROUND_LOOKAHEAD_PAGES, CACHE_TTL_SECS, DELETED_MEDIA_SAFETY_HEALTHY, DELETED_MEDIA_TOMBSTONES, DURABLE_UNAVAILABLE_BACKOFF_SECS,
-		FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE, PROFILE_SOURCE_MEMBERSHIPS,
-		RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_DAEMON_SEMANTIC_BUNDLE, REMEMBERED_SUBREDDITS, REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS,
-		REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK, REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION,
-		SOURCE_REFRESH_STATES, SQLITE_SESSION_CURSORS, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT, TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL,
-		TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,
+		FEED_PAGE_HISTORIES, FEED_SESSIONS, MAX_FEED_SESSIONS, MAX_FROZEN_FEED_PAGES, MIN_ESTIMATED_POST_INTERVAL_SECS, MIN_FRESHNESS_TARGET_SECS, POSTS_PER_PAGE,
+		PROFILE_SOURCE_MEMBERSHIPS, RECENT_REQUEST_PRIORITY_SECS, REMEMBERED_DAEMON_SELECTION_SEQUENCE, REMEMBERED_DAEMON_SEMANTIC_BUNDLE, REMEMBERED_SUBREDDITS,
+		REMEMBERED_SUBREDDIT_DAEMON_INTERVAL_SECS, REMEMBERED_SUBREDDIT_DAEMON_MAX_ATTEMPTS_PER_TICK, REMEMBERED_SUBREDDIT_DAEMON_MAX_SUCCESSES_PER_TICK,
+		REMEMBERED_SUBREDDIT_TTL_SECS, SOURCE_CACHE, SOURCE_CACHE_REVISION, SOURCE_REFRESH_STATES, SQLITE_SESSION_CURSORS, TEST_DURABLE_WRITE_ACTIVE, TEST_DURABLE_WRITE_COUNT,
+		TEST_DURABLE_WRITE_DELAY_MS, TEST_DURABLE_WRITE_FAIL, TEST_PRUNE_REMOVE_ACTIVE, TEST_PRUNE_REMOVE_DELAY_MS, TEST_TOMBSTONE_MARKER_WRITE_FAIL, TEST_TOMBSTONE_WRITE_FAIL,
 	};
 	use crate::utils::{Author, Awards, Flags, Flair, FlairSubscription, Media, Post, Preferences};
 	use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -5077,6 +5262,7 @@ mod tests {
 		SOURCE_REFRESH_STATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		FEED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		SQLITE_SESSION_CURSORS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		FEED_PAGE_HISTORIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_SUBREDDITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		PROFILE_SOURCE_MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		REMEMBERED_DAEMON_SELECTION_SEQUENCE.store(0, AtomicOrdering::Relaxed);
@@ -8634,7 +8820,7 @@ mod tests {
 		assert_eq!(ids, vec!["shared", "fresh-next", "dup-next"]);
 	}
 
-	fn assert_frozen_chronological_pages_do_not_repeat_after_newer_posts_arrive(following: bool) {
+	fn assert_feed_pages_continue_older_and_restart_at_new_head(following: bool, discovered: bool) {
 		let now = chrono::Utc::now().timestamp() as u64;
 		let older_source = new_source(if following { "u_older" } else { "older" });
 		let newer_source = new_source(if following { "u_newer" } else { "newer" });
@@ -8645,7 +8831,10 @@ mod tests {
 				post
 			})
 			.collect::<Vec<_>>();
-		seed_source(&older_source, older_posts);
+		seed_source(&older_source, older_posts.clone());
+		if discovered {
+			crate::materialized_catalog::mark_posts_seen_before_daemon(&older_source, &older_posts);
+		}
 
 		FEED_SESSIONS.lock().unwrap().insert(
 			"demo".to_string(),
@@ -8657,6 +8846,7 @@ mod tests {
 					quarantine: false,
 					query_fingerprint: "demo".to_string(),
 					bundle_followed_user_comments: following,
+					daemon_discovery_order: discovered,
 					..Default::default()
 				},
 				sources: vec![
@@ -8684,7 +8874,10 @@ mod tests {
 				post
 			})
 			.collect::<Vec<_>>();
-		seed_source(&newer_source, newer_posts);
+		seed_source(&newer_source, newer_posts.clone());
+		if discovered {
+			crate::materialized_catalog::record_daemon_discoveries(&newer_source, &newer_posts);
+		}
 
 		let refreshed_first_page = feed_page("demo", 0, POSTS_PER_PAGE).expect("stable first page");
 		let refreshed_ids = refreshed_first_page.posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
@@ -8693,26 +8886,45 @@ mod tests {
 		let frozen_ids = initial_ids.iter().collect::<HashSet<_>>();
 
 		assert_eq!(refreshed_ids, initial_ids);
-		assert_eq!(next_ids[0], "newer-0");
+		assert_eq!(next_ids[0], "older-25");
 		assert_eq!(next_ids.len(), POSTS_PER_PAGE);
 		assert!(next_ids.iter().all(|id| !frozen_ids.contains(id)), "next page repeated a frozen page-zero post");
+		assert!(next_ids.iter().all(|id| !id.starts_with("newer-")), "next page moved forward into the refreshed head");
+
+		assert!(super::restart_feed_session_at_current_head("demo"));
+		let current_head = feed_page("demo", 0, POSTS_PER_PAGE).expect("current head after Previous");
+		assert_eq!(current_head.posts.first().map(|post| post.id.as_str()), Some("newer-0"));
 	}
 
 	#[test]
 	fn home_next_page_excludes_frozen_ids_after_newer_posts_arrive() {
 		let _guard = test_lock();
 		reset_test_caches();
-		assert_frozen_chronological_pages_do_not_repeat_after_newer_posts_arrive(false);
+		assert_feed_pages_continue_older_and_restart_at_new_head(false, false);
 	}
 
 	#[test]
 	fn following_next_page_excludes_frozen_ids_after_newer_posts_arrive() {
 		let _guard = test_lock();
 		reset_test_caches();
-		assert_frozen_chronological_pages_do_not_repeat_after_newer_posts_arrive(true);
+		assert_feed_pages_continue_older_and_restart_at_new_head(true, false);
 	}
 
-	fn assert_sqlite_lost_cursor_excludes_frozen_ids_and_fills_page(following: bool) {
+	#[test]
+	fn home_discovered_next_stays_older_and_previous_reopens_refreshed_head() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_feed_pages_continue_older_and_restart_at_new_head(false, true);
+	}
+
+	#[test]
+	fn following_discovered_next_stays_older_and_previous_reopens_refreshed_head() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_feed_pages_continue_older_and_restart_at_new_head(true, true);
+	}
+
+	fn assert_sqlite_lost_cursor_continues_older_than_delivered_boundary(following: bool, discovered: bool) {
 		let now = chrono::Utc::now().timestamp() as u64;
 		let older_source = new_source("u_older");
 		let newer_source = new_source("u_newer");
@@ -8732,6 +8944,10 @@ mod tests {
 			.collect::<Vec<_>>();
 		let frozen_page = older_posts[..POSTS_PER_PAGE].to_vec();
 		let frozen_ids = frozen_page.iter().map(|post| post.id.clone()).collect::<HashSet<_>>();
+		if discovered {
+			crate::materialized_catalog::mark_posts_seen_before_daemon(&older_source, &older_posts);
+			crate::materialized_catalog::record_daemon_discoveries(&newer_source, &newer_posts);
+		}
 		newer_posts.append(&mut older_posts);
 		let current_generation = newer_posts;
 		let session_id = if following { "sqlite-following-lost-cursor" } else { "sqlite-home-lost-cursor" };
@@ -8744,6 +8960,7 @@ mod tests {
 				query_fingerprint: "sqlite-lost-cursor".to_string(),
 				profile_id: session_id.to_string(),
 				bundle_followed_user_comments: following,
+				daemon_discovery_order: discovered,
 				merge_sort: Some(FeedSort::New),
 				..Default::default()
 			},
@@ -8756,7 +8973,13 @@ mod tests {
 			revision: 0,
 		};
 		let expected_view_kind = if following { 2 } else { 1 };
-		assert_eq!(sqlite_timeline_selection(&session), Some((expected_view_kind, crate::cache_sqlite::TimelineSort::New)));
+		let expected_sort = if discovered {
+			crate::cache_sqlite::TimelineSort::Discovered
+		} else {
+			crate::cache_sqlite::TimelineSort::New
+		};
+		assert_eq!(sqlite_timeline_selection(&session), Some((expected_view_kind, expected_sort)));
+		super::record_feed_page_history(&session, 0, session.frozen_pages.get(&0).expect("frozen page zero"), Some(true));
 
 		// Model a page-zero cursor pinned to the old generation, followed by the
 		// in-memory cursor registry being lost before querying generation two.
@@ -8803,8 +9026,9 @@ mod tests {
 		let ids = result.0.iter().map(|post| post.id.clone()).collect::<Vec<_>>();
 
 		assert_eq!(ids.len(), POSTS_PER_PAGE);
-		assert_eq!(ids.first().map(String::as_str), Some("newer-0"));
+		assert_eq!(ids.first().map(String::as_str), Some("older-25"));
 		assert!(ids.iter().all(|id| !frozen_ids.contains(id)), "SQLite continuation repeated a frozen page-zero post");
+		assert!(ids.iter().all(|id| !id.starts_with("newer-")), "SQLite continuation moved forward into the refreshed head");
 		assert!(query_count > 1, "excluded SQLite rows should be scanned past to fill the page");
 	}
 
@@ -8812,14 +9036,28 @@ mod tests {
 	fn sqlite_home_lost_cursor_excludes_frozen_ids_after_generation_advance() {
 		let _guard = test_lock();
 		reset_test_caches();
-		assert_sqlite_lost_cursor_excludes_frozen_ids_and_fills_page(false);
+		assert_sqlite_lost_cursor_continues_older_than_delivered_boundary(false, false);
 	}
 
 	#[test]
 	fn sqlite_following_lost_cursor_excludes_frozen_ids_after_generation_advance() {
 		let _guard = test_lock();
 		reset_test_caches();
-		assert_sqlite_lost_cursor_excludes_frozen_ids_and_fills_page(true);
+		assert_sqlite_lost_cursor_continues_older_than_delivered_boundary(true, false);
+	}
+
+	#[test]
+	fn sqlite_home_discovered_lost_cursor_continues_older_after_generation_advance() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_sqlite_lost_cursor_continues_older_than_delivered_boundary(false, true);
+	}
+
+	#[test]
+	fn sqlite_following_discovered_lost_cursor_continues_older_after_generation_advance() {
+		let _guard = test_lock();
+		reset_test_caches();
+		assert_sqlite_lost_cursor_continues_older_than_delivered_boundary(true, true);
 	}
 
 	#[test]

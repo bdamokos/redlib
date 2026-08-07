@@ -1780,18 +1780,22 @@ fn feed_page_url(current_url: &str, session_id: &str, page: usize) -> String {
 	)
 }
 
-async fn ensure_contextual_feed_session(requested_session_id: String, request: FeedSessionRequest, cache_page: usize) -> String {
+async fn ensure_contextual_feed_session(requested_session_id: String, request: FeedSessionRequest, cache_page: usize, restart_at_head: bool) -> String {
 	let expected_session_id = crate::post_cache::feed_session_id_for_request(&request);
-	if requested_session_id == expected_session_id
-		&& crate::post_cache::continue_feed_session_with_budget(
+	if requested_session_id == expected_session_id {
+		if restart_at_head && cache_page == 0 {
+			crate::post_cache::restart_feed_session_at_current_head(&requested_session_id);
+		}
+		if crate::post_cache::continue_feed_session_with_budget(
 			&requested_session_id,
 			cache_page,
 			crate::post_cache::POSTS_PER_PAGE,
 			contextual_front_page_sync_source_budget(cache_page),
 		)
 		.await
-	{
-		return requested_session_id;
+		{
+			return requested_session_id;
+		}
 	}
 
 	crate::post_cache::ensure_feed_session_with_budget(request, cache_page, crate::post_cache::POSTS_PER_PAGE, contextual_front_page_sync_source_budget(cache_page)).await
@@ -2355,6 +2359,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				..Default::default()
 			},
 			cache_page,
+			true,
 		)
 		.await;
 
@@ -3045,6 +3050,7 @@ pub async fn community_fragment(req: Request<Body>) -> Result<Response<Body>, St
 				..Default::default()
 			},
 			cache_page,
+			false,
 		)
 		.await;
 
@@ -5085,7 +5091,7 @@ mod tests {
 			..Default::default()
 		};
 
-		let current_session_id = super::ensure_contextual_feed_session(stale_session_id.clone(), current_request, 0).await;
+		let current_session_id = super::ensure_contextual_feed_session(stale_session_id.clone(), current_request, 0, false).await;
 		assert_ne!(current_session_id, stale_session_id);
 		let page = post_cache::feed_page(&current_session_id, 0, post_cache::POSTS_PER_PAGE).expect("current session page");
 		let ids = page.posts.iter().map(|post| post.id.as_str()).collect::<Vec<_>>();

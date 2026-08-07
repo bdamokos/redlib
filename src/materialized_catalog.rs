@@ -375,6 +375,9 @@ pub(crate) fn record_daemon_discoveries(source: &FeedSource, posts: &[Post]) {
 		return;
 	}
 	let now_unix = crate::cache_persistence::unix_now();
+	// Hold the allocator lock for the whole refresh: newly discovered posts from
+	// one source must occupy one contiguous sequence block. Already-known posts
+	// remain insert-only and are intentionally not promoted into that block.
 	let mut state = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
 	for post in posts.iter().rev() {
 		insert_following_discovery_if_missing(&mut state, &post.id, now_unix);
@@ -436,6 +439,17 @@ pub(crate) fn snapshot_following_discoveries() -> Vec<PersistedFollowingDiscover
 	entries.sort_by(|left, right| right.discovered_at_unix.cmp(&left.discovered_at_unix).then_with(|| right.sequence.cmp(&left.sequence)));
 	entries.truncate(DAEMON_DISCOVERY_MAX_POSTS);
 	entries
+}
+
+pub(crate) fn daemon_discovery_sort_key(post: &Post) -> (u64, u64, u64, String) {
+	let state = DAEMON_DISCOVERY.lock().unwrap_or_else(|err| err.into_inner());
+	let (discovered_at_unix, sequence) = std::iter::once(post.id.as_str())
+		.chain(post.following_comments.iter().map(|comment| comment.id.as_str()))
+		.filter_map(|post_id| state.posts.get(post_id))
+		.map(|stamp| (stamp.discovered_at_unix, stamp.sequence))
+		.max()
+		.unwrap_or_default();
+	(discovered_at_unix, sequence, crate::user::post_feed_activity_ts(post), post.id.clone())
 }
 
 pub(crate) fn sort_posts_by_daemon_discovery(posts: &mut [Post]) {
@@ -3737,6 +3751,53 @@ mod tests {
 		let _catalog_guard = super::MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 
 		assert!(super::catalog_video_stats("demo").is_none());
+	}
+
+	#[test]
+	fn concurrent_daemon_refreshes_keep_new_discoveries_in_contiguous_source_blocks() {
+		let _guard = test_lock();
+		reset_catalog();
+
+		let source_a = FeedSource::subreddit("batch_a", FeedSort::New);
+		let source_b = FeedSource::subreddit("batch_b", FeedSort::New);
+		let posts_a = test_posts("a", "batch_a", "alice", 3, 300);
+		let posts_b = test_posts("b", "batch_b", "bob", 3, 200);
+		let barrier = std::sync::Barrier::new(3);
+
+		std::thread::scope(|scope| {
+			scope.spawn(|| {
+				barrier.wait();
+				super::record_daemon_discoveries(&source_a, &posts_a);
+			});
+			scope.spawn(|| {
+				barrier.wait();
+				super::record_daemon_discoveries(&source_b, &posts_b);
+			});
+			barrier.wait();
+		});
+
+		let mut discoveries = posts_a.into_iter().chain(posts_b).collect::<Vec<_>>();
+		super::sort_posts_by_daemon_discovery(&mut discoveries);
+		let source_runs = discoveries
+			.iter()
+			.map(|post| post.community.as_str())
+			.collect::<Vec<_>>()
+			.chunk_by(|left, right| left == right)
+			.count();
+		assert_eq!(source_runs, 2, "concurrent source refreshes interleaved discovery sequences");
+
+		let batch_a_ids = discoveries
+			.iter()
+			.filter(|post| post.community == "batch_a")
+			.map(|post| post.id.as_str())
+			.collect::<Vec<_>>();
+		let batch_b_ids = discoveries
+			.iter()
+			.filter(|post| post.community == "batch_b")
+			.map(|post| post.id.as_str())
+			.collect::<Vec<_>>();
+		assert_eq!(batch_a_ids, vec!["a-0", "a-1", "a-2"]);
+		assert_eq!(batch_b_ids, vec!["b-0", "b-1", "b-2"]);
 	}
 
 	fn test_post(id: &str, subreddit: &str, author: &str, created_ts: u64) -> Post {
