@@ -1955,11 +1955,22 @@ pub(crate) fn apply_source_refresh(source: &FeedSource, posts: &[Post]) {
 }
 
 pub(crate) fn apply_source_refresh_with_observation(source: &FeedSource, posts: &[Post], observation_source: crate::post_components::ObservationSource) {
+	apply_source_refresh_with_observation_policy(source, posts, observation_source, true);
+}
+
+pub(crate) fn apply_source_refresh_with_observation_policy(
+	source: &FeedSource,
+	posts: &[Post],
+	observation_source: crate::post_components::ObservationSource,
+	hydrate_rendered_components: bool,
+) {
 	let Some(source_key) = normalize_catalog_source(source) else {
 		return;
 	};
 
-	crate::post_components::observe_posts(posts, observation_source, format!("{source_key:?}"), crate::cache_persistence::unix_now());
+	if hydrate_rendered_components {
+		crate::post_components::observe_posts(posts, observation_source, format!("{source_key:?}"), crate::cache_persistence::unix_now());
+	}
 
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	if !posts.is_empty() {

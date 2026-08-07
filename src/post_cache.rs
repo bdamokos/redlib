@@ -1909,7 +1909,7 @@ where
 			// interactive fetch; only genuinely new daemon discoveries rise to the top.
 			materialized_catalog::mark_posts_seen_before_daemon(source, &new_entry.posts);
 		}
-		materialized_catalog::apply_source_refresh_with_observation(source, &new_entry.posts, observation_source);
+		materialized_catalog::apply_source_refresh_with_observation_policy(source, &new_entry.posts, observation_source, refresh_origin != Some(RefreshOrigin::Daemon));
 		apply_legacy_mixed_feed_source_refresh(source, &new_entry.posts);
 	}
 	on_committed(&new_entry.posts);
@@ -8299,6 +8299,41 @@ mod tests {
 		);
 		assert_eq!(shared_effects.load(AtomicOrdering::SeqCst), 0);
 		assert!(!SOURCE_REFRESH_STATES.lock().unwrap_or_else(|error| error.into_inner()).contains_key(&source.cache_key()));
+	}
+
+	#[test]
+	fn daemon_refresh_skips_rendered_component_hydration_but_visible_refresh_keeps_it() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let daemon_source = new_source("daemon-hydration-probe");
+		let daemon_post = test_post("daemonhydrateprobe", "daemon-hydration-probe", 200);
+		assert_eq!(
+			store_source_posts_with_origin(&daemon_source, vec![daemon_post.clone()], String::new(), Some(RefreshOrigin::Daemon)),
+			SourceRefreshOutcome::Committed
+		);
+		assert!(
+			crate::post_components::latest(&daemon_post.id).is_none(),
+			"background daemon refresh hydrated the rendered-card cache"
+		);
+		assert_eq!(
+			catalog_source_candidates(&[daemon_source], &HashSet::new())
+				.expect("daemon post remains materialized")
+				.iter()
+				.map(|post| post.id.as_str())
+				.collect::<Vec<_>>(),
+			vec!["daemonhydrateprobe"]
+		);
+
+		let visible_source = new_source("visible-hydration-probe");
+		let visible_post = test_post("visiblehydrateprobe", "visible-hydration-probe", 300);
+		assert_eq!(
+			store_source_posts_with_origin(&visible_source, vec![visible_post.clone()], String::new(), Some(RefreshOrigin::FrontPageSession)),
+			SourceRefreshOutcome::Committed
+		);
+		assert!(
+			crate::post_components::latest(&visible_post.id).is_some(),
+			"visible refresh stopped hydrating rendered components"
+		);
 	}
 
 	#[test]
