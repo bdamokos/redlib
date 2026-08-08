@@ -37,6 +37,14 @@ pub(crate) const DELETED_MEDIA_MAX_KEY_BYTES: usize = 512;
 const LEGACY_SOURCE_CACHE_DIR_NAME: &str = "sources.v1";
 const DEFAULT_CACHE_DIR: &str = "/var/lib/redlib/cache";
 const WRITE_DEBOUNCE_SECS: u64 = 1;
+const SNAPSHOT_WRITE_MIN_INTERVAL_SECS: u64 = 60;
+
+fn snapshot_write_delay(last_completed_elapsed: Option<Duration>) -> Duration {
+	let debounce = Duration::from_secs(WRITE_DEBOUNCE_SECS);
+	let interval = Duration::from_secs(SNAPSHOT_WRITE_MIN_INTERVAL_SECS);
+	let interval_remaining = last_completed_elapsed.map(|elapsed| interval.saturating_sub(elapsed)).unwrap_or_default();
+	debounce.max(interval_remaining)
+}
 
 static PERSISTENCE_EVENTS: OnceLock<mpsc::UnboundedSender<()>> = OnceLock::new();
 static PERSISTENCE_PATH: LazyLock<PathBuf> = LazyLock::new(snapshot_path);
@@ -848,11 +856,17 @@ pub fn init() {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		if PERSISTENCE_EVENTS.set(tx).is_ok() {
 			tokio::spawn(async move {
+				let mut last_snapshot_completed = None;
 				while rx.recv().await.is_some() {
-					tokio::time::sleep(Duration::from_secs(WRITE_DEBOUNCE_SECS)).await;
+					// The aggregate snapshot is large, so a trickle of render and
+					// daemon observations must not turn into one full rewrite per
+					// second. Keep the initial one-second durability behavior, then
+					// coalesce subsequent dirtiness behind a bounded trailing write.
+					let delay = snapshot_write_delay(last_snapshot_completed.map(|completed: Instant| completed.elapsed()));
+					tokio::time::sleep(delay).await;
 					while rx.try_recv().is_ok() {}
 					match tokio::task::spawn_blocking(write_snapshot_and_trim_allocator).await {
-						Ok(Ok(())) => {}
+						Ok(Ok(())) => last_snapshot_completed = Some(Instant::now()),
 						Ok(Err(error)) => warn!("cache_persistence: failed to persist subreddit cache snapshot: {error}"),
 						Err(error) => warn!("cache_persistence: snapshot writer stopped: {error}"),
 					}
@@ -1394,13 +1408,42 @@ impl PersistedRefreshOrigin {
 mod tests {
 	use super::{
 		deserialize_catalog_snapshot, deserialize_deleted_media_tombstones, deserialize_snapshot, serialize_catalog_snapshot, serialize_deleted_media_tombstones,
-		serialize_snapshot, write_deleted_media_tombstones_at, write_deleted_media_tombstones_with_marker_at, PersistedCacheSnapshot, PersistedCacheSnapshotV2,
-		PersistedCacheSnapshotV3, PersistedCacheSnapshotV4WithoutFeedback, PersistedCacheSnapshotV6, PersistedCacheSnapshotV7, PersistedCacheSnapshotV8, PersistedCacheSnapshotV9,
-		PersistedCatalogSnapshotFile, PersistedRememberedSubredditEntry, PersistedRememberedSubredditEntryWithoutFeedback, PersistedSourceUnavailableState,
-		LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3, LEGACY_SNAPSHOT_VERSION_V4, LEGACY_SNAPSHOT_VERSION_V7, LEGACY_SNAPSHOT_VERSION_V8, LEGACY_SNAPSHOT_VERSION_V9,
-		SNAPSHOT_VERSION,
+		serialize_snapshot, snapshot_write_delay, write_deleted_media_tombstones_at, write_deleted_media_tombstones_with_marker_at, PersistedCacheSnapshot,
+		PersistedCacheSnapshotV2, PersistedCacheSnapshotV3, PersistedCacheSnapshotV4WithoutFeedback, PersistedCacheSnapshotV6, PersistedCacheSnapshotV7, PersistedCacheSnapshotV8,
+		PersistedCacheSnapshotV9, PersistedCatalogSnapshotFile, PersistedRememberedSubredditEntry, PersistedRememberedSubredditEntryWithoutFeedback,
+		PersistedSourceUnavailableState, LEGACY_SNAPSHOT_VERSION_V2, LEGACY_SNAPSHOT_VERSION_V3, LEGACY_SNAPSHOT_VERSION_V4, LEGACY_SNAPSHOT_VERSION_V7,
+		LEGACY_SNAPSHOT_VERSION_V8, LEGACY_SNAPSHOT_VERSION_V9, SNAPSHOT_VERSION, SNAPSHOT_WRITE_MIN_INTERVAL_SECS, WRITE_DEBOUNCE_SECS,
 	};
 	use crate::materialized_catalog::PersistedCatalogSnapshot;
+	use std::time::Duration;
+
+	#[test]
+	fn trickled_dirty_events_are_coalesced_with_a_bounded_snapshot_deadline() {
+		assert_eq!(snapshot_write_delay(None), Duration::from_secs(WRITE_DEBOUNCE_SECS));
+		assert_eq!(snapshot_write_delay(Some(Duration::from_secs(5))), Duration::from_secs(55));
+		assert_eq!(snapshot_write_delay(Some(Duration::from_secs(30))), Duration::from_secs(30));
+		assert_eq!(snapshot_write_delay(Some(Duration::from_secs(59))), Duration::from_secs(WRITE_DEBOUNCE_SECS));
+		assert_eq!(
+			snapshot_write_delay(Some(Duration::from_secs(SNAPSHOT_WRITE_MIN_INTERVAL_SECS))),
+			Duration::from_secs(WRITE_DEBOUNCE_SECS)
+		);
+
+		let mut last_completed_at = None;
+		let mut scheduled_at = None;
+		let mut writes = Vec::new();
+		for second in 0..=121 {
+			if scheduled_at.is_none() {
+				let elapsed = last_completed_at.map(|completed| Duration::from_secs(second - completed));
+				scheduled_at = Some(second + snapshot_write_delay(elapsed).as_secs());
+			}
+			if scheduled_at == Some(second) {
+				writes.push(second);
+				last_completed_at = Some(second);
+				scheduled_at = None;
+			}
+		}
+		assert_eq!(writes, vec![1, 61, 121]);
+	}
 
 	fn empty_snapshot() -> PersistedCacheSnapshot {
 		PersistedCacheSnapshot {
