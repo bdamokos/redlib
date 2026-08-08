@@ -6,7 +6,7 @@
 
         for (const navigation of navigations) {
             navigation.dataset.discoveryNavigationBound = "true";
-            const markers = Array.from(navigation.querySelectorAll(".discovery_navigation_marker"));
+            let markers = Array.from(navigation.querySelectorAll(".discovery_navigation_marker"));
             if (markers.length === 0) {
                 continue;
             }
@@ -18,14 +18,9 @@
             let touchGesture = null;
             let suppressClickUntil = 0;
             let labelTimer = 0;
-            const targets = markers
-                .map((marker) => ({
-                    marker,
-                    targetId: marker.dataset.discoveryTarget || "",
-                    target: document.getElementById(marker.dataset.discoveryTarget || ""),
-                }))
-                .filter(({ marker, target, targetId }) => target && marker.getAttribute("href") === `#${targetId}`);
-            const currentPage = Number.parseInt(navigation.dataset.discoveryCurrentPage || "0", 10);
+            let targets = [];
+            let mutationObserver = null;
+            const removedTargetIds = new Set();
 
             const clearPreview = () => {
                 window.clearTimeout(labelTimer);
@@ -33,6 +28,66 @@
                 previewMarker = null;
                 armedMarker = null;
             };
+
+            const deactivate = () => {
+                activeMarker?.removeAttribute("aria-current");
+                activeMarker?.classList.remove("is-active");
+                activeMarker = null;
+            };
+
+            const isVisibleTarget = (target) => target
+                && target.isConnected !== false
+                && target.hidden !== true
+                && !target.closest?.("[hidden]");
+
+            const reconcileTargets = () => {
+                const nextMarkers = [];
+                const nextTargets = [];
+
+                for (const marker of markers) {
+                    if (marker.isConnected === false) {
+                        continue;
+                    }
+                    const targetId = marker.dataset.discoveryTarget || "";
+                    const samePage = marker.getAttribute("href") === `#${targetId}`;
+                    if (!samePage) {
+                        marker.hidden = false;
+                        nextMarkers.push(marker);
+                        continue;
+                    }
+
+                    const target = document.getElementById(targetId);
+                    if (!target && removedTargetIds.has(targetId)) {
+                        if (activeMarker === marker) {
+                            deactivate();
+                        }
+                        if (previewMarker === marker) {
+                            clearPreview();
+                        }
+                        if (touchGesture?.lastMarker === marker) {
+                            touchGesture = null;
+                        }
+                        marker.remove?.();
+                        continue;
+                    }
+
+                    const visible = isVisibleTarget(target);
+                    marker.hidden = !visible;
+                    nextMarkers.push(marker);
+                    if (visible) {
+                        nextTargets.push({ marker, targetId, target });
+                    }
+                }
+
+                markers = nextMarkers;
+                targets = nextTargets;
+                removedTargetIds.clear();
+                if (activeMarker && !targets.some(({ marker }) => marker === activeMarker)) {
+                    deactivate();
+                }
+            };
+
+            reconcileTargets();
 
             const showPreview = (marker, arm = false) => {
                 window.clearTimeout(labelTimer);
@@ -62,12 +117,14 @@
             };
 
             const activate = (marker, announce = false) => {
+                if (!marker || marker.hidden || marker.isConnected === false) {
+                    return;
+                }
                 if (activeMarker === marker) {
                     centerMarker(marker);
                     return;
                 }
-                activeMarker?.removeAttribute("aria-current");
-                activeMarker?.classList.remove("is-active");
+                deactivate();
                 activeMarker = marker;
                 activeMarker.classList.add("is-active");
                 activeMarker.setAttribute("aria-current", "location");
@@ -81,7 +138,12 @@
             const navigateToMarker = (marker) => {
                 const targetId = marker.dataset.discoveryTarget || "";
                 const target = document.getElementById(targetId);
-                if (!target || marker.getAttribute("href") !== `#${targetId}`) {
+                const samePage = marker.getAttribute("href") === `#${targetId}`;
+                if (!isVisibleTarget(target) || !samePage) {
+                    if (samePage) {
+                        reconcileTargets();
+                        return;
+                    }
                     window.location.assign(marker.href);
                     return;
                 }
@@ -182,13 +244,9 @@
                 ? targets.find(({ marker }) => marker.dataset.discoveryTarget === hashTargetId)?.marker
                 : null;
             const initialMarker = hashMarker
-                || targets[0]?.marker
-                || markers.find((marker) => Number.parseInt(marker.dataset.discoveryPage || "0", 10) === currentPage)
-                || markers[0];
-            activate(initialMarker, Boolean(hashMarker));
-
-            if (targets.length === 0) {
-                continue;
+                || targets[0]?.marker;
+            if (initialMarker) {
+                activate(initialMarker, Boolean(hashMarker));
             }
 
             if (hashTarget && hashMarker) {
@@ -208,6 +266,7 @@
             let scrollFrame = 0;
             const updateFromScroll = () => {
                 scrollFrame = 0;
+                reconcileTargets();
                 const targetTop = document.documentElement.classList.contains("fixed_navbar")
                     ? Number.parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) || 0
                     : 0;
@@ -225,6 +284,7 @@
                 if (!navigation.isConnected) {
                     window.removeEventListener("scroll", scheduleScrollUpdate);
                     window.removeEventListener("resize", scheduleScrollUpdate);
+                    mutationObserver?.disconnect();
                     return;
                 }
                 if (!scrollFrame) {
@@ -233,6 +293,32 @@
             };
             window.addEventListener("scroll", scheduleScrollUpdate, { passive: true });
             window.addEventListener("resize", scheduleScrollUpdate, { passive: true });
+
+            const posts = document.querySelector?.("#posts");
+            if (posts && "MutationObserver" in window) {
+                const rememberRemovedTargets = (node) => {
+                    if (node?.id) {
+                        removedTargetIds.add(node.id);
+                    }
+                    for (const descendant of node?.querySelectorAll?.("[id]") || []) {
+                        removedTargetIds.add(descendant.id);
+                    }
+                };
+                mutationObserver = new window.MutationObserver((records) => {
+                    for (const record of records) {
+                        for (const node of record.removedNodes || []) {
+                            rememberRemovedTargets(node);
+                        }
+                    }
+                    scheduleScrollUpdate();
+                });
+                mutationObserver.observe(posts, {
+                    attributes: true,
+                    attributeFilter: ["hidden"],
+                    childList: true,
+                    subtree: true,
+                });
+            }
             scheduleScrollUpdate();
         }
     };

@@ -18,6 +18,8 @@ class ClassList {
 function navigationFixture({ markerCount = 30, targetIndexes = [18, 24], currentPage = '1', hash = '' } = {}) {
     const listeners = new Map();
     const queuedFrames = [];
+    const mutationObservers = [];
+    const posts = {};
     const items = {
         clientHeight: 240,
         scrollHeight: markerCount * 24,
@@ -32,10 +34,13 @@ function navigationFixture({ markerCount = 30, targetIndexes = [18, 24], current
             dataset: { discoveryTarget: id, discoveryPage: page },
             classList: new ClassList('discovery_navigation_marker'),
             attrs: new Map([['href', page === currentPage ? `#${id}` : `/discovered?cache_page=${page}#${id}`]]),
+            hidden: false,
+            isConnected: true,
             addEventListener() {},
             getAttribute(name) { return this.attrs.get(name); },
             setAttribute(name, value) { this.attrs.set(name, value); },
             removeAttribute(name) { this.attrs.delete(name); },
+            remove() { this.isConnected = false; },
             getBoundingClientRect() {
                 const top = 100 + (index * 24) - items.scrollTop;
                 return { top, bottom: top + 24, height: 24 };
@@ -43,9 +48,14 @@ function navigationFixture({ markerCount = 30, targetIndexes = [18, 24], current
         };
         if (targetIndexes.includes(index)) {
             targets.set(id, {
+                id,
+                hidden: false,
+                isConnected: true,
                 top: index === 12 ? -200 : index === 18 ? 80 : 500,
                 getBoundingClientRect() { return { top: this.top }; },
                 scrollIntoView() {},
+                closest(selector) { return selector === '[hidden]' && this.hidden ? this : null; },
+                querySelectorAll() { return []; },
             });
         }
         return marker;
@@ -61,6 +71,7 @@ function navigationFixture({ markerCount = 30, targetIndexes = [18, 24], current
     const document = {
         documentElement: { classList: new ClassList('fixed_navbar') },
         querySelectorAll: () => [navigation],
+        querySelector: (selector) => selector === '#posts' ? posts : null,
         getElementById: (id) => targets.get(id) || null,
         addEventListener(name, listener) {
             if (name === 'DOMContentLoaded') {
@@ -85,6 +96,15 @@ function navigationFixture({ markerCount = 30, targetIndexes = [18, 24], current
         },
         clearTimeout() {},
         setTimeout() { return 1; },
+        MutationObserver: class {
+            constructor(callback) {
+                this.callback = callback;
+                this.disconnected = false;
+                mutationObservers.push(this);
+            }
+            observe() {}
+            disconnect() { this.disconnected = true; }
+        },
     };
     const context = {
         document,
@@ -94,7 +114,7 @@ function navigationFixture({ markerCount = 30, targetIndexes = [18, 24], current
     };
     vm.runInNewContext(script, context);
     window.initializeDiscoveryNavigation(document);
-    return { items, listeners, markers, navigation, queuedFrames, targets };
+    return { items, listeners, markers, mutationObservers, navigation, queuedFrames, targets };
 }
 
 test('initial activation uses the first rendered target and only scrolls the rail viewport', () => {
@@ -149,12 +169,52 @@ test('viewport resize recenters the active marker even when its target is unchan
 });
 
 test('a replaced discovery fragment releases its stale scroll listeners', () => {
-    const { listeners, navigation, queuedFrames } = navigationFixture();
+    const { listeners, mutationObservers, navigation, queuedFrames } = navigationFixture();
 
     navigation.isConnected = false;
     listeners.get('scroll')();
 
     assert.equal(listeners.has('scroll'), false);
     assert.equal(listeners.has('resize'), false);
+    assert.equal(mutationObservers[0].disconnected, true);
     assert.equal(queuedFrames.length, 1);
+});
+
+test('a removed current-page target drops its marker and activates the first remaining boundary', () => {
+    const { markers, mutationObservers, queuedFrames, targets } = navigationFixture();
+
+    queuedFrames.shift()();
+    assert.equal(markers[18].attrs.get('aria-current'), 'location');
+
+    const removed = targets.get('post-18');
+    targets.delete('post-18');
+    removed.isConnected = false;
+    mutationObservers[0].callback([{ removedNodes: [removed] }]);
+    queuedFrames.shift()();
+
+    assert.equal(markers[18].isConnected, false);
+    assert.equal(markers[18].attrs.has('aria-current'), false);
+    assert.equal(markers[24].attrs.get('aria-current'), 'location');
+});
+
+test('a hidden current-page target is skipped and restored without losing its marker', () => {
+    const { markers, mutationObservers, queuedFrames, targets } = navigationFixture();
+
+    queuedFrames.shift()();
+    const target = targets.get('post-18');
+    target.hidden = true;
+    mutationObservers[0].callback([{ removedNodes: [] }]);
+    queuedFrames.shift()();
+
+    assert.equal(markers[18].hidden, true);
+    assert.equal(markers[18].attrs.has('aria-current'), false);
+    assert.equal(markers[24].attrs.get('aria-current'), 'location');
+
+    target.hidden = false;
+    mutationObservers[0].callback([{ removedNodes: [] }]);
+    queuedFrames.shift()();
+
+    assert.equal(markers[18].hidden, false);
+    assert.equal(markers[18].attrs.get('aria-current'), 'location');
+    assert.equal(markers[24].attrs.has('aria-current'), false);
 });
