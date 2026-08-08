@@ -1803,29 +1803,57 @@ pub(crate) fn prune_source_cache() {
 }
 
 fn remove_pruned_sources_if_still_absent(pruned_sources: &[(FeedSource, bool)]) {
+	if pruned_sources.is_empty() {
+		return;
+	}
+
+	let mut candidates_by_key = HashMap::<String, (FeedSource, bool)>::new();
 	for (source, remove_disk_entry) in pruned_sources {
-		#[cfg(test)]
-		{
-			let delay_ms = TEST_PRUNE_REMOVE_DELAY_MS.load(AtomicOrdering::SeqCst);
-			if delay_ms > 0 {
-				TEST_PRUNE_REMOVE_ACTIVE.store(true, AtomicOrdering::SeqCst);
-				std::thread::sleep(Duration::from_millis(delay_ms));
-				TEST_PRUNE_REMOVE_ACTIVE.store(false, AtomicOrdering::SeqCst);
-			}
+		candidates_by_key
+			.entry(source.cache_key())
+			.and_modify(|candidate| candidate.1 |= *remove_disk_entry)
+			.or_insert_with(|| (source.clone(), *remove_disk_entry));
+	}
+	let mut candidates = candidates_by_key
+		.into_iter()
+		.map(|(cache_key, (source, remove_disk_entry))| (cache_key, source, remove_disk_entry))
+		.collect::<Vec<_>>();
+	// Every path that may hold more than one source-generation guard uses this
+	// order, preventing two concurrent prune batches from waiting on each other.
+	candidates.sort_by(|left, right| left.0.cmp(&right.0));
+	let states = candidates.iter().map(|(cache_key, _, _)| source_refresh_state(cache_key)).collect::<Vec<_>>();
+	let generations = states.iter().map(|state| state.lock().unwrap_or_else(|error| error.into_inner())).collect::<Vec<_>>();
+
+	#[cfg(test)]
+	{
+		let delay_ms = TEST_PRUNE_REMOVE_DELAY_MS.load(AtomicOrdering::SeqCst);
+		if delay_ms > 0 {
+			TEST_PRUNE_REMOVE_ACTIVE.store(true, AtomicOrdering::SeqCst);
+			std::thread::sleep(Duration::from_millis(delay_ms));
+			TEST_PRUNE_REMOVE_ACTIVE.store(false, AtomicOrdering::SeqCst);
 		}
-		let cache_key = source.cache_key();
-		let state = source_refresh_state(&cache_key);
-		let generation = state.lock().unwrap_or_else(|error| error.into_inner());
-		let still_absent = SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner()).get(&cache_key).is_none();
-		if still_absent {
-			materialized_catalog::remove_sources(std::slice::from_ref(source));
-			if *remove_disk_entry {
-				crate::cache_persistence::remove_source_cache_entry(&cache_key);
-				materialized_catalog::remove_mixed_feed_sources(std::slice::from_ref(source));
-			}
+	}
+
+	let absent_indices = {
+		let cache = SOURCE_CACHE.lock().unwrap_or_else(|error| error.into_inner());
+		candidates
+			.iter()
+			.enumerate()
+			.filter_map(|(index, (cache_key, _, _))| (!cache.contains_key(cache_key)).then_some(index))
+			.collect::<Vec<_>>()
+	};
+	let absent_sources = absent_indices.iter().map(|index| candidates[*index].1.clone()).collect::<Vec<_>>();
+	materialized_catalog::remove_sources(&absent_sources);
+	for index in absent_indices {
+		let (cache_key, source, remove_disk_entry) = &candidates[index];
+		if *remove_disk_entry {
+			crate::cache_persistence::remove_source_cache_entry(cache_key);
+			materialized_catalog::remove_mixed_feed_sources(std::slice::from_ref(source));
 		}
-		drop(generation);
-		release_source_refresh_state(&cache_key, &state);
+	}
+	drop(generations);
+	for ((cache_key, _, _), state) in candidates.iter().zip(states.iter()) {
+		release_source_refresh_state(cache_key, state);
 	}
 }
 
@@ -6680,6 +6708,26 @@ mod tests {
 
 		assert!(SOURCE_CACHE.lock().unwrap().get(&source.cache_key()).is_none());
 		assert!(catalog_source_candidates(&[source], &HashSet::new()).unwrap().is_empty());
+	}
+
+	#[test]
+	fn pruning_multiple_sources_rebuilds_materialized_catalog_once() {
+		let _guard = test_lock();
+		reset_test_caches();
+
+		let first = new_source("batch-prune-first");
+		let second = new_source("batch-prune-second");
+		seed_source(&first, vec![test_post("first", "batch-prune-first", 100)]);
+		seed_source(&second, vec![test_post("second", "batch-prune-second", 99)]);
+		age_source_cache_for_test(&first, Duration::from_secs(CACHE_TTL_SECS + 60));
+		age_source_cache_for_test(&second, Duration::from_secs(CACHE_TTL_SECS + 60));
+		crate::materialized_catalog::reset_remove_sources_call_count_for_test();
+
+		prune_source_cache();
+
+		assert_eq!(crate::materialized_catalog::remove_sources_call_count_for_test(), 1);
+		assert!(catalog_source_candidates(std::slice::from_ref(&first), &HashSet::new()).unwrap().is_empty());
+		assert!(catalog_source_candidates(std::slice::from_ref(&second), &HashSet::new()).unwrap().is_empty());
 	}
 
 	#[test]

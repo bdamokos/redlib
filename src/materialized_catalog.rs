@@ -5,6 +5,8 @@ use crate::subreddit_semantics;
 use crate::utils::{post_feedback_score_adjustment, post_feedback_summary_affinity, Post, PostFeedbackSummary, POST_FEEDBACK_MODEL_MANUAL};
 use log::warn;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
@@ -2016,6 +2018,8 @@ pub(crate) fn remove_sources(sources: &[FeedSource]) {
 	if source_keys.is_empty() {
 		return;
 	}
+	#[cfg(test)]
+	REMOVE_SOURCES_CALLS.with(|calls| calls.set(calls.get() + 1));
 
 	let mut catalog = MATERIALIZED_CATALOG.lock().unwrap_or_else(|err| err.into_inner());
 	for record in catalog.posts_by_id.values_mut() {
@@ -2023,6 +2027,21 @@ pub(crate) fn remove_sources(sources: &[FeedSource]) {
 	}
 	catalog.posts_by_id.retain(|_, record| !record.source_keys.is_empty());
 	rebuild_indexes(&mut catalog);
+}
+
+#[cfg(test)]
+thread_local! {
+	static REMOVE_SOURCES_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_remove_sources_call_count_for_test() {
+	REMOVE_SOURCES_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn remove_sources_call_count_for_test() -> usize {
+	REMOVE_SOURCES_CALLS.with(Cell::get)
 }
 
 /// Remove sources from the compact persisted-feed mix only when their on-disk payload is
