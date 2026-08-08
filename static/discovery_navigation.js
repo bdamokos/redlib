@@ -10,6 +10,7 @@
             if (markers.length === 0) {
                 continue;
             }
+            const items = navigation.querySelector(".discovery_navigation_items");
 
             let activeMarker = null;
             let previewMarker = null;
@@ -20,9 +21,10 @@
             const targets = markers
                 .map((marker) => ({
                     marker,
+                    targetId: marker.dataset.discoveryTarget || "",
                     target: document.getElementById(marker.dataset.discoveryTarget || ""),
                 }))
-                .filter(({ target }) => target);
+                .filter(({ marker, target, targetId }) => target && marker.getAttribute("href") === `#${targetId}`);
             const currentPage = Number.parseInt(navigation.dataset.discoveryCurrentPage || "0", 10);
 
             const clearPreview = () => {
@@ -47,8 +49,21 @@
                 }
             };
 
+            const centerMarker = (marker) => {
+                if (items) {
+                    const itemsBox = items.getBoundingClientRect();
+                    const markerBox = marker.getBoundingClientRect();
+                    const centeredTop = items.scrollTop
+                        + markerBox.top
+                        - itemsBox.top
+                        - ((items.clientHeight - markerBox.height) / 2);
+                    items.scrollTop = Math.max(0, Math.min(centeredTop, items.scrollHeight - items.clientHeight));
+                }
+            };
+
             const activate = (marker, announce = false) => {
                 if (activeMarker === marker) {
+                    centerMarker(marker);
                     return;
                 }
                 activeMarker?.removeAttribute("aria-current");
@@ -56,7 +71,7 @@
                 activeMarker = marker;
                 activeMarker.classList.add("is-active");
                 activeMarker.setAttribute("aria-current", "location");
-                activeMarker.scrollIntoView({ block: "nearest" });
+                centerMarker(activeMarker);
                 if (announce && window.matchMedia?.("(pointer: coarse)")?.matches) {
                     showPreview(activeMarker);
                     labelTimer = window.setTimeout(clearPreview, 1600);
@@ -159,24 +174,24 @@
                 }
             });
 
-            const initialMarker =
-                markers.filter((marker) => Number.parseInt(marker.dataset.discoveryPage || "0", 10) <= currentPage).at(-1)
-                || markers[0];
-            activate(initialMarker);
-
-            if (targets.length === 0) {
-                continue;
-            }
-
             const hashTargetId = window.location.hash.startsWith("#")
                 ? decodeURIComponent(window.location.hash.slice(1))
                 : "";
             const hashTarget = hashTargetId ? document.getElementById(hashTargetId) : null;
             const hashMarker = hashTarget
-                ? markers.find((marker) => marker.dataset.discoveryTarget === hashTargetId)
+                ? targets.find(({ marker }) => marker.dataset.discoveryTarget === hashTargetId)?.marker
                 : null;
+            const initialMarker = hashMarker
+                || targets[0]?.marker
+                || markers.find((marker) => Number.parseInt(marker.dataset.discoveryPage || "0", 10) === currentPage)
+                || markers[0];
+            activate(initialMarker, Boolean(hashMarker));
+
+            if (targets.length === 0) {
+                continue;
+            }
+
             if (hashTarget && hashMarker) {
-                activate(hashMarker, true);
                 const alignHashTarget = () => hashTarget.scrollIntoView({ block: "start" });
                 window.requestAnimationFrame(alignHashTarget);
                 if ("ResizeObserver" in window) {
@@ -196,15 +211,22 @@
                 const targetTop = document.documentElement.classList.contains("fixed_navbar")
                     ? Number.parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) || 0
                     : 0;
-                const current = targets.reduce((closest, candidate) => {
-                    const distance = Math.abs(candidate.target.getBoundingClientRect().top - targetTop);
-                    return !closest || distance < closest.distance ? { ...candidate, distance } : closest;
-                }, null);
+                const current = targets.reduce(
+                    (currentTarget, candidate) => candidate.target.getBoundingClientRect().top <= targetTop + 1
+                        ? candidate
+                        : currentTarget,
+                    targets[0],
+                );
                 if (current) {
                     activate(current.marker);
                 }
             };
             const scheduleScrollUpdate = () => {
+                if (!navigation.isConnected) {
+                    window.removeEventListener("scroll", scheduleScrollUpdate);
+                    window.removeEventListener("resize", scheduleScrollUpdate);
+                    return;
+                }
                 if (!scrollFrame) {
                     scrollFrame = window.requestAnimationFrame(updateFromScroll);
                 }
