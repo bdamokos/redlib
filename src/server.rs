@@ -26,8 +26,35 @@ use std::{
 	string::ToString,
 };
 use time::OffsetDateTime;
+use tokio::sync::watch;
 
 use crate::{config, dbg_msg};
+
+const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
+
+async fn shutdown_signal() {
+	#[cfg(windows)]
+	// Wait for the CTRL+C signal
+	tokio::signal::ctrl_c().await.expect("Failed to install CTRL+C signal handler");
+
+	#[cfg(unix)]
+	{
+		// Wait for CTRL+C or SIGTERM signals
+		let mut signal_terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to install SIGTERM signal handler");
+		tokio::select! {
+			_ = tokio::signal::ctrl_c() => (),
+			_ = signal_terminate.recv() => ()
+		}
+	}
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+	while !*shutdown.borrow() {
+		if shutdown.changed().await.is_err() {
+			break;
+		}
+	}
+}
 
 const BANNED_USER_AGENTS: &[&str] = &[
 	"AI2Bot",
@@ -393,24 +420,37 @@ impl Server {
 		// Build SocketAddr from provided address
 		let address = &addr.parse().unwrap_or_else(|_| panic!("Cannot parse {addr} as address (example format: 0.0.0.0:8080)"));
 
-		// Bind server to address specified above. Gracefully shut down if CTRL+C is pressed
-		let server = HyperServer::bind(address).serve(make_svc).with_graceful_shutdown(async {
-			#[cfg(windows)]
-			// Wait for the CTRL+C signal
-			tokio::signal::ctrl_c().await.expect("Failed to install CTRL+C signal handler");
-
-			#[cfg(unix)]
-			{
-				// Wait for CTRL+C or SIGTERM signals
-				let mut signal_terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to install SIGTERM signal handler");
-				tokio::select! {
-					_ = tokio::signal::ctrl_c() => (),
-					_ = signal_terminate.recv() => ()
+		// Stop accepting new connections on SIGTERM/CTRL+C, but do not let a slow
+		// request keep the process past the container manager's finite stop window.
+		let (shutdown_tx, shutdown_rx) = watch::channel(false);
+		tokio::spawn(async move {
+			shutdown_signal().await;
+			let _ = shutdown_tx.send(true);
+		});
+		let graceful = HyperServer::bind(address).serve(make_svc).with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+		async move {
+			tokio::select! {
+				result = graceful => result,
+				_ = async move {
+					wait_for_shutdown(shutdown_rx).await;
+					tokio::time::sleep(std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS)).await;
+				} => {
+					eprintln!("Graceful shutdown exceeded {GRACEFUL_SHUTDOWN_TIMEOUT_SECS}s; aborting remaining requests");
+					Ok(())
 				}
 			}
-		});
+		}
+		.boxed()
+	}
+}
 
-		server.boxed()
+#[cfg(test)]
+mod shutdown_tests {
+	use super::GRACEFUL_SHUTDOWN_TIMEOUT_SECS;
+
+	#[test]
+	fn graceful_shutdown_finishes_inside_default_container_stop_window() {
+		assert!(GRACEFUL_SHUTDOWN_TIMEOUT_SECS < 10);
 	}
 }
 

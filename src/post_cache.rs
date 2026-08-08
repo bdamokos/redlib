@@ -4752,21 +4752,16 @@ fn paginate_navigation_targets(
 		return Vec::new();
 	}
 	let max_frozen_page = frozen_pages.keys().copied().max().unwrap_or(0);
-	let union_count = projected_targets
-		.iter()
-		.map(|target| target.post_id.as_str())
-		.chain(frozen_pages.values().flatten().map(|target| target.post_id.as_str()))
-		.collect::<HashSet<_>>()
-		.len();
-	let page_count = union_count.div_ceil(per_page).max(max_frozen_page + 1);
+	let page_count = projected_targets.len().div_ceil(per_page).max(max_frozen_page + 1);
 	let mut seen_ids = HashSet::new();
 	let mut navigation_pages = Vec::with_capacity(page_count);
 	for page in 0..page_count {
 		let page_targets = frozen_pages.get(&page).cloned().unwrap_or_else(|| {
 			projected_targets
 				.iter()
-				.filter(|target| !seen_ids.contains(&target.post_id))
+				.skip(page.saturating_mul(per_page))
 				.take(per_page)
+				.filter(|target| !seen_ids.contains(&target.post_id))
 				.cloned()
 				.collect()
 		});
@@ -8069,7 +8064,7 @@ mod tests {
 	}
 
 	#[test]
-	fn navigation_projection_fills_future_pages_after_frozen_ids() {
+	fn navigation_projection_preserves_cursor_page_slots_after_frozen_ids() {
 		let target = |id: &str| FeedNavigationTarget {
 			post_id: id.to_string(),
 			label: format!("r/{id}"),
@@ -8082,8 +8077,26 @@ mod tests {
 
 		assert_eq!(pages.len(), 3);
 		assert_eq!(pages[0].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
-		assert_eq!(pages[1].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["a", "d"]);
+		assert_eq!(pages[1].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["d"]);
 		assert_eq!(pages[2].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["e"]);
+	}
+
+	#[test]
+	fn navigation_projection_keeps_deep_targets_on_their_keyset_pages_after_previous() {
+		let target = |id: &str| FeedNavigationTarget {
+			post_id: id.to_string(),
+			label: format!("r/{id}"),
+			nsfw: false,
+		};
+		let projected = ["a", "b", "c", "d", "e", "f", "g", "h"].into_iter().map(target).collect::<Vec<_>>();
+		let frozen = HashMap::from([(0, vec![target("head-new"), target("head-old")]), (1, vec![target("c"), target("d")])]);
+
+		let pages = paginate_navigation_targets(&projected, &frozen, 2);
+
+		assert_eq!(pages[0].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["head-new", "head-old"]);
+		assert_eq!(pages[1].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["c", "d"]);
+		assert_eq!(pages[2].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["e", "f"]);
+		assert_eq!(pages[3].iter().map(|target| target.post_id.as_str()).collect::<Vec<_>>(), vec!["g", "h"]);
 	}
 
 	#[test]

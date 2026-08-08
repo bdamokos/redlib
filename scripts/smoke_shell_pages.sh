@@ -167,7 +167,11 @@ def wait_for(predicate, *, timeout_seconds: int = 15, interval_seconds: float = 
 print(f"Checking shell routes against {BASE_URL}")
 
 front_shell = fetch("/")
-require(r'data-fragment-url="/subreddit-fragment"', front_shell, "front shell fragment url")
+require(r'id="feed_content"', front_shell, "contextual front feed content")
+require(r'data-feed-fragment-url="/feed-fragment\?', front_shell, "contextual front fragment url")
+require(r'data-feed-session-id="', front_shell, "contextual front session id")
+require(r'class="post_comments"', front_shell, "contextual front rendered cards")
+require(r'accesskey="N"', front_shell, "contextual front next page link")
 
 sub_shell = fetch("/r/rust")
 require(r'data-fragment-url="/subreddit-fragment/r/rust"', sub_shell, "subreddit shell fragment url")
@@ -222,11 +226,10 @@ require(r'id="column_one"', sidebar_fragment, "sidebar fragment content")
 
 heavy_cookie = heavy_subscription_cookie()
 heavy_front_shell = fetch("/new", cookie=heavy_cookie, timeout=20)
-require(
-    r'Warmed [0-9]+ of [0-9]+ feeds\.',
-    heavy_front_shell,
-    "heavy front shell warmup banner",
-)
+require(r'id="feed_content"', heavy_front_shell, "heavy contextual front feed content")
+require(r'data-feed-session-id="', heavy_front_shell, "heavy contextual front session id")
+require(r'class="post_comments"', heavy_front_shell, "heavy contextual front rendered cards")
+require(r'accesskey="N"', heavy_front_shell, "heavy contextual front next page link")
 
 heavy_front_fragment = fetch("/subreddit-fragment/new", cookie=heavy_cookie, timeout=20)
 require(r'data-feed-session-id="', heavy_front_fragment, "heavy front fragment session id")
