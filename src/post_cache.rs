@@ -3330,12 +3330,6 @@ where
 		(0, None)
 	} else if let Some(cursor) = state.after_page.get(&(page - 1)).cloned() {
 		(page, Some(cursor))
-	} else if !excluded_prior_ids.is_empty() {
-		// A missing exact continuation cursor can follow cursor eviction, a prior
-		// legacy fallback, or a process discontinuity. Restart at the current head
-		// for the requested page and explicitly remove every already-painted ID;
-		// replaying logical pages here would skip an extra page after exclusions.
-		(page, None)
 	} else if let Some((prior_page, cursor)) = state
 		.after_page
 		.iter()
@@ -3344,6 +3338,11 @@ where
 		.map(|(completed_page, cursor)| (*completed_page, cursor.clone()))
 	{
 		(prior_page + 1, Some(cursor))
+	} else if !excluded_prior_ids.is_empty() {
+		// No SQLite continuation survived for any earlier page. Restart at the
+		// current head and explicitly remove every already-painted ID; replaying
+		// logical pages after those exclusions would skip an extra page.
+		(page, None)
 	} else {
 		(0, None)
 	};
@@ -3377,7 +3376,11 @@ where
 			}
 		}
 		if let Some(after_cursor) = after.clone() {
-			state.after_page.insert(logical_page, after_cursor);
+			// A painted session is a snapshot. Re-checking a frozen page after the
+			// daemon advances the active profile must not replace its continuation
+			// with a cursor from the newer generation, or later pages can jump back
+			// into an already-delivered window.
+			state.after_page.entry(logical_page).or_insert(after_cursor);
 		} else {
 			state.after_page.remove(&logical_page);
 		}
@@ -8253,6 +8256,113 @@ mod tests {
 		assert_eq!(traversed_ids.iter().collect::<HashSet<_>>().len(), total_posts);
 		assert_eq!(session.frozen_pages.len(), MAX_FROZEN_FEED_PAGES);
 		assert!(!session.frozen_pages.contains_key(&0));
+	}
+
+	#[test]
+	fn sqlite_frozen_page_recheck_does_not_replace_its_snapshot_cursor() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let session = FeedSession {
+			id: "sqlite-stable-generation".to_string(),
+			request: FeedSessionRequest {
+				profile_id: "sqlite-stable-generation".to_string(),
+				merge_sort: Some(FeedSort::New),
+				..Default::default()
+			},
+			sources: Vec::new(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+		let page = |generation: i64, prefix: &str| crate::cache_sqlite::TimelinePage {
+			posts: (0..POSTS_PER_PAGE)
+				.map(|index| crate::cache_persistence::PersistedPost::from_runtime(&test_post(&format!("{prefix}-{index}"), "rust", 100 - index as u64)))
+				.collect(),
+			next: Some(crate::cache_sqlite::TimelineCursor {
+				generation,
+				random_epoch: 0,
+				sort_primary: 75,
+				sort_secondary: 0,
+				card_key: format!("{prefix}-24"),
+			}),
+		};
+
+		sqlite_timeline_page_for_session_with_query(&session, 0, POSTS_PER_PAGE, |_, _| Ok(Some(page(1, "old"))))
+			.expect("initial SQLite page")
+			.expect("initial SQLite result");
+		sqlite_timeline_page_for_session_with_query(&session, 0, POSTS_PER_PAGE, |_, _| Ok(Some(page(2, "new"))))
+			.expect("frozen-page continuation check")
+			.expect("frozen-page continuation result");
+
+		let mut continuation_generation = None;
+		sqlite_timeline_page_for_session_with_query(&session, 1, POSTS_PER_PAGE, |cursor, _| {
+			continuation_generation = cursor.map(|cursor| cursor.generation);
+			Ok(Some(crate::cache_sqlite::TimelinePage { posts: Vec::new(), next: None }))
+		})
+		.expect("next SQLite page")
+		.expect("next SQLite result");
+		assert_eq!(continuation_generation, Some(1));
+	}
+
+	#[test]
+	fn sqlite_deep_jump_replays_from_nearest_snapshot_cursor() {
+		let _guard = test_lock();
+		reset_test_caches();
+		let timeline = (0..150).map(|index| test_post(&format!("deep-{index}"), "rust", 1_000 - index as u64)).collect::<Vec<_>>();
+		let session = FeedSession {
+			id: "sqlite-deep-jump".to_string(),
+			request: FeedSessionRequest {
+				profile_id: "sqlite-deep-jump".to_string(),
+				merge_sort: Some(FeedSort::New),
+				..Default::default()
+			},
+			sources: Vec::new(),
+			frozen_pages: HashMap::new(),
+			background_active: false,
+			background_complete: true,
+			requested_page: 0,
+			last_updated: Instant::now(),
+			revision: 0,
+		};
+		let query_page = |cursor: Option<&crate::cache_sqlite::TimelineCursor>, limit: usize| {
+			let start = cursor
+				.and_then(|cursor| timeline.iter().position(|post| post.id == cursor.card_key))
+				.map_or(0, |index| index + 1);
+			let end = start.saturating_add(limit).min(timeline.len());
+			let batch = &timeline[start..end];
+			Ok(Some(crate::cache_sqlite::TimelinePage {
+				posts: batch.iter().map(crate::cache_persistence::PersistedPost::from_runtime).collect(),
+				next: (end < timeline.len()).then(|| crate::cache_sqlite::TimelineCursor {
+					generation: 1,
+					random_epoch: 0,
+					sort_primary: batch.last().map(|post| post.created_ts as i64).unwrap_or_default(),
+					sort_secondary: 0,
+					card_key: batch.last().map(|post| post.id.clone()).unwrap_or_default(),
+				}),
+			}))
+		};
+
+		let page_zero = sqlite_timeline_page_for_session_with_query(&session, 0, POSTS_PER_PAGE, query_page)
+			.expect("page zero query")
+			.expect("page zero result")
+			.0;
+		super::record_feed_page_history(&session, 0, &page_zero, Some(true));
+		let page_one = sqlite_timeline_page_for_session_with_query(&session, 1, POSTS_PER_PAGE, query_page)
+			.expect("page one query")
+			.expect("page one result")
+			.0;
+		super::record_feed_page_history(&session, 1, &page_one, Some(true));
+		let deep_page = sqlite_timeline_page_for_session_with_query(&session, 4, POSTS_PER_PAGE, query_page)
+			.expect("deep-page query")
+			.expect("deep-page result")
+			.0;
+
+		assert_eq!(deep_page.first().map(|post| post.id.as_str()), Some("deep-100"));
+		assert_eq!(deep_page.last().map(|post| post.id.as_str()), Some("deep-124"));
+		assert!(deep_page.iter().all(|post| !page_zero.iter().chain(&page_one).any(|delivered| delivered.id == post.id)));
 	}
 
 	#[test]
