@@ -974,7 +974,7 @@ impl Default for Post {
 
 impl Post {
 	pub fn title_html(&self) -> String {
-		link_reddit_user_mentions_in_plain_text(&self.title)
+		link_reddit_references_in_plain_text(&self.title)
 	}
 
 	pub fn linked_users_in_title_helper_html(&self) -> String {
@@ -4041,7 +4041,7 @@ static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 static HTML_HREF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="([^"]+)""#).unwrap());
 static PLAIN_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
 static BARE_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\b(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s<>"']*)?"#).unwrap());
-static REDDIT_USER_MENTION_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(^|[^A-Za-z0-9_/])u/([A-Za-z0-9_-]{2,20})").unwrap());
+static REDDIT_REFERENCE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(^|[^A-Za-z0-9_/-])(/?)(u|r)/([A-Za-z0-9_-]{2,21})").unwrap());
 static SPLIT_REDDIT_USER_MENTION_REGEX: LazyLock<Regex> =
 	LazyLock::new(|| Regex::new(r#"(?i)<a[^>]*href="/(?:u|user)/([A-Za-z0-9_-]{1,20})/?"[^>]*>(u/)([A-Za-z0-9_-]{1,20})</a>(_[A-Za-z0-9_-]+)"#).unwrap());
 static PROFILE_SOCIAL_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"data-faceplate-tracking-context="([^"]*social_link[^"]*)""#).unwrap());
@@ -4050,14 +4050,22 @@ static ALLMYLINKS_DATA_X_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::ne
 static ALLMYLINKS_TITLE_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\btitle="(https?://[^"]+)""#).unwrap());
 static PERCENT_ENCODED_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)https?%3A%2F%2F[^\s<>"']+"#).unwrap());
 
-fn is_reddit_username_char(ch: char) -> bool {
+fn is_reddit_name_char(ch: char) -> bool {
 	ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
 }
 
-fn has_reddit_username_boundary_after(input: &str, index: usize) -> bool {
+fn has_reddit_name_boundary_after(input: &str, index: usize) -> bool {
 	match input[index..].chars().next() {
-		Some(ch) => !is_reddit_username_char(ch),
+		Some(ch) => !is_reddit_name_char(ch),
 		None => true,
+	}
+}
+
+fn valid_reddit_reference(kind: &str, name: &str) -> bool {
+	match kind.to_ascii_lowercase().as_str() {
+		"u" => (2..=20).contains(&name.len()),
+		"r" => (3..=21).contains(&name.len()) && !name.contains('-'),
+		_ => false,
 	}
 }
 
@@ -4076,53 +4084,88 @@ fn escape_html_text(input: &str) -> String {
 	escaped
 }
 
-fn push_user_mention_text(output: &mut String, text: &str, escape_text: bool) {
-	if escape_text {
+fn push_reddit_reference_text(output: &mut String, text: &str, escape_text: bool, fallback_href: Option<&str>) {
+	if text.is_empty() {
+		return;
+	}
+	if let Some(href) = fallback_href {
+		output.push_str(r#"<a href=""#);
+		output.push_str(&escape_html_text(href));
+		output.push_str(r#"">"#);
+		output.push_str(&escape_html_text(text));
+		output.push_str("</a>");
+	} else if escape_text {
 		output.push_str(&escape_html_text(text));
 	} else {
 		output.push_str(text);
 	}
 }
 
-fn link_reddit_user_mentions_in_text_segment(input: &str, escape_text: bool) -> String {
+fn range_overlaps(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
+	ranges.iter().any(|(range_start, range_end)| start < *range_end && end > *range_start)
+}
+
+fn link_reddit_references_in_text_segment(input: &str, escape_text: bool, fallback_href: Option<&str>) -> String {
 	let mut output = String::new();
 	let mut last = 0;
+	let mut url_ranges = PLAIN_URL_REGEX.find_iter(input).map(|value| (value.start(), value.end())).collect::<Vec<_>>();
+	url_ranges.extend(BARE_DOMAIN_REGEX.find_iter(input).map(|value| (value.start(), value.end())));
 
-	for capture in REDDIT_USER_MENTION_REGEX.captures_iter(input) {
-		let Some(username_match) = capture.get(2) else {
+	for capture in REDDIT_REFERENCE_REGEX.captures_iter(input) {
+		let (Some(slash), Some(kind_match), Some(name_match)) = (capture.get(2), capture.get(3), capture.get(4)) else {
 			continue;
 		};
-		if !has_reddit_username_boundary_after(input, username_match.end()) {
+		let reference_start = slash.start();
+		let reference_end = name_match.end();
+		let kind = kind_match.as_str();
+		let name = name_match.as_str();
+		if !has_reddit_name_boundary_after(input, reference_end) || !valid_reddit_reference(kind, name) || range_overlaps(reference_start, reference_end, &url_ranges) {
 			continue;
 		}
 
-		let mention_start = username_match.start().saturating_sub("u/".len());
-		push_user_mention_text(&mut output, &input[last..mention_start], escape_text);
+		push_reddit_reference_text(&mut output, &input[last..reference_start], escape_text, fallback_href);
 
-		let mention_text = &input[mention_start..username_match.end()];
-		let username = username_match.as_str();
-		output.push_str(r#"<a class="user_mention" href="/user/"#);
-		output.push_str(username);
+		let reference_text = &input[reference_start..reference_end];
+		let normalized_kind = kind.to_ascii_lowercase();
+		let class = if normalized_kind == "u" { "user_mention" } else { "subreddit_mention" };
+		output.push_str(r#"<a class=""#);
+		output.push_str(class);
+		output.push_str(r#"" href="/"#);
+		output.push_str(if normalized_kind == "u" { "user" } else { "r" });
+		output.push('/');
+		output.push_str(name);
 		output.push_str(r#"">"#);
-		push_user_mention_text(&mut output, mention_text, escape_text);
+		push_reddit_reference_text(&mut output, reference_text, escape_text, None);
 		output.push_str("</a>");
 
-		last = username_match.end();
+		last = reference_end;
 	}
 
 	if last == 0 {
+		if let Some(href) = fallback_href {
+			push_reddit_reference_text(&mut output, input, true, Some(href));
+			return output;
+		}
 		if escape_text {
 			return escape_html_text(input);
 		}
 		return input.to_string();
 	}
 
-	push_user_mention_text(&mut output, &input[last..], escape_text);
+	push_reddit_reference_text(&mut output, &input[last..], escape_text, fallback_href);
 	output
 }
 
+pub fn link_reddit_references_in_plain_text(input: &str) -> String {
+	link_reddit_references_in_text_segment(input, true, None)
+}
+
+pub fn link_reddit_references_in_linked_plain_text(input: &str, fallback_href: &str) -> String {
+	link_reddit_references_in_text_segment(input, true, Some(fallback_href))
+}
+
 pub fn link_reddit_user_mentions_in_plain_text(input: &str) -> String {
-	link_reddit_user_mentions_in_text_segment(input, true)
+	link_reddit_references_in_plain_text(input)
 }
 
 fn repair_split_reddit_user_mentions_in_html(input: &str) -> String {
@@ -4183,20 +4226,24 @@ fn html_tag_name(tag: &str) -> Option<(&str, bool)> {
 }
 
 pub fn link_reddit_user_mentions_in_html(input: &str) -> String {
+	link_reddit_references_in_html(input)
+}
+
+pub fn link_reddit_references_in_html(input: &str) -> String {
 	let repaired = repair_split_reddit_user_mentions_in_html(input);
 	let input = repaired.as_str();
 	let mut output = String::with_capacity(input.len());
 	let mut index = 0;
-	let mut anchor_depth = 0usize;
+	let mut suppressed_depth = 0usize;
 
 	while index < input.len() {
 		if input.as_bytes()[index] == b'<' {
 			let Some(relative_end) = input[index..].find('>') else {
 				let segment = &input[index..];
-				if anchor_depth > 0 {
+				if suppressed_depth > 0 {
 					output.push_str(segment);
 				} else {
-					output.push_str(&link_reddit_user_mentions_in_text_segment(segment, false));
+					output.push_str(&link_reddit_references_in_text_segment(segment, false, None));
 				}
 				break;
 			};
@@ -4204,11 +4251,11 @@ pub fn link_reddit_user_mentions_in_html(input: &str) -> String {
 			let tag_end = index + relative_end + 1;
 			let tag = &input[index..tag_end];
 			if let Some((name, closing)) = html_tag_name(tag) {
-				if name.eq_ignore_ascii_case("a") {
+				if ["a", "code", "pre", "script", "style"].iter().any(|value| name.eq_ignore_ascii_case(value)) {
 					if closing {
-						anchor_depth = anchor_depth.saturating_sub(1);
+						suppressed_depth = suppressed_depth.saturating_sub(1);
 					} else if !tag.trim_end().ends_with("/>") {
-						anchor_depth += 1;
+						suppressed_depth += 1;
 					}
 				}
 			}
@@ -4219,10 +4266,10 @@ pub fn link_reddit_user_mentions_in_html(input: &str) -> String {
 
 		let next_tag = input[index..].find('<').map_or(input.len(), |relative| index + relative);
 		let segment = &input[index..next_tag];
-		if anchor_depth > 0 {
+		if suppressed_depth > 0 {
 			output.push_str(segment);
 		} else {
-			output.push_str(&link_reddit_user_mentions_in_text_segment(segment, false));
+			output.push_str(&link_reddit_references_in_text_segment(segment, false, None));
 		}
 		index = next_tag;
 	}
@@ -4233,12 +4280,18 @@ pub fn link_reddit_user_mentions_in_html(input: &str) -> String {
 fn reddit_user_mentions(input: &str) -> Vec<String> {
 	let mut mentions = Vec::new();
 	let mut seen = HashSet::new();
+	let mut url_ranges = PLAIN_URL_REGEX.find_iter(input).map(|value| (value.start(), value.end())).collect::<Vec<_>>();
+	url_ranges.extend(BARE_DOMAIN_REGEX.find_iter(input).map(|value| (value.start(), value.end())));
 
-	for capture in REDDIT_USER_MENTION_REGEX.captures_iter(input) {
-		let Some(username_match) = capture.get(2) else {
+	for capture in REDDIT_REFERENCE_REGEX.captures_iter(input) {
+		let (Some(slash), Some(kind), Some(username_match)) = (capture.get(2), capture.get(3), capture.get(4)) else {
 			continue;
 		};
-		if !has_reddit_username_boundary_after(input, username_match.end()) {
+		if !kind.as_str().eq_ignore_ascii_case("u")
+			|| !has_reddit_name_boundary_after(input, username_match.end())
+			|| !valid_reddit_reference("u", username_match.as_str())
+			|| range_overlaps(slash.start(), username_match.end(), &url_ranges)
+		{
 			continue;
 		}
 
@@ -6652,16 +6705,26 @@ mod tests {
 	#[test]
 	fn links_reddit_user_mentions_in_plain_text() {
 		assert_eq!(
-			super::link_reddit_user_mentions_in_plain_text(r#"Hello U/Demo_User and <u/not_html>"#),
-			r#"Hello <a class="user_mention" href="/user/Demo_User">U/Demo_User</a> and &lt;<a class="user_mention" href="/user/not_html">u/not_html</a>&gt;"#
+			super::link_reddit_user_mentions_in_plain_text(r#"Hello U/Demo_User, /u/OtherUser, r/rust, and /r/learnrust & <u/not_html>"#),
+			r#"Hello <a class="user_mention" href="/user/Demo_User">U/Demo_User</a>, <a class="user_mention" href="/user/OtherUser">/u/OtherUser</a>, <a class="subreddit_mention" href="/r/rust">r/rust</a>, and <a class="subreddit_mention" href="/r/learnrust">/r/learnrust</a> &amp; &lt;<a class="user_mention" href="/user/not_html">u/not_html</a>&gt;"#
 		);
 	}
 
 	#[test]
-	fn rewrite_urls_links_user_mentions_outside_existing_links() {
+	fn rewrite_urls_links_references_outside_existing_links_urls_and_code() {
 		assert_eq!(
-			rewrite_urls(r#"<div class="md"><p>Thanks u/Alice and <a href="https://example.com/u/Bob">u/Bob</a>.</p></div>"#),
-			r#"<div class="md"><p>Thanks <a class="user_mention" href="/user/Alice">u/Alice</a> and <a href="https://example.com/u/Bob">u/Bob</a>.</p></div>"#
+			rewrite_urls(
+				r#"<div class="md"><p>Thanks u/Alice in /r/rust; <a href="/u/Bob">u/Bob</a>; https://example.com/u/Carol and example.org/r/test.</p><pre>u/CodeUser r/code</pre><code>/u/InlineCode</code></div>"#
+			),
+			r#"<div class="md"><p>Thanks <a class="user_mention" href="/user/Alice">u/Alice</a> in <a class="subreddit_mention" href="/r/rust">/r/rust</a>; <a href="/u/Bob">u/Bob</a>; https://example.com/u/Carol and example.org/r/test.</p><pre>u/CodeUser r/code</pre><code>/u/InlineCode</code></div>"#
+		);
+	}
+
+	#[test]
+	fn reddit_reference_boundaries_and_invalid_names_remain_plain() {
+		assert_eq!(
+			super::link_reddit_references_in_plain_text("xu/Alice /u/a /r/ab r/bad-name u/[deleted] r/rust!"),
+			r#"xu/Alice /u/a /r/ab r/bad-name u/[deleted] <a class="subreddit_mention" href="/r/rust">r/rust</a>!"#
 		);
 	}
 

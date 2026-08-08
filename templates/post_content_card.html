@@ -7,7 +7,7 @@
 		{% if !post.flair.text.is_empty() %}
 		<span class="post_flair" style="color:{{ post.flair.foreground_color }}; background:{{ post.flair.background_color }};">{{ post.flair.text }}</span>
 		{% endif %}
-		<a href="{{ post.permalink }}">{{ post.title }}</a>
+		{{ post.title_html()|safe }}
 		{% if post.nsfw %}<small class="nsfw">NSFW</small>{% endif %}
 		{% if post.spoiler %}<small class="spoiler">Spoiler</small>{% endif %}
 	</h2>
@@ -29,7 +29,7 @@
 			</a>
 			{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
 			<figcaption>
-				{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
+				{% if !image.caption.is_empty() %}<p>{{ crate::utils::link_reddit_references_in_plain_text(image.caption)|safe }}</p>{% endif %}
 				{% if !image.outbound_url.is_empty() %}<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>{% endif %}
 			</figcaption>
 			{% endif %}

@@ -181,7 +181,7 @@
 				/>
 			</a>
 			<figcaption>
-				<p>{{ image.caption }}</p>
+				<p>{{ crate::utils::link_reddit_references_in_plain_text(image.caption)|safe }}</p>
 				{% if image.outbound_url.len() > 0 %}
 				<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a>
 				{% endif %}
@@ -195,7 +195,7 @@
 
 	<!-- POST BODY -->
 	<div class="post_body">
-		{{ post.body|safe }}
+		{{ crate::utils::link_reddit_references_in_html(post.body)|safe }}
 		{% call poll(post) %}
 	</div>
 	<div class="post_score" title="{{ post.score.1 }}">
@@ -469,7 +469,7 @@
 			<span class="post_context_prefix">
 				{% if post.parent_kind == "t1" %}Reply to comment in{% else %}Comment on{% endif %}
 			</span>
-			<a href="{{ post.link_permalink }}">{{ post.link_title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}
+			{{ crate::utils::link_reddit_references_in_linked_plain_text(post.link_title, post.link_permalink)|safe }}{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}
 		{% else %}
 		{% if post.flair.flair_parts.len() > 0 %}
 			<a href="/r/{{ post.community }}/search?q=flair_name%3A%22{{ post.flair.text }}%22&restrict_sr=on"
@@ -477,7 +477,7 @@
 				style="color:{{ post.flair.foreground_color }}; background:{{ post.flair.background_color }};"
 				dir="ltr">{% call render_flair(post.flair.flair_parts) %}</a>
 		{% endif %}
-		<a href="{{ post.permalink }}">{{ post.title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}
+		{{ crate::utils::link_reddit_references_in_linked_plain_text(post.title, post.permalink)|safe }}{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}
 		{% endif %}
 	</h2>
 	<!-- POST MEDIA/THUMBNAIL -->
@@ -518,7 +518,7 @@
 				{% if !image.caption.is_empty() || image.outbound_url.len() > 0 %}
 				<figcaption>
 					{% if !image.caption.is_empty() %}
-					<p>{{ image.caption }}</p>
+					<p>{{ crate::utils::link_reddit_references_in_plain_text(image.caption)|safe }}</p>
 					{% endif %}
 					{% if image.outbound_url.len() > 0 %}
 					<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>
@@ -559,9 +559,9 @@
 	{% if !post.preview_body.is_empty() || !post.body.is_empty() %}
 	<div class="post_body post_preview{% if auto_expand_preview %} expanded{% endif %}">
 		{% if !post.preview_body.is_empty() %}
-		{{ post.preview_body|safe }}
+		{{ crate::utils::link_reddit_references_in_html(post.preview_body)|safe }}
 		{% else %}
-		{{ post.body|safe }}
+		{{ crate::utils::link_reddit_references_in_html(post.body)|safe }}
 		{% endif %}
 	</div>
 	{% endif %}
@@ -629,7 +629,7 @@
 						{% endif %}
 						&middot; <a href="{{ c.parent_comment.permalink }}">view parent</a>
 					</div>
-					<div class="post_following_comment_parent_body md">{{ c.parent_comment.body|safe }}</div>
+					<div class="post_following_comment_parent_body md">{{ crate::utils::link_reddit_references_in_html(c.parent_comment.body)|safe }}</div>
 				</details>
 				{% else %}
 				<div class="post_following_comment_parent">
@@ -642,11 +642,11 @@
 						{% endif %}
 						&middot; <a href="{{ c.parent_comment.permalink }}">view parent</a>
 					</div>
-					<div class="post_following_comment_parent_body md">{{ c.parent_comment.body|safe }}</div>
+					<div class="post_following_comment_parent_body md">{{ crate::utils::link_reddit_references_in_html(c.parent_comment.body)|safe }}</div>
 				</div>
 				{% endif %}
 				{% endif %}
-				<div class="post_following_comment_body md">{{ c.body|safe }}</div>
+				<div class="post_following_comment_body md">{{ crate::utils::link_reddit_references_in_html(c.body)|safe }}</div>
 			</li>
 			{% endfor %}
 		</ul>
@@ -740,7 +740,7 @@
 		<span class="created" title="{{ post.display_created_tooltip() }}" data-created-ts="{{ post.created_ts }}">{{ post.display_rel_time() }}</span>
 	</div>
 	<div class="post_component_slot" data-post-component-slot aria-busy="true">
-		<h2 class="post_title"><a href="{{ post.permalink }}">{{ post.title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}</h2>
+		<h2 class="post_title">{{ crate::utils::link_reddit_references_in_linked_plain_text(post.title, post.permalink)|safe }}{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}{% if post.flags.spoiler %} <small class="spoiler">Spoiler</small>{% endif %}</h2>
 		<div class="post_component_loading" data-post-component-loading role="status">Loading post content…</div>
 	</div>
 	<div class="post_score" title="{{ post.score.1 }}">{% if !str_eq(prefs.hide_score, "on") %}{{ post.score.0 }}{% else %}&#x2022;{% endif %}<span class="label"> Upvotes</span></div>

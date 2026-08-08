@@ -62,7 +62,7 @@
 							style="color:{{ post.flair.foreground_color }}; background:{{ post.flair.background_color }};"
 							dir="ltr">{% call utils::render_flair(post.flair.flair_parts) %}</a>
 					{% endif %}
-					<a href="{{ post.permalink }}">{{ post.title }}</a>{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}
+					{{ crate::utils::link_reddit_references_in_linked_plain_text(post.title, post.permalink)|safe }}{% if post.flags.nsfw %} <small class="nsfw">NSFW</small>{% endif %}
 				</h2>
 
 				<div class="post_score" title="{{ post.score.1 }}">

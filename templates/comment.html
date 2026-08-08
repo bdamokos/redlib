@@ -38,7 +38,7 @@
 		{% if is_filtered %}
 		<div class="comment_body_filtered {% if highlighted %}highlighted{% endif %}">(Filtered content)</div>
 		{% else %}
-		<div class="comment_body {% if highlighted %}highlighted{% endif %}">{{ body|safe }}</div>
+		<div class="comment_body {% if highlighted %}highlighted{% endif %}">{{ crate::utils::link_reddit_references_in_html(body)|safe }}</div>
 		{% endif %}
 		<blockquote class="replies">{% for c in replies -%}{{ c.render().unwrap()|safe }}{%- endfor %}
 		</blockquote>

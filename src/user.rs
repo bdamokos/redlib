@@ -2650,10 +2650,11 @@ mod tests {
 	#[test]
 	fn renders_following_comment_original_and_parent_links() {
 		let mut post = test_post("demo", "Primary post title", "demo_sub", "", "image", "https://i.redd.it/example.jpg", &[]);
+		post.title = "Primary from u/TitleUser in /r/rust".to_string();
 		post.following_comments.push(FollowingComment {
 			id: "comment_one".to_string(),
 			author: "demo_author".to_string(),
-			body: "<p>This is the child comment.</p>".to_string(),
+			body: "<p>This child mentions /u/ChildUser and r/rust.</p>".to_string(),
 			permalink: "/r/demo_sub/comments/thread/comment_one/".to_string(),
 			created_ts: 1,
 			rel_time: "1h ago".to_string(),
@@ -2663,7 +2664,7 @@ mod tests {
 			parent_kind: "t1".to_string(),
 			parent_comment: ParentComment {
 				id: "parent_one".to_string(),
-				body: "<p>This is the parent comment.</p>".to_string(),
+				body: "<p>This parent mentions u/ParentUser and /r/learnrust.</p>".to_string(),
 				permalink: "/r/demo_sub/comments/thread/parent_one/".to_string(),
 				author: "demo_parent".to_string(),
 				rel_time: "2h ago".to_string(),
@@ -2713,7 +2714,13 @@ mod tests {
 
 		assert!(html.contains("original comment"));
 		assert!(html.contains("view parent"));
-		assert!(html.contains("This is the parent comment."));
+		assert!(html.contains(r#"<a class="user_mention" href="/user/TitleUser">u/TitleUser</a>"#));
+		assert!(html.contains(r#"<a class="subreddit_mention" href="/r/rust">/r/rust</a>"#));
+		assert!(!html.contains(r#"<a href="/r/demo_sub/comments/demo/"><a"#));
+		assert!(html.contains(r#"<a class="user_mention" href="/user/ChildUser">/u/ChildUser</a>"#));
+		assert!(html.contains(r#"<a class="subreddit_mention" href="/r/rust">r/rust</a>"#));
+		assert!(html.contains(r#"<a class="user_mention" href="/user/ParentUser">u/ParentUser</a>"#));
+		assert!(html.contains(r#"<a class="subreddit_mention" href="/r/learnrust">/r/learnrust</a>"#));
 	}
 
 	#[test]

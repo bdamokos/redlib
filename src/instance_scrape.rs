@@ -1135,7 +1135,7 @@ fn parse_comment_tree(element: ElementRef<'_>, post_link: &str, post_author: &st
 }
 
 fn sanitize_html(fragment: &str) -> String {
-	AmmoniaBuilder::default().clean(fragment).to_string()
+	crate::utils::link_reddit_references_in_html(&AmmoniaBuilder::default().clean(fragment).to_string())
 }
 
 fn next_after_token(parsed: &Html) -> Option<String> {
@@ -1342,10 +1342,13 @@ mod tests {
 
 	#[test]
 	fn sanitizes_untrusted_html() {
-		let sanitized = sanitize_html(r#"<div><script>alert(1)</script><a href="https://example.com" onclick="evil()">ok</a></div>"#);
+		let sanitized = sanitize_html(r#"<div><script>alert(1)</script><a href="https://example.com" onclick="evil()">u/already</a> /u/scraped and r/rust</div>"#);
 		assert!(!sanitized.contains("<script"));
 		assert!(!sanitized.contains("onclick"));
 		assert!(sanitized.contains("https://example.com"));
+		assert!(sanitized.contains(r#"<a href="https://example.com" rel="noopener noreferrer">u/already</a>"#));
+		assert!(sanitized.contains(r#"<a class="user_mention" href="/user/scraped">/u/scraped</a>"#));
+		assert!(sanitized.contains(r#"<a class="subreddit_mention" href="/r/rust">r/rust</a>"#));
 	}
 
 	#[test]

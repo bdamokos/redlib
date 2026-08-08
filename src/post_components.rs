@@ -499,6 +499,10 @@ impl StablePostContentV1 {
 		self.body.as_str()
 	}
 
+	pub fn title_html(&self) -> String {
+		crate::utils::link_reddit_references_in_linked_plain_text(&self.title, &self.permalink)
+	}
+
 	pub fn is_image(&self) -> bool {
 		matches!(self.media, StableMediaV1::Image { .. })
 	}
@@ -1119,6 +1123,39 @@ mod tests {
 			StablePostContentV1::from_post(&first).unwrap().revision(),
 			StablePostContentV1::from_post(&second).unwrap().revision()
 		);
+	}
+
+	#[test]
+	fn stable_gallery_card_linkifies_title_body_and_caption_references() {
+		let mut post = sample_post();
+		post.title = "From u/TitleUser in /r/rust".to_string();
+		post.body = "<p>Body mentions /u/BodyUser and r/learnrust.</p>".to_string();
+		post.post_type = "gallery".to_string();
+		post.gallery = vec![GalleryMedia {
+			url: "/img/a.png".to_string(),
+			preview_url: String::new(),
+			preview_srcset: String::new(),
+			width: 1,
+			height: 1,
+			caption: "Credit u/PhotoUser in r/pics & friends".to_string(),
+			outbound_url: String::new(),
+		}];
+		let stable = StablePostContentV1::from_post(&post).unwrap();
+		let html = StablePostCardTemplate {
+			post: &stable,
+			revision: "test-revision",
+		}
+		.render()
+		.unwrap();
+
+		assert!(html.contains(r#"<a class="user_mention" href="/user/TitleUser">u/TitleUser</a>"#));
+		assert!(html.contains(r#"<a class="subreddit_mention" href="/r/rust">/r/rust</a>"#));
+		assert!(html.contains(r#"<a href="/r/rust/comments/abc123/stable_title/">From </a>"#));
+		assert!(!html.contains(r#"<a href="/r/rust/comments/abc123/stable_title/"><a"#));
+		assert!(html.contains(r#"<a href="/user/BodyUser" rel="noopener noreferrer">/u/BodyUser</a>"#));
+		assert!(html.contains(r#"<a href="/r/learnrust" rel="noopener noreferrer">r/learnrust</a>"#));
+		assert!(html.contains(r#"<a class="user_mention" href="/user/PhotoUser">u/PhotoUser</a>"#));
+		assert!(html.contains(r#"<a class="subreddit_mention" href="/r/pics">r/pics</a> &amp; friends"#));
 	}
 
 	#[test]
