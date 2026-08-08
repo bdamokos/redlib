@@ -601,8 +601,8 @@ async fn process_job(client: &Client<hyper::client::HttpConnector>, job: Observe
 	Ok(outcome)
 }
 
-fn should_flush_sidecar(dirty: bool, queue_empty: bool, elapsed: Duration, max_delay: Duration) -> bool {
-	dirty && (queue_empty || elapsed >= max_delay)
+fn should_flush_sidecar(dirty: bool, elapsed: Duration, max_delay: Duration) -> bool {
+	dirty && elapsed >= max_delay
 }
 
 #[derive(Default)]
@@ -657,7 +657,7 @@ async fn worker_loop() {
 			let metadata_dirty = OBSERVED_METADATA_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
 			let content_dirty = OBSERVED_CONTENT_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
 			let dirty = metadata_dirty || content_dirty;
-			if should_flush_sidecar(dirty, true, last_flush_attempt.elapsed(), flush_max_delay) {
+			if should_flush_sidecar(dirty, last_flush_attempt.elapsed(), flush_max_delay) {
 				if mutation_guard.is_none() {
 					// Dirty memory must never be replaced by a disk refresh. This
 					// branch is defensive—the normal worker retains its guard until a
@@ -694,6 +694,28 @@ async fn worker_loop() {
 							_ = OBSERVED_BACKFILL_NOTIFY.notified() => {},
 						}
 					}
+				}
+				continue;
+			}
+			if dirty {
+				// A trickle of observations can repeatedly drain the queue. Keep
+				// the mutation guard and coalesce those jobs until the same bounded
+				// durability deadline used by an active queue. Waking for new work
+				// does not force a whole-sidecar rewrite.
+				if mutation_guard.is_none() {
+					match acquire_mutation_guard().await {
+						Ok(guard) => mutation_guard = Some(guard),
+						Err(error) => {
+							warn!("observed_semantic_backfill: failed to reacquire mutation guard for dirty queue: {error}");
+							tokio::time::sleep(Duration::from_secs(SIDECAR_FLUSH_RETRY_SECS)).await;
+							continue;
+						}
+					}
+				}
+				let remaining = flush_max_delay.saturating_sub(last_flush_attempt.elapsed());
+				tokio::select! {
+					_ = tokio::time::sleep(remaining) => {},
+					_ = OBSERVED_BACKFILL_NOTIFY.notified() => {},
 				}
 				continue;
 			}
@@ -766,7 +788,7 @@ async fn worker_loop() {
 		let metadata_dirty = OBSERVED_METADATA_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
 		let content_dirty = OBSERVED_CONTENT_SIDECAR_DIRTY.load(AtomicOrdering::Acquire);
 		let dirty = metadata_dirty || content_dirty;
-		if should_flush_sidecar(dirty, false, last_flush_attempt.elapsed(), flush_max_delay) {
+		if should_flush_sidecar(dirty, last_flush_attempt.elapsed(), flush_max_delay) {
 			last_flush_attempt = Instant::now();
 			match flush_sidecars_and_trim_allocator(metadata_dirty, content_dirty).await {
 				Ok(flushed) => {
@@ -863,10 +885,25 @@ mod tests {
 	#[test]
 	fn sidecar_flushes_when_queue_drains_or_max_delay_elapses() {
 		let max_delay = Duration::from_secs(60);
-		assert!(!should_flush_sidecar(false, true, Duration::from_secs(60), max_delay));
-		assert!(should_flush_sidecar(true, true, Duration::ZERO, max_delay));
-		assert!(!should_flush_sidecar(true, false, Duration::from_secs(59), max_delay));
-		assert!(should_flush_sidecar(true, false, Duration::from_secs(60), max_delay));
+		assert!(!should_flush_sidecar(false, Duration::from_secs(60), max_delay));
+		assert!(!should_flush_sidecar(true, Duration::from_secs(59), max_delay));
+		assert!(should_flush_sidecar(true, Duration::from_secs(60), max_delay));
+	}
+
+	#[test]
+	fn trickled_queue_drains_coalesce_until_the_production_flush_deadline() {
+		let max_delay = Duration::from_secs(60);
+		let mut flushes = 0;
+
+		// The failed 1 GiB fixture repeatedly drained as 120 source
+		// observations trickled in. Draining is not itself a reason to rewrite
+		// the whole 34 MiB sidecar inside the durability window.
+		for elapsed_secs in (0..60).step_by(5) {
+			flushes += usize::from(should_flush_sidecar(true, Duration::from_secs(elapsed_secs), max_delay));
+		}
+		flushes += usize::from(should_flush_sidecar(true, Duration::from_secs(60), max_delay));
+
+		assert_eq!(flushes, 1, "trickled queue drains must persist once at the bounded deadline");
 	}
 
 	#[test]
